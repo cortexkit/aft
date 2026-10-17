@@ -18,6 +18,7 @@
 - Semantic search: when Synapse announces a timed embedding-model pause (`lane_paused`), indexing waits it out and resumes where it stopped instead of failing or re-embedding finished work, without holding build slots or locks. Searches meanwhile use keyword search with "Semantic search unavailable: the embedding model is paused; using keyword search only.", and health shows the semantic index as paused until the announced time.
 - edit: multi-item `edits[]` and line-range edits now work on existing files whose paths contain glob characters, such as Next.js `app/[id]/page.tsx`, instead of being refused as glob targets; real globs behave as before. Thanks for the report (#486).
 - gh shim (manifest 19): `gh workflow disable` and `gh workflow enable` run under the operator bypass, like `run cancel`, and are refused as undeclared on older manifests.
+- write / edit / apply_patch: when a call creates a file that does not parse, the reply now ends with "Syntax check: the new file does not parse (first error near line N); it was written as given." (in apply_patch, directly under that file's line). Existing files still roll back as before, and a new Swift file that `swiftc -parse` accepts gets no line.
 
 ## Sandbox profiles
 

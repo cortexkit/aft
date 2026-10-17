@@ -349,7 +349,33 @@ pub(crate) fn format_response_unbounded(
             text.push_str(&notice);
         }
     }
+    if matches!(bare_name, "edit" | "write") {
+        if let Some(notice) = created_file_syntax_error_line(data) {
+            if text.is_empty() {
+                text = notice;
+            } else {
+                text.push_str("\n\n");
+                text.push_str(&notice);
+            }
+        }
+    }
     text
+}
+
+/// The final reply line for an `edit`/`write` call that created a file which
+/// does not parse. The command handlers set `syntax_error_line` only for a
+/// file they created; `created` and `syntax_valid` are checked as well so a
+/// file that existed before the call can never get this line.
+fn created_file_syntax_error_line(data: &Value) -> Option<String> {
+    if data.get("created").and_then(Value::as_bool) != Some(true)
+        || data.get("syntax_valid").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let line = data
+        .get(crate::edit::CREATED_SYNTAX_ERROR_LINE_FIELD)
+        .and_then(Value::as_u64)?;
+    Some(crate::edit::created_file_syntax_error_notice(line))
 }
 
 fn import_string_field(response: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -1385,6 +1411,32 @@ mod edit_diagnostics_tests {
         );
         let no_op = super::format_edit_response(&serde_json::json!({"no_op": true}));
         assert!(no_op.contains("Likely causes"), "{no_op}");
+    }
+
+    #[test]
+    fn created_file_syntax_line_is_last_and_only_for_created_invalid_files() {
+        let render = |name: &str, data: serde_json::Value| {
+            super::format_response(name, &crate::protocol::Response::success("1", data), false)
+        };
+        let expected = "Syntax check: the new file does not parse (first error near line 7); it was written as given.";
+        let created = serde_json::json!({
+            "created": true, "syntax_valid": false, "syntax_error_line": 7,
+            "backup_skipped_reason": "disabled",
+        });
+        let write = render("write", created.clone());
+        assert_eq!(write.lines().last(), Some(expected), "{write}");
+        assert_eq!(write.matches("Syntax check:").count(), 1, "{write}");
+        let edit = render("edit", created);
+        assert_eq!(edit.lines().last(), Some(expected), "{edit}");
+
+        for data in [
+            serde_json::json!({"created": false, "syntax_valid": false, "syntax_error_line": 7}),
+            serde_json::json!({"created": true, "syntax_valid": true, "syntax_error_line": 7}),
+            serde_json::json!({"created": true, "syntax_valid": false}),
+        ] {
+            let text = render("write", data);
+            assert!(!text.contains("Syntax check"), "{text}");
+        }
     }
 
     #[test]

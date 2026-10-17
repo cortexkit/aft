@@ -646,6 +646,11 @@ pub fn compute_reformatted_excerpt(
 pub struct WriteResult {
     /// Whether tree-sitter syntax validation passed. `None` if unsupported language.
     pub syntax_valid: Option<bool>,
+    /// 1-based line of the first parse error, set only when this call created
+    /// the file and its confirmed syntax check failed. Such a file is kept on
+    /// disk as written (there is nothing to roll back to), and the reply tells
+    /// the agent where the error is.
+    pub syntax_error_line: Option<usize>,
     /// Whether the file was auto-formatted.
     pub formatted: bool,
     /// Why formatting was skipped, if it was. Values: "unsupported_language",
@@ -777,6 +782,27 @@ impl WriteResult {
             }
         }
     }
+
+    /// Record where a file created by this call fails to parse. Reply
+    /// renderers read `syntax_error_line` to tell the agent the new file was
+    /// written even though it does not parse.
+    pub fn append_created_syntax_error_to(&self, result: &mut serde_json::Value) {
+        if let Some(line) = self.syntax_error_line {
+            result[CREATED_SYNTAX_ERROR_LINE_FIELD] = serde_json::json!(line);
+        }
+    }
+}
+
+/// Response field carrying the 1-based first error line of a created file that
+/// does not parse. Present only for files the call created.
+pub(crate) const CREATED_SYNTAX_ERROR_LINE_FIELD: &str = "syntax_error_line";
+
+/// The reply line for a file this call created that does not parse. Every
+/// reply path renders it through this function so the wording stays the same.
+pub(crate) fn created_file_syntax_error_notice(first_error_line: u64) -> String {
+    format!(
+        "Syntax check: the new file does not parse (first error near line {first_error_line}); it was written as given."
+    )
 }
 
 thread_local! {
@@ -860,7 +886,7 @@ pub fn write_format_validate(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, false, None)
+    write_format_validate_impl(path, content, config, params, false, None, false)
 }
 
 /// Reuse the captured original only while its strong file identity still matches.
@@ -878,7 +904,7 @@ pub(crate) fn write_format_validate_observed(
         .and(observation.version)
         .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path))
         .map(|_| original);
-    write_format_validate_impl(path, content, config, params, false, pre)
+    write_format_validate_impl(path, content, config, params, false, pre, false)
 }
 
 /// Write, format and syntax-check now; the caller checks the completed project
@@ -889,7 +915,22 @@ pub(crate) fn write_format_validate_deferred(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true, None)
+    write_format_validate_impl(path, content, config, params, true, None, false)
+}
+
+/// Write and format a file that did not exist before the caller's
+/// multi-step operation started, even if an earlier step of that operation
+/// already wrote it. There is no earlier content to protect, so an invalid
+/// result is never rolled back, and no syntax check runs here: the caller
+/// checks the file's final content once with [`check_created_file_syntax`]
+/// after its last step. `syntax_valid` and `syntax_error_line` are `None`.
+pub(crate) fn write_format_deferred_created(
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+) -> Result<WriteResult, AftError> {
+    write_format_validate_impl(path, content, config, params, true, None, true)
 }
 
 mod swift;
@@ -901,10 +942,17 @@ fn write_format_validate_impl(
     params: &serde_json::Value,
     defer_full_validation: bool,
     captured_original: Option<&str>,
+    syntax_checked_by_caller: bool,
 ) -> Result<WriteResult, AftError> {
+    // A file this call creates has no prior content: it cannot be rolled back
+    // to anything, so an invalid result is kept and reported through
+    // `syntax_error_line` instead. With `syntax_checked_by_caller`, the file
+    // was created earlier in the caller's own multi-step operation: it also
+    // has no prior content to protect, and the caller checks its syntax.
+    let existed = !syntax_checked_by_caller && (captured_original.is_some() || path.exists());
     let pre_write_content = if let Some(source) = captured_original {
         Some(std::borrow::Cow::Borrowed(source))
-    } else if path.exists() {
+    } else if existed {
         #[cfg(test)]
         WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
         read_edit_text(path).ok().map(std::borrow::Cow::Owned)
@@ -931,10 +979,17 @@ fn write_format_validate_impl(
     #[cfg(test)]
     WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
     let mut final_text = ObservedFinalText::read(path);
+    let mut syntax_error_line = None;
     let syntax_valid = final_text
         .as_ref()
         .map(|observed| observed.text.as_str())
+        .filter(|_| !syntax_checked_by_caller)
         .and_then(|source| {
+            if !existed {
+                let check = check_created_file_syntax(path, source);
+                syntax_error_line = check.first_error_line;
+                return check.valid;
+            }
             let syntax_valid = validate_captured_syntax(path, source);
             swift::confirm_if_needed(
                 path,
@@ -986,6 +1041,7 @@ fn write_format_validate_impl(
 
     Ok(WriteResult {
         syntax_valid,
+        syntax_error_line,
         formatted,
         format_skipped_reason,
         validate_requested,
@@ -999,12 +1055,78 @@ fn write_format_validate_impl(
 }
 
 fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
+    parse_captured_syntax(path, source).map(|tree| !tree.root_node().has_error())
+}
+
+fn parse_captured_syntax(path: &Path, source: &str) -> Option<tree_sitter::Tree> {
     let lang = detect_language(path)?;
     #[cfg(test)]
     A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
-    crate::parser::parse_source_with_cached_parser(path, source, lang)
-        .ok()
-        .map(|tree| !tree.root_node().has_error())
+    crate::parser::parse_source_with_cached_parser(path, source, lang).ok()
+}
+
+/// Syntax verdict for a file the current call created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreatedFileSyntax {
+    /// `None` when the language has no parser.
+    pub valid: Option<bool>,
+    /// 1-based line of the first parse error. Set only when `valid` is
+    /// `Some(false)` after any compiler confirmation.
+    pub first_error_line: Option<usize>,
+}
+
+/// Check the syntax of a file that did not exist before this call.
+///
+/// A new file cannot be rolled back to earlier content, so an invalid result
+/// is kept on disk and reported to the agent instead. The error line comes
+/// from the same tree-sitter parse that produced the verdict. Swift files that
+/// tree-sitter rejects are confirmed with `swiftc -parse` first, so a file the
+/// compiler accepts counts as valid and carries no error line.
+pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
+    let Some(tree) = parse_captured_syntax(path, source) else {
+        return CreatedFileSyntax {
+            valid: None,
+            first_error_line: None,
+        };
+    };
+    let root = tree.root_node();
+    let valid = swift::confirm_created(path, source, Some(!root.has_error()));
+    let first_error_line = if valid == Some(false) {
+        first_syntax_error_line(root)
+    } else {
+        None
+    };
+    CreatedFileSyntax {
+        valid,
+        first_error_line,
+    }
+}
+
+/// 1-based start line of the first ERROR or MISSING node in document order.
+///
+/// tree-sitter sets `has_error` on a node exactly when its subtree contains an
+/// ERROR or MISSING node, so the walk only descends into subtrees that carry
+/// one and returns `None` only for a tree without errors. It is iterative
+/// because deeply nested syntax trees could overflow a recursive walk.
+pub(crate) fn first_syntax_error_line(root: tree_sitter::Node<'_>) -> Option<usize> {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            return Some(node.start_position().row + 1);
+        }
+        if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1046,6 +1168,52 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn created_file_syntax_reports_first_error_line() {
+        let path = Path::new("new.ts");
+        // ERROR node on line 3 (later lines are broken too).
+        let check = check_created_file_syntax(
+            path,
+            "const a = 1;\nconst b = 2;\nfunction broken( {{\nconst c = ;\n",
+        );
+        assert_eq!(check.valid, Some(false));
+        assert_eq!(check.first_error_line, Some(3));
+        // A MISSING node (unclosed call) also counts.
+        let missing = check_created_file_syntax(path, "const a = 1;\nfoo(1\n");
+        assert_eq!(missing.valid, Some(false));
+        assert!(missing.first_error_line.is_some_and(|line| line >= 2));
+        let valid = check_created_file_syntax(path, "const a = 1;\n");
+        assert_eq!(valid.valid, Some(true));
+        assert_eq!(valid.first_error_line, None);
+        let unsupported = check_created_file_syntax(Path::new("notes.unknownext"), "{{");
+        assert_eq!(unsupported.valid, None);
+        assert_eq!(unsupported.first_error_line, None);
+    }
+
+    #[test]
+    fn created_file_pipeline_keeps_invalid_new_file_and_reports_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            format_on_edit: false,
+            ..Config::default()
+        };
+        let path = temp.path().join("new.ts");
+        let broken = "const a = 1;\n\nfunction {\n";
+        let result = write_format_validate(&path, broken, &config, &serde_json::json!({})).unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(result.syntax_valid, Some(false));
+        assert_eq!(result.syntax_error_line, Some(3));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+
+        // The same content written over an existing clean file rolls back and
+        // carries no created-file line.
+        let existing = temp.path().join("existing.ts");
+        std::fs::write(&existing, "const a = 1;\n").unwrap();
+        let result =
+            write_format_validate(&existing, broken, &config, &serde_json::json!({})).unwrap();
+        assert!(result.rolled_back);
+        assert_eq!(result.syntax_error_line, None);
+    }
     #[test]
     fn a03_diff_construction_bound_and_output_goldens() {
         let cases = [

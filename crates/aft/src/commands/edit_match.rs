@@ -331,9 +331,22 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     // Validate the observed post-format bytes, as the shared write pipeline does.
     // Path validation can cache a missing parent before append creates it; asking
     // the file parser to stat that parent again would reuse the stale failure.
-    let syntax_valid = final_content
-        .as_deref()
-        .and_then(|content| edit::validate_syntax_str(content, path.as_path()));
+    // A file this append created goes through the same created-file check as
+    // `write`, so the reply can say where the new file fails to parse.
+    let created_syntax = if existed {
+        None
+    } else {
+        final_content
+            .as_deref()
+            .map(|content| edit::check_created_file_syntax(path.as_path(), content))
+    };
+    let syntax_valid = match created_syntax {
+        Some(check) => check.valid,
+        None => final_content
+            .as_deref()
+            .and_then(|content| edit::validate_syntax_str(content, path.as_path())),
+    };
+    let syntax_error_line = created_syntax.and_then(|check| check.first_error_line);
 
     let mut result = serde_json::json!({
         "ok": true,
@@ -345,6 +358,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     });
     if !warnings.is_empty() {
         result["warnings"] = serde_json::json!(warnings);
+    }
+    if let Some(line) = syntax_error_line {
+        result[edit::CREATED_SYNTAX_ERROR_LINE_FIELD] = serde_json::json!(line);
     }
 
     if let Some(reason) = &format_skipped_reason {
@@ -377,6 +393,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     if lsp_outcome.is_some() {
         let write_result = edit::WriteResult {
             syntax_valid,
+            syntax_error_line,
             formatted,
             format_skipped_reason: format_skipped_reason.clone(),
             validate_requested: false,

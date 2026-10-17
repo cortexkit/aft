@@ -206,6 +206,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }
+    write_result.append_created_syntax_error_to(&mut result);
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
