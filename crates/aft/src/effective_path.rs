@@ -120,16 +120,54 @@ pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
 
 #[cfg(unix)]
 fn command_with_path(program: &OsStr, path: &OsStr) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
     // Startup exports the effective PATH before threads start. Reapplying even
     // the same value marks PATH as changed in Rust's Command and disables
     // posix_spawn for bare executable names, forcing a costly daemon fork.
-    // Library callers that have not initialized process PATH still need the
-    // override to preserve executable lookup and the child's environment.
-    if std::env::var_os("PATH").as_deref() != Some(path) {
-        cmd.env("PATH", path);
+    if std::env::var_os("PATH").as_deref() == Some(path) {
+        return std::process::Command::new(program);
     }
+    // The process PATH can still differ: library callers that never
+    // initialized it, or a daemon started from an AFT-governed shell, whose
+    // startup removes the outer gh-shim directory from the process PATH after
+    // the effective PATH was computed. The child must keep the effective PATH
+    // for its environment and for the executable lookup. std only does that
+    // lookup itself on the fork+exec path (execvp after installing the new
+    // environment), so resolve the bare name here, against the same PATH, and
+    // spawn the absolute path. argv[0] keeps the bare name, as execvp would.
+    let mut cmd = match resolve_in_path(program, path) {
+        Some(resolved) => {
+            let mut cmd = std::process::Command::new(resolved);
+            cmd.arg0(program);
+            cmd
+        }
+        None => std::process::Command::new(program),
+    };
+    cmd.env("PATH", path);
     cmd
+}
+
+/// Find `program` the way execvp would search `path`: the first directory
+/// holding an entry this process may execute. Returns `None`, leaving the
+/// lookup to the child, for names that are already paths, and for a PATH with
+/// an empty or relative entry, because execvp resolves those against the
+/// child's working directory, which may differ from ours.
+#[cfg(unix)]
+fn resolve_in_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    if program.is_empty() || program.as_bytes().contains(&b'/') {
+        return None;
+    }
+    let directories = std::env::split_paths(path).collect::<Vec<_>>();
+    if directories.iter().any(|directory| !directory.is_absolute()) {
+        return None;
+    }
+    directories.into_iter().find_map(|directory| {
+        let candidate = directory.join(program);
+        let text = std::ffi::CString::new(candidate.as_os_str().as_bytes()).ok()?;
+        let executable_file = std::fs::metadata(&candidate).is_ok_and(|meta| meta.is_file())
+            // SAFETY: `text` is a valid NUL-terminated path for the call.
+            && unsafe { libc::access(text.as_ptr(), libc::X_OK) } == 0;
+        executable_file.then_some(candidate)
+    })
 }
 
 /// On Windows the process PATH is already correct (registry-backed
@@ -776,6 +814,41 @@ fn reap_child_in_background(mut child: Child) {
         });
 }
 
+/// Test seam that tells which spawn mechanism std used for a `Command`.
+///
+/// A `pthread_atfork` prepare handler counts fork() calls made by the current
+/// thread. std's fork+exec fallback calls libc `fork`, which runs the handler;
+/// its `posix_spawn` path (a syscall on macOS, a CLONE_VFORK clone on glibc)
+/// does not. The count is per thread, so parallel tests that fork do not
+/// disturb each other.
+#[cfg(all(test, unix))]
+pub(crate) mod fork_counter {
+    use std::cell::Cell;
+    use std::sync::Once;
+
+    thread_local! {
+        static FORKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    extern "C" fn count_fork() {
+        FORKS.with(|forks| forks.set(forks.get() + 1));
+    }
+
+    /// Run `body` and return its result with the number of forks this thread
+    /// made meanwhile.
+    pub(crate) fn forks_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| {
+            // SAFETY: the handler only touches a const-initialized thread-local.
+            let rc = unsafe { libc::pthread_atfork(Some(count_fork), None, None) };
+            assert_eq!(rc, 0, "pthread_atfork failed");
+        });
+        let before = FORKS.with(Cell::get);
+        let value = body();
+        (value, FORKS.with(Cell::get) - before)
+    }
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -796,6 +869,72 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "PATH" && value == Some(path)));
+    }
+
+    /// A PATH that differs from the process PATH must not push bare-name
+    /// helpers (git above all) onto std's fork+exec fallback, and the child
+    /// must still find the tool on, and inherit, that PATH.
+    #[test]
+    fn distinct_effective_path_spawns_bare_names_without_fork() {
+        let tools = tempfile::tempdir().unwrap();
+        let tool = tools.path().join("aft-path-probe-tool");
+        fs::write(&tool, "#!/bin/sh\nprintf '%s' \"$PATH\"\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let path =
+            std::env::join_paths([tools.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
+
+        let workdir = tempfile::tempdir().unwrap();
+        let (output, forks) = fork_counter::forks_during(|| {
+            let mut command = command_with_path(OsStr::new("aft-path-probe-tool"), &path);
+            command.current_dir(workdir.path()).output().unwrap()
+        });
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            path.as_bytes(),
+            "child keeps the effective PATH"
+        );
+        assert_eq!(
+            forks, 0,
+            "bare-name spawn under a distinct PATH used fork+exec"
+        );
+
+        // The fork counter must see the fork of a pre_exec spawn; otherwise the
+        // zero forks asserted above would not show that posix_spawn was used.
+        let (_, control) = fork_counter::forks_during(|| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            // SAFETY: the closure does nothing.
+            unsafe { command.pre_exec(|| Ok(())) };
+            command.status().unwrap()
+        });
+        assert_eq!(control, 1, "fork counter missed a pre_exec spawn");
+    }
+
+    #[test]
+    fn path_resolution_defers_relative_entries_and_paths_to_the_child() {
+        let tools = tempfile::tempdir().unwrap();
+        let tool = tools.path().join("aft-path-probe-tool");
+        fs::write(&tool, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let absolute = std::env::join_paths([tools.path()]).unwrap();
+        assert_eq!(
+            resolve_in_path(OsStr::new("aft-path-probe-tool"), &absolute),
+            Some(tool.clone())
+        );
+        let with_relative = std::env::join_paths([Path::new("bin"), tools.path()]).unwrap();
+        assert_eq!(
+            resolve_in_path(OsStr::new("aft-path-probe-tool"), &with_relative),
+            None
+        );
+        assert_eq!(resolve_in_path(tool.as_os_str(), &absolute), None);
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            resolve_in_path(OsStr::new("aft-path-probe-tool"), &absolute),
+            None,
+            "a non-executable entry is skipped, as execvp would"
+        );
     }
 
     use super::*;

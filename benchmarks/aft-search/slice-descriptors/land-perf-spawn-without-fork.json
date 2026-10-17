@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "The only fenced change caches the git root-commit probe used for artifact cache keys, invalidated by a stamp of the repository's git files; search inputs are unchanged. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
