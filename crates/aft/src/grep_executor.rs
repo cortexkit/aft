@@ -3168,9 +3168,17 @@ mod tests {
         let found = found.lock().unwrap().clone();
         let missed = hook.files_missed_before_expiry(&found);
         assert!(missed <= 1, "{missed} files checked in time were dropped");
-        // The root itself, plus each entry checked in time; the entry let
-        // through at the deadline is not counted.
-        assert!(entries_visited <= hook.calls_before_expiry().len() + 1);
+        // The count covers the root (never filtered, so never hooked) plus
+        // each entry the walk took in before its deadline. Exactly one
+        // filter-checked entry is not counted: the one the walk refused at
+        // its deadline, checked before expiry (so in `calls_before_expiry`)
+        // or after it (the single call in `after_expiry`). Counting that
+        // refused entry would exceed this bound by one.
+        let checked_in_time = hook.calls_before_expiry().len();
+        assert!(
+            entries_visited <= checked_in_time + after_expiry,
+            "{entries_visited} entries counted, {checked_in_time} checked in time"
+        );
     }
 
     #[test]

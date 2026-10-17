@@ -569,6 +569,7 @@ fn run_with_limiter<T: Send + 'static>(
     std::thread::Builder::new()
         .name("aft-filesystem-probe".into())
         .spawn(move || {
+            let _permit = permit;
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
