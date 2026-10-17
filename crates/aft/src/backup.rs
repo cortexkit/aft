@@ -3012,8 +3012,9 @@ impl BackupStore {
                             continue;
                         }
                         if let Err(error) = crate::cross_volume::move_path(&source, &target) {
-                            // The backup stays at its legacy path; say so
-                            // instead of dropping the failure.
+                            // A backup that cannot be moved stays in the root
+                            // `backups/` folder; log the move failure instead
+                            // of dropping it.
                             crate::slog_warn!(
                                 "legacy backup {} kept in place: cannot move it to {}: {}",
                                 source.display(),

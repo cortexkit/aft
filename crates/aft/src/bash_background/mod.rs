@@ -1380,8 +1380,9 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
                         continue;
                     }
                     if let Err(error) = crate::cross_volume::move_path(&source, &target) {
-                        // The task stays readable at its legacy path; say so
-                        // instead of dropping the failure.
+                        // A task that cannot be moved stays readable in the
+                        // root `bash-tasks/` folder; log the move failure
+                        // instead of dropping it.
                         crate::slog_warn!(
                             "legacy bash task {} kept in place: cannot move it to {}: {}",
                             source.display(),
