@@ -173,19 +173,26 @@ fn open_contents(root: &Path, target: &Path) -> Result<File, ReadExactRefusal> {
             _ => Err(ReadExactRefusal::AccessDenied),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // Nonblocking opens prevent a FIFO replacement from stalling before fstat.
+    // The root and every parent are opened only to look names up in them, so
+    // they get search-only handles: a plain open of the file needs search
+    // (execute) permission on its parents, not read (list) permission, and
+    // the walk must not refuse a file under a parent like a 0711 directory
+    // owned by someone else. Nonblocking opens of the final component keep a
+    // FIFO replacement from stalling before fstat.
     let mut handle = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(SEARCH_DIRECTORY | libc::O_NOFOLLOW)
         .open(root)
         .map_err(open_error)?;
     for (index, name) in names.iter().enumerate() {
         let last = index + 1 == names.len();
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
+        let flags = libc::O_NOFOLLOW
             | libc::O_CLOEXEC
-            | if last { 0 } else { libc::O_DIRECTORY };
+            | if last {
+                libc::O_RDONLY | libc::O_NONBLOCK
+            } else {
+                SEARCH_DIRECTORY
+            };
         // SAFETY: `handle` is an open directory and `name` is NUL-terminated.
         let fd = unsafe { libc::openat(handle.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
@@ -202,6 +209,23 @@ fn open_contents(root: &Path, target: &Path) -> Result<File, ReadExactRefusal> {
     }
     Ok(handle)
 }
+
+/// Open flags for a directory handle used only as an `openat` base. Linux's
+/// O_PATH and Apple's O_SEARCH need search permission on the directory but
+/// not read permission. The fstat, identity and real-location checks run on
+/// the final file's handle only, which is still a plain O_RDONLY open.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEARCH_DIRECTORY: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
+#[cfg(target_vendor = "apple")]
+const SEARCH_DIRECTORY: libc::c_int = libc::O_SEARCH;
+/// Other Unix systems get a read handle, so there a file whose parent grants
+/// search but not read permission (such as a 0711 directory owned by another
+/// user) is refused with an I/O error even though a plain open could read it.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+const SEARCH_DIRECTORY: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
 
 /// Windows has no component-relative open here, so the parent directories
 /// are resolved by path; `opened_location` then judges where the handle
@@ -795,6 +819,48 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
         assert_eq!(
             open_contents(&root, &root.join("sub/file")).err(),
+            Some(ReadExactRefusal::AccessDenied)
+        );
+    }
+
+    /// A parent directory the reader may search but not list: a plain open of
+    /// a file under it succeeds, so the walk must too, while a symlink to
+    /// such a directory is still refused as a parent.
+    #[cfg(unix)]
+    #[test]
+    fn file_read_exact_search_only_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses directory permissions, so the case cannot be set up.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, which ignores directory read permission");
+            return;
+        }
+        let (_dir, root, outside, policy) = swap_fixture();
+        // Execute-only for the owner is what a non-owner sees on a 0711
+        // directory; the owner of a 0711 directory could still list it.
+        struct Restore(Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+        let _restore = Restore(vec![root.join("sub"), outside.clone()]);
+        for path in &_restore.0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o111)).unwrap();
+        }
+        assert!(std::fs::read_dir(root.join("sub")).is_err());
+        assert_eq!(std::fs::read(root.join("sub/file")).unwrap(), b"inside");
+
+        let read =
+            super::read_exact(Path::new("sub/file"), &root, &policy, ReadHooks::default()).unwrap();
+        assert_eq!(read.value["bytes_base64"], STANDARD.encode("inside"));
+        assert_eq!(read.resolved, root.join("sub/file"));
+
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert_eq!(
+            open_contents(&root, &root.join("link/file")).err(),
             Some(ReadExactRefusal::AccessDenied)
         );
     }
