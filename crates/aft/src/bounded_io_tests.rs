@@ -42,6 +42,11 @@ struct WalkHook {
     /// For an entry hook: block the call for exactly this path (one of `roots`).
     block_exact: bool,
     seen: AtomicUsize,
+    /// Paths of the calls made while the walk could still go on, in order.
+    before_expiry: Mutex<Vec<PathBuf>>,
+    /// Calls made after the walk's deadline passed or its request stopped
+    /// waiting: work the walk should no longer be doing.
+    after_expiry: AtomicUsize,
     blocked: Mutex<Option<Sender<PathBuf>>>,
     release: Mutex<Option<Receiver<()>>>,
 }
@@ -60,6 +65,65 @@ impl WalkHookGuard {
     pub(crate) fn release(&mut self) {
         self.release.take();
     }
+    /// Paths of the hooked calls made before the walk had to stop, in order.
+    pub(crate) fn calls_before_expiry(&self) -> Vec<PathBuf> {
+        self.hook.before_expiry.lock().unwrap().clone()
+    }
+    /// How many hooked calls the walk made after it had to stop.
+    pub(crate) fn calls_after_expiry(&self) -> usize {
+        self.hook.after_expiry.load(Ordering::Relaxed)
+    }
+    /// Checks the partial result of a walk its deadline stopped: it holds at
+    /// least one file, and only files the walk checked before it had to stop.
+    /// Returns how many files it checked before then are missing from `found`.
+    pub(crate) fn files_missed_before_expiry(&self, found: &[PathBuf]) -> usize {
+        let checked = self.calls_before_expiry();
+        let checked_files = checked
+            .iter()
+            .filter(|path| path.is_file())
+            .collect::<HashSet<_>>();
+        assert!(!found.is_empty(), "the walk kept no file it found");
+        for path in found {
+            assert!(
+                checked_files.contains(path),
+                "{} was kept but not checked before the walk had to stop",
+                path.display()
+            );
+        }
+        checked_files.len() - found.len()
+    }
+}
+
+/// A canonical tree of 1,250 entries: 20 files at the root, and 30
+/// directories of 40 files each. A walk slowed by 1 ms per entry check takes
+/// several seconds over all of it, so a short walk deadline expires early.
+pub(crate) fn many_entry_tree() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    for file in 0..20 {
+        std::fs::write(root.join(format!("root_{file:02}.rs")), "pub fn f() {}\n").unwrap();
+    }
+    for directory in 0..30 {
+        let parent = root.join(format!("directory_{directory:02}"));
+        std::fs::create_dir(&parent).unwrap();
+        for file in 0..40 {
+            std::fs::write(parent.join(format!("file_{file:02}.rs")), "pub fn f() {}\n").unwrap();
+        }
+    }
+    (dir, root)
+}
+
+/// Runs a walk on a helper limiter of its own with a single slot, and reports
+/// whether that slot was already free when the walk's reply reached the caller.
+pub(crate) fn run_walk_in_own_slot<T: Send + 'static>(
+    path: &Path,
+    deadline: Instant,
+    work: impl FnOnce(PathBuf, &WalkControl) -> T + Send + 'static,
+) -> (io::Result<WalkEnd<T>>, bool) {
+    let limiter = Arc::new(Limiter::new(1));
+    let end = run_walk_with_limiter(path, deadline, Arc::clone(&limiter), work);
+    let free = *limiter.live.lock().unwrap() == 0;
+    (end, free)
 }
 
 impl Drop for WalkHookGuard {
@@ -92,6 +156,8 @@ fn walk_hook(
         block_at,
         block_exact,
         seen: AtomicUsize::new(0),
+        before_expiry: Mutex::new(Vec::new()),
+        after_expiry: AtomicUsize::new(0),
         blocked: Mutex::new(Some(blocked_tx)),
         release: Mutex::new(Some(release_rx)),
     });
@@ -149,6 +215,13 @@ fn run_walk_hook(path: &Path, entries: bool) {
         return;
     };
     let seen = hook.seen.fetch_add(1, Ordering::Relaxed) + 1;
+    // Hooked calls run on the walk's helper thread, where its control is set.
+    let expired = WALK.with(|walk| walk.borrow().as_ref().is_some_and(|walk| walk.expired()));
+    if expired {
+        hook.after_expiry.fetch_add(1, Ordering::Relaxed);
+    } else {
+        hook.before_expiry.lock().unwrap().push(path.to_path_buf());
+    }
     let block = if hook.block_exact {
         hook.roots.iter().any(|root| path == root)
     } else {

@@ -569,7 +569,6 @@ fn run_with_limiter<T: Send + 'static>(
     std::thread::Builder::new()
         .name("aft-filesystem-probe".into())
         .spawn(move || {
-            let _permit = permit;
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
@@ -650,11 +649,15 @@ impl WalkControl {
         }
     }
     /// Records one more walked entry. Returns true when the walk must stop now:
-    /// its deadline passed or the request stopped waiting for it.
+    /// its deadline passed or the request stopped waiting for it. The walk
+    /// then drops the entry unprocessed, so it is not counted.
     pub(crate) fn advance(&self) -> bool {
+        if self.expired() {
+            return true;
+        }
         self.entries.fetch_add(1, Ordering::Relaxed);
         self.step();
-        self.expired()
+        false
     }
     pub(crate) fn expired(&self) -> bool {
         self.stop.load(Ordering::Relaxed) || Instant::now() >= self.deadline
@@ -778,23 +781,32 @@ pub(crate) fn walk_reached(path: &Path) {
 /// entries would look like one call making no progress. It does not rename
 /// the walk's current path: the filter runs between the walker's own calls.
 ///
-/// Returns false once the walk's deadline has passed: the caller skips the
-/// entry, and the walk is marked cut short so it reports itself truncated.
-/// Outside a walk it does nothing and returns true.
-pub(crate) fn walk_entry(_path: &Path) -> bool {
+/// Returns true once the walk must stop: its deadline passed or the request
+/// stopped waiting for it. The walk is then marked cut short, so it reports
+/// itself truncated. A filter must then keep the entry, not drop it. Dropping
+/// an entry does not stop the walker: it goes on reading every remaining entry
+/// of each directory it has open, and opening each remaining sibling
+/// directory, only to drop them too, while the walk holds its helper slot.
+/// The kept entry instead reaches the walk's own loop, whose
+/// `WalkControl::advance` sees the same expiry and ends the walk before
+/// processing that entry. Every walker whose filter calls this must check
+/// `advance` first for each entry it receives.
+///
+/// Outside a walk it does nothing and returns false.
+pub(crate) fn walk_entry_must_stop(_path: &Path) -> bool {
     WALK.with(|walk| {
         let walk = walk.borrow();
         let Some(walk) = walk.as_ref() else {
-            return true;
+            return false;
         };
         walk.step();
         #[cfg(test)]
         regression_tests::before_walk_entry(_path);
         if walk.expired() {
             walk.cut.store(true, Ordering::Relaxed);
-            return false;
+            return true;
         }
-        true
+        false
     })
 }
 
@@ -873,7 +885,6 @@ fn run_walk_with_limiter<T: Send + 'static>(
     std::thread::Builder::new()
         .name("aft-filesystem-walk".into())
         .spawn(move || {
-            let _permit = permit;
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             // Never start a walk whose deadline passed while it was scheduled.
@@ -885,6 +896,9 @@ fn run_walk_with_limiter<T: Send + 'static>(
             WALK.with(|walk| *walk.borrow_mut() = Some(Arc::clone(&helper_control)));
             let result = with_budget(budget, || work(owned, &helper_control));
             WALK.with(|walk| *walk.borrow_mut() = None);
+            // The walk is done with the filesystem: free its slot before the
+            // reply, so the next request can take it as soon as this one ends.
+            drop(permit);
             let _ = tx.send(result);
         })?;
     let window = single_access_budget();
@@ -1284,8 +1298,8 @@ mod regression_tests;
 pub(crate) use regression_tests::stall_helper;
 #[cfg(test)]
 pub(crate) use regression_tests::{
-    block_stat, slow_walk, slow_walk_entries, stall_walk_at, stall_walk_entry,
-    with_single_access_budget,
+    block_stat, many_entry_tree, run_walk_in_own_slot, slow_walk, slow_walk_entries, stall_walk_at,
+    stall_walk_entry, with_single_access_budget,
 };
 #[cfg(all(test, unix))]
 pub(crate) fn stall_helper_if_requested(path: &Path) {

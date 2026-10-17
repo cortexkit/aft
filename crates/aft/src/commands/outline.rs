@@ -2491,9 +2491,12 @@ fn collect_outline_files_with_device_lookup<F>(
         let boundary = *boundary;
         builder.filter_entry(move |entry| {
             // Entries this filter drops never reach the walk's loop below, so
-            // count them as progress here.
-            if !crate::bounded_io::walk_entry(entry.path()) {
-                return false;
+            // count them as progress here. Past the walk's deadline, keep the
+            // entry: the loop's `advance` then ends the walk without
+            // processing it, where dropping it would only make the walker read
+            // on to the next one, opening each remaining sibling directory.
+            if crate::bounded_io::walk_entry_must_stop(entry.path()) {
+                return true;
             }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
@@ -2529,6 +2532,8 @@ fn collect_outline_files_with_device_lookup<F>(
     }
 
     for entry in builder.build() {
+        // Checked before any work on the entry: past the deadline, the filter
+        // above lets one entry through only so this stops the walk.
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP || control.advance() {
             *walk_truncated = true;
             break;
@@ -2553,7 +2558,7 @@ fn collect_outline_files_with_device_lookup<F>(
         }
     }
     *skipped_foreign_mounts += skipped_mounts.load(Ordering::Relaxed);
-    // The filter above skips every entry once the walk's deadline passes.
+    // The filter above marks the walk cut short once its deadline passes.
     if control.cut_short() {
         *walk_truncated = true;
     }
@@ -5064,6 +5069,76 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             !files.iter().any(|path| Path::new(path).ends_with(&skip)),
             "foreign-mount contents must not be traversed"
         );
+    }
+
+    /// Walks the 1,250-entry test tree with every entry check slowed by 1 ms
+    /// and a 400 ms walk deadline, and checks that the walk stops at its
+    /// deadline: no more entries read, its helper slot free when the reply
+    /// arrives, and the files it found before then kept. Returns how many
+    /// files it checked in time but did not keep.
+    fn assert_expired_outline_walk_stops(breadth_first: bool) -> usize {
+        use std::time::{Duration, Instant};
+        let (_dir, root) = crate::bounded_io::many_entry_tree();
+        let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
+        let files = Arc::new(FoundPaths::default());
+        let directories = Arc::new(FoundPaths::default());
+        let walk_files = Arc::clone(&files);
+        let walk_directories = Arc::clone(&directories);
+        // A 300 ms stall window: a walk that went on reading after its
+        // deadline is abandoned by the request well before it could finish.
+        let (end, slot_free) =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(300), || {
+                crate::bounded_io::run_walk_in_own_slot(
+                    &root,
+                    Instant::now() + Duration::from_millis(400),
+                    move |root, control| {
+                        discover_outline_files_unbounded(
+                            &root,
+                            breadth_first,
+                            control,
+                            &walk_files,
+                            &walk_directories,
+                        )
+                    },
+                )
+            });
+        let after_expiry = hook.calls_after_expiry();
+        assert!(
+            slot_free,
+            "the expired walk still held its helper slot after the reply"
+        );
+        // At most the one entry check that saw the expiry; nothing after it.
+        assert!(
+            after_expiry <= 1,
+            "the walk checked {after_expiry} entries after its deadline"
+        );
+        let Ok(crate::bounded_io::WalkEnd::Finished(discovery)) = end else {
+            panic!("the expired walk must end on its own, not be abandoned");
+        };
+        assert!(
+            discovery.walk_truncated,
+            "a walk stopped by its deadline is truncated"
+        );
+        let found = files
+            .take()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        hook.files_missed_before_expiry(&found)
+    }
+
+    #[test]
+    fn expired_depth_first_outline_walk_stops_reading_entries_and_frees_its_slot() {
+        let missed = assert_expired_outline_walk_stops(false);
+        assert!(missed <= 1, "{missed} files checked in time were dropped");
+    }
+
+    #[test]
+    fn expired_breadth_first_outline_walk_stops_reading_entries_and_frees_its_slot() {
+        // Breadth-first keeps a directory's files only once all its entries
+        // are checked, so files of the directory the deadline interrupted
+        // may be missing; the kept files are still only ones checked in time.
+        assert_expired_outline_walk_stops(true);
     }
 
     fn make_symbol(

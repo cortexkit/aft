@@ -826,9 +826,12 @@ fn fallback_target_walk_builder(
         .parents(true)
         .filter_entry(move |entry| {
             // Entries this filter drops never reach the walk's own loop, so
-            // count them as progress here; past the walk's deadline, skip them.
-            if !crate::bounded_io::walk_entry(entry.path()) {
-                return false;
+            // count them as progress here. Past the walk's deadline, keep the
+            // entry: the loop's `advance` then ends the walk without
+            // processing it, where dropping it would only make the walker read
+            // on to the next one.
+            if crate::bounded_io::walk_entry_must_stop(entry.path()) {
+                return true;
             }
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
@@ -1235,8 +1238,14 @@ fn walk_files_unbounded(
         fallback_target_walk_builder(search_root, skipped_foreign_mounts, ignored_target).build();
 
     for entry in walker.filter_map(|entry| entry.ok()) {
+        // First, before counting or examining the entry: past the deadline,
+        // the walker's filter lets one entry through only so this stops.
+        if control.advance() {
+            walk_truncated = true;
+            break;
+        }
         entries_visited += 1;
-        if control.advance() || entries_visited > max_files.saturating_mul(8).max(1024) {
+        if entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
             break;
         }
@@ -1366,17 +1375,19 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     .build();
 
     for entry in walker.filter_map(|entry| entry.ok()) {
-        counts.entries_visited += 1;
-        if cancellation.is_some_and(|token| token.cancel_requested_before_commit()) {
+        // First, before counting or examining the entry: past the deadline,
+        // the walker's filter lets one entry through only so this stops.
+        if control.advance() {
             return FallbackWalkProgress {
-                bound: Some(WalkBound::Cancelled),
+                bound: Some(WalkBound::TimeBudget),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 counts,
             };
         }
-        if control.advance() {
+        counts.entries_visited += 1;
+        if cancellation.is_some_and(|token| token.cancel_requested_before_commit()) {
             return FallbackWalkProgress {
-                bound: Some(WalkBound::TimeBudget),
+                bound: Some(WalkBound::Cancelled),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 counts,
             };
@@ -3106,5 +3117,99 @@ mod tests {
         eprintln!(
             "median: per-root={per_root_median}ns shared={shared_query_median}ns speedup={speedup:.2}x"
         );
+    }
+
+    /// The walk deadline for the expiry tests below: well past the first few
+    /// hundred slowed entry checks, far short of all 1,250.
+    const EXPIRING_WALK_BUDGET: Duration = Duration::from_millis(400);
+
+    #[test]
+    fn expired_fallback_walk_stops_reading_entries_and_frees_its_slot() {
+        let (_dir, root) = crate::bounded_io::many_entry_tree();
+        let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
+        let found = Arc::new(Mutex::new(Vec::new()));
+        let walk_found = Arc::clone(&found);
+        // A 300 ms stall window: a walk that went on reading after its
+        // deadline is abandoned by the request well before it could finish.
+        let (end, slot_free) =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(300), || {
+                crate::bounded_io::run_walk_in_own_slot(
+                    &root,
+                    Instant::now() + EXPIRING_WALK_BUDGET,
+                    move |root, control| {
+                        walk_files_unbounded(
+                            &root,
+                            &root,
+                            &PathFilters::default(),
+                            100_000,
+                            false,
+                            control,
+                            &walk_found,
+                            Arc::new(AtomicUsize::new(0)),
+                        )
+                    },
+                )
+            });
+        let after_expiry = hook.calls_after_expiry();
+        assert!(
+            slot_free,
+            "the expired walk still held its helper slot after the reply"
+        );
+        // At most the one entry the filter lets through so the walk's loop
+        // sees the expiry; nothing after it is read.
+        assert!(
+            after_expiry <= 1,
+            "the walk checked {after_expiry} entries after its deadline"
+        );
+        let Ok(WalkEnd::Finished((truncated, entries_visited))) = end else {
+            panic!("the expired walk must end on its own, not be abandoned");
+        };
+        assert!(truncated, "a walk stopped by its deadline is truncated");
+        let found = found.lock().unwrap().clone();
+        let missed = hook.files_missed_before_expiry(&found);
+        assert!(missed <= 1, "{missed} files checked in time were dropped");
+        // The root itself, plus each entry checked in time; the entry let
+        // through at the deadline is not counted.
+        assert!(entries_visited <= hook.calls_before_expiry().len() + 1);
+    }
+
+    #[test]
+    fn expired_scope_probe_stops_reading_entries_and_frees_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // Only empty directories: the probe finds no file and walks them all.
+        for directory in 0..1_000 {
+            std::fs::create_dir(root.join(format!("empty_{directory:04}"))).unwrap();
+        }
+        let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
+        let (end, slot_free) =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(300), || {
+                crate::bounded_io::run_walk_in_own_slot(
+                    &root,
+                    Instant::now() + EXPIRING_WALK_BUDGET,
+                    |root, control| {
+                        scope_has_files_unbounded(
+                            &root,
+                            &root,
+                            &PathFilters::default(),
+                            false,
+                            control,
+                        )
+                    },
+                )
+            });
+        let after_expiry = hook.calls_after_expiry();
+        assert!(
+            slot_free,
+            "the expired probe still held its helper slot after the reply"
+        );
+        assert!(
+            after_expiry <= 1,
+            "the probe checked {after_expiry} entries after its deadline"
+        );
+        let Ok(WalkEnd::Finished(answer)) = end else {
+            panic!("the expired probe must end on its own, not be abandoned");
+        };
+        assert_eq!(answer, None, "an expired probe cannot prove an empty scope");
     }
 }
