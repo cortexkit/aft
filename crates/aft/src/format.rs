@@ -100,18 +100,18 @@ impl std::fmt::Display for FormatError {
 /// Without this, killing the immediate child (`sh`) leaves `sleep`
 /// holding stdout/stderr pipes open, and the reader threads block
 /// until `sleep` terminates — turning a 2s timeout into a 60s hang.
+///
+/// The child leads a new process group whose id is its pid, which is all
+/// `kill_process_tree` needs for `killpg`. Use `process_group(0)`, never a
+/// `pre_exec` closure (such as a `setsid` call): std turns `process_group`
+/// into a `posix_spawn` attribute, while any `pre_exec` closure forces the
+/// fork+exec fallback. On macOS a fork of the large, many-threaded daemon
+/// takes every malloc zone lock, so every formatter run on an edit would
+/// stall allocation across the whole process.
 #[cfg(unix)]
 pub(crate) fn isolate_in_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: setsid is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    cmd.process_group(0);
 }
 
 #[cfg(not(unix))]
@@ -2986,6 +2986,61 @@ mod tests {
             }
             other => panic!("expected NotFound, got: {:?}", other),
         }
+    }
+
+    /// Formatters and checkers run on every edit. Their spawn must stay on
+    /// std's posix_spawn path: a fork of the multi-GiB daemon on macOS takes
+    /// every malloc zone lock. Any `pre_exec` closure in the builder (for
+    /// example one that calls `setsid`) silently brings the fork back.
+    #[cfg(unix)]
+    #[test]
+    fn external_tools_spawn_without_fork() {
+        let workdir = tempfile::tempdir().unwrap();
+        let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
+            run_external_tool("/bin/sh", &["-c", "pwd"], Some(workdir.path()), 30)
+        });
+        let result = result.unwrap();
+        let expected = std::fs::canonicalize(workdir.path()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(result.stdout.trim()).unwrap(),
+            expected,
+            "the tool runs in the requested directory"
+        );
+        assert_eq!(forks, 0, "run_external_tool used fork+exec");
+
+        let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
+            run_external_tool_capture("/bin/sh", &["-c", "exit 3"], Some(workdir.path()), 30)
+        });
+        assert_eq!(result.unwrap().exit_code, 3);
+        assert_eq!(forks, 0, "run_external_tool_capture used fork+exec");
+    }
+
+    /// The timeout kill reaches the tool's own children through its process
+    /// group, so a grandchild cannot keep the output pipes open.
+    #[cfg(unix)]
+    #[test]
+    fn run_external_tool_timeout_kills_grandchildren() {
+        let workdir = tempfile::tempdir().unwrap();
+        let pid_file = workdir.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let result = run_external_tool("/bin/sh", &["-c", &script], None, 1);
+        assert!(
+            matches!(result, Err(FormatError::Timeout { .. })),
+            "{result:?}"
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !crate::bash_background::process::is_process_alive(pid),
+            "grandchild {pid} survived the timeout kill"
+        );
     }
 
     #[test]
