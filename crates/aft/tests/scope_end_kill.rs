@@ -1389,11 +1389,9 @@ async fn flow_read_scope_on_tool_provider_v1_route_returns_exact_bytes() {
             true,
         )
         .await;
-    // The read checks the head's stored policy. The scope is registered after
-    // the bind is acknowledged; a grant operation on the head route registers
-    // it synchronously, so its answer orders registration before the read.
-    let listed = daemon.call(1, json!({"op":"grants.list"})).await;
-    assert_eq!(listed.header.ty, FrameType::Response, "{}", body(&listed));
+    // The read checks the head's stored policy, which is registered after the
+    // bind is acknowledged. Nothing here orders that registration before the
+    // read: the read itself must wait for it.
     daemon
         .bind_route(
             2,

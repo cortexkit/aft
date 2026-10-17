@@ -6421,11 +6421,25 @@ impl AppContext {
     /// Wait outside executor admission. Register before checking state so an
     /// open completing between the check and await cannot lose its notification.
     pub(crate) async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {
+        self.wait_for_database_while(deadline, || self.database_runtime_pending(command))
+            .await;
+    }
+
+    /// Wait, up to `deadline`, until persistence is no longer initializing,
+    /// whatever the command; it may then be open, failed, or unconfigured.
+    pub(crate) async fn wait_for_database_settled(&self, deadline: Instant) {
+        self.wait_for_database_while(deadline, || {
+            self.database_runtime_state.load(Ordering::Acquire) == 1
+        })
+        .await;
+    }
+
+    async fn wait_for_database_while(&self, deadline: Instant, pending: impl Fn() -> bool) {
         loop {
             let changed = self.database_runtime_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if !self.database_runtime_pending(command) {
+            if !pending() {
                 return;
             }
             if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)

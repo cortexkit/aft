@@ -47,10 +47,15 @@ fn read_with(
     if !resolved.starts_with(&bind_root) {
         return Err(ReadExactRefusal::AccessDenied);
     }
-    // Resolve aliases before consulting grants or floors, and before opening contents.
+    // Resolve aliases before consulting grants or floors, and before opening
+    // contents. The shared project-content exclusion refuses SQLite names,
+    // AFT storage directories, and any name (a hard link included) for a file
+    // that a live SQLite connection in this process has open; it decides with
+    // stat alone, because opening and closing a live SQLite file releases
+    // SQLite's process-wide POSIX locks and can crash this daemon.
     if policy.decide(AccessOperation::Read, &resolved, false) != AccessDecision::Allow
-        || sqlite_file(&joined)
-        || sqlite_file(&resolved)
+        || crate::project_content::is_excluded(&joined)
+        || crate::project_content::is_excluded(&resolved)
     {
         return Err(ReadExactRefusal::AccessDenied);
     }
@@ -65,13 +70,21 @@ fn read_with(
     let mut file = open(&bind_root, &resolved)?;
     let opened = opened_location(&file).map_err(|_| ReadExactRefusal::IoError)?;
     let opened = crate::inspect::job::normalize_path(&opened);
+    let metadata = file.metadata().map_err(|_| ReadExactRefusal::IoError)?;
+    // A name swapped in after the checks above can point at a live SQLite
+    // file, so the handle's own device and inode are judged too. Closing this
+    // descriptor would release SQLite's locks, so on that refusal the handle
+    // is deliberately leaked instead of closed.
+    if crate::db::file_identity::is_live_sqlite_file_with_metadata(&opened, Some(&metadata)) {
+        std::mem::forget(file);
+        return Err(ReadExactRefusal::AccessDenied);
+    }
     if !opened.starts_with(&bind_root)
         || policy.decide(AccessOperation::Read, &opened, false) != AccessDecision::Allow
-        || sqlite_file(&opened)
+        || crate::project_content::is_excluded(&opened)
     {
         return Err(ReadExactRefusal::AccessDenied);
     }
-    let metadata = file.metadata().map_err(|_| ReadExactRefusal::IoError)?;
     if !metadata.is_file() {
         return Err(ReadExactRefusal::NotRegular);
     }
@@ -130,15 +143,6 @@ fn bounded_bytes(reader: impl Read) -> Result<Vec<u8>, ReadExactRefusal> {
         return Err(ReadExactRefusal::TooLarge);
     }
     Ok(bytes)
-}
-
-fn sqlite_file(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    name.ends_with(".db") || name.ends_with("-wal") || name.ends_with("-shm")
 }
 
 fn open_error(error: io::Error) -> ReadExactRefusal {
@@ -509,7 +513,15 @@ mod tests {
     #[test]
     fn file_read_exact_sqlite_never_opened() {
         let (dir, policy) = fixture();
-        for name in ["live.db", "live.db-wal", "live.db-shm"] {
+        for name in [
+            "live.db",
+            "live.db-wal",
+            "live.db-shm",
+            "live.db-journal",
+            "live.sqlite",
+            "live.sqlite3",
+            "LIVE.SQLITE3",
+        ] {
             std::fs::write(dir.path().join(name), "sqlite").unwrap();
             assert_eq!(
                 read_with(Path::new(name), dir.path(), &policy, |_, _| panic!(
@@ -518,6 +530,92 @@ mod tests {
                 Err(ReadExactRefusal::AccessDenied)
             );
         }
+    }
+
+    /// A live WAL database in the checkout, plus a hard link named like
+    /// source to its `-shm` file. Returns the connection so the database
+    /// stays live, and the link.
+    #[cfg(unix)]
+    fn live_shm_alias(
+        root: &Path,
+    ) -> (crate::db::file_identity::IdentityConnection, PathBuf) {
+        let connection = crate::db::file_identity::IdentityConnection::open(
+            root.join("unconventional.cache"),
+            "file_read_exact_live_alias",
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE probe(value TEXT); \
+                 INSERT INTO probe VALUES ('alive');",
+            )
+            .unwrap();
+        let sidecar = root.join("unconventional.cache-shm");
+        assert!(sidecar.exists(), "WAL mode creates the -shm file");
+        let alias = root.join("innocent.rs");
+        std::fs::hard_link(&sidecar, &alias).unwrap();
+        (connection, alias)
+    }
+
+    #[cfg(unix)]
+    fn still_alive(connection: &crate::db::file_identity::IdentityConnection) {
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM probe", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "alive"
+        );
+    }
+
+    /// The name says source, but the inode is a live SQLite `-shm` file:
+    /// the read is refused before any descriptor to it is opened.
+    #[cfg(unix)]
+    #[test]
+    fn file_read_exact_live_sqlite_hard_link_never_opened() {
+        let (dir, policy) = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let (connection, alias) = live_shm_alias(&root);
+        let opens = std::cell::Cell::new(0);
+        let result = read_with(Path::new("innocent.rs"), &root, &policy, |root, resolved| {
+            opens.set(opens.get() + 1);
+            open_contents(root, resolved)
+        });
+        assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
+        assert_eq!(opens.get(), 0, "a live SQLite alias was opened");
+        let symlink = root.join("symlink.rs");
+        std::os::unix::fs::symlink(&alias, &symlink).unwrap();
+        let result = read_with(Path::new("symlink.rs"), &root, &policy, |root, resolved| {
+            opens.set(opens.get() + 1);
+            open_contents(root, resolved)
+        });
+        assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
+        assert_eq!(opens.get(), 0, "a symlink to a live SQLite alias was opened");
+        still_alive(&connection);
+    }
+
+    /// A writer swaps an ordinary checked file for a hard link to a live
+    /// `-shm` file between the checks and the open, then swaps the ordinary
+    /// file back, so only the opened handle's own identity is left to refuse
+    /// it before any byte is read.
+    #[cfg(unix)]
+    #[test]
+    fn file_read_exact_opened_live_sqlite_handle_refused() {
+        let (dir, policy) = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let (connection, alias) = live_shm_alias(&root);
+        let script = root.join("script.rs");
+        std::fs::write(&script, "fn source() {}\n").unwrap();
+        let result = read_with(Path::new("script.rs"), &root, &policy, |root, resolved| {
+            let original = resolved.with_extension("old");
+            std::fs::rename(resolved, &original).unwrap();
+            std::fs::hard_link(&alias, resolved).unwrap();
+            let file = open_contents(root, resolved);
+            std::fs::remove_file(resolved).unwrap();
+            std::fs::rename(&original, resolved).unwrap();
+            file
+        });
+        assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
+        still_alive(&connection);
     }
 
     #[test]

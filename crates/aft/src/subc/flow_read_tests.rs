@@ -669,3 +669,175 @@ fn flow_read_stalled_read_expires_without_late_success() {
     pause.resume();
     worker.join().unwrap();
 }
+
+/// A parent head root whose persistence the test controls: the database is
+/// still opening (nothing staged, so only the test finishes it) and the head's
+/// scope row is not registered yet, as just after the head's bind reply.
+fn unregistered_parent() -> (
+    tempfile::TempDir,
+    Arc<AppContext>,
+    Arc<Executor>,
+    RouteIdentity,
+    RouteIdentity,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("head");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("script"), "abc").unwrap();
+    let parent = head(&root);
+    let child = identity(&root, stamp(), "reserved:basal");
+    let mut config = Config::default();
+    config.project_root = Some(root);
+    config.storage_dir = Some(dir.path().join("store"));
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    ctx.mark_database_runtime_initializing_for_test();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(parent.root.clone(), ctx.clone());
+    (dir, ctx, executor, parent, child)
+}
+
+/// Starts a flow read for `script` and answers the daemon's parent liveness
+/// query as live, so what follows depends only on the parent's persistence.
+async fn start_live_read(
+    executor: &Arc<Executor>,
+    parent: &RouteIdentity,
+    child: RouteIdentity,
+    parent_wait: Duration,
+) -> mpsc::Receiver<WriterFrame> {
+    let routes = HashMap::from([
+        (route_key(41, 1), child.clone()),
+        (route_key(42, 1), parent.clone()),
+    ]);
+    let (writer, output) = mpsc::channel(8);
+    let (control_tx, mut requests) = mpsc::channel(8);
+    let pending = readiness::PendingControlReplies::default();
+    let metrics = Arc::new(DispatchPathMetrics::new());
+    let control = Arc::new(readiness::DaemonControl::new(
+        control_tx,
+        metrics.clone(),
+        PROTOCOL_VERSION,
+        vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
+        vec![],
+        pending.clone(),
+        HELLO_CORR + 1,
+    ));
+    let body = json!({"op":"file.read_exact","path":"script"});
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    let active = Arc::default();
+    dispatch_with_wait(
+        &writer,
+        &metrics,
+        &frame,
+        child,
+        body,
+        &routes,
+        executor,
+        &active,
+        Some(&control),
+        parent_wait,
+    )
+    .await
+    .unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pending.resolve(
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            request.header.corr,
+            serde_json::to_vec(&reply(parent.scope.as_ref().unwrap(), ScopeStatus::Live)).unwrap()
+        )
+        .unwrap()
+    ));
+    output
+}
+
+/// No answer may arrive within `quiet`: the read is still waiting.
+async fn assert_still_waiting(output: &mut mpsc::Receiver<WriterFrame>, quiet: Duration) {
+    if let Ok(answer) = tokio::time::timeout(quiet, output.recv()).await {
+        let answer = answer.expect("reply channel open");
+        panic!(
+            "read answered before the parent was registered: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+}
+
+/// A read sent right after the parent head's bind reply waits for the
+/// parent's database to open and its scope row to be registered, then
+/// succeeds, instead of refusing a read the parent's policy allows.
+#[tokio::test]
+async fn flow_read_waits_for_parent_database_and_scope_registration() {
+    let (_dir, ctx, executor, parent, child) = unregistered_parent();
+    let mut output = start_live_read(&executor, &parent, child, Duration::from_secs(10)).await;
+    assert_still_waiting(&mut output, Duration::from_millis(300)).await;
+
+    ctx.set_db(Arc::new(StdMutex::new(
+        crate::db::open(&ctx.storage_dir().join("aft.db")).unwrap(),
+    )));
+    ctx.finish_database_runtime(Ok(()));
+    assert_still_waiting(&mut output, Duration::from_millis(300)).await;
+
+    access_grants::register(&parent, &ctx).unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(5), output.recv())
+        .await
+        .expect("read answers once the parent is registered")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(answer.header.ty, FrameType::Response, "{body}");
+    assert_eq!(
+        body,
+        json!({"bytes_base64":"YWJj", "size":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"})
+    );
+}
+
+/// When the parent's scope row never arrives, the read refuses once the wait
+/// bound passes, and not before; a database that fails to open ends the wait
+/// at once.
+#[tokio::test]
+async fn flow_read_refuses_after_bound_when_parent_never_registers() {
+    let bound = Duration::from_millis(400);
+    let (_dir, ctx, executor, parent, child) = unregistered_parent();
+    ctx.set_db(Arc::new(StdMutex::new(
+        crate::db::open(&ctx.storage_dir().join("aft.db")).unwrap(),
+    )));
+    ctx.finish_database_runtime(Ok(()));
+    let started = Instant::now();
+    let mut output = start_live_read(&executor, &parent, child, bound).await;
+    let answer = tokio::time::timeout(Duration::from_secs(5), output.recv())
+        .await
+        .expect("an unregistered parent is refused once the bound passes")
+        .unwrap();
+    assert!(started.elapsed() >= bound, "refused before the wait bound");
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(answer.header.ty, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "file_read_exact_access_denied");
+
+    let (_dir, ctx, executor, parent, child) = unregistered_parent();
+    let started = Instant::now();
+    let mut output = start_live_read(&executor, &parent, child, Duration::from_secs(10)).await;
+    ctx.finish_database_runtime_error("database cannot open".into(), false);
+    let answer = tokio::time::timeout(Duration::from_secs(5), output.recv())
+        .await
+        .expect("a failed parent database is refused without waiting out the bound")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(answer.header.ty, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "file_read_exact_io_error");
+}

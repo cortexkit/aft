@@ -2,7 +2,9 @@
 
 use super::*;
 
-const WAIT_BUDGET: Duration = Duration::from_secs(10);
+/// How long a call may wait for its root's persistence before it is admitted
+/// anyway and answered by its ordinary refusal path.
+pub(super) const WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_WAITERS: usize = 256;
 
 #[derive(Default)]

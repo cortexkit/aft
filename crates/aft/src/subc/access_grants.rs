@@ -78,7 +78,25 @@ pub(super) fn register(
     register_on(&conn, identity, ctx)
 }
 
+/// Woken after each scope registration commits. A flow read can reach AFT
+/// before its parent head's queued registration has run; it waits on this
+/// instead of refusing a read the parent's policy would allow.
+pub(super) fn scope_registered() -> &'static tokio::sync::Notify {
+    static REGISTERED: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    REGISTERED.get_or_init(tokio::sync::Notify::new)
+}
+
 fn register_on(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+) -> Result<(), subc_protocol::ErrorBody> {
+    register_scope_rows(conn, identity, ctx)?;
+    scope_registered().notify_waiters();
+    Ok(())
+}
+
+fn register_scope_rows(
     conn: &rusqlite::Connection,
     identity: &RouteIdentity,
     ctx: &AppContext,

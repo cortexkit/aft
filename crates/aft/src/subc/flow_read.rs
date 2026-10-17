@@ -120,6 +120,36 @@ pub(super) async fn dispatch(
     active: &ActiveToolCalls,
     control: Option<&Arc<readiness::DaemonControl>>,
 ) -> Result<(), SubcError> {
+    dispatch_with_wait(
+        tx,
+        metrics,
+        frame,
+        identity,
+        envelope,
+        routes,
+        executor,
+        active,
+        control,
+        persistence::WAIT_BUDGET,
+    )
+    .await
+}
+
+/// `parent_wait` bounds how long the read waits for the parent head's
+/// database and scope registration; tests shorten it.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_with_wait(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    frame: &Frame,
+    identity: RouteIdentity,
+    envelope: Value,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    executor: &Arc<Executor>,
+    active: &ActiveToolCalls,
+    control: Option<&Arc<readiness::DaemonControl>>,
+    parent_wait: Duration,
+) -> Result<(), SubcError> {
     let admit = || {
         if envelope.get("op").and_then(Value::as_str) != Some(file_read_exact::OPERATION) {
             return Err(Refusal::RouteNotAdmitted("operation"));
@@ -173,6 +203,15 @@ pub(super) async fn dispatch(
         let result = match admission {
             Err(error) => Err(error.error()),
             Ok(()) => {
+                if let Some(ctx) = executor.actor_context(&parent.root) {
+                    let child = identity.scope.as_ref().expect("child route was checked");
+                    let mut deadline = Instant::now() + parent_wait;
+                    if let Ok(expiry) = read_deadline(child) {
+                        deadline = deadline.min(expiry);
+                    }
+                    wait_for_parent_policy(&ctx, access_grants::scope_key(&parent), deadline)
+                        .await;
+                }
                 if !active_tool_call_is_registered(&active, route, corr) {
                     return;
                 }
@@ -301,6 +340,52 @@ fn parent_policy_snapshot(
     access_grants::policy_snapshot(&conn, key)
         .map_err(|_| Refusal::IoError)?
         .ok_or(Refusal::AccessDenied)
+}
+
+/// How often a waiting read looks for its parent's scope row even without a
+/// wake-up, in case the row was written by a path that sends none.
+const SCOPE_RECHECK: Duration = Duration::from_millis(100);
+
+/// The parent head's bind is acknowledged before its database opens and its
+/// scope row is registered, and both happen in queued jobs that this read's
+/// pure-read lane can overtake. Wait, up to `deadline`, until the database is
+/// open and the parent's scope row exists. The wait never decides the
+/// outcome: the read itself still refuses if either is missing afterwards,
+/// and a failed or unconfigured database ends the wait at once.
+///
+/// This runs on the read's own async task, not on an executor worker, and
+/// each look at the row runs on a blocking thread so a held database lock
+/// never stalls the async runtime.
+async fn wait_for_parent_policy(
+    ctx: &Arc<AppContext>,
+    key: crate::db::access_grants::ScopeKey,
+    deadline: Instant,
+) {
+    // A staged open must not wait for the bind's configure tail to start it.
+    crate::database_open::dispatch(ctx);
+    ctx.wait_for_database_settled(deadline).await;
+    loop {
+        let registered = access_grants::scope_registered().notified();
+        tokio::pin!(registered);
+        registered.as_mut().enable();
+        if ctx.db().is_none() {
+            return;
+        }
+        let (probe_ctx, probe_key) = (ctx.clone(), key.clone());
+        let probe =
+            tokio::task::spawn_blocking(move || parent_policy_snapshot(&probe_ctx, &probe_key))
+                .await;
+        // Only a missing row is worth waiting for; any other answer is final.
+        if !matches!(probe, Ok(Err(Refusal::AccessDenied))) {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let wake = tokio::time::Instant::from_std(deadline.min(now + SCOPE_RECHECK));
+        let _ = tokio::time::timeout_at(wake, registered).await;
+    }
 }
 
 fn read_deadline(stamp: &ScopeStamp) -> Result<Instant, Refusal> {
