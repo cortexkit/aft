@@ -2308,27 +2308,95 @@ fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
     discovery
 }
 
+/// How long outline's directory discovery may walk; parsing the files it finds
+/// still has to fit in the request after it.
+const OUTLINE_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Paths a discovery walk has found so far. The walk adds to it as it goes, so
+/// the request thread still has them if it stops waiting for the walk.
+#[derive(Default)]
+struct FoundPaths(std::sync::Mutex<Vec<String>>);
+
+impl FoundPaths {
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn push(&self, path: String) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(path);
+    }
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 fn discover_outline_files_with_options(
     directory: &Path,
     breadth_first: bool,
 ) -> OutlineFileDiscovery {
-    crate::bounded_io::run(directory, None, move |directory| {
-        Ok(discover_outline_files_unbounded(&directory, breadth_first))
-    })
-    .unwrap_or_else(|_| OutlineFileDiscovery {
-        entries_examined: 0,
-        files: Vec::new(),
-        directories: Vec::new(),
-        walk_truncated: true,
-        collection_truncated: true,
-        skipped_foreign_mounts: 0,
-        ignored_entries: 0,
-    })
+    let files = Arc::new(FoundPaths::default());
+    let directories = Arc::new(FoundPaths::default());
+    let walk_files = Arc::clone(&files);
+    let walk_directories = Arc::clone(&directories);
+    let walked = crate::bounded_io::run_walk(
+        directory,
+        std::time::Instant::now() + OUTLINE_WALK_BUDGET,
+        move |directory, control| {
+            discover_outline_files_unbounded(
+                &directory,
+                breadth_first,
+                control,
+                &walk_files,
+                &walk_directories,
+            )
+        },
+    );
+    let mut discovery = match walked {
+        Ok(crate::bounded_io::WalkEnd::Finished(discovery)) => discovery,
+        Ok(crate::bounded_io::WalkEnd::Stopped {
+            stall,
+            entries_visited,
+        }) => {
+            if let Some(stall) = stall {
+                stall.record(!files.is_empty());
+            }
+            OutlineFileDiscovery {
+                entries_examined: entries_visited,
+                files: Vec::new(),
+                directories: Vec::new(),
+                walk_truncated: true,
+                collection_truncated: false,
+                skipped_foreign_mounts: 0,
+                ignored_entries: 0,
+            }
+        }
+        Err(_) => OutlineFileDiscovery {
+            entries_examined: 0,
+            files: Vec::new(),
+            directories: Vec::new(),
+            walk_truncated: true,
+            collection_truncated: true,
+            skipped_foreign_mounts: 0,
+            ignored_entries: 0,
+        },
+    };
+    discovery.files = files.take();
+    discovery.directories = directories.take();
+    discovery.files.sort();
+    discovery.directories.sort();
+    discovery
 }
 
-fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> OutlineFileDiscovery {
-    let mut files = Vec::new();
-    let mut directories = Vec::new();
+/// Fills `files` and `directories`; the caller sorts them.
+fn discover_outline_files_unbounded(
+    directory: &Path,
+    breadth_first: bool,
+    control: &crate::bounded_io::WalkControl,
+    files: &FoundPaths,
+    directories: &FoundPaths,
+) -> OutlineFileDiscovery {
     let mut entries_examined = 0;
     let mut walk_truncated = false;
     let mut collection_truncated = false;
@@ -2342,37 +2410,37 @@ fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> Ou
             let ignore_stack = OutlineIgnoreStack::for_target_root(directory);
             entries_examined = collect_outline_files_breadth_first_with_device_lookup(
                 directory,
-                &mut files,
-                &mut directories,
+                files,
+                directories,
                 &mut walk_truncated,
                 &mut collection_truncated,
                 &mut skipped_foreign_mounts,
                 &boundary,
                 &ignore_stack,
                 &mut ignored_entries,
+                control,
             );
         } else {
             collect_outline_files_with_device_lookup(
                 directory,
-                &mut files,
-                &mut directories,
+                files,
+                directories,
                 &mut walk_truncated,
                 &mut collection_truncated,
                 &mut skipped_foreign_mounts,
                 &boundary,
                 crate::walk_boundary::filesystem_device_id,
+                control,
             );
         }
     } else {
         collection_truncated = true;
     }
-    files.sort();
-    directories.sort();
 
     OutlineFileDiscovery {
         entries_examined,
-        files,
-        directories,
+        files: Vec::new(),
+        directories: Vec::new(),
         walk_truncated,
         collection_truncated,
         skipped_foreign_mounts,
@@ -2396,15 +2464,17 @@ fn outline_target_walk_builder(directory: &Path) -> ignore::WalkBuilder {
     builder
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_outline_files_with_device_lookup<F>(
     directory: &Path,
-    files: &mut Vec<String>,
-    directories: &mut Vec<String>,
+    files: &FoundPaths,
+    directories: &FoundPaths,
     walk_truncated: &mut bool,
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
     boundary: &crate::walk_boundary::DeviceBoundary,
     device_lookup: F,
+    control: &crate::bounded_io::WalkControl,
 ) where
     F: Fn(&Path) -> std::io::Result<Option<u64>> + Copy + Send + Sync + 'static,
 {
@@ -2438,6 +2508,7 @@ fn collect_outline_files_with_device_lookup<F>(
             if should_skip_directory(entry.path()) {
                 return false;
             }
+            crate::bounded_io::walk_reached(entry.path());
             match boundary.should_descend_with(entry.path(), device_lookup) {
                 Ok(true) => true,
                 Ok(false) => {
@@ -2453,7 +2524,7 @@ fn collect_outline_files_with_device_lookup<F>(
     }
 
     for entry in builder.build() {
-        if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+        if files.len() >= OUTLINE_FILE_COLLECTION_CAP || control.advance() {
             *walk_truncated = true;
             break;
         }
@@ -2482,26 +2553,29 @@ fn collect_outline_files_with_device_lookup<F>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_outline_files_breadth_first_with_device_lookup(
     directory: &Path,
-    files: &mut Vec<String>,
-    directories: &mut Vec<String>,
+    files: &FoundPaths,
+    directories: &FoundPaths,
     walk_truncated: &mut bool,
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
     boundary: &crate::walk_boundary::DeviceBoundary,
     root_ignore_stack: &OutlineIgnoreStack,
     ignored_entries: &mut usize,
+    control: &crate::bounded_io::WalkControl,
 ) -> usize {
     let root_stack = root_ignore_stack.clone();
     let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack)]);
     let mut entries_examined = 0usize;
 
     while let Some((current, ignore_stack)) = pending.pop_front() {
-        if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+        if files.len() >= OUTLINE_FILE_COLLECTION_CAP || control.advance() {
             *walk_truncated = true;
             return entries_examined;
         }
+        control.reached(&current);
         let Ok(entries) = std::fs::read_dir(&current) else {
             *collection_truncated = true;
             continue;
@@ -2549,10 +2623,15 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         // Queue directories before counting sibling files so the traversal keeps
         // its breadth-first coverage when the 10,000-file limit is reached.
         for path in child_directories {
+            if control.advance() {
+                *walk_truncated = true;
+                return entries_examined;
+            }
             if should_skip_directory(&path) || ignore_stack.is_ignored(&path, true) {
                 *ignored_entries += 1;
                 continue;
             }
+            control.reached(&path);
             match boundary.should_descend(&path) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
@@ -4785,6 +4864,41 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
     }
 
     #[test]
+    fn slow_outline_discovery_returns_a_partial_not_read_blocked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        for index in 0..150 {
+            let directory = root.join(format!("pkg_{index:03}"));
+            std::fs::create_dir(&directory).expect("create package");
+            std::fs::write(directory.join("lib.rs"), "pub fn package() {}\n")
+                .expect("write package");
+        }
+        // About 2.3 s of directory work against a 1.5 s request budget.
+        let _slow = crate::bounded_io::slow_walk(&root, std::time::Duration::from_millis(15));
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..crate::config::Config::default()
+            },
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "slow-outline", "command": "outline", "directory": root
+        }))
+        .expect("request");
+        let budget = crate::bounded_io::Budget::after(std::time::Duration::from_millis(1500));
+        let response =
+            crate::bounded_io::with_budget(Some(budget), || handle_outline(&request, &ctx));
+        let body = &response.data;
+        assert!(response.success, "{body}");
+        assert_eq!(body["walk_truncated"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        let text = body.to_string();
+        assert!(text.contains("pkg_"), "the walked part is outlined: {text}");
+        assert!(!text.contains("read_blocked"), "{text}");
+    }
+
+    #[test]
     fn outline_walk_skips_and_reports_injected_foreign_mount() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("root");
@@ -4796,8 +4910,8 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         std::fs::write(foreign.join("skip.rs"), "pub fn skip() {}\n").expect("write foreign file");
 
         let boundary = crate::walk_boundary::DeviceBoundary::from_device_for_test(41);
-        let mut files = Vec::new();
-        let mut directories = Vec::new();
+        let found_files = FoundPaths::default();
+        let found_directories = FoundPaths::default();
         let mut walk_truncated = false;
         let mut collection_truncated = false;
         let mut skipped_foreign_mounts = 0usize;
@@ -4813,14 +4927,16 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
 
         collect_outline_files_with_device_lookup(
             &root,
-            &mut files,
-            &mut directories,
+            &found_files,
+            &found_directories,
             &mut walk_truncated,
             &mut collection_truncated,
             &mut skipped_foreign_mounts,
             &boundary,
             lookup,
+            &crate::bounded_io::WalkControl::unbounded_for_test(&root),
         );
+        let files = found_files.take();
 
         assert_eq!(skipped_foreign_mounts, 1, "foreign mount is disclosed");
         assert!(

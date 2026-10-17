@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
+use crate::bounded_io::{WalkControl, WalkEnd};
 use crate::commands::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
 };
@@ -318,16 +319,29 @@ fn bounded_scope_has_files(
 ) -> Option<bool> {
     let filters = filters.clone();
     let filter_root = filter_root.to_path_buf();
-    crate::bounded_io::run(search_root, None, move |search_root| {
-        Ok(scope_has_files_unbounded(
-            &filter_root,
-            &search_root,
-            &filters,
-            ignored_target,
-        ))
-    })
-    .ok()
-    .flatten()
+    let walked = crate::bounded_io::run_walk(
+        search_root,
+        Instant::now() + FALLBACK_WALK_BUDGET,
+        move |search_root, control| {
+            scope_has_files_unbounded(
+                &filter_root,
+                &search_root,
+                &filters,
+                ignored_target,
+                control,
+            )
+        },
+    );
+    match walked {
+        Ok(WalkEnd::Finished(answer)) => answer,
+        Ok(WalkEnd::Stopped { stall, .. }) => {
+            if let Some(stall) = stall {
+                stall.record(false);
+            }
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 fn scope_has_files_unbounded(
@@ -335,14 +349,14 @@ fn scope_has_files_unbounded(
     search_root: &Path,
     filters: &PathFilters,
     ignored_target: bool,
+    control: &WalkControl,
 ) -> Option<bool> {
-    let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
     let walker =
         fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target).build();
     for (visited, entry) in walker.enumerate() {
         if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
-            || started.elapsed() >= FALLBACK_WALK_BUDGET
+            || control.advance()
             || crate::executor::current_job_cancelled()
         {
             return None;
@@ -356,7 +370,7 @@ fn scope_has_files_unbounded(
             return Some(true);
         }
     }
-    (skipped.load(Ordering::Relaxed) == 0).then_some(false)
+    (skipped.load(Ordering::Relaxed) == 0 && !control.cut_short()).then_some(false)
 }
 
 pub fn execute(
@@ -936,16 +950,29 @@ pub(crate) fn diagnose_scope_counts(
 ) -> Option<ScopeFileCounts> {
     let filters = filters.clone();
     let filter_root = filter_root.to_path_buf();
-    crate::bounded_io::run(search_root, None, move |search_root| {
-        Ok(diagnose_scope_counts_unbounded(
-            &filter_root,
-            &search_root,
-            &filters,
-            ignored_target,
-        ))
-    })
-    .ok()
-    .flatten()
+    let walked = crate::bounded_io::run_walk(
+        search_root,
+        Instant::now() + FALLBACK_WALK_BUDGET,
+        move |search_root, control| {
+            diagnose_scope_counts_unbounded(
+                &filter_root,
+                &search_root,
+                &filters,
+                ignored_target,
+                control,
+            )
+        },
+    );
+    match walked {
+        Ok(WalkEnd::Finished(counts)) => counts,
+        Ok(WalkEnd::Stopped { stall, .. }) => {
+            if let Some(stall) = stall {
+                stall.record(false);
+            }
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 fn diagnose_scope_counts_unbounded(
@@ -953,13 +980,13 @@ fn diagnose_scope_counts_unbounded(
     search_root: &Path,
     filters: &PathFilters,
     ignored_target: bool,
+    control: &WalkControl,
 ) -> Option<ScopeFileCounts> {
-    let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
     let mut counts = ScopeFileCounts::default();
     let within_budget = |visited: usize| {
         visited < MAX_FALLBACK_WALK_FILES.saturating_mul(8)
-            && started.elapsed() < FALLBACK_WALK_BUDGET
+            && !control.advance()
             && !crate::executor::current_job_cancelled()
     };
     if search_root.is_file() {
@@ -991,9 +1018,10 @@ fn diagnose_scope_counts_unbounded(
                 accepted.insert(entry.file_name().to_os_string());
             }
         }
-        if skipped.load(Ordering::Relaxed) > 0 {
+        if skipped.load(Ordering::Relaxed) > 0 || control.cut_short() {
             return None;
         }
+        control.reached(&directory);
         for entry in std::fs::read_dir(&directory).ok()? {
             if !within_budget(counts.entries_visited) {
                 return None;
@@ -1123,58 +1151,87 @@ fn bounded_fallback_walk_files_with_limits_target(
     budget: Duration,
     ignored_target: bool,
 ) -> FallbackWalkOutcome {
-    let filter_root = filter_root.to_path_buf();
+    let owned_filter_root = filter_root.to_path_buf();
     let filters = filters.clone();
-    crate::bounded_io::run(
+    // The walker shares matches as it finds them, so a walk the request stops
+    // waiting for still returns what it found.
+    let found = Arc::new(Mutex::new(Vec::new()));
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let walk_found = Arc::clone(&found);
+    let walk_skipped = Arc::clone(&skipped_foreign_mounts);
+    let walked = crate::bounded_io::run_walk(
         search_root,
-        Some(Instant::now() + budget),
-        move |search_root| {
-            Ok(walk_files_unbounded(
-                &filter_root,
+        Instant::now() + budget,
+        move |search_root, control| {
+            walk_files_unbounded(
+                &owned_filter_root,
                 &search_root,
                 &filters,
                 max_files,
-                budget,
                 ignored_target,
-            ))
+                control,
+                &walk_found,
+                walk_skipped,
+            )
         },
-    )
-    .unwrap_or_else(|_| FallbackWalkOutcome {
-        files: Vec::new(),
-        walk_truncated: true,
-        skipped_foreign_mounts: 0,
-        entries_visited: 0,
-    })
+    );
+    let (walk_truncated, entries_visited) = match walked {
+        Ok(WalkEnd::Finished(walked)) => walked,
+        Ok(WalkEnd::Stopped {
+            stall,
+            entries_visited,
+        }) => {
+            if let Some(stall) = stall {
+                let kept = !found.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+                stall.record(kept);
+            }
+            (true, entries_visited)
+        }
+        Err(_) => (true, 0),
+    };
+    let mut files = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+    // Sorted here rather than in the walker: sorting stats every match without
+    // reporting progress, and a stopped walk's partial list needs the same order.
+    sort_walked_paths_by_mtime_desc(&mut files, walk_filter_root(filter_root, search_root));
+    FallbackWalkOutcome {
+        files,
+        walk_truncated,
+        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+        entries_visited,
+    }
 }
 
+/// Patterns for an explicitly named file are matched relative to its parent.
+fn walk_filter_root<'a>(filter_root: &'a Path, search_root: &'a Path) -> &'a Path {
+    if filter_root == search_root && search_root.is_file() {
+        search_root.parent().unwrap_or(search_root)
+    } else {
+        filter_root
+    }
+}
+
+/// Returns whether the walk stopped early, and how many entries it visited.
+#[allow(clippy::too_many_arguments)]
 fn walk_files_unbounded(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
     max_files: usize,
-    budget: Duration,
     ignored_target: bool,
-) -> FallbackWalkOutcome {
-    let filter_root = if filter_root == search_root && search_root.is_file() {
-        search_root.parent().unwrap_or(search_root)
-    } else {
-        filter_root
-    };
-    let started = Instant::now();
-    let mut files = Vec::new();
+    control: &WalkControl,
+    found: &Mutex<Vec<PathBuf>>,
+    skipped_foreign_mounts: Arc<AtomicUsize>,
+) -> (bool, usize) {
+    let filter_root = walk_filter_root(filter_root, search_root);
+    let mut matched = 0usize;
     let mut walk_truncated = false;
     let mut entries_visited = 0usize;
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = fallback_target_walk_builder(
-        search_root,
-        Arc::clone(&skipped_foreign_mounts),
-        ignored_target,
-    )
-    .build();
+    let walker =
+        fallback_target_walk_builder(search_root, skipped_foreign_mounts, ignored_target).build();
 
     for entry in walker.filter_map(|entry| entry.ok()) {
         entries_visited += 1;
-        if started.elapsed() >= budget || entries_visited > max_files.saturating_mul(8).max(1024) {
+        if control.advance() || entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
             break;
         }
@@ -1186,24 +1243,18 @@ fn walk_files_unbounded(
         }
         let path = entry.into_path();
         if filters.matches(filter_root, &path) {
-            files.push(path);
-            if files.len() > max_files {
+            if matched == max_files {
                 walk_truncated = true;
-                files.truncate(max_files);
                 break;
             }
+            matched += 1;
+            found.lock().unwrap_or_else(|e| e.into_inner()).push(path);
         }
     }
-
-    sort_walked_paths_by_mtime_desc(&mut files, filter_root);
-    FallbackWalkOutcome {
-        files,
-        walk_truncated,
-        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
-        entries_visited,
-    }
+    (walk_truncated || control.cut_short(), entries_visited)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn for_each_bounded_fallback_walk_file_with_limits<F>(
     filter_root: &Path,
     search_root: &Path,
@@ -1222,32 +1273,62 @@ where
     let project_root = project_root.to_path_buf();
     let filters = filters.clone();
     let cancellation = crate::executor::current_job_cancellation();
-    let walked = crate::bounded_io::run(
+    // Shared as found, so a walk the request stops waiting for keeps them.
+    let found = Arc::new(Mutex::new(Vec::new()));
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let walk_found = Arc::clone(&found);
+    let walk_skipped = Arc::clone(&skipped_foreign_mounts);
+    let walked = crate::bounded_io::run_walk(
         search_root,
-        Some(Instant::now() + budget),
-        move |search_root| {
-            let mut files = Vec::new();
-            let progress = walk_each_file_unbounded(
+        Instant::now() + budget,
+        move |search_root, control| {
+            walk_each_file_unbounded(
                 &filter_root,
                 &search_root,
                 &filters,
                 &project_root,
                 path_exclusion,
                 max_files,
-                budget,
-                &mut |path| files.push(path.clone()),
+                &mut |path| {
+                    walk_found
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(path.clone())
+                },
                 ignored_target,
                 cancellation.as_ref(),
-            );
-            Ok((files, progress))
+                control,
+                walk_skipped,
+            )
         },
     );
+    let files = || std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
     match walked {
-        Ok((files, progress)) => {
-            for file in files {
+        Ok(WalkEnd::Finished(progress)) => {
+            for file in files() {
                 on_file(&file);
             }
             progress
+        }
+        Ok(WalkEnd::Stopped {
+            stall,
+            entries_visited,
+        }) => {
+            let files = files();
+            if let Some(stall) = stall {
+                stall.record(!files.is_empty());
+            }
+            for file in &files {
+                on_file(file);
+            }
+            FallbackWalkProgress {
+                bound: Some(WalkBound::TimeBudget),
+                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                counts: ScopeFileCounts {
+                    entries_visited,
+                    ..ScopeFileCounts::default()
+                },
+            }
         }
         Err(_) => FallbackWalkProgress {
             bound: Some(WalkBound::TimeBudget),
@@ -1256,6 +1337,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     filter_root: &Path,
     search_root: &Path,
@@ -1263,15 +1345,14 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     project_root: &Path,
     path_exclusion: Option<GrepPathExclusion>,
     max_files: usize,
-    budget: Duration,
     on_file: &mut F,
     ignored_target: bool,
     cancellation: Option<&crate::executor::JobCancellation>,
+    control: &WalkControl,
+    skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> FallbackWalkProgress {
-    let started = Instant::now();
     let mut files_seen = 0usize;
     let mut counts = ScopeFileCounts::default();
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let walker = fallback_target_walk_builder(
         search_root,
         Arc::clone(&skipped_foreign_mounts),
@@ -1288,7 +1369,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
                 counts,
             };
         }
-        if started.elapsed() >= budget {
+        if control.advance() {
             return FallbackWalkProgress {
                 bound: Some(WalkBound::TimeBudget),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
@@ -1323,7 +1404,8 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         }
     }
     FallbackWalkProgress {
-        bound: None,
+        // A directory refused at the walk's deadline was never searched.
+        bound: control.cut_short().then_some(WalkBound::TimeBudget),
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         counts,
     }
@@ -2234,6 +2316,51 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ran out of its time budget"), "{text}");
+    }
+
+    #[test]
+    fn slow_fallback_grep_walk_returns_a_partial_not_read_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for index in 0..120 {
+            let directory = root.join(format!("directory_{index:03}"));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join("file.rs"), "pub fn needle() {}\n").unwrap();
+        }
+        // About 1.8 s of directory work against a 1.5 s request budget.
+        let _slow = crate::bounded_io::slow_walk(&root, Duration::from_millis(15));
+        let budget = crate::bounded_io::Budget::after(Duration::from_millis(1500));
+        let (result, finished) = crate::bounded_io::with_budget(Some(budget), || {
+            let result = fallback_grep_with_limits(
+                &root,
+                &root,
+                &root,
+                &literal("needle"),
+                &PathFilters::default(),
+                1000,
+                IndexStatus::Fallback,
+                None,
+                MAX_FALLBACK_WALK_FILES,
+                FALLBACK_WALK_BUDGET,
+            );
+            let finished = crate::bounded_io::finish_response(Response::success(
+                "grep",
+                serde_json::json!({"text": ""}),
+            ));
+            (result, finished)
+        });
+        assert_eq!(result.walk_bound, Some(WalkBound::TimeBudget));
+        assert!(result.walk_truncated);
+        assert!(
+            result.files_searched > 0 && result.files_searched < 120,
+            "the files walked before the deadline are still searched: {}",
+            result.files_searched
+        );
+        assert!(
+            finished.success,
+            "a slow walk is not a request failure: {:?}",
+            finished.data
+        );
     }
 
     #[test]
