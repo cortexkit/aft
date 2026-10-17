@@ -41,6 +41,11 @@ struct WalkHook {
     block_at: Option<usize>,
     /// For an entry hook: block the call for exactly this path (one of `roots`).
     block_exact: bool,
+    /// Sets the walk's stop flag right after this many hooked calls, as the
+    /// request does when it stops waiting, so the walk expires at a known
+    /// entry instead of at a wall-clock deadline a loaded machine can reach
+    /// at any point.
+    expire_after: Option<usize>,
     seen: AtomicUsize,
     /// Paths of the calls made while the walk could still go on, in order.
     before_expiry: Mutex<Vec<PathBuf>>,
@@ -73,8 +78,8 @@ impl WalkHookGuard {
     pub(crate) fn calls_after_expiry(&self) -> usize {
         self.hook.after_expiry.load(Ordering::Relaxed)
     }
-    /// Checks the partial result of a walk its deadline stopped: it holds at
-    /// least one file, and only files the walk checked before it had to stop.
+    /// Checks the partial result of a walk that expired: it holds at least
+    /// one file, and only files the walk checked before it had to stop.
     /// Returns how many files it checked before then are missing from `found`.
     pub(crate) fn files_missed_before_expiry(&self, found: &[PathBuf]) -> usize {
         let checked = self.calls_before_expiry();
@@ -95,8 +100,8 @@ impl WalkHookGuard {
 }
 
 /// A canonical tree of 1,250 entries: 20 files at the root, and 30
-/// directories of 40 files each. A walk slowed by 1 ms per entry check takes
-/// several seconds over all of it, so a short walk deadline expires early.
+/// directories of 40 files each, so a walk expired after a few hundred entry
+/// checks still has most of the tree left to read.
 pub(crate) fn many_entry_tree() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -142,6 +147,7 @@ fn walk_hook(
     delay: Duration,
     block_at: Option<usize>,
     block_exact: bool,
+    expire_after: Option<usize>,
 ) -> WalkHookGuard {
     let mut roots = vec![root.to_path_buf()];
     if let Ok(canonical) = std::fs::canonicalize(root) {
@@ -155,6 +161,7 @@ fn walk_hook(
         delay,
         block_at,
         block_exact,
+        expire_after,
         seen: AtomicUsize::new(0),
         before_expiry: Mutex::new(Vec::new()),
         after_expiry: AtomicUsize::new(0),
@@ -172,26 +179,35 @@ fn walk_hook(
 /// Slows every per-directory call a walk makes under `root` by `delay`. The
 /// walk keeps making progress, so it is slow, not stalled.
 pub(crate) fn slow_walk(root: &Path, delay: Duration) -> WalkHookGuard {
-    walk_hook(root, false, delay, None, false)
+    walk_hook(root, false, delay, None, false, None)
 }
 
 /// Slows every per-entry call a walk makes under `root` by `delay`: each entry
 /// read, type check, or filter inside a directory. Each call returns, so the
 /// walk is slow, not stalled, however many entries one directory holds.
 pub(crate) fn slow_walk_entries(root: &Path, delay: Duration) -> WalkHookGuard {
-    walk_hook(root, true, delay, None, false)
+    walk_hook(root, true, delay, None, false, None)
+}
+
+/// Counts every per-entry call a walk makes under `root`, and expires the
+/// walk right after the `checks`th one by setting its stop flag: the flag the
+/// request sets when it stops waiting, which `WalkControl::expired` reads
+/// alongside the deadline. The `checks`th call itself counts as made before
+/// expiry; the walk's own check that follows it already sees the expiry.
+pub(crate) fn expire_walk_after_entries(root: &Path, checks: usize) -> WalkHookGuard {
+    walk_hook(root, true, Duration::ZERO, None, false, Some(checks))
 }
 
 /// Blocks the per-entry call a walk makes for exactly `path` until the guard
 /// is released or dropped: one entry whose check never returns.
 pub(crate) fn stall_walk_entry(path: &Path) -> WalkHookGuard {
-    walk_hook(path, true, Duration::ZERO, None, true)
+    walk_hook(path, true, Duration::ZERO, None, true, None)
 }
 
 /// Blocks the `access`th per-directory call a walk makes under `root` until
 /// the guard is released or dropped: one call that stops making progress.
 pub(crate) fn stall_walk_at(root: &Path, access: usize) -> WalkHookGuard {
-    walk_hook(root, false, Duration::ZERO, Some(access), false)
+    walk_hook(root, false, Duration::ZERO, Some(access), false, None)
 }
 
 pub(super) fn before_walk_access(path: &Path) {
@@ -221,6 +237,13 @@ fn run_walk_hook(path: &Path, entries: bool) {
         hook.after_expiry.fetch_add(1, Ordering::Relaxed);
     } else {
         hook.before_expiry.lock().unwrap().push(path.to_path_buf());
+    }
+    if hook.expire_after == Some(seen) {
+        WALK.with(|walk| {
+            if let Some(walk) = walk.borrow().as_ref() {
+                walk.stop.store(true, Ordering::Relaxed);
+            }
+        });
     }
     let block = if hook.block_exact {
         hook.roots.iter().any(|root| path == root)

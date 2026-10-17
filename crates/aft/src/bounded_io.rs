@@ -1299,8 +1299,8 @@ mod regression_tests;
 pub(crate) use regression_tests::stall_helper;
 #[cfg(test)]
 pub(crate) use regression_tests::{
-    block_stat, many_entry_tree, run_walk_in_own_slot, slow_walk, slow_walk_entries, stall_walk_at,
-    stall_walk_entry, with_single_access_budget,
+    block_stat, expire_walk_after_entries, many_entry_tree, run_walk_in_own_slot, slow_walk,
+    slow_walk_entries, stall_walk_at, stall_walk_entry, with_single_access_budget,
 };
 #[cfg(all(test, unix))]
 pub(crate) fn stall_helper_if_requested(path: &Path) {

@@ -3119,25 +3119,30 @@ mod tests {
         );
     }
 
-    /// The walk deadline for the expiry tests below: well past the first few
-    /// hundred slowed entry checks, far short of all 1,250.
-    const EXPIRING_WALK_BUDGET: Duration = Duration::from_millis(400);
+    /// How many entry checks the expiry tests below let a walk make before
+    /// the hook expires it: enough to keep files, far short of the whole tree.
+    const EXPIRE_AFTER_ENTRY_CHECKS: usize = 200;
+
+    /// The walk deadline for the expiry tests below. The hook expires the
+    /// walk long before it; this only bounds a walk that never stops.
+    const HANG_GUARD_DEADLINE: Duration = Duration::from_secs(60);
 
     #[test]
     fn expired_fallback_walk_stops_reading_entries_and_frees_its_slot() {
         let (_dir, root) = crate::bounded_io::many_entry_tree();
-        let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
+        let hook = crate::bounded_io::expire_walk_after_entries(&root, EXPIRE_AFTER_ENTRY_CHECKS);
         let found = Arc::new(Mutex::new(Vec::new()));
         let walk_found = Arc::clone(&found);
-        // A 10 s stall window only guards against a hang, so a loaded runner
-        // cannot turn a slow but correct stop into an abandoned walk. A walk
-        // that went on reading after its deadline still fails: it finishes
-        // every entry well inside the window and the count below catches it.
+        // The hook expires the walk; the deadline and the 10 s stall window
+        // only guard against a hang, so a loaded runner cannot move the point
+        // where the walk expires or turn a slow but correct stop into an
+        // abandoned walk. A walk that went on reading after it expired still
+        // fails: the count below catches every further entry check.
         let (end, slot_free) =
             crate::bounded_io::with_single_access_budget(Duration::from_secs(10), || {
                 crate::bounded_io::run_walk_in_own_slot(
                     &root,
-                    Instant::now() + EXPIRING_WALK_BUDGET,
+                    Instant::now() + HANG_GUARD_DEADLINE,
                     move |root, control| {
                         walk_files_unbounded(
                             &root,
@@ -3161,19 +3166,19 @@ mod tests {
         // sees the expiry; nothing after it is read.
         assert!(
             after_expiry <= 1,
-            "the walk checked {after_expiry} entries after its deadline"
+            "the walk checked {after_expiry} entries after it expired"
         );
         let Ok(WalkEnd::Finished((truncated, entries_visited))) = end else {
             panic!("the expired walk must end on its own, not be abandoned");
         };
-        assert!(truncated, "a walk stopped by its deadline is truncated");
+        assert!(truncated, "an expired walk is truncated");
         let found = found.lock().unwrap().clone();
         let missed = hook.files_missed_before_expiry(&found);
         assert!(missed <= 1, "{missed} files checked in time were dropped");
         // The count covers the root (never filtered, so never hooked) plus
-        // each entry the walk took in before its deadline. Exactly one
-        // filter-checked entry is not counted: the one the walk refused at
-        // its deadline, checked before expiry (so in `calls_before_expiry`)
+        // each entry the walk took in before it expired. Exactly one
+        // filter-checked entry is not counted: the one the walk refused when
+        // it expired, checked before expiry (so in `calls_before_expiry`)
         // or after it (the single call in `after_expiry`). Counting that
         // refused entry would exceed this bound by one.
         let checked_in_time = hook.calls_before_expiry().len();
@@ -3191,12 +3196,12 @@ mod tests {
         for directory in 0..1_000 {
             std::fs::create_dir(root.join(format!("empty_{directory:04}"))).unwrap();
         }
-        let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
+        let hook = crate::bounded_io::expire_walk_after_entries(&root, EXPIRE_AFTER_ENTRY_CHECKS);
         let (end, slot_free) =
             crate::bounded_io::with_single_access_budget(Duration::from_secs(10), || {
                 crate::bounded_io::run_walk_in_own_slot(
                     &root,
-                    Instant::now() + EXPIRING_WALK_BUDGET,
+                    Instant::now() + HANG_GUARD_DEADLINE,
                     |root, control| {
                         scope_has_files_unbounded(
                             &root,
@@ -3215,7 +3220,7 @@ mod tests {
         );
         assert!(
             after_expiry <= 1,
-            "the probe checked {after_expiry} entries after its deadline"
+            "the probe checked {after_expiry} entries after it expired"
         );
         let Ok(WalkEnd::Finished(answer)) = end else {
             panic!("the expired probe must end on its own, not be abandoned");
