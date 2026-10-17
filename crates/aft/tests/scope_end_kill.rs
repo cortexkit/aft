@@ -330,6 +330,25 @@ impl Daemon {
         scope: Option<subc_protocol::scope::ScopeStamp>,
         legacy: bool,
     ) {
+        let session = format!("session-{channel}");
+        self.bind_route(
+            channel, bind_epoch, principal, scope, legacy, &session, !legacy,
+        )
+        .await;
+    }
+    /// `probe_ready` waits for aft.db through `late_results`; routes that may
+    /// only call one operation (such as exact-read routes) skip that probe.
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_route(
+        &mut self,
+        channel: u16,
+        bind_epoch: u32,
+        principal: &str,
+        scope: Option<subc_protocol::scope::ScopeStamp>,
+        legacy: bool,
+        session: &str,
+        probe_ready: bool,
+    ) {
         self.corr += 1;
         let corr = self.corr;
         let bind = ModuleControlRequest::RouteBind {
@@ -338,11 +357,7 @@ impl Daemon {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(
-                &self.root.join("project"),
-                "runner",
-                &format!("session-{channel}"),
-            ),
+            identity: BindIdentity::new(&self.root.join("project"), "runner", session),
             principal: Some(if principal == "direct" {
                 Principal::Direct
             } else {
@@ -374,7 +389,7 @@ impl Daemon {
             .await
             .expect("bind reply");
         assert_eq!(ack.header.ty, FrameType::Response, "{}", body(&ack));
-        if !legacy {
+        if probe_ready {
             // Bind acknowledgement precedes asynchronous aft.db opening.
             // late_results must become available before submitting shell calls;
             // this readiness probe consumes no call key or ledger row.
@@ -1317,4 +1332,138 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
             json!({"name":"bash_kill","preset":"head","arguments":{"taskId":task["task_id"]}}),
         )
         .await;
+}
+
+// Basal reads exact files over an ordinary tool-provider/v1 route to AFT,
+// bound with the head's bind identity under a `flow-read/` child of the head's
+// scope, sending the flat `{"op":"file.read_exact","path":...}` body rather
+// than a `{name, arguments, call_key}` tool-call envelope.
+fn flow_owner() -> Principal {
+    Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    }
+}
+fn flow_head_stamp() -> subc_protocol::scope::ScopeStamp {
+    subc_protocol::scope::ScopeStamp::new(
+        flow_owner(),
+        "head",
+        7,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_owner_authorized(true)
+}
+fn flow_read_stamp() -> subc_protocol::scope::ScopeStamp {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    subc_protocol::scope::ScopeStamp::new(
+        flow_owner(),
+        "flow-read/call-1",
+        1,
+        subc_protocol::scope::ScopeKind::Ephemeral,
+    )
+    .with_owner_authorized(true)
+    .with_expires_at_ms(Some(now + 60_000))
+    .with_parent(Some(subc_protocol::scope::ScopeParent::new(
+        flow_owner(),
+        "head",
+        7,
+    )))
+}
+
+#[tokio::test]
+async fn flow_read_scope_on_tool_provider_v1_route_returns_exact_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("module");
+    let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    std::fs::write(root.join("project/flow-script.txt"), b"abc").unwrap();
+    daemon
+        .bind_route(
+            1,
+            1,
+            "direct",
+            Some(flow_head_stamp()),
+            false,
+            "head-session",
+            true,
+        )
+        .await;
+    // The read checks the head's stored policy. The scope is registered after
+    // the bind is acknowledged; a grant operation on the head route registers
+    // it synchronously, so its answer orders registration before the read.
+    let listed = daemon.call(1, json!({"op":"grants.list"})).await;
+    assert_eq!(listed.header.ty, FrameType::Response, "{}", body(&listed));
+    daemon
+        .bind_route(
+            2,
+            1,
+            "basal",
+            Some(flow_read_stamp()),
+            false,
+            "head-session",
+            false,
+        )
+        .await;
+    let corr = daemon
+        .start(
+            2,
+            1,
+            json!({"op":"file.read_exact","path":"flow-script.txt"}),
+        )
+        .await;
+    // AFT confirms the parent head scope is live with the daemon before reading.
+    let describe = daemon
+        .next_matching(Duration::from_secs(10), |frame| {
+            frame.header.channel == 0
+                && frame.header.ty == FrameType::Request
+                && body(frame)["op"] == "scope.describe"
+        })
+        .await
+        .expect("parent scope.describe");
+    assert_eq!(body(&describe)["ref"], "head", "{}", body(&describe));
+    let live = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
+        status: subc_protocol::scope::ScopeStatus::Live,
+        scope_epoch: Some(7),
+        scope: Some(flow_head_stamp()),
+        daemon_incarnation: "test-daemon".into(),
+        owner_synced: true,
+        owner_configured: true,
+    };
+    daemon
+        .send(
+            FrameType::Response,
+            0,
+            0,
+            describe.header.corr,
+            Some(serde_json::to_value(live).unwrap()),
+        )
+        .await;
+    let reply = daemon.reply(2, corr).await;
+    assert_eq!(reply.header.ty, FrameType::Response, "{}", body(&reply));
+    assert_eq!(
+        body(&reply),
+        json!({
+            "bytes_base64":"YWJj",
+            "size":3,
+            "sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        })
+    );
+}
+
+#[tokio::test]
+async fn file_read_exact_on_tool_provider_v1_route_without_flow_scope_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("module");
+    let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    std::fs::write(root.join("project/flow-script.txt"), b"abc").unwrap();
+    daemon
+        .bind_route(2, 1, "basal", None, false, "head-session", true)
+        .await;
+    let reply = daemon
+        .call(2, json!({"op":"file.read_exact","path":"flow-script.txt"}))
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error, "{}", body(&reply));
+    assert_eq!(body(&reply)["code"], "file_read_exact_route_not_admitted");
+    assert_eq!(body(&reply)["message"], "Route not admitted: owner.");
 }
