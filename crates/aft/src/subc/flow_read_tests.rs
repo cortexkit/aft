@@ -594,7 +594,11 @@ fn flow_read_revoked_between_snapshot_and_recheck() {
     use crate::db::access_grants as store;
     let (_dir, ctx, parent, child) = read_fixture();
     let key = access_grants::scope_key(&parent);
-    let path = parent.project_root.join("script").canonicalize().unwrap();
+    // Grants are stored under their policy spelling, and grants.revoke
+    // normalizes its argument the same way before deleting. A raw
+    // canonicalize() result differs on Windows (a \\?\ verbatim prefix), so
+    // the revocation below would match no row there.
+    let path = crate::access_policy::policy_path(&parent.project_root.join("script"));
     {
         let db = ctx.db().unwrap();
         let conn = db.lock().unwrap();
