@@ -51,7 +51,7 @@ fn write_new_broken_file_reports_first_error_line_last() {
         &mut aft,
         "write-new-broken",
         "write",
-        json!({ "filePath": "src/broken.ts", "content": BROKEN_TS }),
+        json!({ "path": "src/broken.ts", "content": BROKEN_TS }),
     );
 
     assert_eq!(resp["created"], true, "{resp:?}");
@@ -81,7 +81,7 @@ fn write_new_valid_file_has_no_syntax_line() {
         &mut aft,
         "write-new-valid",
         "write",
-        json!({ "filePath": "src/valid.ts", "content": VALID_TS }),
+        json!({ "path": "src/valid.ts", "content": VALID_TS }),
     );
 
     assert_eq!(resp["created"], true, "{resp:?}");
@@ -103,7 +103,7 @@ fn existing_clean_file_broken_by_write_or_edit_keeps_rollback_reply() {
         &mut aft,
         "write-existing-broken",
         "write",
-        json!({ "filePath": "src/clean.ts", "content": BROKEN_TS }),
+        json!({ "path": "src/clean.ts", "content": BROKEN_TS }),
     );
     assert_eq!(write["rolled_back"], true, "{write:?}");
     assert!(write.get("syntax_error_line").is_none(), "{write:?}");
@@ -117,7 +117,7 @@ fn existing_clean_file_broken_by_write_or_edit_keeps_rollback_reply() {
         "edit-existing-broken",
         "edit",
         json!({
-            "filePath": "src/clean.ts",
+            "path": "src/clean.ts",
             "edits": [{ "oldString": "= 1;", "newString": "= ;" }],
         }),
     );
@@ -140,7 +140,7 @@ fn edit_append_creating_broken_file_reports_first_error_line_last() {
         &mut aft,
         "append-new-broken",
         "edit",
-        json!({ "filePath": "src/appended.ts", "appendContent": BROKEN_TS }),
+        json!({ "path": "src/appended.ts", "appendContent": BROKEN_TS }),
     );
 
     assert_eq!(resp["created"], true, "{resp:?}");
@@ -162,7 +162,7 @@ fn edit_append_creating_broken_file_reports_first_error_line_last() {
         &mut aft,
         "append-existing-broken",
         "edit",
-        json!({ "filePath": "src/appended.ts", "appendContent": "export const later = 3;\n" }),
+        json!({ "path": "src/appended.ts", "appendContent": "export const later = 3;\n" }),
     );
     assert_eq!(again["created"], false, "{again:?}");
     assert!(again.get("syntax_error_line").is_none(), "{again:?}");
@@ -247,7 +247,7 @@ fn swift_new_file_swiftc_accepts_has_no_syntax_line() {
         &mut aft,
         "write-new-swift",
         "write",
-        json!({ "filePath": "Sources/tuple.swift", "content": content }),
+        json!({ "path": "Sources/tuple.swift", "content": content }),
     );
 
     assert_eq!(resp["created"], true, "{resp:?}");
