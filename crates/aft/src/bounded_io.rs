@@ -465,6 +465,7 @@ fn run_with_limiter<T: Send + 'static>(
     };
     let owned = path.to_path_buf();
     let budget = current();
+    let confinement = crate::context::confinement::capture();
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -481,7 +482,7 @@ fn run_with_limiter<T: Send + 'static>(
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
-            let result = with_budget(budget, || {
+            let result = crate::context::confinement::inherit(confinement, || with_budget(budget, || {
                 // Owning a slot does not mean the OS has scheduled this helper.
                 // Never start expired work or blame its scheduling delay on I/O.
                 let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
@@ -491,7 +492,7 @@ fn run_with_limiter<T: Send + 'static>(
                 *running = true;
                 drop(running);
                 work(owned)
-            });
+            }));
             let _ = tx.send(result);
         })?;
     #[cfg(test)]
@@ -958,6 +959,7 @@ pub(crate) mod tests {
         Ok(())
     }
     pub(super) fn before_regular_open(path: &Path) -> io::Result<()> {
+        note_open(path);
         let fired = FIFO_REPLACEMENTS.lock().unwrap().remove(path);
         if let Some((fired, reached)) = fired {
             std::fs::remove_file(path)?;
@@ -966,6 +968,36 @@ pub(crate) mod tests {
             let _ = reached.send(());
         }
         Ok(())
+    }
+    static OPEN_WATCHES: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    /// Counts the opens of one file's contents while it is alive, so a test
+    /// can prove a file was never read.
+    pub(crate) struct OpenWatch {
+        path: PathBuf,
+        pub(crate) opens: Arc<AtomicUsize>,
+    }
+    impl Drop for OpenWatch {
+        fn drop(&mut self) {
+            OPEN_WATCHES.lock().unwrap().remove(&self.path);
+        }
+    }
+    pub(crate) fn watch_opens(path: &Path) -> OpenWatch {
+        let opens = Arc::new(AtomicUsize::new(0));
+        OPEN_WATCHES
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), Arc::clone(&opens));
+        OpenWatch {
+            path: path.to_path_buf(),
+            opens,
+        }
+    }
+    /// Record an open of `path`'s contents for an [`OpenWatch`] on it.
+    pub(crate) fn note_open(path: &Path) {
+        if let Some(opens) = OPEN_WATCHES.lock().unwrap().get(path) {
+            opens.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub(crate) fn fifo(path: &Path) {
         let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();

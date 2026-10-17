@@ -1,0 +1,37 @@
+{
+  "native": {
+    "id": "confine-vector",
+    "success": true,
+    "text": "0 files matching **/*.rs",
+    "complete": false,
+    "no_files_matched_scope": false,
+    "skipped_foreign_mounts": 0,
+    "files": [],
+    "total": 0,
+    "truncated": false,
+    "walk_truncated": true,
+    "index": {
+      "trigram": {
+        "status": "fallback",
+        "reason": "confined root walk"
+      }
+    },
+    "fallback": "filesystem",
+    "files_list_envelope": {
+      "shown": 0,
+      "total": {
+        "kind": "at_least",
+        "value": 0
+      },
+      "unit": "files",
+      "reason": "walk",
+      "causes": [
+        "walk"
+      ],
+      "narrow": [
+        "path"
+      ]
+    }
+  },
+  "text": "0 files matching **/*.rs\n\nshown 0 of ≥0 files (walk) · narrow: path"
+}

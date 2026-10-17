@@ -482,11 +482,26 @@ impl Fixture {
             entries,
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
+        // As on the frame loop, a scoped worker's saved confinement is read
+        // off the loop first when memory cannot answer for it.
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            frame,
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let mut waits = crate::subc::persistence::DatabaseWaits::default();
+        let decoded = match waits.read_confinement(decoded, &routes, &self.executor) {
+            Ok(()) => waits.next().await,
+            Err(decoded) => decoded,
+        };
+        let frame = decoded.frame;
         handle_tool_call(
             &writer,
             &frame,
             None,
-            PhaseTrace::new(Instant::now()),
+            decoded.confinement,
+            decoded.phase_trace,
             &routes,
             &HashMap::new(),
             &ReclaimedRoutes::default(),
@@ -612,6 +627,7 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         .unwrap(),
         phase_trace: PhaseTrace::new(Instant::now()),
         parsed_body: Default::default(),
+        confinement: None,
     };
     let reply = |corr, status| {
         let live = status == subc_protocol::scope::ScopeStatus::Live;

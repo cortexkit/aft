@@ -1,0 +1,23 @@
+{
+  "native": {
+    "id": "confine-vector",
+    "success": true,
+    "text": "only.rs\n  - fn   pinned_token 1:1\nopen/\n  kept.rs\n    - fn   pinned_token 1:1\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)",
+    "discovered": true,
+    "complete": true,
+    "output_truncated": false,
+    "files_shown": 2,
+    "structure_footer": "",
+    "walk_truncated": false,
+    "collection_truncated": false,
+    "skipped_foreign_mounts": 0,
+    "skipped_files": [
+      {
+        "file": ".git",
+        "reason": "unsupported_language"
+      }
+    ],
+    "skipped_denied": 2
+  },
+  "text": "only.rs\n  - fn   pinned_token 1:1\nopen/\n  kept.rs\n    - fn   pinned_token 1:1\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)\n\nSkipped 1 file(s) with no supported language."
+}

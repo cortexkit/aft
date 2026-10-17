@@ -1,6 +1,7 @@
 # Notes for the next release
 
 - Disk retention: finished bash tasks release scratch directories once their process groups exit, older terminal scratch folders are swept, and vanished-checkout views drain in bounded consecutive passes with a visible backlog count.
+- Worker catalogs can set `confine: "root"` to keep a read-only session inside its own checkout, even after an AFT restart; only read, grep, glob, and aft_outline are offered, and outside paths are refused without permission prompts.
 - 0.60.1: Worker file tools can read Cargo registry sources and Rust toolchains without permission cards; writes, credential/cache paths, permanent deny floors, and shell confinement are unchanged.
 - Permissions: grep, outline, zoom, callgraph, AST search, inspect and OpenCode glob now recognize exact session-owned bash output without OpenCode's external-directory prompts or Pi's root-restriction denials; directory-wide searches, other sessions' output and mutations stay protected.
 - Daemon stability: source scans for search, code navigation, inspection, and file watching now skip AFT's internal task/cache directories and SQLite databases plus their WAL/shared-memory/journal files, avoiding lost SQLite locks and SIGBUS crashes. Source folders with database-like names remain searchable, and committed database fixtures no longer break view builds. Explicit, authorized task-record reads remain available.

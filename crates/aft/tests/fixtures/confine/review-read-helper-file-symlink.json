@@ -1,0 +1,6 @@
+{
+  "id": "confine-helper",
+  "success": false,
+  "code": "path_outside_confined_root",
+  "message": "path 'escape-file' is not available in this confined root"
+}

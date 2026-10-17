@@ -8679,6 +8679,35 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/confinement.rs",
+      "line": 92,
+      "column": 22,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\", \"target\", \"directory\", \"files\", \"url\"] {",
+      "location": "line 92, column 22",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The read preflight validates both canonical and legacy path keys before dispatch; this spelling is internal confinement logic, not a new agent argument."
+    },
+    {
+      "path": "crates/aft/src/subc/confine_tests.rs",
+      "line": 134,
+      "column": 27,
+      "token": "filePath",
+      "text": "\"read\" => json!({\"filePath\": input}),",
+      "location": "line 134, column 27",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The confinement test helper builds an existing legacy read call to exercise boundary enforcement; this spelling is test input, not a new agent argument."
+    },
+    {
+      "path": "crates/aft/tests/fixtures/confine/catalog-reply.json",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The captured catalog records the existing read schema's legacy filePath property and required-key declaration; changing these bytes would stop it matching the real handler."
     }
   ]
 }

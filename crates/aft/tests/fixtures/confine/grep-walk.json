@@ -1,0 +1,51 @@
+{
+  "native": {
+    "id": "confine-vector",
+    "success": true,
+    "text": "Found 0 match across 0 file [index: fallback; incomplete: checked 0 files before the walk's 0-file limit]\n\n(checked 0 of more than 0 files (index not used); the fallback walk stops at 0 files, so files past that limit were not searched and matches may be missing. For an exhaustive search, narrow with path or include so the walk reaches every file.)",
+    "complete": false,
+    "no_files_matched_scope": false,
+    "skipped_foreign_mounts": 0,
+    "matches": [],
+    "rendered_matches": 0,
+    "offset": 0,
+    "output_byte_capped": false,
+    "lines_truncated": 0,
+    "next_offset": null,
+    "total_matches": 0,
+    "files_searched": 0,
+    "files_read_directly": 0,
+    "files_with_matches": 0,
+    "index_status": "Fallback",
+    "truncated": false,
+    "search_ms": 0.0,
+    "walk_stopped_by": "file_limit",
+    "walk_truncated": true,
+    "index": {
+      "trigram": {
+        "status": "fallback",
+        "reason": "confined root walk"
+      }
+    },
+    "fallback": "filesystem",
+    "matches_list_envelope": {
+      "shown": 0,
+      "total": {
+        "kind": "at_least",
+        "value": 0
+      },
+      "unit": "rows",
+      "reason": "walk",
+      "causes": [
+        "walk"
+      ],
+      "narrow": [
+        "offset",
+        "path",
+        "include",
+        "exclude"
+      ]
+    }
+  },
+  "text": "Found 0 match across 0 file [index: fallback; incomplete: checked 0 files before the walk's 0-file limit]\n\n(checked 0 of more than 0 files (index not used); the fallback walk stops at 0 files, so files past that limit were not searched and matches may be missing. For an exhaustive search, narrow with path or include so the walk reaches every file.)\n\nshown 0 of ≥0 rows (walk) · narrow: offset, path, include, exclude"
+}

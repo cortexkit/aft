@@ -75,7 +75,7 @@ pub(super) fn describe() -> Value {
             stability: "alpha".into(),
         }],
         implementation_version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: vec![],
+        capabilities: vec!["tool-catalog-confine/v1".into()],
     })
     .expect("the commons role declaration is JSON")
 }
@@ -504,6 +504,45 @@ pub(super) fn catalog_for_request(
     runon: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+        worker_wait_max_ms,
+        false,
+    )
+}
+
+pub(super) fn catalog_for_confined_request(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+    worker_wait_max_ms: u64,
+) -> Result<Value, ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+        worker_wait_max_ms,
+        true,
+    )
+}
+
+fn render_catalog(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+    worker_wait_max_ms: u64,
+    confined: bool,
+) -> Result<Value, ErrorBody> {
     #[cfg(test)]
     CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
     let mut answer = CatalogAnswer::new("", "").with_tools(tools_for_session(
@@ -512,6 +551,16 @@ pub(super) fn catalog_for_request(
         powershell_available,
         runon,
     ));
+    if confined {
+        answer
+            .tools
+            .retain(|tool| matches!(tool.name.as_str(), "read" | "grep" | "glob" | "outline"));
+        for tool in &mut answer.tools {
+            if tool.name == "outline" {
+                tool.name = "aft_outline".into();
+            }
+        }
+    }
     // Every preset can settle a keyed call after its reply (a held shell
     // call, or a scoped call whose end was never observed), so every catalog
     // declares the session capability that lets a custodian pull those
@@ -1677,6 +1726,7 @@ impl LedgerEdge {
                             std::time::Instant::now(),
                         ),
                         parsed_body: Default::default(),
+                        confinement: None,
                     });
                 }
                 Err(error) => log::warn!("withdrawn call could not be ended: {error}"),
@@ -2524,8 +2574,8 @@ mod tests {
 
     /// `role.describe` serves exactly the declaration pinned in the
     /// conformance fixture: `role.describe`, `tool.catalog` and `tool.call`
-    /// plus `tool.withdraw`, `late_results` and `late_results.ack`, with no
-    /// module-level capabilities.
+    /// plus `tool.withdraw`, `late_results` and `late_results.ack`, and the
+    /// root-confinement capability used for worker admission.
     #[test]
     fn slice_b_declaration_matches_independent_fixture_without_normalizing_other_fields() {
         let fixtures: Value = serde_json::from_str(include_str!(
@@ -3860,11 +3910,26 @@ mod route_tests {
             entries: deferred_tx,
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
+        // As on the frame loop, a scoped worker's saved confinement is read
+        // off the loop first when memory cannot answer for it.
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            frame,
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let mut waits = super::super::persistence::DatabaseWaits::default();
+        let decoded = match waits.read_confinement(decoded, &routes, &executor) {
+            Ok(()) => waits.next().await,
+            Err(decoded) => decoded,
+        };
+        let frame = decoded.frame;
         handle_tool_call(
             &writer,
             &frame,
             None,
-            PhaseTrace::new(Instant::now()),
+            decoded.confinement,
+            decoded.phase_trace,
             &routes,
             &HashMap::new(),
             &crate::subc::ReclaimedRoutes::default(),
@@ -4355,6 +4420,7 @@ mod route_tests {
         let (edge, _ready) = LedgerEdge::new();
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -4472,6 +4538,175 @@ mod route_tests {
 
     fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
         serde_json::from_value(json!({"owner": {"kind": "direct"}, "ref": "scope", "scope_epoch": 1, "kind": kind, "owner_authorized": true})).unwrap()
+    }
+
+    /// A scoped worker route on its own project and aft.db, with `pin.rs` in
+    /// the project. The temporary directories must outlive the route.
+    fn worker_route(
+        role: RouteRole,
+        call_mode: subc_protocol::call_mode::CallMode,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<AppContext>,
+        RouteIdentity,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::write(root.join("pin.rs"), "pub fn pinned_symbol() {}\n").unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().into()),
+                restrict_to_project_root: false,
+                ..Default::default()
+            },
+        ));
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        )));
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: ProjectRootId::from_path(&root).unwrap(),
+            project_root: root.clone(),
+            harness: "runner".into(),
+            session: "designer".into(),
+            role,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.clone(),
+                harness: "runner".into(),
+                session_id: "designer".into(),
+                principal_id: Some("reserved:broca".into()),
+            },
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::new(vec![]),
+            scope: Some(stamp("worker")),
+            run_scope: OnceLock::new(),
+            call_mode,
+            made_tool_call: AtomicBool::new(false),
+        }));
+        (project, storage, ctx, identity)
+    }
+
+    /// Fetch the worker catalog with `confine: "root"`, which saves the fence.
+    async fn confine_route(
+        identity: &RouteIdentity,
+        ctx: &Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+    ) {
+        let reply = exchange_with_actor(
+            json!({"op":"tool.catalog","preset":"worker","params":{"confine":"root"}}),
+            identity.clone(),
+            ctx.clone(),
+            metrics,
+            |_, _| panic!("catalog reached file dispatch"),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let catalog: Value = serde_json::from_slice(&reply.body).unwrap();
+        let names = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["read", "grep", "glob", "aft_outline"]);
+    }
+
+    #[tokio::test]
+    async fn confined_route_dispatch_uses_saved_policy_and_public_outline_name() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_project, _storage, ctx, identity) = worker_route(
+            RouteRole::ToolProviderV1,
+            subc_protocol::call_mode::CallMode::Classic,
+        );
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        confine_route(&identity, &ctx, &metrics).await;
+        let reply = exchange_with_actor(json!({"op":"tool.call", "preset":"worker", "name":"aft_outline", "arguments":{"target":"pin.rs"}}), identity.clone(), ctx.clone(), &metrics, |request, ctx| {
+            assert_eq!(request.command, "outline");
+            assert!(ctx.request_force_restrict(&request.id));
+            crate::commands::outline::handle_outline(&request, ctx)
+        }).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let result: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(result["structuredContent"]["success"], true, "{result}");
+        assert!(String::from_utf8_lossy(&reply.body).contains("pinned_symbol"));
+        for name in ["bash", "inspect", "write"] {
+            let reply = exchange_with_actor(
+                json!({"op":"tool.call", "preset":"head", "name":name,"arguments":{}}),
+                identity.clone(),
+                ctx.clone(),
+                &metrics,
+                |_, _| panic!("unoffered tool reached dispatch"),
+            )
+            .await;
+            assert_eq!(error_body(&reply).code, "tool_not_offered_confined");
+        }
+    }
+
+    /// A confined catalog offers outline as `aft_outline` on legacy routes
+    /// too. Every route kind and call mode must accept that offered name and
+    /// dispatch the internal `outline` command, while an unconfined worker,
+    /// whose catalog never offered `aft_outline`, is still refused it.
+    #[tokio::test]
+    async fn confined_public_outline_name_runs_on_every_route_and_call_mode() {
+        use subc_protocol::call_mode::CallMode;
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for role in [RouteRole::Legacy, RouteRole::ToolProviderV1] {
+            for mode in [CallMode::Classic, CallMode::Codemode, CallMode::Flow] {
+                let label = format!("{role:?} {mode:?}");
+                let (_project, _storage, ctx, identity) = worker_route(role, mode.clone());
+                let metrics = Arc::new(DispatchPathMetrics::new());
+                let mut body = json!({"preset":"worker", "name":"aft_outline", "arguments":{"target":"pin.rs"}});
+                if role == RouteRole::ToolProviderV1 {
+                    body["op"] = json!("tool.call");
+                }
+                ACTIONS.store(0, Ordering::SeqCst);
+                let reply = exchange_with_actor(
+                    body.clone(),
+                    identity.clone(),
+                    ctx.clone(),
+                    &metrics,
+                    |request, _| {
+                        ACTIONS.fetch_add(1, Ordering::SeqCst);
+                        Response::success(request.id, json!({}))
+                    },
+                )
+                .await;
+                let text = String::from_utf8_lossy(&reply.body);
+                assert_eq!(
+                    ACTIONS.load(Ordering::SeqCst),
+                    0,
+                    "{label} unconfined: {text}"
+                );
+                assert!(
+                    text.contains("unknown_tool") || text.contains("call_mode_unsupported"),
+                    "{label} unconfined: {text}"
+                );
+
+                confine_route(&identity, &ctx, &metrics).await;
+                let reply = exchange_with_actor(
+                    body,
+                    identity.clone(),
+                    ctx.clone(),
+                    &metrics,
+                    |request, ctx| {
+                        assert_eq!(request.command, "outline");
+                        assert!(ctx.request_force_restrict(&request.id));
+                        crate::commands::outline::handle_outline(&request, ctx)
+                    },
+                )
+                .await;
+                let text = String::from_utf8_lossy(&reply.body);
+                assert_eq!(reply.header.ty, FrameType::Response, "{label}: {text}");
+                assert!(text.contains("pinned_symbol"), "{label}: {text}");
+            }
+        }
     }
 
     fn error_body(reply: &WriterFrame) -> subc_protocol::ErrorBody {
@@ -4882,6 +5117,7 @@ mod ledger_terminal_tests {
         let body = json!({"name":"bash", "arguments":arguments, "call_key":"held-copy-key"});
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -4946,6 +5182,7 @@ mod ledger_terminal_tests {
         let body = json!({"name":"read", "arguments":{"filePath":"r".repeat(32768)}, "call_key":"copy-key"});
         let decode = |body: &Value, corr| DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -5142,6 +5379,7 @@ mod ledger_terminal_tests {
         let (edge, mut ready) = LedgerEdge::new();
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 7, serde_json::to_vec(&json!({"name":"read", "arguments":{"filePath":"README.md"}, "call_key":"drain-key"})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(std::time::Instant::now()),
         };
@@ -5212,6 +5450,7 @@ mod ledger_terminal_tests {
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
+                        confinement: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),
@@ -5253,6 +5492,7 @@ mod ledger_terminal_tests {
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
+                        confinement: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),

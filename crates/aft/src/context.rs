@@ -44,6 +44,9 @@ pub(crate) use gitignore_state::IgnoreRuleChange;
 // The shared ignore-rule definition every project walker applies; see
 // `apply_project_ignore_rules`.
 pub(crate) use gitignore_state::apply_project_ignore_rules;
+
+#[path = "confinement.rs"]
+pub(crate) mod confinement;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
@@ -2695,6 +2698,35 @@ fn lock_database_slot<T>(
     Ok(slot.lock())
 }
 
+/// Remembered root-confinement answers for scoped worker policy keys.
+///
+/// Confinement is monotonic (a later catalog fetch cannot remove it), so a
+/// key found confined stays confined. An unconfined answer is also kept, so
+/// an ordinary worker's calls skip aft.db and its lock; it can go stale only
+/// through a confining save, and every such save goes through
+/// `AppContext::remember_confined_policy_key`, which marks the key confined
+/// and forgets every unconfined answer before the save commits. Unconfined
+/// answers also belong to the aft.db handle they were read from: once the
+/// context uses another database (a rebind to another storage directory, or
+/// a reopen), they no longer count and the next call reads again. A new
+/// process starts empty and reads the saved rows again.
+#[derive(Default)]
+struct PolicyConfinementMemo {
+    confined: std::collections::HashSet<crate::db::remote_exec::PolicyKey>,
+    unconfined: std::collections::HashSet<crate::db::remote_exec::PolicyKey>,
+    /// The database the `unconfined` answers were read from.
+    unconfined_db: Option<std::sync::Weak<Mutex<TrackedConnection>>>,
+    /// Bumped by every confining save, so an unconfined answer read before
+    /// one is not remembered after it.
+    generation: u64,
+    #[cfg(test)]
+    store_reads: usize,
+    /// Runs once, between a policy read from aft.db and remembering its
+    /// answer, so a test can save a policy in that window.
+    #[cfg(test)]
+    after_read_for_test: Option<Box<dyn FnOnce(&AppContext) + Send>>,
+}
+
 #[derive(Default)]
 struct DatabaseRuntimeFailure {
     error: Option<String>,
@@ -3529,6 +3561,11 @@ pub struct AppContext {
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
     database_runtime_failure: parking_lot::Mutex<DatabaseRuntimeFailure>,
+    /// Whether each scoped worker (identified by its remote-exec policy key)
+    /// saved `confine: "root"`, as far as this context has read or saved it,
+    /// so tool calls can skip the aft.db read and its lock. See
+    /// [`PolicyConfinementMemo`].
+    policy_confinement: parking_lot::Mutex<PolicyConfinementMemo>,
     #[cfg(test)]
     database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
@@ -4240,6 +4277,7 @@ impl AppContext {
             database_runtime_state: AtomicU8::new(0),
             database_runtime_changed: tokio::sync::Notify::new(),
             database_runtime_failure: parking_lot::Mutex::new(DatabaseRuntimeFailure::default()),
+            policy_confinement: parking_lot::Mutex::new(PolicyConfinementMemo::default()),
             #[cfg(test)]
             database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
@@ -6454,6 +6492,134 @@ impl AppContext {
             {
                 return;
             }
+        }
+    }
+
+    /// True until this context's first configure stages a database open. Such
+    /// a context (a library or test context) has never had aft.db open.
+    pub(crate) fn database_runtime_unconfigured(&self) -> bool {
+        self.database_runtime_state.load(Ordering::Acquire) == 0
+    }
+
+    /// True while a committed configure's database open has not finished.
+    pub(crate) fn database_runtime_initializing(&self) -> bool {
+        self.database_runtime_state.load(Ordering::Acquire) == 1
+    }
+
+    /// Wait outside executor admission until the database open in progress
+    /// finishes or `deadline` passes, whatever command is waiting.
+    pub(crate) async fn wait_for_database_open(&self, deadline: Instant) {
+        loop {
+            let changed = self.database_runtime_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.database_runtime_initializing() {
+                return;
+            }
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The remembered confinement of `key`: `Some(true)` once known confined
+    /// (which always wins), `Some(false)` once read as unconfined and not
+    /// confined since, `None` when only aft.db can answer.
+    pub(crate) fn policy_key_confinement(
+        &self,
+        key: &crate::db::remote_exec::PolicyKey,
+    ) -> Option<bool> {
+        // Never waits for the database handle slot, which an open holds while
+        // SQLite opens: the subc frame loop asks this. A busy slot only means
+        // a remembered unconfined answer cannot be checked against it now.
+        let db = self.app.try_db().flatten();
+        let memo = self.policy_confinement.lock();
+        if memo.confined.contains(key) {
+            return Some(true);
+        }
+        let same_db = match (&db, memo.unconfined_db.as_ref().and_then(|db| db.upgrade())) {
+            (Some(current), Some(read_from)) => Arc::ptr_eq(current, &read_from),
+            _ => false,
+        };
+        (same_db && memo.unconfined.contains(key)).then_some(false)
+    }
+
+    /// Mark `key` confined. Call it before the transaction that saves a
+    /// confining policy commits, so no call can use an older "unconfined"
+    /// answer once the fence is saved. Every remembered "unconfined" answer
+    /// is dropped too, not only this key's: a key with no row for its own
+    /// epoch reads an older epoch's row (see `db::remote_exec::confined`), so
+    /// fencing one epoch can confine another key of the same worker.
+    pub(crate) fn remember_confined_policy_key(&self, key: crate::db::remote_exec::PolicyKey) {
+        let mut memo = self.policy_confinement.lock();
+        memo.confined.insert(key);
+        memo.unconfined.clear();
+        memo.generation = memo.generation.wrapping_add(1);
+    }
+
+    /// The generation to pass to [`Self::remember_unconfined_policy_key`]:
+    /// take it before reading a key's policy from aft.db.
+    pub(crate) fn policy_confinement_generation(&self) -> u64 {
+        self.policy_confinement.lock().generation
+    }
+
+    /// Remember that the aft.db handle `db` said `key` is unconfined, unless a
+    /// key was marked confined since `generation` was taken: that read may
+    /// predate the fence, so it is not kept and the next call reads again.
+    pub(crate) fn remember_unconfined_policy_key(
+        &self,
+        key: crate::db::remote_exec::PolicyKey,
+        generation: u64,
+        db: &Arc<Mutex<TrackedConnection>>,
+    ) {
+        let mut memo = self.policy_confinement.lock();
+        if memo.generation != generation || memo.confined.contains(&key) {
+            return;
+        }
+        let same_db = memo
+            .unconfined_db
+            .as_ref()
+            .and_then(|db| db.upgrade())
+            .is_some_and(|read_from| Arc::ptr_eq(db, &read_from));
+        if !same_db {
+            memo.unconfined.clear();
+            memo.unconfined_db = Some(Arc::downgrade(db));
+        }
+        memo.unconfined.insert(key);
+    }
+
+    /// Count one read of a policy key's confinement from aft.db.
+    pub(crate) fn note_policy_confinement_read(&self) {
+        #[cfg(test)]
+        {
+            self.policy_confinement.lock().store_reads += 1;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_confinement_reads_for_test(&self) -> usize {
+        self.policy_confinement.lock().store_reads
+    }
+
+    /// Run `hook` once, after the next policy read from aft.db and before its
+    /// answer is remembered.
+    #[cfg(test)]
+    pub(crate) fn after_next_policy_read_for_test(
+        &self,
+        hook: impl FnOnce(&AppContext) + Send + 'static,
+    ) {
+        self.policy_confinement.lock().after_read_for_test = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_policy_read_hook_for_test(&self) {
+        // Taken out first: the hook may save a policy, which locks the memo.
+        let hook = self.policy_confinement.lock().after_read_for_test.take();
+        if let Some(hook) = hook {
+            hook(self);
         }
     }
 
@@ -12256,7 +12422,14 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_path_with_artifact_session(req_id, path, Some(session_id))
+        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id));
+        if crate::context::confinement::for_request(req_id) {
+            // Canonical targets and symlink destinations are private outside the
+            // fence. Always report the caller's spelling, including on failure.
+            result.map_err(|_| crate::context::confinement::refusal(req_id, path))
+        } else {
+            result
+        }
     }
 
     fn validate_path_with_artifact_session(
@@ -12416,6 +12589,8 @@ impl AppContext {
         identity: &Path,
         operation: crate::access_policy::AccessOperation,
     ) -> Result<(), crate::protocol::Response> {
+        #[cfg(test)]
+        confinement::note_ask();
         use crate::access_policy::{AskRoute, GrantKind};
         let AskRoute::Consent { once } = crate::access_policy::current_ask_route() else {
             return Ok(());
@@ -12493,6 +12668,21 @@ impl AppContext {
         } else {
             identify(resolved.to_path_buf())
         };
+        if crate::context::confinement::for_request(req_id) && self.request_force_restrict(req_id) {
+            // `identity` went through `policy_path`, which drops the Windows
+            // verbatim prefix (`\\?\C:\`) that `canonicalize` puts on the
+            // root. Compare both in that same form, or nothing is in the root.
+            let root = self.config().project_root.as_ref().map(|root| {
+                crate::inspect::job::normalize_path(&self.resolved_path_restriction_root(root))
+            });
+            if !root.is_some_and(|root| identity.starts_with(root))
+                || !crate::bounded_io::metadata(&identity).is_ok()
+            {
+                return Err(crate::context::confinement::refusal(req_id, original));
+            }
+            // Containment is unconditional, but an in-root file still obeys
+            // the existing credential and user-configured denial floors.
+        }
         let owned_artifact = artifact_session.is_some_and(|session| {
             self.bash_background
                 .is_session_owned_artifact_path(session, &identity)

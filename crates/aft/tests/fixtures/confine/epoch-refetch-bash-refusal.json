@@ -1,0 +1,6 @@
+{
+  "id": "confine-vector",
+  "success": false,
+  "code": "tool_not_offered_confined",
+  "message": "tool \"bash\" is not offered in a confined session"
+}

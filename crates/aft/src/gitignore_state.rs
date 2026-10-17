@@ -30,6 +30,17 @@ pub(crate) fn apply_project_ignore_rules<'a>(
     builder: &'a mut ignore::WalkBuilder,
     walk_root: &Path,
 ) -> &'a mut ignore::WalkBuilder {
+    if crate::context::confinement::active() {
+        // Ignore files can themselves be symlinks to another checkout. A
+        // confined walk must not read those files, even to filter its results.
+        return builder
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .parents(false)
+            .require_git(false);
+    }
     builder
         .git_ignore(true)
         .git_global(true)

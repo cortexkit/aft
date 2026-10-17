@@ -1,0 +1,176 @@
+{
+  "generation": "f1852cee27f6b9eded37313cd40aaec99004e51c06766e78b03e4aa663ecffd8",
+  "catalog_digest": "f1852cee27f6b9eded37313cd40aaec99004e51c06766e78b03e4aa663ecffd8",
+  "tools": [
+    {
+      "name": "read",
+      "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
+      "semantics": 1,
+      "modes": [
+        "classic",
+        "codemode",
+        "flow"
+      ],
+      "result_ops": [
+        "prepend",
+        "append"
+      ],
+      "capabilities": [
+        "code.read/v1"
+      ],
+      "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "description": "Path to file or directory (absolute or relative to project root)",
+            "type": "string"
+          },
+          "startLine": {
+            "description": "1-based line or directory entry to start reading from",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "endLine": {
+            "description": "1-based line or directory entry to stop reading at (inclusive)",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "limit": {
+            "description": "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "offset": {
+            "description": "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "filePath"
+        ]
+      }
+    },
+    {
+      "name": "grep",
+      "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
+      "semantics": 1,
+      "modes": [
+        "classic",
+        "codemode",
+        "flow"
+      ],
+      "capabilities": [
+        "code.search/v1"
+      ],
+      "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "include": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "offset": {
+            "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    },
+    {
+      "name": "glob",
+      "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
+      "semantics": 1,
+      "modes": [
+        "classic",
+        "codemode",
+        "flow"
+      ],
+      "capabilities": [
+        "code.search/v1"
+      ],
+      "description": "Find files matching a glob pattern. Returns matching file paths sorted by modification time. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    },
+    {
+      "name": "aft_outline",
+      "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
+      "semantics": 1,
+      "modes": [
+        "classic",
+        "codemode",
+        "flow"
+      ],
+      "capabilities": [
+        "code.outline/v1"
+      ],
+      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "target": {
+            "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "files": {
+            "description": "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
+            "type": "boolean"
+          },
+          "includeTests": {
+            "description": "Directory outline only: include test files. Defaults to false; tests are hidden.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "target"
+        ]
+      }
+    }
+  ],
+  "capabilities": {
+    "late_results": true
+  }
+}

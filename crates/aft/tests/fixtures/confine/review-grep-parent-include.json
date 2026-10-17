@@ -1,0 +1,31 @@
+{
+  "id": "confine-vector",
+  "success": true,
+  "text": "Found 0 match across 0 file [index: fallback; searched all 0 files directly]\n\n(0 files searched: the include pattern matched none of 2 files; nothing was searched.)",
+  "complete": true,
+  "no_files_matched_scope": true,
+  "skipped_foreign_mounts": 0,
+  "matches": [],
+  "rendered_matches": 0,
+  "offset": 0,
+  "output_byte_capped": false,
+  "lines_truncated": 0,
+  "next_offset": null,
+  "total_matches": 0,
+  "files_searched": 0,
+  "files_read_directly": 0,
+  "files_with_matches": 0,
+  "index_status": "Fallback",
+  "truncated": false,
+  "search_ms": 0.0,
+  "files_examined": 2,
+  "ignored_items": 0,
+  "files_excluded_by_patterns": 2,
+  "index": {
+    "trigram": {
+      "status": "fallback",
+      "reason": "confined root walk"
+    }
+  },
+  "fallback": "filesystem"
+}

@@ -61,6 +61,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         &writer,
         &frame,
         None,
+        None,
         PhaseTrace::new(Instant::now()),
         &routes,
         &HashMap::new(),
@@ -172,6 +173,7 @@ async fn route_bash(
     handle_tool_call(
         &writer,
         &frame,
+        None,
         None,
         PhaseTrace::new(Instant::now()),
         &routes,
@@ -417,6 +419,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     handle_tool_call(
         &writer,
         &frame,
+        None,
         None,
         PhaseTrace::new(started),
         &HashMap::from([(route_key(41, 1), identity)]),

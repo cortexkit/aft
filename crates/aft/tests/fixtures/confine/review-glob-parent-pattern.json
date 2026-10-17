@@ -1,0 +1,21 @@
+{
+  "id": "confine-vector",
+  "success": true,
+  "text": "0 files matching ../live/**\n\n(0 files searched: the include pattern matched none of 2 files; nothing was searched.)",
+  "complete": true,
+  "no_files_matched_scope": true,
+  "skipped_foreign_mounts": 0,
+  "files": [],
+  "total": 0,
+  "truncated": false,
+  "files_examined": 2,
+  "ignored_items": 0,
+  "files_excluded_by_patterns": 2,
+  "index": {
+    "trigram": {
+      "status": "fallback",
+      "reason": "confined root walk"
+    }
+  },
+  "fallback": "filesystem"
+}

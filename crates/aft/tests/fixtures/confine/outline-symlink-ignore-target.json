@@ -1,0 +1,22 @@
+{
+  "id": "confine-vector",
+  "success": true,
+  "text": "symlink.rs  rust         1 syms       1 lines\n",
+  "files": [
+    {
+      "path": "symlink.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    }
+  ],
+  "complete": true,
+  "line_count_gaps": [],
+  "entries_examined": 2,
+  "walk_truncated": false,
+  "walk_limit": 10000,
+  "collection_truncated": false,
+  "skipped_foreign_mounts": 0,
+  "unchecked_files": [],
+  "rollup_count": 0
+}

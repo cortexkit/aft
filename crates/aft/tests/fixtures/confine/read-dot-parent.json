@@ -1,0 +1,6 @@
+{
+  "id": "confine-vector",
+  "success": false,
+  "code": "path_outside_confined_root",
+  "message": "path './../live/sentinel.rs' is not available in this confined root"
+}

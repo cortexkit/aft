@@ -1,0 +1,7 @@
+{
+  "op": "tool.catalog",
+  "preset": "worker",
+  "params": {
+    "confine": "root"
+  }
+}

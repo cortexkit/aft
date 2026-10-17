@@ -23,6 +23,34 @@ use crate::search_index::{
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
 pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
+
+#[cfg(test)]
+thread_local! {
+    static WALK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_FALLBACK_WALK_FILES) };
+}
+
+fn fallback_walk_limit() -> usize {
+    #[cfg(test)]
+    {
+        WALK_LIMIT.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_FALLBACK_WALK_FILES
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_LIMIT.with(|limit| limit.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_LIMIT.with(|current| current.replace(limit)));
+    run()
+}
 /// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
 pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 
@@ -188,13 +216,23 @@ pub fn resolve_grep_scope(
         ));
     }
 
+    // In a confined call, refuse a search root outside the confined root or
+    // denied by the read policy before any walk starts there. A confined call
+    // also skips the shortcut that answers from the session's own bash task
+    // output files, because that shortcut reads them without walking.
+    for search_root in &search_roots {
+        crate::context::confinement::check_walk_root(req_id, search_root)?;
+    }
+    let confined = crate::context::confinement::active();
     let roots = search_roots
         .into_iter()
         .flat_map(|search_root| {
-            let outputs = paths.filter(|paths| !paths.is_null()).and_then(|_| {
-                ctx.bash_background()
-                    .explicit_task_artifacts(session_id, &search_root)
-            });
+            let outputs = paths
+                .filter(|paths| !confined && !paths.is_null())
+                .and_then(|_| {
+                    ctx.bash_background()
+                        .explicit_task_artifacts(session_id, &search_root)
+                });
             match outputs {
                 Some(outputs) => {
                     let filter_root = if search_root.is_dir() {
@@ -213,7 +251,8 @@ pub fn resolve_grep_scope(
         .map(|(search_root, task_filter_root)| {
             let scope = resolve_search_scope(&project_root, Some(&search_root.to_string_lossy()));
             let is_external = !scope.use_index;
-            let ignored_target = paths.is_some_and(|paths| !paths.is_null())
+            let ignored_target = !crate::context::confinement::active()
+                && paths.is_some_and(|paths| !paths.is_null())
                 && !is_same_directory(&scope.root, &project_root)
                 && target_is_ignored(&scope.root);
             let authorized_task_artifact = task_filter_root.is_some();
@@ -252,6 +291,43 @@ pub fn resolve_grep_scope(
     })
 }
 
+/// Runs one grep below a single starting path the way a request does once its
+/// scope is resolved, without that resolution or its path checks, so tests
+/// can show what the search itself does with a starting path.
+#[cfg(all(test, unix))]
+pub(crate) fn grep_root_for_test(
+    ctx: &AppContext,
+    search_root: &Path,
+    pattern: &str,
+) -> GrepResult {
+    let pattern = match crate::pattern_compile::compile(
+        pattern,
+        crate::pattern_compile::CompileOpts::default(),
+    ) {
+        crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
+        other => panic!("compile regex {pattern:?}: {other:?}"),
+    };
+    let scope = GrepScope {
+        roots: vec![ResolvedRoot {
+            search_root: search_root.to_path_buf(),
+            filter_root: search_root.to_path_buf(),
+            use_index: false,
+            is_external: true,
+            ignored_target: false,
+            authorized_task_artifact: false,
+        }],
+        multi_root: false,
+        per_root_max: 16,
+    };
+    let params = GrepParams {
+        include: Vec::new(),
+        exclude: Vec::new(),
+        max_results: 16,
+        path_exclusion: None,
+    };
+    execute_profiled_with_filters(ctx, &pattern, &scope, &params, &PathFilters::default()).0
+}
+
 pub fn compute_filter_root(
     project_root: &Path,
     search_root: &Path,
@@ -268,6 +344,10 @@ pub fn compute_filter_root(
 pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Option<bool> {
     let mut unknown = false;
     for root in &scope.roots {
+        // A starting path a confined walk may not use has nothing in scope.
+        if !crate::context::confinement::admits_walk_root(&root.search_root) {
+            continue;
+        }
         // An explicitly-named existing file is always in scope (it's searched
         // directly even if gitignored / .aftignored), so don't report it as
         // "no files matched scope".
@@ -338,8 +418,12 @@ fn scope_has_files_unbounded(
 ) -> Option<bool> {
     let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
-    let walker =
-        fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target).build();
+    let Some(builder) =
+        fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target)
+    else {
+        return Some(false);
+    };
+    let walker = builder.build();
     for (visited, entry) in walker.enumerate() {
         if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
             || started.elapsed() >= FALLBACK_WALK_BUDGET
@@ -496,15 +580,23 @@ fn execute_root_profiled(
     max_results: usize,
     project_root: &Path,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
+    // A confined search never starts outside its fence, whether at a named
+    // file (read directly below, not walked) or at a directory.
+    if !crate::context::confinement::admits_walk_root(&root.search_root) {
+        return (
+            empty_grep_result(IndexStatus::Fallback, false),
+            GrepExecutionPhaseTimings::default(),
+        );
+    }
     // Explicit single-file scope: search the named file directly, bypassing the
     // trigram index and the gitignore/.aftignore-aware walk. Matches ripgrep,
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        if root.use_index {
+        if root.use_index && !crate::context::confinement::active() {
             crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
         }
-        let index_status = if root.use_index {
+        let index_status = if root.use_index && !crate::context::confinement::active() {
             current_index_status(ctx)
         } else {
             IndexStatus::Fallback
@@ -526,6 +618,29 @@ fn execute_root_profiled(
             )
         };
         return (result, GrepExecutionPhaseTimings::default());
+    }
+
+    if crate::context::confinement::active() {
+        let mut counts = ScopeFileCounts::default();
+        let result = fallback_grep_counted(
+            project_root,
+            &root.search_root,
+            &root.filter_root,
+            pattern,
+            filters,
+            max_results,
+            IndexStatus::Fallback,
+            params.path_exclusion,
+            &mut counts,
+            root.ignored_target,
+        );
+        return (
+            result,
+            GrepExecutionPhaseTimings {
+                walk_counts: Some(counts),
+                ..Default::default()
+            },
+        );
     }
 
     let snapshot_started = Instant::now();
@@ -791,25 +906,57 @@ pub fn merge_grep_results(
     }
 }
 
+/// The whole-project walker semantic search sweeps with. Confined calls never
+/// run semantic search, so this walk does not check its starting path; grep,
+/// glob and their scope probes use [`fallback_target_walk_builder`], which
+/// does.
 pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {
-    fallback_target_walk_builder(search_root, skipped_foreign_mounts, false)
+    target_walk_builder(search_root, skipped_foreign_mounts, false)
 }
 
+/// The grep/glob directory walker for `search_root`, or `None` when a
+/// confined walk may not start there (outside the confined root, or denied
+/// by the read policy). The walker never filters its own starting path, so
+/// that path is checked here, before anything under it is opened; callers
+/// treat `None` as a walk that found nothing.
 fn fallback_target_walk_builder(
+    search_root: &Path,
+    skipped_foreign_mounts: Arc<AtomicUsize>,
+    ignored_target: bool,
+) -> Option<WalkBuilder> {
+    if !crate::context::confinement::admits_walk_root(search_root) {
+        return None;
+    }
+    Some(target_walk_builder(
+        search_root,
+        skipped_foreign_mounts,
+        ignored_target,
+    ))
+}
+
+/// The grep/glob directory walker for `search_root`; a confined walk checks
+/// every entry below the starting path, but not the starting path itself.
+fn target_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
     ignored_target: bool,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
+    // A confined walk loads none of the crate's ignore files (see
+    // `apply_project_ignore_rules`); it applies the confined root's own
+    // ignore files here and checks every entry against the read policy.
+    let confined = crate::context::confinement::ConfinedIgnoreRules::current(
+        crate::context::confinement::SEARCH_IGNORE_FILES,
+    );
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
-        .parents(true)
+        .parents(!crate::context::confinement::active())
         .filter_entry(move |entry| {
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
@@ -819,7 +966,8 @@ fn fallback_target_walk_builder(
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
             }
-            if entry.depth() > 0 && file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
+            let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
+            if entry.depth() > 0 && is_dir {
                 match boundary
                     .as_ref()
                     .map(|boundary| boundary.should_descend(entry.path()))
@@ -833,8 +981,8 @@ fn fallback_target_walk_builder(
                 }
             }
             let name = entry.file_name().to_string_lossy();
-            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
-                let descend = !matches!(
+            let keep = if is_dir {
+                !matches!(
                     name.as_ref(),
                     "node_modules"
                         | "target"
@@ -845,10 +993,27 @@ fn fallback_target_walk_builder(
                         | ".tox"
                         | "dist"
                         | "build"
-                );
-                return descend && crate::bounded_io::probe_directory(entry.path(), None).is_ok();
+                )
+            } else {
+                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            };
+            if !keep {
+                return false;
             }
-            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            // Checked before the directory is opened, and only for entries
+            // the walk would otherwise keep, so a denial is never counted for
+            // a path the walk skips anyway. Symlinks are never followed, so
+            // they need no read check.
+            if let Some(confined) = &confined {
+                let is_file = file_type.as_ref().is_some_and(std::fs::FileType::is_file);
+                if entry.depth() > 0
+                    && (is_dir || is_file)
+                    && (confined.is_ignored(entry.path(), is_dir) || !confined.admits(entry.path()))
+                {
+                    return false;
+                }
+            }
+            !is_dir || crate::bounded_io::probe_directory(entry.path(), None).is_ok()
         });
     if ignored_target {
         // Like outline, an explicitly ignored target also honors Git rules
@@ -962,6 +1127,11 @@ fn diagnose_scope_counts_unbounded(
             && started.elapsed() < FALLBACK_WALK_BUDGET
             && !crate::executor::current_job_cancelled()
     };
+    // A starting path a confined walk may not use has nothing in scope; it is
+    // checked before the file test below, which would stat it.
+    if !crate::context::confinement::admits_walk_root(search_root) {
+        return Some(counts);
+    }
     if search_root.is_file() {
         counts.examined = 1;
         let root = search_root.parent().unwrap_or(search_root);
@@ -978,8 +1148,11 @@ fn diagnose_scope_counts_unbounded(
             return None;
         }
         let mut accepted = HashSet::new();
-        let mut builder =
-            fallback_target_walk_builder(&directory, Arc::clone(&skipped), ignored_target);
+        let Some(mut builder) =
+            fallback_target_walk_builder(&directory, Arc::clone(&skipped), ignored_target)
+        else {
+            continue;
+        };
         builder.max_depth(Some(1));
         for entry in builder.build() {
             if !within_budget(counts.entries_visited) {
@@ -1033,7 +1206,7 @@ pub(crate) fn bounded_fallback_walk_files(
         filter_root,
         search_root,
         filters,
-        MAX_FALLBACK_WALK_FILES,
+        fallback_walk_limit(),
         FALLBACK_WALK_BUDGET,
     )
 }
@@ -1048,7 +1221,7 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
         filter_root,
         search_root,
         filters,
-        MAX_FALLBACK_WALK_FILES,
+        fallback_walk_limit(),
         FALLBACK_WALK_BUDGET,
         ignored_target,
     )
@@ -1155,6 +1328,20 @@ fn walk_files_unbounded(
     budget: Duration,
     ignored_target: bool,
 ) -> FallbackWalkOutcome {
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    // Built before the file test below, which would stat the starting path.
+    let Some(builder) = fallback_target_walk_builder(
+        search_root,
+        Arc::clone(&skipped_foreign_mounts),
+        ignored_target,
+    ) else {
+        return FallbackWalkOutcome {
+            files: Vec::new(),
+            walk_truncated: false,
+            skipped_foreign_mounts: 0,
+            entries_visited: 0,
+        };
+    };
     let filter_root = if filter_root == search_root && search_root.is_file() {
         search_root.parent().unwrap_or(search_root)
     } else {
@@ -1164,13 +1351,7 @@ fn walk_files_unbounded(
     let mut files = Vec::new();
     let mut walk_truncated = false;
     let mut entries_visited = 0usize;
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = fallback_target_walk_builder(
-        search_root,
-        Arc::clone(&skipped_foreign_mounts),
-        ignored_target,
-    )
-    .build();
+    let walker = builder.build();
 
     for entry in walker.filter_map(|entry| entry.ok()) {
         entries_visited += 1;
@@ -1272,12 +1453,14 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     let mut files_seen = 0usize;
     let mut counts = ScopeFileCounts::default();
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = fallback_target_walk_builder(
+    let Some(builder) = fallback_target_walk_builder(
         search_root,
         Arc::clone(&skipped_foreign_mounts),
         ignored_target,
-    )
-    .build();
+    ) else {
+        return FallbackWalkProgress::default();
+    };
+    let walker = builder.build();
 
     for entry in walker.filter_map(|entry| entry.ok()) {
         counts.entries_visited += 1;
@@ -1408,7 +1591,7 @@ fn fallback_grep_counted(
         max_results,
         index_status,
         path_exclusion,
-        MAX_FALLBACK_WALK_FILES,
+        fallback_walk_limit(),
         FALLBACK_WALK_BUDGET,
         counts,
         ignored_target,
@@ -1476,6 +1659,7 @@ fn fallback_grep_with_limits_counted(
     let mut matches = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
     let io_budget = crate::bounded_io::current();
+    let confinement = crate::context::confinement::capture();
 
     let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
         if batch.is_empty() {
@@ -1487,34 +1671,42 @@ fn fallback_grep_with_limits_counted(
             .map_init(
                 || crate::bounded_io::enter(io_budget.clone()),
                 |_scope, file| {
-                    if stop_scan.load(Ordering::Relaxed)
-                        || Instant::now() >= scan_deadline
-                        || job_cancellation
-                            .as_ref()
-                            .is_some_and(|token| token.cancel_requested_before_commit())
-                    {
-                        return None;
-                    }
-                    let file_matches = fallback_search_file(
-                        file,
-                        pattern,
-                        max_results,
-                        stop_after,
-                        &total_matches,
-                        &files_searched,
-                        &files_with_matches,
-                        &truncated,
-                        &engine_capped,
-                        job_cancellation.as_ref(),
-                        Some(scan_deadline),
-                        false,
-                    );
-                    if truncated.load(Ordering::Relaxed)
-                        && total_matches.load(Ordering::Relaxed) >= stop_after
-                    {
-                        stop_scan.store(true, Ordering::Relaxed);
-                    }
-                    (!file_matches.is_empty()).then_some(file_matches)
+                    crate::context::confinement::inherit(confinement.clone(), || {
+                        #[cfg(test)]
+                        assert_eq!(
+                            crate::context::confinement::capture(),
+                            confinement,
+                            "grep scan worker lost the confinement fence"
+                        );
+                        if stop_scan.load(Ordering::Relaxed)
+                            || Instant::now() >= scan_deadline
+                            || job_cancellation
+                                .as_ref()
+                                .is_some_and(|token| token.cancel_requested_before_commit())
+                        {
+                            return None;
+                        }
+                        let file_matches = fallback_search_file(
+                            file,
+                            pattern,
+                            max_results,
+                            stop_after,
+                            &total_matches,
+                            &files_searched,
+                            &files_with_matches,
+                            &truncated,
+                            &engine_capped,
+                            job_cancellation.as_ref(),
+                            Some(scan_deadline),
+                            false,
+                        );
+                        if truncated.load(Ordering::Relaxed)
+                            && total_matches.load(Ordering::Relaxed) >= stop_after
+                        {
+                            stop_scan.store(true, Ordering::Relaxed);
+                        }
+                        (!file_matches.is_empty()).then_some(file_matches)
+                    })
                 },
             )
             .filter_map(|matches| matches)

@@ -1,0 +1,25 @@
+{
+  "native": {
+    "id": "confine-vector",
+    "success": true,
+    "text": "2 files matching **/*.rs\n\nopen/kept.rs\nonly.rs\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)",
+    "complete": true,
+    "no_files_matched_scope": false,
+    "skipped_foreign_mounts": 0,
+    "files": [
+      "<fixture>/pin/open/kept.rs",
+      "<fixture>/pin/only.rs"
+    ],
+    "total": 2,
+    "truncated": false,
+    "index": {
+      "trigram": {
+        "status": "fallback",
+        "reason": "confined root walk"
+      }
+    },
+    "fallback": "filesystem",
+    "skipped_denied": 2
+  },
+  "text": "2 files matching **/*.rs\n\nopen/kept.rs\nonly.rs\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)"
+}

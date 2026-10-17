@@ -1,0 +1,20 @@
+{
+  "id": "confine-vector",
+  "success": true,
+  "text": "1 file matching **/*.rs\n\nonly.rs",
+  "complete": true,
+  "no_files_matched_scope": false,
+  "skipped_foreign_mounts": 0,
+  "files": [
+    "<fixture>/pin/only.rs"
+  ],
+  "total": 1,
+  "truncated": false,
+  "index": {
+    "trigram": {
+      "status": "fallback",
+      "reason": "confined root walk"
+    }
+  },
+  "fallback": "filesystem"
+}

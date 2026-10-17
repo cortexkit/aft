@@ -1,0 +1,58 @@
+{
+  "id": "confine-vector",
+  "success": true,
+  "text": "ancestor.rs        rust         1 syms       1 lines\nglobal.rs          rust         1 syms       1 lines\ninfo.rs            rust         1 syms       1 lines\nonly.rs            rust         1 syms       1 lines\nsymlink.rs         rust         1 syms       1 lines\nnested/symlink.rs  rust         1 syms       1 lines\n.git               unknown      0 syms       1 lines\n",
+  "files": [
+    {
+      "path": ".git",
+      "language": "unknown",
+      "symbols": 0,
+      "lines": 1
+    },
+    {
+      "path": "ancestor.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    },
+    {
+      "path": "global.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    },
+    {
+      "path": "info.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    },
+    {
+      "path": "nested/symlink.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    },
+    {
+      "path": "only.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    },
+    {
+      "path": "symlink.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 1
+    }
+  ],
+  "complete": true,
+  "line_count_gaps": [],
+  "entries_examined": 12,
+  "walk_truncated": false,
+  "walk_limit": 10000,
+  "collection_truncated": false,
+  "skipped_foreign_mounts": 0,
+  "unchecked_files": [],
+  "rollup_count": 0
+}

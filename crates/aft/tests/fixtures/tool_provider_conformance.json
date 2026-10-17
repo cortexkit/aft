@@ -106,7 +106,7 @@
         }
       ],
       "implementation_version": "<built-package-version>",
-      "capabilities": []
+      "capabilities": ["tool-catalog-confine/v1"]
     },
     "presets": {
       "head": {

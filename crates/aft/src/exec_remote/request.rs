@@ -13,13 +13,22 @@ pub struct PresetParams {
     pub network: Option<super::types::Network>,
 }
 
-/// Only the routing fields of a frozen catalog plan; never tool arguments.
+/// Frozen worker catalog routing and confinement fields; never tool arguments.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct FrozenParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confine: Option<RootConfinement>,
     pub remote_exec: Option<super::policy::RemoteExecPolicy>,
     pub siblings: Vec<String>,
     /// Reserved for host-specific serving; AFT does not act on it today.
     pub host: Option<String>,
+}
+
+/// A frozen worker may opt into the root-only filesystem surface.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum RootConfinement {
+    #[serde(rename = "root")]
+    Root,
 }
 
 impl FrozenParams {
@@ -48,6 +57,12 @@ impl FrozenParams {
             return Err("siblings: paths must be absolute".into());
         }
         Ok(Self {
+            confine: params
+                .get("confine")
+                .map(|value| {
+                    serde_json::from_value(value.clone()).map_err(|e| format!("confine: {e}"))
+                })
+                .transpose()?,
             remote_exec,
             siblings,
             host: params

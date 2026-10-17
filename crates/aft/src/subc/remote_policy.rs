@@ -41,10 +41,23 @@ pub(super) fn catalog(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    // Validate and strip the known plan params on every route. A session
-    // starter preflights its plan on an unscoped route before any scoped
-    // session exists, so the same params must be accepted there; only a
-    // scoped worker fetch freezes routing settings (see `key`).
+    if let Some(value) = original.get("confine") {
+        if value != "root" {
+            return Err(subc_protocol::ErrorBody::new(
+                "invalid_confine",
+                "params.confine accepts only \"root\"",
+            ));
+        }
+        if key(identity, Some(&preset)).is_none() {
+            return Err(subc_protocol::ErrorBody::new(
+                "confine_requires_scoped_worker",
+                "params.confine requires a scoped worker with an authenticated principal",
+            ));
+        }
+    }
+    // Routing params also support unscoped plan preflights. Confinement is
+    // different: it requires a persistable scoped worker, checked above.
+    // Remove recognized params before the generic catalog validator runs.
     if let Some(args) = body.get_mut("params").and_then(Value::as_object_mut) {
         for (name, value) in &original {
             let valid = match name.as_str() {
@@ -62,6 +75,7 @@ pub(super) fn catalog(
                 }
                 "remote_exec" | "siblings" if preset == "worker" => true,
                 "allow_paths" if preset == "worker" => true,
+                "confine" => true,
                 _ => continue,
             };
             if !valid {
@@ -106,7 +120,10 @@ pub(super) fn catalog(
         })?;
     }
     if let Some(key) = key(identity, Some(&preset)) {
-        if original.contains_key("remote_exec") || original.contains_key("siblings") {
+        if original.contains_key("remote_exec")
+            || original.contains_key("siblings")
+            || original.contains_key("confine")
+        {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {
                 Ok(policy) => policy,
                 Err(error) => {
@@ -114,6 +131,9 @@ pub(super) fn catalog(
                         "remote execution routing disabled: malformed catalog params: {error}"
                     );
                     crate::exec_remote::FrozenParams {
+                        confine: original
+                            .get("confine")
+                            .map(|_| crate::exec_remote::RootConfinement::Root),
                         host: original
                             .get("host")
                             .and_then(Value::as_str)
@@ -134,11 +154,15 @@ pub(super) fn catalog(
                     "routing policy database lock poisoned",
                 )
             })?;
+            // A worker unconfined until now may be remembered as such: mark it
+            // confined before the fence commits, so no call can still be
+            // admitted on the older answer once the fence is saved.
             store::freeze(
                 &conn,
                 &key,
                 &policy,
                 crate::bash_background::persistence::unix_millis(),
+                || ctx.remember_confined_policy_key(key.clone()),
             )
             .map_err(|e| {
                 cortexkit_role_tool_provider::errors::invalid_request(
@@ -163,7 +187,12 @@ pub(super) fn catalog(
                 .as_ref()
                 .is_some_and(|policy| policy.enabled)
         });
-    tool_provider::catalog_for_request(
+    let render = if confined(ctx, identity)? {
+        tool_provider::catalog_for_confined_request
+    } else {
+        tool_provider::catalog_for_request
+    };
+    render(
         request,
         catalog_preset,
         &identity.disabled_tools,
@@ -171,6 +200,154 @@ pub(super) fn catalog(
         offered,
         worker_wait_max_ms,
     )
+}
+
+pub(super) fn confined_tool(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "glob" | "outline" | "aft_outline")
+}
+
+/// Whether this route's scoped worker saved `confine: "root"` (the root
+/// confinement fence) at a catalog fetch. The worker policy key is read even
+/// when the current call claims another preset, so claiming one cannot escape.
+/// An unreadable database or malformed saved params refuse the call rather
+/// than answer "unconfined", with one exception: a context whose persistence
+/// was never configured. Every route bind configures persistence, and
+/// `catalog` refuses `confine` without a database, so such a context (a
+/// library or test harness) has no store the fence could have been saved in.
+///
+/// This never writes aft.db, and a key once read is answered from memory
+/// afterwards (see `PolicyConfinementMemo` in `context`). A read takes the
+/// aft.db lock, so the subc frame loop never calls this: it answers from
+/// [`confinement_from_memory`] or
+/// has `persistence::DatabaseWaits::read_confinement` run this on a blocking
+/// thread first (see [`admit_confined_on_frame_loop`]).
+pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> ConfinementRead {
+    if let Some(known) = confinement_from_memory(ctx, identity) {
+        return known;
+    }
+    let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
+        return Err(policy_unavailable());
+    };
+    // Capture the memo generation before reading aft.db: if a policy saving
+    // `confine: "root"` commits after this read, the read's "unconfined"
+    // answer is not remembered (see `AppContext::remember_unconfined_policy_key`).
+    let generation = ctx.policy_confinement_generation();
+    ctx.note_policy_confinement_read();
+    let conn = db.lock().map_err(|_| policy_unavailable())?;
+    let confined = store::confined(&conn, &key).map_err(|_| policy_unavailable())?;
+    drop(conn);
+    #[cfg(test)]
+    ctx.run_after_policy_read_hook_for_test();
+    if confined {
+        ctx.remember_confined_policy_key(key);
+    } else {
+        ctx.remember_unconfined_policy_key(key, generation, &db);
+    }
+    Ok(confined)
+}
+
+/// A route's saved confinement: whether its scoped worker saved
+/// `confine: "root"`, or why that could not be read.
+pub(super) type ConfinementRead = Result<bool, subc_protocol::ErrorBody>;
+
+pub(super) fn policy_unavailable() -> subc_protocol::ErrorBody {
+    subc_protocol::ErrorBody::new(
+        "confine_policy_unavailable",
+        "cannot read the scoped worker's confinement policy",
+    )
+}
+
+/// The answer [`confined`] gives when it needs no aft.db read: a route that
+/// cannot hold a saved fence, a key whose confinement this context already
+/// read or saved, or a context with no database handle. `None` means the
+/// saved policy must be read from aft.db.
+pub(super) fn confinement_from_memory(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+) -> Option<ConfinementRead> {
+    let Some(key) = key(identity, Some("worker")) else {
+        return Some(Ok(false));
+    };
+    if let Some(confined) = ctx.policy_key_confinement(&key) {
+        return Some(Ok(confined));
+    }
+    if ctx.db().is_some() {
+        return None;
+    }
+    // A database that is still opening or failed to open may hold a saved
+    // confinement policy we cannot read, so refuse. Calls on such routes
+    // wait for an opening database first (see `persistence::DatabaseWaits`),
+    // so this refusal follows a failed open or a wait that expired.
+    Some(if ctx.database_runtime_unconfigured() {
+        Ok(false)
+    } else {
+        Err(policy_unavailable())
+    })
+}
+
+/// Whether a call on this route must wait for an opening aft.db before its
+/// saved confinement policy can be read. False for routes that cannot have
+/// one, and once the policy is known from memory.
+pub(super) fn awaits_policy_store(ctx: &AppContext, identity: &RouteIdentity) -> bool {
+    ctx.database_runtime_initializing()
+        && key(identity, Some("worker"))
+            .is_some_and(|key| ctx.policy_key_confinement(&key).is_none())
+}
+
+pub(super) fn admit_confined(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    name: &str,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    admit_confined_tool(confined(ctx, identity)?, name)
+}
+
+/// [`admit_confined`] for the subc frame loop, which must never wait for the
+/// aft.db lock: a catalog job can hold it for seconds while SQLite waits for
+/// its write lock, and the loop would stop answering health checks,
+/// cancellations and other roots meanwhile. The policy comes from memory or
+/// from `read`, the result of [`confined`] run off the loop before the call
+/// reached admission. A call with neither is refused, never run unconfined.
+pub(super) fn admit_confined_on_frame_loop(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    name: &str,
+    read: Option<&ConfinementRead>,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    let confined = confinement_from_memory(ctx, identity)
+        .or_else(|| read.cloned())
+        .unwrap_or_else(|| Err(policy_unavailable()))?;
+    admit_confined_tool(confined, name)
+}
+
+fn admit_confined_tool(confined: bool, name: &str) -> Result<bool, subc_protocol::ErrorBody> {
+    if confined && !confined_tool(name) {
+        return Err(subc_protocol::ErrorBody::new(
+            "tool_not_offered_confined",
+            format!("tool {name:?} is not offered in a confined session"),
+        ));
+    }
+    Ok(confined)
+}
+
+pub(super) fn with_call_policy<R>(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    id: &str,
+    name: &str,
+    args: Value,
+    run: impl FnOnce(Value) -> R,
+) -> Result<R, Response> {
+    let confined = admit_confined(ctx, identity, name)
+        .map_err(|error| Response::error(id, &error.code, error.message))?;
+    if confined {
+        crate::context::confinement::with_root(ctx, id, || {
+            crate::context::confinement::preflight(ctx, id, &identity.session, &args)?;
+            Ok(run(args))
+        })
+    } else {
+        Ok(run(args))
+    }
 }
 
 /// Where a bash call's remote-run policy comes from.

@@ -79,6 +79,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         },
         None => vec![resolve_search_scope(&project_root, None).root],
     };
+    // In a confined call, refuse a search root outside the confined root or
+    // denied by the read policy before any walk starts there.
+    for root in &search_roots {
+        if let Err(refusal) = crate::context::confinement::check_walk_root(&req.id, root) {
+            return refusal;
+        }
+    }
 
     // Return clear error if the search path doesn't exist
     if let Some(missing_root) = search_roots
@@ -100,15 +107,19 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let ignored_targets = search_roots
         .iter()
         .map(|root| {
-            req.params
-                .get("path")
-                .and_then(|value| value.as_str())
-                .is_some()
+            !crate::context::confinement::active()
+                && req
+                    .params
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .is_some()
                 && !crate::grep_executor::is_same_directory(root, &project_root)
                 && crate::grep_executor::target_is_ignored(root)
         })
         .collect::<Vec<_>>();
-    let parent_answer = if ignored_targets.iter().any(|ignored| *ignored) {
+    let parent_answer = if crate::context::confinement::active()
+        || ignored_targets.iter().any(|ignored| *ignored)
+    {
         None
     } else {
         crate::views::parent::glob_fan_out(ctx, &search_roots, pattern)
@@ -286,13 +297,18 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     // Disclose the trigram index state and whether any root was answered by a
     // filesystem walk rather than the index.
-    body["index"] = crate::commands::grep::trigram_index_disclosure(ctx);
+    body["index"] = if crate::context::confinement::active() {
+        serde_json::json!({"trigram": {"status":"fallback", "reason":"confined root walk"}})
+    } else {
+        crate::commands::grep::trigram_index_disclosure(ctx)
+    };
     body["fallback"] = if source == "index" {
         serde_json::Value::Null
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
     crate::views::parent::attach_gaps(&mut body, parent_gaps);
+    crate::context::confinement::disclose_denied(&mut body);
 
     let rendered_count =
         crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());
@@ -348,6 +364,9 @@ fn glob_root(
     ignored_target: bool,
     explicit_session: Option<&str>,
 ) -> GlobDiscovery {
+    if crate::context::confinement::active() {
+        return fallback_glob(project_root, search_root, pattern, ignored_target);
+    }
     if let Some(outputs) = explicit_session.and_then(|session| {
         ctx.bash_background()
             .explicit_task_artifacts(session, search_root)
@@ -458,6 +477,30 @@ fn glob_root(
             fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
         }
     }
+}
+
+/// Runs one `glob_root` discovery and returns the files it found, the source
+/// that answered, and how many walk entries it visited, so tests outside this
+/// module can check which branch a call took and whether it walked at all.
+#[cfg(all(test, unix))]
+pub(crate) fn glob_root_files_for_test(
+    ctx: &AppContext,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    max_results: usize,
+    explicit_session: Option<&str>,
+) -> (Vec<PathBuf>, &'static str, usize) {
+    let discovery = glob_root(
+        ctx,
+        project_root,
+        search_root,
+        pattern,
+        max_results,
+        false,
+        explicit_session,
+    );
+    (discovery.files, discovery.source, discovery.entries_visited)
 }
 
 fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
