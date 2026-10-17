@@ -1424,11 +1424,15 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
     }
     // `runon` is forwarded as written; the bash handler names an unknown
     // demand and decides whether this session may run remotely at all.
+    // Some models fill every optional parameter, sending `runon: ""` for a
+    // local command; a blank demand names no machine, so it means local.
     if let Some(runon) = map_in.get("runon").filter(|value| !value.is_null()) {
         let Some(demand) = runon.as_str() else {
             return Err(invalid_request("bash: 'runon' must be a string"));
         };
-        out.insert("runon".to_string(), Value::String(demand.to_string()));
+        if !demand.trim().is_empty() {
+            out.insert("runon".to_string(), Value::String(demand.to_string()));
+        }
     }
 
     Ok(Translated {
@@ -4538,6 +4542,32 @@ mod tests {
         assert_eq!(
             Path::new(workdir),
             Path::new("/project").join("scripts").as_path()
+        );
+    }
+
+    #[test]
+    fn blank_bash_runon_is_a_local_command() {
+        for blank in ["", "  "] {
+            let translated = subc_translate_owned(
+                "bash",
+                serde_json::json!({"command": "git status", "runon": blank, "sandbox": "host"}),
+                Path::new("/project"),
+            )
+            .expect("blank runon must translate");
+            assert!(
+                !translated.args.contains_key("runon"),
+                "blank runon {blank:?} must not request a remote run"
+            );
+        }
+        let translated = subc_translate_owned(
+            "bash",
+            serde_json::json!({"command": "cargo test", "runon": "linux,4c"}),
+            Path::new("/project"),
+        )
+        .expect("runon must translate");
+        assert_eq!(
+            translated.args.get("runon"),
+            Some(&serde_json::json!("linux,4c"))
         );
     }
 
