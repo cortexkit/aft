@@ -699,7 +699,7 @@ fn unregistered_parent() -> (
     (dir, ctx, executor, parent, child)
 }
 
-/// Starts a flow read for `script` and answers the daemon's parent liveness
+/// Starts a flow read of the parent checkout's `script` file and answers the daemon's parent liveness
 /// query as live, so what follows depends only on the parent's persistence.
 async fn start_live_read(
     executor: &Arc<Executor>,

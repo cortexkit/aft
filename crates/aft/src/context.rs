@@ -6425,8 +6425,10 @@ impl AppContext {
             .await;
     }
 
-    /// Wait, up to `deadline`, until persistence is no longer initializing,
-    /// whatever the command; it may then be open, failed, or unconfigured.
+    /// Wait, up to `deadline`, until persistence is no longer initializing.
+    /// Unlike `wait_for_database_runtime`, this does not depend on whether a
+    /// particular command needs the database. Afterwards persistence may be
+    /// open, failed, unconfigured, or (on timeout) still initializing.
     pub(crate) async fn wait_for_database_settled(&self, deadline: Instant) {
         self.wait_for_database_while(deadline, || {
             self.database_runtime_state.load(Ordering::Acquire) == 1

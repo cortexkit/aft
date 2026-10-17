@@ -532,13 +532,11 @@ mod tests {
         }
     }
 
-    /// A live WAL database in the checkout, plus a hard link named like
-    /// source to its `-shm` file. Returns the connection so the database
-    /// stays live, and the link.
+    /// A live WAL database in the checkout, plus a hard link named
+    /// `innocent.rs`, like a source file, to its `-shm` file. Returns the open
+    /// connection, which keeps the database live, and the link's path.
     #[cfg(unix)]
-    fn live_shm_alias(
-        root: &Path,
-    ) -> (crate::db::file_identity::IdentityConnection, PathBuf) {
+    fn live_shm_alias(root: &Path) -> (crate::db::file_identity::IdentityConnection, PathBuf) {
         let connection = crate::db::file_identity::IdentityConnection::open(
             root.join("unconventional.cache"),
             "file_read_exact_live_alias",
@@ -576,10 +574,15 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let (connection, alias) = live_shm_alias(&root);
         let opens = std::cell::Cell::new(0);
-        let result = read_with(Path::new("innocent.rs"), &root, &policy, |root, resolved| {
-            opens.set(opens.get() + 1);
-            open_contents(root, resolved)
-        });
+        let result = read_with(
+            Path::new("innocent.rs"),
+            &root,
+            &policy,
+            |root, resolved| {
+                opens.set(opens.get() + 1);
+                open_contents(root, resolved)
+            },
+        );
         assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
         assert_eq!(opens.get(), 0, "a live SQLite alias was opened");
         let symlink = root.join("symlink.rs");
@@ -589,7 +592,11 @@ mod tests {
             open_contents(root, resolved)
         });
         assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
-        assert_eq!(opens.get(), 0, "a symlink to a live SQLite alias was opened");
+        assert_eq!(
+            opens.get(),
+            0,
+            "a symlink to a live SQLite alias was opened"
+        );
         still_alive(&connection);
     }
 

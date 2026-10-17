@@ -209,8 +209,7 @@ async fn dispatch_with_wait(
                     if let Ok(expiry) = read_deadline(child) {
                         deadline = deadline.min(expiry);
                     }
-                    wait_for_parent_policy(&ctx, access_grants::scope_key(&parent), deadline)
-                        .await;
+                    wait_for_parent_policy(&ctx, access_grants::scope_key(&parent), deadline).await;
                 }
                 if !active_tool_call_is_registered(&active, route, corr) {
                     return;
