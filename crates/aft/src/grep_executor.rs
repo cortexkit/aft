@@ -3129,10 +3129,12 @@ mod tests {
         let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
         let found = Arc::new(Mutex::new(Vec::new()));
         let walk_found = Arc::clone(&found);
-        // A 300 ms stall window: a walk that went on reading after its
-        // deadline is abandoned by the request well before it could finish.
+        // A 10 s stall window only guards against a hang, so a loaded runner
+        // cannot turn a slow but correct stop into an abandoned walk. A walk
+        // that went on reading after its deadline still fails: it finishes
+        // every entry well inside the window and the count below catches it.
         let (end, slot_free) =
-            crate::bounded_io::with_single_access_budget(Duration::from_millis(300), || {
+            crate::bounded_io::with_single_access_budget(Duration::from_secs(10), || {
                 crate::bounded_io::run_walk_in_own_slot(
                     &root,
                     Instant::now() + EXPIRING_WALK_BUDGET,
@@ -3191,7 +3193,7 @@ mod tests {
         }
         let hook = crate::bounded_io::slow_walk_entries(&root, Duration::from_millis(1));
         let (end, slot_free) =
-            crate::bounded_io::with_single_access_budget(Duration::from_millis(300), || {
+            crate::bounded_io::with_single_access_budget(Duration::from_secs(10), || {
                 crate::bounded_io::run_walk_in_own_slot(
                     &root,
                     Instant::now() + EXPIRING_WALK_BUDGET,

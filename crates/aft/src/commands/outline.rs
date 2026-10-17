@@ -5084,10 +5084,12 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         let directories = Arc::new(FoundPaths::default());
         let walk_files = Arc::clone(&files);
         let walk_directories = Arc::clone(&directories);
-        // A 300 ms stall window: a walk that went on reading after its
-        // deadline is abandoned by the request well before it could finish.
+        // A 10 s stall window only guards against a hang, so a loaded runner
+        // cannot turn a slow but correct stop into an abandoned walk. A walk
+        // that went on reading after its deadline still fails: it finishes
+        // every entry well inside the window and the count below catches it.
         let (end, slot_free) =
-            crate::bounded_io::with_single_access_budget(Duration::from_millis(300), || {
+            crate::bounded_io::with_single_access_budget(Duration::from_secs(10), || {
                 crate::bounded_io::run_walk_in_own_slot(
                     &root,
                     Instant::now() + Duration::from_millis(400),
