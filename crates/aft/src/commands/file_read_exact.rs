@@ -65,20 +65,19 @@ fn read_with(
     }
     let checked = path_identity(&resolved).map_err(open_error)?;
     // The checks above judged a path; a concurrent writer can still swap a
-    // directory in it for a symlink before this open. The open must not
-    // follow such a swap, and the opened file's real location is judged again.
-    let mut file = open(&bind_root, &resolved)?;
-    let opened = opened_location(&file).map_err(|_| ReadExactRefusal::IoError)?;
-    let opened = crate::inspect::job::normalize_path(&opened);
+    // directory in it for a symlink, or the file for a hard link to a live
+    // SQLite file, before this open. The open must not follow such a swap.
+    let mut file = OpenedFile::new(open(&bind_root, &resolved)?);
+    // Before any other check, judge the handle's own device and inode against
+    // the live SQLite registry. Every refusal from here on drops `file`, and
+    // `OpenedFile` never closes a handle the registry identifies as live.
     let metadata = file.metadata().map_err(|_| ReadExactRefusal::IoError)?;
-    // A name swapped in after the checks above can point at a live SQLite
-    // file, so the handle's own device and inode are judged too. Closing this
-    // descriptor would release SQLite's locks, so on that refusal the handle
-    // is deliberately leaked instead of closed.
-    if crate::db::file_identity::is_live_sqlite_file_with_metadata(&opened, Some(&metadata)) {
-        std::mem::forget(file);
+    if crate::db::file_identity::is_live_sqlite_handle(&metadata) {
         return Err(ReadExactRefusal::AccessDenied);
     }
+    // The opened file's real location is judged again.
+    let opened = opened_location(&file).map_err(|_| ReadExactRefusal::IoError)?;
+    let opened = crate::inspect::job::normalize_path(&opened);
     if !opened.starts_with(&bind_root)
         || policy.decide(AccessOperation::Read, &opened, false) != AccessDecision::Allow
         || crate::project_content::is_excluded(&opened)
@@ -100,13 +99,53 @@ fn read_with(
         hook: _hooks.mid_read,
     })?;
     #[cfg(not(test))]
-    let bytes = bounded_bytes(&mut file)?;
+    let bytes = bounded_bytes(&mut *file)?;
     // Callers re-check the head's policy after the read; give them the place
     // the bytes actually came from rather than the path that was asked for.
     Ok(ExactRead {
         value: encode_bytes(&bytes),
         resolved: opened,
     })
+}
+
+/// A file opened for an exact read. Closing any descriptor to a live SQLite
+/// file releases SQLite's process-wide POSIX locks and can crash this process,
+/// so on drop the handle is closed only when the live SQLite registry does not
+/// identify it by its device and inode; otherwise (or when the handle cannot
+/// even be identified) it is deliberately leaked. Every return after the open,
+/// refusal or success, goes through this drop.
+struct OpenedFile(std::mem::ManuallyDrop<File>);
+
+impl OpenedFile {
+    fn new(file: File) -> Self {
+        Self(std::mem::ManuallyDrop::new(file))
+    }
+}
+
+impl std::ops::Deref for OpenedFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OpenedFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for OpenedFile {
+    fn drop(&mut self) {
+        let closable = self
+            .0
+            .metadata()
+            .is_ok_and(|metadata| !crate::db::file_identity::is_live_sqlite_handle(&metadata));
+        if closable {
+            // SAFETY: the file is dropped exactly once, here, and never used after.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +604,19 @@ mod tests {
         );
     }
 
+    /// Whether descriptor `fd` is still open on the file at `path`. A closed
+    /// descriptor fails fstat, and a number reused for another file has a
+    /// different device or inode.
+    #[cfg(unix)]
+    fn fd_open_on(fd: std::os::fd::RawFd, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let expected = std::fs::metadata(path).unwrap();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat only writes into `stat`; an invalid descriptor fails.
+        let status = unsafe { libc::fstat(fd, &mut stat) };
+        status == 0 && stat.st_dev as u64 == expected.dev() && stat.st_ino as u64 == expected.ino()
+    }
+
     /// The name says source, but the inode is a live SQLite `-shm` file:
     /// the read is refused before any descriptor to it is opened.
     #[cfg(unix)]
@@ -585,6 +637,7 @@ mod tests {
         );
         assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
         assert_eq!(opens.get(), 0, "a live SQLite alias was opened");
+        still_alive(&connection);
         let symlink = root.join("symlink.rs");
         std::os::unix::fs::symlink(&alias, &symlink).unwrap();
         let result = read_with(Path::new("symlink.rs"), &root, &policy, |root, resolved| {
@@ -603,15 +656,19 @@ mod tests {
     /// A writer swaps an ordinary checked file for a hard link to a live
     /// `-shm` file between the checks and the open, then swaps the ordinary
     /// file back, so only the opened handle's own identity is left to refuse
-    /// it before any byte is read.
+    /// it before any byte is read. On macOS the handle's location query then
+    /// usually fails (the name it was opened by is gone), so the identity
+    /// check must come first, and the refused handle must stay open.
     #[cfg(unix)]
     #[test]
     fn file_read_exact_opened_live_sqlite_handle_refused() {
+        use std::os::fd::AsRawFd;
         let (dir, policy) = fixture();
         let root = dir.path().canonicalize().unwrap();
         let (connection, alias) = live_shm_alias(&root);
         let script = root.join("script.rs");
         std::fs::write(&script, "fn source() {}\n").unwrap();
+        let opened_fd = std::cell::Cell::new(None);
         let result = read_with(Path::new("script.rs"), &root, &policy, |root, resolved| {
             let original = resolved.with_extension("old");
             std::fs::rename(resolved, &original).unwrap();
@@ -619,10 +676,47 @@ mod tests {
             let file = open_contents(root, resolved);
             std::fs::remove_file(resolved).unwrap();
             std::fs::rename(&original, resolved).unwrap();
+            opened_fd.set(file.as_ref().ok().map(|file| file.as_raw_fd()));
             file
         });
         assert_eq!(result, Err(ReadExactRefusal::AccessDenied));
+        let fd = opened_fd.get().expect("the swapped link was opened");
+        assert!(
+            fd_open_on(fd, &alias),
+            "the refused live SQLite handle was closed"
+        );
         still_alive(&connection);
+    }
+
+    /// Every return after an open drops the handle through `OpenedFile`,
+    /// which leaks a handle to a live SQLite file instead of closing it and
+    /// closes any other handle as usual.
+    #[cfg(unix)]
+    #[test]
+    fn file_read_exact_opened_file_never_closes_live_sqlite_handle() {
+        use std::os::fd::AsRawFd;
+        let (dir, _) = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let (connection, alias) = live_shm_alias(&root);
+        // The `-shm` file under its own name with no other link: a link-count
+        // shortcut would take it for an ordinary file and close it.
+        std::fs::remove_file(&alias).unwrap();
+        let sidecar = root.join("unconventional.cache-shm");
+        let live = File::open(&sidecar).unwrap();
+        let live_fd = live.as_raw_fd();
+        drop(OpenedFile::new(live));
+        assert!(
+            fd_open_on(live_fd, &sidecar),
+            "a live SQLite handle was closed on drop"
+        );
+        still_alive(&connection);
+
+        let ordinary = root.join("ordinary.rs");
+        std::fs::write(&ordinary, "fn source() {}\n").unwrap();
+        let file = File::open(&ordinary).unwrap();
+        let fd = file.as_raw_fd();
+        drop(OpenedFile::new(file));
+        assert!(!fd_open_on(fd, &ordinary), "an ordinary handle was leaked");
     }
 
     #[test]
