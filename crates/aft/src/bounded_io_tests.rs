@@ -10,6 +10,299 @@ struct HelperGate {
 static HELPER_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+thread_local! {
+    static SINGLE_ACCESS_BUDGET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn single_access_budget_override() -> Option<Duration> {
+    SINGLE_ACCESS_BUDGET.with(std::cell::Cell::get)
+}
+
+/// Runs `work` with a shorter single-call limit, which is also the walk stall
+/// window, on this thread only. Both are read on the requesting thread.
+pub(crate) fn with_single_access_budget<T>(budget: Duration, work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SINGLE_ACCESS_BUDGET.with(|budget| budget.set(self.0));
+        }
+    }
+    let _restore = Restore(SINGLE_ACCESS_BUDGET.with(|current| current.replace(Some(budget))));
+    work()
+}
+
+/// A test hook on the per-directory calls a walk makes under `roots`, or with
+/// `entries`, on the per-entry calls inside one directory.
+struct WalkHook {
+    roots: Vec<PathBuf>,
+    entries: bool,
+    delay: Duration,
+    block_at: Option<usize>,
+    /// For an entry hook: block the call for exactly this path (one of `roots`).
+    block_exact: bool,
+    /// Sets the walk's stop flag right after this many hooked calls, as the
+    /// request does when it stops waiting, so the walk expires at a known
+    /// entry instead of at a wall-clock deadline a loaded machine can reach
+    /// at any point.
+    expire_after: Option<usize>,
+    seen: AtomicUsize,
+    /// Paths of the calls made while the walk could still go on, in order.
+    before_expiry: Mutex<Vec<PathBuf>>,
+    /// Calls made after the walk's deadline passed or its request stopped
+    /// waiting: work the walk should no longer be doing.
+    after_expiry: AtomicUsize,
+    blocked: Mutex<Option<Sender<PathBuf>>>,
+    release: Mutex<Option<Receiver<()>>>,
+}
+
+static WALK_HOOKS: LazyLock<Mutex<Vec<Arc<WalkHook>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Removes its hook when dropped, and releases a blocked call.
+pub(crate) struct WalkHookGuard {
+    hook: Arc<WalkHook>,
+    release: Option<Sender<()>>,
+    /// Receives the path of the call the hook blocked.
+    pub(crate) blocked: Receiver<PathBuf>,
+}
+
+impl WalkHookGuard {
+    pub(crate) fn release(&mut self) {
+        self.release.take();
+    }
+    /// Paths of the hooked calls made before the walk had to stop, in order.
+    pub(crate) fn calls_before_expiry(&self) -> Vec<PathBuf> {
+        self.hook.before_expiry.lock().unwrap().clone()
+    }
+    /// How many hooked calls the walk made after it had to stop.
+    pub(crate) fn calls_after_expiry(&self) -> usize {
+        self.hook.after_expiry.load(Ordering::Relaxed)
+    }
+    /// Checks the partial result of a walk that expired: it holds at least
+    /// one file, and only files the walk checked before it had to stop.
+    /// Returns how many files it checked before then are missing from `found`.
+    pub(crate) fn files_missed_before_expiry(&self, found: &[PathBuf]) -> usize {
+        let checked = self.calls_before_expiry();
+        let checked_files = checked
+            .iter()
+            .filter(|path| path.is_file())
+            .collect::<HashSet<_>>();
+        assert!(!found.is_empty(), "the walk kept no file it found");
+        for path in found {
+            assert!(
+                checked_files.contains(path),
+                "{} was kept but not checked before the walk had to stop",
+                path.display()
+            );
+        }
+        checked_files.len() - found.len()
+    }
+}
+
+/// A canonical tree of 1,250 entries: 20 files at the root, and 30
+/// directories of 40 files each, so a walk expired after a few hundred entry
+/// checks still has most of the tree left to read.
+pub(crate) fn many_entry_tree() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    for file in 0..20 {
+        std::fs::write(root.join(format!("root_{file:02}.rs")), "pub fn f() {}\n").unwrap();
+    }
+    for directory in 0..30 {
+        let parent = root.join(format!("directory_{directory:02}"));
+        std::fs::create_dir(&parent).unwrap();
+        for file in 0..40 {
+            std::fs::write(parent.join(format!("file_{file:02}.rs")), "pub fn f() {}\n").unwrap();
+        }
+    }
+    (dir, root)
+}
+
+/// Runs a walk on a helper limiter of its own with a single slot, and reports
+/// whether that slot was already free when the walk's reply reached the caller.
+pub(crate) fn run_walk_in_own_slot<T: Send + 'static>(
+    path: &Path,
+    deadline: Instant,
+    work: impl FnOnce(PathBuf, &WalkControl) -> T + Send + 'static,
+) -> (io::Result<WalkEnd<T>>, bool) {
+    let limiter = Arc::new(Limiter::new(1));
+    let end = run_walk_with_limiter(path, deadline, Arc::clone(&limiter), work);
+    let free = *limiter.live.lock().unwrap() == 0;
+    (end, free)
+}
+
+impl Drop for WalkHookGuard {
+    fn drop(&mut self) {
+        WALK_HOOKS
+            .lock()
+            .unwrap()
+            .retain(|hook| !Arc::ptr_eq(hook, &self.hook));
+        self.release.take();
+    }
+}
+
+fn walk_hook(
+    root: &Path,
+    entries: bool,
+    delay: Duration,
+    block_at: Option<usize>,
+    block_exact: bool,
+    expire_after: Option<usize>,
+) -> WalkHookGuard {
+    let mut roots = vec![root.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        roots.push(canonical);
+    }
+    let (blocked_tx, blocked) = channel();
+    let (release, release_rx) = channel();
+    let hook = Arc::new(WalkHook {
+        roots,
+        entries,
+        delay,
+        block_at,
+        block_exact,
+        expire_after,
+        seen: AtomicUsize::new(0),
+        before_expiry: Mutex::new(Vec::new()),
+        after_expiry: AtomicUsize::new(0),
+        blocked: Mutex::new(Some(blocked_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    WALK_HOOKS.lock().unwrap().push(Arc::clone(&hook));
+    WalkHookGuard {
+        hook,
+        release: Some(release),
+        blocked,
+    }
+}
+
+/// Slows every per-directory call a walk makes under `root` by `delay`. The
+/// walk keeps making progress, so it is slow, not stalled.
+pub(crate) fn slow_walk(root: &Path, delay: Duration) -> WalkHookGuard {
+    walk_hook(root, false, delay, None, false, None)
+}
+
+/// Slows every per-entry call a walk makes under `root` by `delay`: each entry
+/// read, type check, or filter inside a directory. Each call returns, so the
+/// walk is slow, not stalled, however many entries one directory holds.
+pub(crate) fn slow_walk_entries(root: &Path, delay: Duration) -> WalkHookGuard {
+    walk_hook(root, true, delay, None, false, None)
+}
+
+/// Counts every per-entry call a walk makes under `root`, and expires the
+/// walk right after the `checks`th one by setting its stop flag: the flag the
+/// request sets when it stops waiting, which `WalkControl::expired` reads
+/// alongside the deadline. The `checks`th call itself counts as made before
+/// expiry; the walk's own check that follows it already sees the expiry.
+pub(crate) fn expire_walk_after_entries(root: &Path, checks: usize) -> WalkHookGuard {
+    walk_hook(root, true, Duration::ZERO, None, false, Some(checks))
+}
+
+/// Blocks the per-entry call a walk makes for exactly `path` until the guard
+/// is released or dropped: one entry whose check never returns.
+pub(crate) fn stall_walk_entry(path: &Path) -> WalkHookGuard {
+    walk_hook(path, true, Duration::ZERO, None, true, None)
+}
+
+/// Blocks the `access`th per-directory call a walk makes under `root` until
+/// the guard is released or dropped: one call that stops making progress.
+pub(crate) fn stall_walk_at(root: &Path, access: usize) -> WalkHookGuard {
+    walk_hook(root, false, Duration::ZERO, Some(access), false, None)
+}
+
+pub(super) fn before_walk_access(path: &Path) {
+    run_walk_hook(path, false);
+}
+
+pub(super) fn before_walk_entry(path: &Path) {
+    run_walk_hook(path, true);
+}
+
+fn run_walk_hook(path: &Path, entries: bool) {
+    let hook = WALK_HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|hook| {
+            hook.entries == entries && hook.roots.iter().any(|root| path.starts_with(root))
+        })
+        .cloned();
+    let Some(hook) = hook else {
+        return;
+    };
+    let seen = hook.seen.fetch_add(1, Ordering::Relaxed) + 1;
+    // Hooked calls run on the walk's helper thread, where its control is set.
+    let expired = WALK.with(|walk| walk.borrow().as_ref().is_some_and(|walk| walk.expired()));
+    if expired {
+        hook.after_expiry.fetch_add(1, Ordering::Relaxed);
+    } else {
+        hook.before_expiry.lock().unwrap().push(path.to_path_buf());
+    }
+    if hook.expire_after == Some(seen) {
+        WALK.with(|walk| {
+            if let Some(walk) = walk.borrow().as_ref() {
+                walk.stop.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+    let block = if hook.block_exact {
+        hook.roots.iter().any(|root| path == root)
+    } else {
+        hook.block_at == Some(seen)
+    };
+    if block {
+        if let Some(blocked) = hook.blocked.lock().unwrap().take() {
+            let _ = blocked.send(path.to_path_buf());
+        }
+        let release = hook.release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.recv_timeout(Duration::from_secs(30));
+        }
+    }
+    if !hook.delay.is_zero() {
+        std::thread::sleep(hook.delay);
+    }
+}
+
+static BLOCKED_STATS: LazyLock<Mutex<HashMap<PathBuf, (Sender<()>, Receiver<()>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Blocks the next single `stat` of `path` until dropped.
+pub(crate) struct StatBlock {
+    path: PathBuf,
+    pub(crate) reached: Receiver<()>,
+    release: Option<Sender<()>>,
+}
+
+impl Drop for StatBlock {
+    fn drop(&mut self) {
+        BLOCKED_STATS.lock().unwrap().remove(&self.path);
+        self.release.take();
+    }
+}
+
+pub(crate) fn block_stat(path: &Path) -> StatBlock {
+    let (reached_tx, reached) = channel();
+    let (release, release_rx) = channel();
+    BLOCKED_STATS
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), (reached_tx, release_rx));
+    StatBlock {
+        path: path.to_path_buf(),
+        reached,
+        release: Some(release),
+    }
+}
+
+pub(super) fn before_stat(path: &Path) {
+    let blocked = BLOCKED_STATS.lock().unwrap().remove(path);
+    if let Some((reached, release)) = blocked {
+        let _ = reached.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
 #[cfg(unix)]
 pub(crate) struct HelperStall {
     path: PathBuf,
@@ -431,4 +724,168 @@ fn running_helper_timeout_has_only_native_platform_hint() {
         ""
     };
     assert_eq!(hint, expected_hint);
+}
+
+#[test]
+fn walk_deadline_is_not_cut_to_the_single_access_limit() {
+    let limiter = Arc::new(Limiter::new(1));
+    let budget = Budget::after(Duration::from_secs(30));
+    let requested = Instant::now() + Duration::from_secs(20);
+    // The walk keeps moving for three times the single-call limit. A healthy
+    // walk that outlasts one call's limit must still finish.
+    let end = with_single_access_budget(Duration::from_millis(100), || {
+        with_budget(Some(budget.clone()), || {
+            run_walk_with_limiter(Path::new("slow-walk"), requested, limiter, |_, control| {
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_millis(300) {
+                    if control.advance() {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Some(control.deadline())
+            })
+        })
+    });
+    let Ok(WalkEnd::Finished(Some(deadline))) = end else {
+        panic!("a walk that kept making progress was stopped or reported as blocked");
+    };
+    assert_eq!(
+        deadline, requested,
+        "the walk keeps the deadline it asked for"
+    );
+    assert!(budget.failure.lock().unwrap().is_none());
+}
+
+#[test]
+fn request_budget_still_bounds_a_walks_explicit_deadline() {
+    let limiter = Arc::new(Limiter::new(1));
+    let budget = Budget::after(Duration::from_millis(400));
+    let started = Instant::now();
+    let end = with_budget(Some(budget.clone()), || {
+        run_walk_with_limiter(
+            Path::new("long-walk"),
+            Instant::now() + Duration::from_secs(30),
+            limiter,
+            |_, control| {
+                let mut entries = 0usize;
+                while !control.advance() {
+                    entries += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                (entries, control.deadline())
+            },
+        )
+    });
+    let Ok(WalkEnd::Finished((entries, deadline))) = end else {
+        panic!("the walk must stop itself at its deadline and return");
+    };
+    assert!(entries > 0);
+    assert!(
+        deadline < budget.deadline,
+        "the walk's deadline leaves reply time inside the request budget"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(budget.failure.lock().unwrap().is_none());
+}
+
+#[test]
+fn stalled_walk_names_the_stalled_path_and_its_stop_flag_frees_the_slot() {
+    let limiter = Arc::new(Limiter::new(4));
+    let (blocked_tx, blocked_rx) = channel();
+    let (release_tx, release_rx) = channel::<()>();
+    let budget = Budget::after(Duration::from_secs(30));
+    let walker_limiter = Arc::clone(&limiter);
+    let end = with_single_access_budget(Duration::from_millis(150), || {
+        with_budget(Some(budget.clone()), || {
+            run_walk_with_limiter(
+                Path::new("walk-root"),
+                Instant::now() + Duration::from_secs(30),
+                walker_limiter,
+                move |_, control| {
+                    control.advance();
+                    control.reached(Path::new("walk-root/stuck"));
+                    blocked_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                    // Once the stuck call returns, the walk would go on to its
+                    // own 30 s deadline unless the request told it to stop.
+                    while !control.advance() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                },
+            )
+        })
+    });
+    blocked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let Ok(WalkEnd::Stopped {
+        stall: Some(stall), ..
+    }) = end
+    else {
+        panic!("a walk stuck in one call must be reported as stalled");
+    };
+    assert_eq!(stall.path(), Path::new("walk-root/stuck"));
+    assert!(
+        budget.failure.lock().unwrap().is_none(),
+        "the caller decides how to record the stall"
+    );
+    assert_eq!(
+        *limiter.live.lock().unwrap(),
+        1,
+        "the stuck walk holds its slot"
+    );
+    release_tx.send(()).unwrap();
+    let released = Instant::now();
+    while *limiter.live.lock().unwrap() != 0 {
+        assert!(
+            released.elapsed() < Duration::from_secs(2),
+            "the abandoned walk kept its helper slot after the request ended"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn stall_record_keeps_partial_results_or_fails_the_reply() {
+    let stall = WalkStall {
+        path: PathBuf::from("root/stuck"),
+        waited: Duration::from_secs(5),
+    };
+    let budget = Budget::after(Duration::from_secs(5));
+    let response = with_budget(Some(budget.clone()), || {
+        stall.record(true);
+        assert!(
+            prior_failure().is_none(),
+            "later calls in the request still run"
+        );
+        // The router finishes the reply twice; the stall is named once.
+        let once = finish_response(Response::success(
+            "walk",
+            serde_json::json!({"text": "1 file matching *.rs", "complete": true}),
+        ));
+        finish_response(once)
+    });
+    let expected = format!(
+        "read_blocked: {}: {}",
+        Path::new("root/stuck").display(),
+        blocked_reason(Duration::from_secs(5))
+    );
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(
+        response.data["text"],
+        format!("1 file matching *.rs\n\n{expected}")
+    );
+    assert_eq!(
+        response.data["gaps"],
+        serde_json::json!([{"kind": "read_blocked", "path": "root/stuck", "reason": expected}])
+    );
+
+    let budget = Budget::after(Duration::from_secs(5));
+    let response = with_budget(Some(budget), || {
+        stall.record(false);
+        finish_response(Response::success("walk", serde_json::json!({"text": ""})))
+    });
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "read_blocked");
+    assert_eq!(response.data["message"], expected);
 }
