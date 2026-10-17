@@ -548,6 +548,7 @@ fn pause_read() -> (file_read_exact::ReadHooks, ReadPause) {
                 .recv_timeout(Duration::from_secs(10))
                 .expect("test releases the paused read");
         })),
+        ..file_read_exact::ReadHooks::default()
     };
     (
         hooks,
