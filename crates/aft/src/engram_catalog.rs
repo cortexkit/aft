@@ -23,7 +23,7 @@
 //! | Path | Entry id | Class / mechanism |
 //! |---|---|---|
 //! | `aft.db` | `aft/db` | device-local page-db, `read-transaction-live` |
-//! | `trusted-filter-projects.json` | `aft/trusted-filter-projects` | device-local filetree (one file) |
+//! | `trusted-filter-projects.json` | `aft/trusted-filter-projects` | portable filetree (one file) |
 //! | `<harness>/backups` | `aft/backups-<label>` | [`UNDO_BACKUPS_CLASS`] filetree |
 //! | `<harness>/backups.parked-<suffix>` | `aft/backups-<label>-parked`, later ones `aft/backups-<label>-parked-<suffix>` | [`UNDO_BACKUPS_CLASS`] filetree |
 //! | `<harness>/checkpoints` | `aft/checkpoints-<label>` | excluded filetree |
@@ -266,6 +266,8 @@ fn collect_candidates(storage_root: &Path) -> io::Result<Vec<Candidate>> {
         let path = storage_root.join(&name);
         if name == DB_FILE {
             if is_real_file(&path) {
+                // ENGRAM does not capture device-local entries. Once the backup
+                // storage limit is raised, make this portable with the same id.
                 let mut db = Candidate::fixed("aft/db", DB_FILE, "device-local", "page-db");
                 // ENGRAM copies changed pages under one held read transaction;
                 // AFT's writers keep running meanwhile (WAL).
@@ -279,7 +281,7 @@ fn collect_candidates(storage_root: &Path) -> io::Result<Vec<Candidate>> {
                 candidates.push(Candidate::fixed(
                     "aft/trusted-filter-projects",
                     TRUSTED_FILTER_PROJECTS_FILE,
-                    "device-local",
+                    "portable",
                     "filetree",
                 ));
             }
@@ -926,7 +928,7 @@ mod tests {
             ("aft/db", "device-local", "page-db", "aft.db"),
             (
                 "aft/trusted-filter-projects",
-                "device-local",
+                "portable",
                 "filetree",
                 "trusted-filter-projects.json",
             ),
@@ -1053,7 +1055,7 @@ mod tests {
             *entry_by_id(&value, "aft/trusted-filter-projects"),
             serde_json::json!({
                 "entry_id": "aft/trusted-filter-projects",
-                "class": "device-local",
+                "class": "portable",
                 "mechanism": "filetree",
                 "path": "trusted-filter-projects.json",
             })
