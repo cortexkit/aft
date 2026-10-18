@@ -4741,9 +4741,24 @@ impl BgTaskRegistry {
     /// configure replay, including exit markers, lost PTYs and dead processes.
     fn rehydrate_resolved_task(
         &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.rehydrate_resolved_task_with_process_probe(
+            metadata,
+            paths,
+            session_id,
+            Self::persisted_task_process_is_alive,
+        )
+    }
+
+    fn rehydrate_resolved_task_with_process_probe(
+        &self,
         mut metadata: PersistedTask,
         paths: TaskPaths,
         session_id: &str,
+        process_is_alive: impl FnOnce(&PersistedTask) -> bool,
     ) -> Result<(), String> {
         #[cfg(unix)]
         if metadata.remote.is_some() && metadata.is_terminal() {
@@ -4758,12 +4773,35 @@ impl BgTaskRegistry {
             self.resume_remote_task(&task_id)?;
             return Ok(());
         }
+        let (marker, process_alive) = if matches!(
+            metadata.status,
+            BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
+        ) {
+            let mut marker = read_exit_marker(&paths).ok().flatten();
+            let process_alive = if marker.is_none()
+                && (metadata.status == BgTaskStatus::Starting || metadata.mode != BgMode::Pty)
+            {
+                let alive = process_is_alive(&metadata);
+                if !alive {
+                    // The wrapper writes its exit marker before exiting. It may
+                    // have done both since our first read, so observe the marker
+                    // again after detecting death before declaring the outcome lost.
+                    marker = read_exit_marker(&paths).ok().flatten();
+                }
+                alive
+            } else {
+                false
+            };
+            (marker, process_alive)
+        } else {
+            (None, false)
+        };
         match metadata.status {
             BgTaskStatus::Starting => {
                 let completion_was_delivered = metadata.completion_delivered;
-                if let Ok(Some(marker)) = read_exit_marker(&paths) {
+                if let Some(marker) = marker {
                     metadata = terminal_metadata_from_marker(metadata, marker, None);
-                } else if Self::persisted_task_process_is_alive(&metadata) {
+                } else if process_alive {
                     crate::slog_info!("background task {} replay Starting -> Running: durable child identity child_pid={:?} pgid={:?}", metadata.task_id, metadata.child_pid, metadata.pgid);
                     metadata.status = BgTaskStatus::Running;
                 } else if metadata.child_pid.is_some() || metadata.pgid.is_some() {
@@ -4784,7 +4822,7 @@ impl BgTaskRegistry {
             }
             BgTaskStatus::Running | BgTaskStatus::Killing => {
                 if metadata.mode == BgMode::Pty {
-                    if let Ok(Some(marker)) = read_exit_marker(&paths) {
+                    if let Some(marker) = marker {
                         let completion_was_delivered = metadata.completion_delivered;
                         metadata = terminal_metadata_from_marker(metadata, marker, None);
                         metadata.completion_delivered |= completion_was_delivered;
@@ -4813,7 +4851,7 @@ impl BgTaskRegistry {
                         )?;
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     }
-                } else if let Ok(Some(marker)) = read_exit_marker(&paths) {
+                } else if let Some(marker) = marker {
                     let reason = (metadata.status == BgTaskStatus::Killing)
                         .then(|| "recovered from inconsistent killing state on replay".to_string());
                     if reason.is_some() {
@@ -4829,7 +4867,7 @@ impl BgTaskRegistry {
                 } else if metadata.status == BgTaskStatus::Killing {
                     // Killing records intent, not proof that the daemon sent a
                     // signal. Finish that work before publishing its outcome.
-                    if Self::persisted_task_process_is_alive(&metadata) {
+                    if process_alive {
                         terminate_piped_task(
                             &metadata.task_id,
                             metadata.pgid,
@@ -4852,7 +4890,7 @@ impl BgTaskRegistry {
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
                     self.insert_rehydrated_task(metadata, paths, true)?;
-                } else if Self::persisted_task_process_is_alive(&metadata) {
+                } else if process_alive {
                     self.insert_rehydrated_task(metadata, paths, true)?;
                 } else {
                     let completion_was_delivered = metadata.completion_delivered;
@@ -13350,6 +13388,80 @@ mod tests {
                 wait_for_task_temp_cleanup(&registry, &task);
                 assert!(!scratch.exists(), "replay leaked {mode:?} scratch");
                 assert!(read_task(&paths.json).unwrap().sandbox_temp_dir.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn bash_background_replay_prefers_exit_marker_written_during_process_probe() {
+        for status in [
+            BgTaskStatus::Starting,
+            BgTaskStatus::Running,
+            BgTaskStatus::Killing,
+        ] {
+            for (code, expected) in [(0, BgTaskStatus::Completed), (7, BgTaskStatus::Failed)] {
+                for delivered in [false, true] {
+                    let registry = BgTaskRegistry::default();
+                    let dir = tempfile::tempdir().unwrap();
+                    let paths = task_paths(dir.path(), "session", &random_slug()).unwrap();
+                    fs::create_dir_all(&paths.io_dir).unwrap();
+                    let mut metadata = PersistedTask::starting(
+                        paths.task_id.clone(),
+                        "session".into(),
+                        format!("exit {code}"),
+                        dir.path().into(),
+                        None,
+                        None,
+                        true,
+                        false,
+                    );
+                    metadata.mark_running(u32::MAX, i32::MAX);
+                    metadata.status = status.clone();
+                    metadata.completion_delivered = delivered;
+                    write_task(&paths.json, &metadata).unwrap();
+                    let probed = std::cell::Cell::new(false);
+                    registry
+                        .rehydrate_resolved_task_with_process_probe(
+                            metadata,
+                            paths.clone(),
+                            "session",
+                            |_| {
+                                assert!(!probed.replace(true));
+                                assert_eq!(read_exit_marker(&paths).unwrap(), None);
+                                // The wrapper publishes its status after replay's first
+                                // marker read, then exits before the liveness probe.
+                                fs::write(&paths.exit, code.to_string()).unwrap();
+                                false
+                            },
+                        )
+                        .unwrap();
+                    assert!(probed.get());
+                    let task = registry.task(&paths.task_id).unwrap();
+                    let state = task.lock_state().unwrap();
+                    assert_eq!(state.metadata.status, expected, "replayed {status:?}");
+                    assert_eq!(state.metadata.exit_code, Some(code));
+                    assert_eq!(
+                        state.metadata.status_reason.as_deref(),
+                        (status == BgTaskStatus::Killing)
+                            .then_some("recovered from inconsistent killing state on replay")
+                    );
+                    assert_eq!(state.metadata.exit_marker_unavailable, None);
+                    assert_eq!(state.metadata.completion_delivered, delivered);
+                    drop(state);
+                    let persisted = read_task(&paths.json).unwrap();
+                    assert_eq!(persisted.status, expected);
+                    assert_eq!(persisted.exit_code, Some(code));
+                    assert_eq!(
+                        read_exit_marker(&paths).unwrap(),
+                        Some(ExitMarker::Code(code as i32))
+                    );
+                    assert_eq!(
+                        registry
+                            .drain_completions_for_session(Some("session"))
+                            .len(),
+                        usize::from(!delivered)
+                    );
+                }
             }
         }
     }
