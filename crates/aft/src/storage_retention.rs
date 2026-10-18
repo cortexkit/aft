@@ -1341,6 +1341,11 @@ impl DueBatch {
             return Ok(());
         }
         let items = std::mem::take(&mut self.items);
+        // Cancelled work stays on disk for the next pass; do not hold up
+        // binds and pins for admission checks whose results would be unused.
+        if report.cancelled {
+            return Ok(());
+        }
         let phase = Instant::now();
         // Try the retention barrier without waiting. If a bind or pin holds it,
         // that caller is protecting this storage right now, so retention backs
@@ -1349,14 +1354,25 @@ impl DueBatch {
             crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
                 .map_err(|error| io::Error::other(error.to_string()))
                 .and_then(|barrier| {
-                    Ok((barrier, bindings(storage)?, OwnerManifests::read(storage)))
+                    #[cfg(test)]
+                    test_hook(storage, "due-admitted");
+                    if cancelled() {
+                        report.cancelled = true;
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        barrier,
+                        bindings(storage)?,
+                        OwnerManifests::read(storage),
+                    )))
                 });
         *report
             .timings_ms
             .entry("due_admission_history".into())
             .or_default() += phase.elapsed().as_millis() as u64;
         let (barrier, current, owners) = match admission {
-            Ok(admission) => admission,
+            Ok(Some(admission)) => admission,
+            Ok(None) => return Ok(()),
             Err(error) => {
                 for item in items {
                     let before = DomainReport::from_report(report);
@@ -3874,6 +3890,153 @@ mod storage_retention_tests {
         });
         assert_eq!(passes, 2);
         assert_eq!(remaining(), 0);
+    }
+
+    #[test]
+    fn storage_retention_cancelled_final_flush_skips_admission_and_rereads() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let callgraph = cache(temp.path(), "callgraph", &scope);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let walk_hook = {
+            let cancelled = cancelled.clone();
+            observe_test_hook(
+                &view,
+                Arc::new(move |step| {
+                    if step == "walk" {
+                        // Signal cancellation while validating the view. Preparation
+                        // still queues it before the loop checks the next candidate.
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                }),
+            )
+        };
+        let hook = {
+            let cancelled = cancelled.clone();
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            let admissions = admissions.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| {
+                    // Setup reads precede cancellation; only count final-flush work.
+                    if cancelled.load(Ordering::SeqCst) {
+                        match step {
+                            "history-read" => {
+                                history_reads.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "owner-scan" => {
+                                owner_scans.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "due-admitted" => {
+                                admissions.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }),
+            )
+        };
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| cancelled.load(Ordering::SeqCst),
+            &Instant::now,
+            NO_TIME_BOUND,
+        );
+        assert!(report.cancelled, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.examined, 1, "cancel after queuing only the view");
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 1, "{report:?}");
+        assert!(view.exists() && callgraph.exists());
+        assert_eq!(
+            (
+                history_reads.load(Ordering::SeqCst),
+                owner_scans.load(Ordering::SeqCst),
+                admissions.load(Ordering::SeqCst),
+            ),
+            (0, 0, 0),
+            "cancelled final flush must not reread history, scan owners, or take sweep.lock"
+        );
+        drop(hook);
+        drop(walk_hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(!next.cancelled, "{next:?}");
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 2, "{next:?}");
+        assert_eq!(next.due_views_remaining, 0, "{next:?}");
+        assert!(!view.exists() && !callgraph.exists());
+    }
+
+    #[test]
+    fn storage_retention_due_flush_rechecks_cancellation_under_barrier() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let cancelled = cancelled.clone();
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            let admissions = admissions.clone();
+            let storage = temp.path().to_path_buf();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "due-admitted" => {
+                        assert!(storage.join("retention/sweep.lock").exists());
+                        admissions.fetch_add(1, Ordering::SeqCst);
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                    "history-read" if cancelled.load(Ordering::SeqCst) => {
+                        history_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    "owner-scan" if cancelled.load(Ordering::SeqCst) => {
+                        owner_scans.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| cancelled.load(Ordering::SeqCst),
+            &Instant::now,
+            NO_TIME_BOUND,
+        );
+        assert!(report.cancelled, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 1, "{report:?}");
+        assert!(view.exists());
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (
+                history_reads.load(Ordering::SeqCst),
+                owner_scans.load(Ordering::SeqCst),
+            ),
+            (0, 0),
+            "cancellation at admission must skip history and owner rereads"
+        );
+        drop(hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(!next.cancelled, "{next:?}");
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 1, "{next:?}");
+        assert!(!view.exists());
     }
 
     /// A drain burst over a large backlog. Every removal rechecks binding
