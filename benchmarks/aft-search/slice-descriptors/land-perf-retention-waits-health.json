@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/parser.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "The fenced files only gain read-only memory_shape() counters that the health rollup uses to decide whether a root's memory estimate must be recomputed. Indexing, ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

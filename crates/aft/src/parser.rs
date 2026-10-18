@@ -1602,6 +1602,16 @@ impl SymbolCache {
         self.entries.len()
     }
 
+    /// Cheap counters that move whenever the walk in [`Self::estimated_memory`]
+    /// would most likely give a different answer, read without walking.
+    pub(crate) fn memory_shape(&self) -> [u64; 3] {
+        [
+            self.generation,
+            self.mutation_revision,
+            self.entries.len() as u64,
+        ]
+    }
+
     /// Estimate the resident hot symbol map from cached paths and the strings
     /// owned by each symbol. Tree-sitter parse trees are request-local and are
     /// therefore not part of this long-lived cache estimate.

@@ -485,6 +485,28 @@ impl SearchIndex {
                 .count()
     }
 
+    /// Cheap counters that move whenever the walk in [`Self::estimated_memory`]
+    /// would most likely give a different answer, read without walking.
+    /// `None` while compaction holds its lock (the estimate is then `busy`).
+    pub(crate) fn memory_shape(&self) -> Option<[u64; 11]> {
+        let compaction = self.compaction_state.try_lock().ok()?;
+        Some([
+            self.files.len() as u64,
+            self.path_to_id.len() as u64,
+            self.delta.postings.len() as u64,
+            self.delta_file_trigrams.len() as u64,
+            self.file_trigram_count.len() as u64,
+            self.unindexed_files.len() as u64,
+            self.delta.superseded.len() as u64,
+            self.base
+                .as_ref()
+                .map_or(0, |base| base.lookup.len() as u64 + 1),
+            self.delta_packed_bytes as u64,
+            compaction.buffered_paths.len() as u64,
+            self.files.as_ptr() as usize as u64,
+        ])
+    }
+
     /// Estimate resident trigram-index bytes. Base posting lists stay on disk
     /// and are read with `pread`; only the resident base lookup table, delta
     /// postings, superseded mask, and file tables are included here.

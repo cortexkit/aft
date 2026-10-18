@@ -2113,6 +2113,11 @@ fn memory_rollup_metrics(
             if detail.standing == Some(true) {
                 row["standing"] = Value::Bool(true);
             }
+            if let Some(age_ms) = detail.measured_age_ms {
+                // The rollup may reuse an earlier index walk; name its age so
+                // a reused figure is never read as a fresh one.
+                row["memory_measured_age_ms"] = json!(age_ms);
+            }
             (root.clone(), row)
         })
         .collect::<serde_json::Map<String, Value>>()
@@ -2296,6 +2301,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let actor_count = actor_entries.len();
     let mut memory_roots = std::collections::BTreeMap::new();
     let mut census_roots = std::collections::BTreeMap::new();
+    let mut census_ages = std::collections::BTreeMap::new();
     let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
     let mut repair_roots_annotated = 0usize;
     let mut embedding_backend_available = true;
@@ -2349,6 +2355,7 @@ fn build_health_diagnostic_rollup_from_actors(
             .and_then(|entry| entry.artifact_key.clone())
             .unwrap_or_else(|| root_label.clone());
         let (census_memory, memory) = ctx.memory_root_snapshot_and_rollup();
+        census_ages.insert(root_label.clone(), memory.measured_age_ms);
         census_roots.insert(root_label.clone(), census_memory);
         let memory = if standing.is_some() {
             memory.with_standing()
@@ -2573,8 +2580,18 @@ fn build_health_diagnostic_rollup_from_actors(
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     let memory = memory_rollup_metrics(Some(memory_roots));
     let census_snapshot = crate::memory::MemorySnapshot::new_uncapped("ready", census_roots);
-    let memory_census =
+    let mut memory_census =
         crate::commands::memory_census::render_memory_census(&census_snapshot, None);
+    if let Some(rows) = memory_census
+        .get_mut("roots")
+        .and_then(Value::as_object_mut)
+    {
+        for (root, age_ms) in census_ages {
+            if let Some(row) = rows.get_mut(&root).and_then(Value::as_object_mut) {
+                row.insert("memory_measured_age_ms".into(), json!(age_ms));
+            }
+        }
+    }
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     shared_app.publish_lifecycle_census(lifecycle.clone());
     let detail = if busy_roots > 0 {
@@ -4108,6 +4125,101 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "offline measurement of per-root rollup costs on a populated root"]
+    fn bench_health_rollup_per_root_costs() {
+        const FILES: usize = 2_000;
+        const SYMBOLS: usize = 40;
+        let (_dir, root) = test_root("rollup-per-root");
+        let ctx = test_ctx();
+        {
+            let cache = ctx.symbol_cache();
+            let mut cache = cache.write().unwrap();
+            for file in 0..FILES {
+                let symbols = (0..SYMBOLS)
+                    .map(|index| crate::symbols::Symbol {
+                        name: format!("symbol_{file}_{index}"),
+                        kind: crate::symbols::SymbolKind::Function,
+                        range: crate::symbols::Range {
+                            start_line: 0,
+                            start_col: 0,
+                            end_line: 0,
+                            end_col: 10,
+                        },
+                        signature: Some(format!("fn symbol_{file}_{index}()")),
+                        scope_chain: vec!["module".into()],
+                        exported: true,
+                        parent: None,
+                    })
+                    .collect();
+                cache.insert(
+                    root.as_path().join(format!("src/file_{file}.rs")),
+                    std::time::SystemTime::UNIX_EPOCH,
+                    1,
+                    blake3::hash(&file.to_le_bytes()),
+                    symbols,
+                );
+            }
+        }
+        let files: Vec<_> = (0..FILES)
+            .map(|file| {
+                let path = root.as_path().join(format!("src/f{file}.ts"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &path,
+                    format!("export function f{file}() {{ return {file}; }}\n"),
+                )
+                .unwrap();
+                path
+            })
+            .collect();
+        let store_dir = root.as_path().join(".callgraph-bench");
+        let writer = crate::callgraph_store::CallGraphStore::open(
+            store_dir.clone(),
+            root.as_path().to_path_buf(),
+        )
+        .unwrap();
+        writer.cold_build(&files).unwrap();
+        writer.mark_files_stale(&files[..FILES / 10]).unwrap();
+        drop(writer);
+        let reader = crate::callgraph_store::CallGraphStore::open_readonly(
+            store_dir,
+            root.as_path().to_path_buf(),
+        )
+        .unwrap()
+        .expect("ready store");
+        *ctx.callgraph_store().write().unwrap() = Some(Arc::new(reader));
+        let time = |label: &str, run: &dyn Fn()| {
+            run();
+            let started = Instant::now();
+            for _ in 0..20 {
+                run();
+            }
+            println!(
+                "per-root {label}: {} us per rollup",
+                started.elapsed().as_micros() / 20
+            );
+        };
+        time("memory walk (status path, always walks)", &|| {
+            std::hint::black_box(ctx.memory_root_snapshot());
+        });
+        time("memory (rollup path, unchanged root)", &|| {
+            std::hint::black_box(ctx.memory_root_snapshot_and_rollup());
+        });
+        time("stale_path_census", &|| {
+            let store = ctx.callgraph_store().read().unwrap();
+            std::hint::black_box(store.as_ref().unwrap().try_stale_path_census().unwrap());
+        });
+        time("health_summary", &|| {
+            std::hint::black_box(ctx.try_health_summary());
+        });
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        time("full rollup (1 root)", &|| cache.refresh(&executor, &app));
+    }
+
+    #[test]
     fn health_names_future_bash_tasks_without_global_shell_degradation() {
         let (dir, root) = test_root("health-task-refusal");
         let storage = dir.path().join("storage");
@@ -4439,6 +4551,73 @@ mod tests {
                 .iter()
                 .all(|(successful, walks)| { *walks == if *successful { 1 } else { 0 } }),
             "memory walks did not match each attempt's census outcome: {walks_by_attempt:?}"
+        );
+    }
+
+    /// The rollup asks every root for its memory every few seconds. While a
+    /// root's indexes keep their shape it must reuse the last index walk, a
+    /// shape change must walk again at once, and the reported age must say how
+    /// old the reused figures are.
+    #[test]
+    fn rollup_reuses_an_unchanged_roots_memory_walk_and_reports_its_age() {
+        let ctx = test_ctx();
+        let walks = crate::context::memory_estimate_walks_for_test;
+        let measure = || {
+            let before = walks();
+            let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
+            (
+                walks() - before,
+                rollup.measured_age_ms.expect("rollup age"),
+            )
+        };
+        let (first_walks, first_age) = measure();
+        assert_eq!(first_walks, 1, "the first rollup must walk the indexes");
+        assert!(first_age < 1_000, "a fresh walk reported age {first_age}");
+        std::thread::sleep(Duration::from_millis(30));
+        let (reused_walks, reused_age) = measure();
+        assert_eq!(reused_walks, 0, "an unchanged root was walked again");
+        assert!(
+            reused_age >= 30,
+            "a reused walk must report its age, got {reused_age}"
+        );
+        ctx.symbol_cache().write().unwrap().insert(
+            std::path::PathBuf::from("/rollup-shape/changed.rs"),
+            std::time::SystemTime::UNIX_EPOCH,
+            1,
+            blake3::hash(b"changed"),
+            Vec::new(),
+        );
+        let (changed_walks, changed_age) = measure();
+        assert_eq!(changed_walks, 1, "a shape change must walk again at once");
+        assert!(
+            changed_age < reused_age,
+            "a new walk must reset the age: {changed_age} >= {reused_age}"
+        );
+        let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
+        let rendered = memory_rollup_metrics(Some(std::collections::BTreeMap::from([(
+            "/rollup-shape".to_string(),
+            rollup,
+        )])));
+        assert!(
+            rendered["roots"]["/rollup-shape"]["memory_measured_age_ms"].is_u64(),
+            "the per-root memory row must carry its age: {rendered}"
+        );
+        // A status read outside the rollup always walks and carries no age.
+        let before = walks();
+        let _ = ctx.memory_root_snapshot();
+        assert_eq!(walks() - before, 1);
+        // The memory census the rollup publishes also carries, per root, the
+        // age of the index walk behind its memory figures.
+        let (_root_dir, root) = test_root("rollup-shape-census");
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let cache = HealthRollupCache::new();
+        cache.refresh_for_test(&executor, &crate::context::App::default_shared());
+        let census = cache.memory_census();
+        let label = root.as_path().display().to_string();
+        assert!(
+            census["roots"][label.as_str()]["memory_measured_age_ms"].is_u64(),
+            "the census row must carry its age: {census}"
         );
     }
 

@@ -168,9 +168,9 @@ async fn observe_deferred_bash_wait(
         if let Some(window) = renew_window.filter(|_| worker_session) {
             registry.renew_hard_kill(&task_id, &session_id, window);
         }
-        let target_finished = registry
-            .status(&task_id, &session_id, None, None, 0)
-            .is_none_or(|snapshot| snapshot.info.status.is_terminal());
+        // Only the finished/running answer matters here; the executor poll
+        // that answers the call builds the full snapshot once.
+        let target_finished = registry.wait_target_finished(&task_id, &session_id);
         let detach_pending = wait_mode && registry.wait_mode_detach_pending(&session_id);
         DeferredWaitObservation {
             target_finished,
@@ -224,6 +224,84 @@ mod default_kill_tests {
         }
         assert!(!observation.target_finished);
         assert_eq!(polls, 1, "each observation must poll the actual child");
+    }
+
+    /// A held call observes its task once per poll interval (and on every
+    /// terminal transition in the registry). Those observations must not
+    /// build task snapshots, which open task files on disk: with many held
+    /// calls, per-observation snapshots kept the blocking pool busy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_wait_observations_build_no_snapshots() {
+        use std::sync::atomic::Ordering;
+        const OBSERVATIONS: u64 = 50;
+        let (_dir, ctx, task) =
+            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+        let child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        task.state.lock().unwrap().runtime =
+            crate::bash_background::registry::TaskRuntime::Piped(Some(child));
+        let registry = ctx.bash_background();
+        let snapshots_before = registry.inner.snapshots_built.load(Ordering::Relaxed);
+        let mut finished = 0;
+        for _ in 0..OBSERVATIONS {
+            let observation = observe_deferred_bash_wait(
+                registry.clone(),
+                task.task_id.clone(),
+                task.session_id.clone(),
+                false,
+                false,
+                None,
+            )
+            .await;
+            finished += u64::from(observation.target_finished);
+        }
+        let polls = registry.inner.child_polls.load(Ordering::Relaxed);
+        let snapshots = registry.inner.snapshots_built.load(Ordering::Relaxed) - snapshots_before;
+        // End the child while it is still running, then check that a finished
+        // task is reported finished without a snapshot either.
+        if let crate::bash_background::registry::TaskRuntime::Piped(Some(mut child)) =
+            std::mem::replace(
+                &mut task.state.lock().unwrap().runtime,
+                crate::bash_background::registry::TaskRuntime::Piped(None),
+            )
+        {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        task.state.lock().unwrap().metadata.status =
+            crate::bash_background::BgTaskStatus::Completed;
+        let terminal = observe_deferred_bash_wait(
+            registry.clone(),
+            task.task_id.clone(),
+            task.session_id.clone(),
+            false,
+            false,
+            None,
+        )
+        .await;
+        let missing = observe_deferred_bash_wait(
+            registry.clone(),
+            "bash-00000000000000ff".into(),
+            task.session_id.clone(),
+            false,
+            false,
+            None,
+        )
+        .await;
+        let snapshots_total =
+            registry.inner.snapshots_built.load(Ordering::Relaxed) - snapshots_before;
+        eprintln!(
+            "deferred wait observations={OBSERVATIONS} child_polls={polls} snapshots={snapshots_total}"
+        );
+        assert_eq!(finished, 0, "a running task was reported finished");
+        assert_eq!(polls, OBSERVATIONS, "each observation must poll the child");
+        assert_eq!(snapshots, 0, "running-task observations built snapshots");
+        assert!(terminal.target_finished);
+        assert!(missing.target_finished, "an unknown task ends the wait");
+        assert_eq!(snapshots_total, 0, "observations built snapshots");
     }
 
     async fn deferred_wait_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {

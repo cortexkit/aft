@@ -5607,6 +5607,22 @@ impl SemanticIndex {
             + self.entries.len()
     }
 
+    /// Cheap counters that move whenever the walk in [`Self::estimated_memory`]
+    /// would most likely give a different answer, read without walking.
+    pub(crate) fn memory_shape(&self) -> [u64; 9] {
+        [
+            self.entries.len() as u64,
+            self.entries.as_ptr() as usize as u64,
+            self.file_mtimes.len() as u64,
+            self.file_sizes.len() as u64,
+            self.file_hashes.len() as u64,
+            self.deferred_files.len() as u64,
+            self.tombstones.len() as u64,
+            self.shared_base.as_ref().map_or(0, |base| base.entry_count) as u64,
+            self.dimension as u64,
+        ]
+    }
+
     /// Estimate resident semantic-index bytes from the vectors and metadata
     /// actually held by each entry. This intentionally excludes allocator and
     /// hash-table bucket overhead, which are not cheaply observable.
