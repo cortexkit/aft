@@ -91,6 +91,19 @@ sys.exit(0)
         self.assertEqual(len(calls), 1)
         self.assertNotIn("--no-fail-fast", calls[0])
 
+    def test_libtest_archive_partition_never_compiles_and_excludes_serial_probes(self):
+        result, calls = self.run_gate("lib-shard", archives=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertTrue(all(call[:2] == ["nextest", "run"] for call in calls), calls)
+        self.assertTrue(all("--archive-file" in call for call in calls), calls)
+        library = next(call for call in calls if "kind(lib)" in call)
+        self.assertEqual(library[library.index("--") + 1:], [
+            "--skip", "platform_verifier_tls_client_subprocess",
+            "--skip", "panic_hook_preserves_default_backtrace_behavior_and_persists",
+        ])
+        self.assertIn("GATE PASSED", result.stdout)
+
     def test_ci_log_write_failure_stops_instead_of_hiding_missing_evidence(self):
         result, calls = self.run_gate("conformance", tee_fail=True)
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
