@@ -6263,6 +6263,17 @@ pub(crate) fn take_present_on_disk<T>(
     path_of: impl Fn(&T) -> &Path,
     surface: &str,
 ) -> PresentOnDisk<T> {
+    take_present_on_disk_with_presence(items, limit, path_of, surface, path_missing_on_disk)
+}
+
+/// Reuse presence observed by a walk, while still checking stale indexed paths.
+pub(crate) fn take_present_on_disk_with_presence<T>(
+    items: impl IntoIterator<Item = T>,
+    limit: usize,
+    path_of: impl Fn(&T) -> &Path,
+    surface: &str,
+    missing: impl Fn(&Path) -> bool,
+) -> PresentOnDisk<T> {
     let stat_budget = limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET);
     let mut present = Vec::new();
     let mut dropped = 0usize;
@@ -6281,7 +6292,7 @@ pub(crate) fn take_present_on_disk<T>(
             continue;
         }
         stats += 1;
-        if path_missing_on_disk(path_of(&item)) {
+        if missing(path_of(&item)) {
             dropped += 1;
             if dropped_examples.len() < 3 {
                 dropped_examples.push(path_of(&item).display().to_string());
@@ -6489,27 +6500,52 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 /// Metadata and display keys are snapshotted before sorting: the comparator must
 /// remain a total order even if files change or disappear during the sort.
 pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, None);
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, None, None);
 }
 
 /// Sort paths emitted by one filesystem walk without resolving every path again.
 ///
-/// Walk entries already share one resolved root and do not traverse symlinks, so
-/// lexical normalization produces the same display tie-break key. Calling
-/// `canonicalize` for every match only repeats filesystem lookups the walk just
-/// performed.
-pub(crate) fn sort_walked_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, false, None);
+/// The walker supplies the resolved root and mtimes. Missing mtimes sort last;
+/// neither they nor the root may be looked up again after the walk has stopped.
+pub(crate) fn sort_walked_paths_by_mtime_desc(
+    paths: &mut [PathBuf],
+    resolved_root: &Path,
+    mtimes: &HashMap<PathBuf, Option<SystemTime>>,
+) {
+    let display_paths = paths
+        .iter()
+        .map(|path| (path.clone(), walked_display_sort_key(resolved_root, path)))
+        .collect();
+    sort_paths_by_snapshot(paths, mtimes, &display_paths);
 }
 
-/// Indexed paths already have canonical keys and mtimes. Unindexed roots still
-/// use the disk-backed ordering, so mixed-root glob retains the same contract.
+fn walked_display_sort_key(resolved_root: &Path, path: &Path) -> String {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        resolved_root.join(path)
+    };
+    normalized_display_sort_key(
+        Some(&crate::inspect::job::normalize_path(resolved_root)),
+        &crate::inspect::job::normalize_path(&resolved),
+    )
+}
+
+/// Indexed paths have canonical keys; walked paths have snapshotted mtimes,
+/// including failed lookups. The caller has already resolved the stable root.
 pub(crate) fn sort_paths_by_cached_mtime_desc(
     paths: &mut [PathBuf],
     stable_root: &Path,
     mtimes: &HashMap<PathBuf, SystemTime>,
+    walked_mtimes: &HashMap<PathBuf, Option<SystemTime>>,
 ) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, Some(mtimes));
+    sort_paths_by_mtime_desc_with_key_normalization(
+        paths,
+        stable_root,
+        true,
+        Some(mtimes),
+        Some(walked_mtimes),
+    );
 }
 
 fn sort_paths_by_mtime_desc_with_key_normalization(
@@ -6517,17 +6553,26 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
     stable_root: &Path,
     canonicalize_paths: bool,
     cached_mtimes: Option<&HashMap<PathBuf, SystemTime>>,
+    walked_mtimes: Option<&HashMap<PathBuf, Option<SystemTime>>>,
 ) {
     use std::collections::HashMap;
-    let stable_root = crate::inspect::job::canonicalize_normalized(stable_root);
+    let stable_root = if walked_mtimes.is_some() {
+        crate::inspect::job::normalize_path(stable_root)
+    } else {
+        crate::inspect::job::canonicalize_normalized(stable_root)
+    };
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
     for path in paths.iter() {
         mtimes.entry(path.clone()).or_insert_with(|| {
-            cached_mtimes
-                .and_then(|times| times.get(path))
-                .copied()
-                .or_else(|| path_modified_time(path))
+            if let Some(time) = walked_mtimes.and_then(|times| times.get(path)) {
+                *time
+            } else {
+                cached_mtimes
+                    .and_then(|times| times.get(path))
+                    .copied()
+                    .or_else(|| path_modified_time(path))
+            }
         });
         display_paths.entry(path.clone()).or_insert_with(|| {
             let resolved = if path.is_absolute() {
@@ -6537,6 +6582,7 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
             };
             let comparison_path = if canonicalize_paths
                 && !cached_mtimes.is_some_and(|times| times.contains_key(path))
+                && !walked_mtimes.is_some_and(|times| times.contains_key(path))
             {
                 #[cfg(test)]
                 audit_record(|work| work.sort_canonicalizes += 1);
@@ -6547,6 +6593,14 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
             normalized_display_sort_key(Some(&stable_root), &comparison_path)
         });
     }
+    sort_paths_by_snapshot(paths, &mtimes, &display_paths);
+}
+
+fn sort_paths_by_snapshot(
+    paths: &mut [PathBuf],
+    mtimes: &HashMap<PathBuf, Option<SystemTime>>,
+    display_paths: &HashMap<PathBuf, String>,
+) {
     paths.sort_by(|left, right| {
         let left_mtime = mtimes.get(left).and_then(|v| *v);
         let right_mtime = mtimes.get(right).and_then(|v| *v);
@@ -13311,9 +13365,42 @@ mod tests {
 
         let mut canonicalized = paths.clone();
         sort_paths_by_mtime_desc(&mut canonicalized, dir.path());
-        sort_walked_paths_by_mtime_desc(&mut paths, dir.path());
+        let mtimes = paths
+            .iter()
+            .map(|path| (path.clone(), path_modified_time(path)))
+            .collect();
+        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        audit_work_reset();
+        sort_walked_paths_by_mtime_desc(&mut paths, &root, &mtimes);
 
         assert_eq!(paths, canonicalized);
+        assert_eq!(audit_work().sort_stats, 0);
+        assert_eq!(audit_work().sort_canonicalizes, 0);
+    }
+
+    #[test]
+    fn walked_path_sort_keeps_unknown_mtimes_last_without_filesystem_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let mut paths =
+            ["z-unknown.rs", "old.rs", "a-unknown.rs", "new.rs"].map(|name| root.join(name));
+        let mtimes = HashMap::from([
+            (root.join("old.rs"), Some(SystemTime::UNIX_EPOCH)),
+            (
+                root.join("new.rs"),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            ),
+            (root.join("z-unknown.rs"), None),
+        ]);
+        drop(dir);
+        audit_work_reset();
+        sort_walked_paths_by_mtime_desc(&mut paths, &root, &mtimes);
+        assert_eq!(
+            paths,
+            ["new.rs", "old.rs", "a-unknown.rs", "z-unknown.rs"].map(|name| root.join(name))
+        );
+        assert_eq!(audit_work().sort_stats, 0);
+        assert_eq!(audit_work().sort_canonicalizes, 0);
     }
 
     /// Manual release-mode probe for the sort paid by one fallback glob walk.
@@ -13339,12 +13426,17 @@ mod tests {
             }
         }
 
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let mtimes = paths
+            .iter()
+            .map(|path| (path.clone(), path_modified_time(path)))
+            .collect();
         let mut micros_per_operation = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let started = Instant::now();
             for _ in 0..ITERATIONS {
                 let mut sample = paths.clone();
-                sort_walked_paths_by_mtime_desc(&mut sample, temp.path());
+                sort_walked_paths_by_mtime_desc(&mut sample, &root, &mtimes);
                 std::hint::black_box(sample);
             }
             micros_per_operation.push(started.elapsed().as_micros() / ITERATIONS as u128);

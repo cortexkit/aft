@@ -169,7 +169,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits, take_present_on_disk_with_presence",
             },
         ],
     },
@@ -202,12 +202,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, fallback_glob_does_not_reopen_discovered_paths_after_a_stall, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, rendered_glob_file_count, take_present_on_disk_with_presence",
             },
         ],
     },
@@ -226,7 +226,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, slow_outline_discovery_returns_a_partial_not_read_blocked, assert_expired_outline_walk_stops, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
             },
         ],
     },
@@ -597,9 +597,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/glob.rs",
-        enclosing_item: "exact_file_glob_with_ready_index_matches_basename_without_widening_scope, exact_file_glob_fallback_matches_basename_without_widening_scope",
+        enclosing_item: "exact_file_glob_with_ready_index_matches_basename_without_widening_scope, exact_file_glob_fallback_matches_basename_without_widening_scope, slow_large_walk_returns_an_honest_partial_not_read_blocked, walk_stall_after_matches_keeps_them_and_names_the_stalled_directory",
         location_or_primitive: "test walk_truncated assertions",
-        reason: "test-only assertions on walk_truncated for indexed and fallback exact-file discovery; they do not cut a list or produce a tool response",
+        reason: "test-only assertions on walk_truncated for indexed and fallback exact-file discovery and for slow or stalled fallback walks; they do not cut a list or produce a tool response",
     },
     // Checkpoint and restore results name their first files and then say how
     // many more there are; the checkpoint itself always covers every file.

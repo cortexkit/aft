@@ -7,9 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +29,10 @@ struct Measurements {
 struct Failure {
     code: &'static str,
     message: String,
+    /// Set when a walk stalled on this path after it had already found
+    /// results. The reply keeps those results and names the path instead of
+    /// becoming an error; see `finish_response`.
+    partial: Option<PathBuf>,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -307,9 +309,42 @@ pub(crate) fn finish_response(response: Response) -> Response {
             .clone()
     });
     match error {
+        Some(Failure {
+            code,
+            message,
+            partial: Some(path),
+        }) if response.success => keep_partial_reply(response, code, &path, &message),
         Some(error) => Response::error(&response.id, error.code, error.message),
         None => response,
     }
+}
+
+/// A walk that stalled after finding results keeps them: the reply is marked
+/// incomplete, names the stalled path as a gap, and ends with the same
+/// `read_blocked` sentence an error reply would carry. `finish_response` can run
+/// more than once on one reply, so this never adds the gap or the line twice.
+fn keep_partial_reply(mut response: Response, code: &str, path: &Path, message: &str) -> Response {
+    if let Some(object) = response.data.as_object_mut() {
+        object.insert("complete".into(), serde_json::Value::Bool(false));
+        let gap = serde_json::json!({"kind": code, "path": path, "reason": message});
+        let gaps = object
+            .entry("gaps")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(gaps) = gaps.as_array_mut() {
+            if !gaps.contains(&gap) {
+                gaps.push(gap);
+            }
+        }
+        if let Some(serde_json::Value::String(text)) = object.get_mut("text") {
+            if !text.ends_with(message) {
+                if !text.is_empty() {
+                    text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+                }
+                text.push_str(message);
+            }
+        }
+    }
+    response
 }
 thread_local! {
     static CURRENT: RefCell<Option<Budget>> = const { RefCell::new(None) };
@@ -317,6 +352,8 @@ thread_local! {
     // that map per file. Its workers remember successful lookups locally.
     static DIRECTORIES: RefCell<(u64, HashMap<PathBuf, Access>)> = RefCell::new((0, HashMap::new()));
     static HELPER_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    // Set only on a walk's helper thread; see `run_walk`.
+    static WALK: RefCell<Option<Arc<WalkControl>>> = const { RefCell::new(None) };
 }
 pub(crate) struct Scope(Option<Budget>);
 impl Drop for Scope {
@@ -338,6 +375,15 @@ pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -
 pub(crate) fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
+/// The longest one filesystem call may take, and the longest a walk may go
+/// without progress before it counts as stalled.
+fn single_access_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = regression_tests::single_access_budget_override() {
+        return budget;
+    }
+    IO_BUDGET
+}
 fn deadline(at: Option<Instant>) -> Instant {
     request_deadline(at)
         .into_iter()
@@ -348,20 +394,47 @@ fn request_deadline(at: Option<Instant>) -> Option<Instant> {
         .chain(CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.deadline)))
         .min()
 }
+fn failure_message(code: &str, path: &Path, reason: &str) -> String {
+    format!("{code}: {}: {reason}", path.display())
+}
+/// The reason given when one OS call did not return in time.
+fn blocked_reason(waited: Duration) -> String {
+    let hint = if cfg!(target_os = "macos") {
+        "; on macOS, check ck-aft access in Privacy & Security, then retry"
+    } else {
+        ""
+    };
+    format!(
+        "OS access did not finish within {:.3} s{hint}",
+        waited.as_secs_f64()
+    )
+}
 fn failure(path: &Path, code: &'static str, reason: &str) -> io::Error {
-    let message = format!("{code}: {}: {reason}", path.display());
+    let message = failure_message(code, path, reason);
     if let Some(budget) = current() {
-        budget
-            .failure
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(|| Failure {
+        let mut recorded = budget.failure.lock().unwrap_or_else(|e| e.into_inner());
+        // The first failure wins, except over a stall whose results were kept:
+        // a later failure makes the whole reply an error.
+        if recorded
+            .as_ref()
+            .is_none_or(|failure| failure.partial.is_some())
+        {
+            *recorded = Some(Failure {
                 code,
                 message: message.clone(),
+                partial: None,
             });
+        }
         budget.failed.store(true, Ordering::Release);
     }
-    io::Error::new(io::ErrorKind::TimedOut, Failure { code, message })
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        Failure {
+            code,
+            message,
+            partial: None,
+        },
+    )
 }
 fn prior_failure() -> Option<io::Error> {
     CURRENT.with(|current| {
@@ -473,8 +546,8 @@ impl Drop for Permit {
         self.0.available.notify_one();
     }
 }
-/// Spawn only for boundary probes, whole walks, or reads on risky filesystems.
-/// A stuck call retains its limiter permit, never executor/root ownership.
+/// Spawn only for boundary probes or reads on risky filesystems; whole walks use
+/// `run_walk`. A stuck call retains its limiter permit, never executor/root ownership.
 pub(crate) fn run<T: Send + 'static>(
     path: &Path,
     at: Option<Instant>,
@@ -515,6 +588,35 @@ fn run_with_timeout<T: Send + 'static>(
 ) -> io::Result<T> {
     if let Some(error) = prior_failure() {
         return Err(error);
+    }
+    // A walk's helper makes its per-directory calls inline instead of taking
+    // a helper slot per directory. The request thread watches the walk's
+    // progress, so one of these calls that stops returning is still reported,
+    // under its own path.
+    if let Some(walk) = WALK.with(|walk| walk.borrow().clone()) {
+        if walk.expired() {
+            // Not a request failure: the walk stops here and reports itself
+            // truncated.
+            walk.cut.store(true, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the walk reached its deadline before this call",
+            ));
+        }
+        if let Some(probe) = &probe {
+            // This probe runs on the walk's existing helper. Publish its access
+            // phase just as a newly scheduled helper would, so shared waiters
+            // use the running call's cap rather than a stale queue deadline.
+            let started = Instant::now();
+            let deadline = request_deadline(at).map_or(started + access_budget, |at| {
+                at.min(started + access_budget)
+            });
+            probe.set_deadline(deadline, Some(started));
+        }
+        walk.reached(path);
+        let result = work(path.to_path_buf());
+        walk.step();
+        return result;
     }
     let queued = Instant::now();
     let request_deadline = request_deadline(at);
@@ -628,6 +730,384 @@ fn run_with_timeout<T: Send + 'static>(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("filesystem helper stopped"));
+            }
+        }
+    }
+}
+
+/// Reply time a walk leaves inside the request budget for the work after it
+/// (sorting, presence checks, formatting).
+const WALK_REPLY_MARGIN: Duration = Duration::from_millis(500);
+
+/// State shared by a walk's helper thread and the request thread waiting on it.
+///
+/// The request thread does not time the walk as a whole. The walker stops
+/// itself at `deadline` and reports a truncated walk. The waiting thread
+/// reports `read_blocked` only when the walk makes no progress for the stall
+/// window, which means one filesystem call inside it has not returned.
+pub(crate) struct WalkControl {
+    started: Instant,
+    deadline: Instant,
+    /// Set by the request thread when it stops waiting, so an abandoned walk
+    /// exits at its next entry and frees its helper slot.
+    stop: AtomicBool,
+    /// Set when a call inside the walk was refused because the walk's
+    /// deadline had passed; the walk did not finish.
+    cut: AtomicBool,
+    entries: AtomicUsize,
+    /// Time of the last progress, in nanoseconds after `started`.
+    progress: AtomicU64,
+    /// The path the walk last started work on, named if the walk stalls.
+    current: Mutex<PathBuf>,
+}
+impl WalkControl {
+    fn new(deadline: Instant, path: &Path) -> Self {
+        Self {
+            started: Instant::now(),
+            deadline,
+            stop: AtomicBool::new(false),
+            cut: AtomicBool::new(false),
+            entries: AtomicUsize::new(0),
+            progress: AtomicU64::new(0),
+            current: Mutex::new(path.to_path_buf()),
+        }
+    }
+    /// Records one more walked entry. Returns true when the walk must stop now:
+    /// its deadline passed or the request stopped waiting for it. The walk
+    /// then drops the entry unprocessed, so it is not counted.
+    pub(crate) fn advance(&self) -> bool {
+        if self.expired() {
+            return true;
+        }
+        self.entries.fetch_add(1, Ordering::Relaxed);
+        self.step();
+        false
+    }
+    pub(crate) fn expired(&self) -> bool {
+        self.stop.load(Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+    /// Names the path the walk is about to work on, such as a directory it is
+    /// about to open.
+    pub(crate) fn reached(&self, path: &Path) {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        current.clear();
+        current.push(path);
+        drop(current);
+        self.step();
+        #[cfg(test)]
+        regression_tests::before_walk_access(path);
+    }
+    /// Records one more entry of a directory the walk is reading or checking,
+    /// and names `path` as the call about to run. A large directory makes
+    /// many calls between `reached` updates (one per entry read, one per type
+    /// check); each returns promptly, but together they can outlast the stall
+    /// window. Counting each one as progress means only a single call that
+    /// does not return is reported as a stall. Returns true when the walk must
+    /// stop now, like `advance`.
+    pub(crate) fn entry(&self, path: &Path) -> bool {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        current.clear();
+        current.push(path);
+        drop(current);
+        self.step();
+        #[cfg(test)]
+        regression_tests::before_walk_entry(path);
+        self.expired()
+    }
+    /// Stat a discovered match as entry progress, not as another directory
+    /// access. The request can stop waiting if this one metadata call stalls.
+    pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+        if self.entry(path) {
+            self.cut.store(true, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the walk reached its deadline before metadata",
+            ));
+        }
+        let result = stat(path.to_path_buf());
+        self.step();
+        result
+    }
+    /// True when a call inside the walk was refused at the walk's deadline.
+    pub(crate) fn cut_short(&self) -> bool {
+        self.cut.load(Ordering::Relaxed)
+    }
+    pub(crate) fn entries(&self) -> usize {
+        self.entries.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    /// A control for calling a walker directly in a test, outside `run_walk`.
+    #[cfg(test)]
+    pub(crate) fn unbounded_for_test(path: &Path) -> Self {
+        Self::new(Instant::now() + Duration::from_secs(3600), path)
+    }
+    fn step(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.progress.fetch_max(elapsed, Ordering::Relaxed);
+    }
+    fn last_progress(&self) -> Instant {
+        self.started + Duration::from_nanos(self.progress.load(Ordering::Relaxed))
+    }
+}
+
+/// How a walk ended, as seen by the request thread.
+pub(crate) enum WalkEnd<T> {
+    /// The walk returned, complete or stopped at its own bounds.
+    Finished(T),
+    /// The request stopped waiting and told the walk to stop. The caller keeps
+    /// whatever the walk had already shared with it, and reports the walk
+    /// truncated. `stall` is set when one call made no progress for the stall
+    /// window.
+    Stopped {
+        stall: Option<WalkStall>,
+        entries_visited: usize,
+    },
+}
+
+enum WalkMessage<T> {
+    Started,
+    Finished(T),
+}
+
+/// One filesystem call inside a walk that stopped making progress.
+pub(crate) struct WalkStall {
+    path: PathBuf,
+    waited: Duration,
+}
+impl WalkStall {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    /// Records the stall as the request's `read_blocked` failure. With
+    /// `kept_partial`, the caller keeps results the walk found before it
+    /// stalled, and the reply stays a partial success that names the stalled
+    /// path; otherwise the reply becomes the error.
+    pub(crate) fn record(&self, kept_partial: bool) {
+        let reason = blocked_reason(self.waited);
+        if !kept_partial {
+            let _ = failure(&self.path, "read_blocked", &reason);
+            return;
+        }
+        if let Some(budget) = current() {
+            // `failed` stays clear: later calls in this request still run,
+            // and any of them that fails turns the reply into its error.
+            budget
+                .failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(|| Failure {
+                    code: "read_blocked",
+                    message: failure_message("read_blocked", &self.path, &reason),
+                    partial: Some(self.path.clone()),
+                });
+        }
+    }
+}
+
+/// Inside a walk's helper, names the path the walk is about to work on, so a
+/// stall there is reported under that path. Does nothing outside a walk.
+pub(crate) fn walk_reached(path: &Path) {
+    WALK.with(|walk| {
+        if let Some(walk) = walk.borrow().as_ref() {
+            walk.reached(path);
+        }
+    });
+}
+
+/// Inside a walk's helper, records that the walk examined one more entry,
+/// such as in a walker's entry filter, which also sees the entries the walk's
+/// own loop never receives. Without this, a directory of many filtered-out
+/// entries would look like one call making no progress. It does not rename
+/// the walk's current path: the filter runs between the walker's own calls.
+///
+/// Returns true once the walk must stop: its deadline passed or the request
+/// stopped waiting for it. The walk is then marked cut short, so it reports
+/// itself truncated. A filter must then keep the entry, not drop it. Dropping
+/// an entry does not stop the walker: it goes on reading every remaining entry
+/// of each directory it has open, and opening each remaining sibling
+/// directory, only to drop them too, while the walk holds its helper slot.
+/// The kept entry instead reaches the walk's own loop, whose
+/// `WalkControl::advance` sees the same expiry and ends the walk before
+/// processing that entry. Every walker whose filter calls this must check
+/// `advance` first for each entry it receives.
+///
+/// Outside a walk it does nothing and returns false.
+pub(crate) fn walk_entry_must_stop(_path: &Path) -> bool {
+    WALK.with(|walk| {
+        let walk = walk.borrow();
+        let Some(walk) = walk.as_ref() else {
+            return false;
+        };
+        walk.step();
+        #[cfg(test)]
+        regression_tests::before_walk_entry(_path);
+        if walk.expired() {
+            walk.cut.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    })
+}
+
+/// Runs a whole directory walk on a helper thread.
+///
+/// The walk is bounded at its iterator: `work` must call
+/// `WalkControl::advance` for each entry and stop when it returns true. Its
+/// deadline is `deadline`, moved earlier only to leave reply time inside the
+/// request budget, never cut to the single-call limit. The request thread
+/// waits until the walk returns, until the request budget runs out, or until
+/// the walk makes no progress for the stall window. A walk that is slow but
+/// still moving is never reported as blocked.
+///
+/// `Err` means the walk did not run (no helper slot or the deadline already
+/// passed); that failure is already recorded on the request.
+pub(crate) fn run_walk<T: Send + 'static>(
+    path: &Path,
+    deadline: Instant,
+    work: impl FnOnce(PathBuf, &WalkControl) -> T + Send + 'static,
+) -> io::Result<WalkEnd<T>> {
+    run_walk_with_limiter(path, deadline, Arc::clone(&HELPERS), work)
+}
+
+/// The walk's own deadline and the time the request thread stops waiting.
+fn walk_deadlines(requested: Instant) -> (Instant, Instant) {
+    let now = Instant::now();
+    let window = single_access_budget();
+    let request = CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.deadline));
+    let walk = match request {
+        Some(request) => {
+            let margin = WALK_REPLY_MARGIN.min(request.saturating_duration_since(now) / 2);
+            requested.min(request.checked_sub(margin).unwrap_or(request))
+        }
+        None => requested,
+    };
+    let wait = request.map_or(walk + window, |request| request.min(walk + window));
+    (walk, wait)
+}
+
+fn run_walk_with_limiter<T: Send + 'static>(
+    path: &Path,
+    deadline: Instant,
+    limiter: Arc<Limiter>,
+    work: impl FnOnce(PathBuf, &WalkControl) -> T + Send + 'static,
+) -> io::Result<WalkEnd<T>> {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    // A walk started from inside another walk shares the outer walk's bounds.
+    if let Some(outer) = WALK.with(|walk| walk.borrow().clone()) {
+        return Ok(WalkEnd::Finished(work(path.to_path_buf(), &outer)));
+    }
+    let (walk_deadline, wait_deadline) = walk_deadlines(deadline);
+    if Instant::now() >= walk_deadline {
+        return Err(failure(
+            path,
+            "read_deadline_exceeded",
+            "filesystem deadline elapsed before this call started",
+        ));
+    }
+    let Some(permit) = limiter.acquire(walk_deadline) else {
+        return Err(failure(path, "read_io_queue_timeout", "no filesystem helper slot became available before the deadline; this call did not start"));
+    };
+    let control = Arc::new(WalkControl::new(walk_deadline, path));
+    let owned = path.to_path_buf();
+    let budget = current();
+    let confinement = crate::context::confinement::capture();
+    #[cfg(test)]
+    if let Some(counts) = budget.as_ref().map(|b| Arc::clone(&b.measurements)) {
+        counts.round_trips.fetch_add(1, Ordering::Relaxed);
+        counts.spawns.fetch_add(1, Ordering::Relaxed);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let running = Arc::new(Mutex::new(false));
+    let helper_running = Arc::clone(&running);
+    let helper_control = Arc::clone(&control);
+    std::thread::Builder::new()
+        .name("aft-filesystem-walk".into())
+        .spawn(move || {
+            #[cfg(test)]
+            regression_tests::before_helper(&owned);
+            // Publish helper start and its first progress together. A waiter
+            // must never charge scheduling delay against the stall window.
+            let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
+            if helper_control.expired() {
+                return;
+            }
+            helper_control.step();
+            *running = true;
+            drop(running);
+            let _ = tx.send(WalkMessage::Started);
+            WALK.with(|walk| *walk.borrow_mut() = Some(Arc::clone(&helper_control)));
+            let result = crate::context::confinement::inherit(confinement, || {
+                with_budget(budget, || work(owned, &helper_control))
+            });
+            WALK.with(|walk| *walk.borrow_mut() = None);
+            // The walk is done with the filesystem: free its slot before the
+            // reply, so the next request can take it as soon as this one ends.
+            drop(permit);
+            let _ = tx.send(WalkMessage::Finished(result));
+        })?;
+    let window = single_access_budget();
+    loop {
+        let wake = if *running.lock().unwrap_or_else(|e| e.into_inner()) {
+            wait_deadline.min(control.last_progress() + window)
+        } else {
+            walk_deadline
+        };
+        match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+            Ok(WalkMessage::Started) => continue,
+            Ok(WalkMessage::Finished(result)) => return Ok(WalkEnd::Finished(result)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                control.stop.store(true, Ordering::Relaxed);
+                if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
+                    return Err(failure(
+                        path,
+                        "read_io_queue_timeout",
+                        "filesystem helper did not start before the deadline; this call did not start",
+                    ));
+                }
+                return Err(io::Error::other("filesystem helper stopped"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                let running = running.lock().unwrap_or_else(|e| e.into_inner());
+                if !*running {
+                    // Not yet scheduled: a scheduling delay is not a stall.
+                    if now >= walk_deadline {
+                        control.stop.store(true, Ordering::Relaxed);
+                        return Err(failure(
+                            path,
+                            "read_io_queue_timeout",
+                            "filesystem helper did not start before the deadline; this call did not start",
+                        ));
+                    }
+                    continue;
+                }
+                drop(running);
+                let last = control.last_progress();
+                let waited = now.saturating_duration_since(last);
+                // Request expiry alone does not mean an OS call stalled for
+                // the single-access window; return an ordinary walk partial.
+                let stalled = waited >= window;
+                if stalled || now >= wait_deadline {
+                    control.stop.store(true, Ordering::Relaxed);
+                    let stall = stalled.then(|| WalkStall {
+                        path: control
+                            .current
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone(),
+                        waited,
+                    });
+                    return Ok(WalkEnd::Stopped {
+                        stall,
+                        entries_visited: control.entries(),
+                    });
+                }
             }
         }
     }
@@ -841,12 +1321,12 @@ fn probe_target(path: &Path) -> io::Result<()> {
     {
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() {
-            run(path, None, std::fs::metadata)?
+            run(path, None, stat)?
         } else {
             metadata
         }
     } else {
-        match run(path, None, std::fs::metadata) {
+        match run(path, None, stat) {
             Ok(metadata) => metadata,
             Err(error) => {
                 if error.raw_os_error() == Some(1) {
@@ -910,6 +1390,12 @@ fn local_filesystem(_: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// One `stat` that follows symlinks, as a single bounded access.
+fn stat(path: PathBuf) -> io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    regression_tests::before_stat(&path);
+    std::fs::metadata(path)
+}
 pub(crate) fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
     if Instant::now() >= deadline(at) {
         return Err(failure(
@@ -1011,12 +1497,17 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
             return Ok(metadata);
         }
     }
-    run_traversal(path, std::fs::metadata)
+    run_traversal(path, stat)
 }
 
 #[cfg(test)]
 #[path = "bounded_io_tests.rs"]
 mod regression_tests;
+#[cfg(test)]
+pub(crate) use regression_tests::{
+    block_stat, expire_walk_after_entries, many_entry_tree, run_walk_in_own_slot, slow_walk,
+    slow_walk_entries, stall_walk_at, stall_walk_entry, with_single_access_budget,
+};
 #[cfg(all(test, unix))]
 pub(crate) use regression_tests::{stall_helper, stall_running_helper};
 #[cfg(all(test, unix))]

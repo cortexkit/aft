@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Fallback directory walks run under the request budget and snapshot each match's mtime and the resolved filter root before returning, so partial-result ordering needs no filesystem access after the walk. Complete walks keep mtime-descending order with the same display-path tie-break; indexed search ranking and routing are unchanged. Real-query rows must remain byte-identical."
+}

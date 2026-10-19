@@ -18,6 +18,7 @@ use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResoluti
 struct GlobDiscovery {
     files: Vec<PathBuf>,
     indexed_mtimes: HashMap<PathBuf, SystemTime>,
+    walked_mtimes: HashMap<PathBuf, Option<SystemTime>>,
     walk_truncated: bool,
     source: &'static str,
     entries_visited: usize,
@@ -104,6 +105,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let total_started = Instant::now();
     let mut parent_gaps = Vec::new();
     let mut indexed_mtimes = HashMap::new();
+    let mut walked_mtimes = HashMap::new();
     let ignored_targets = search_roots
         .iter()
         .map(|root| {
@@ -160,6 +162,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .map(|_| req.session()),
         );
         indexed_mtimes = discovery.indexed_mtimes;
+        walked_mtimes = discovery.walked_mtimes;
         (
             discovery.files,
             discovery.walk_truncated,
@@ -201,6 +204,12 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "mixed/fallback"
         };
         for discovery in &discoveries {
+            walked_mtimes.extend(
+                discovery
+                    .walked_mtimes
+                    .iter()
+                    .map(|(path, time)| (path.clone(), *time)),
+            );
             indexed_mtimes.extend(
                 discovery
                     .indexed_mtimes
@@ -208,7 +217,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .map(|(path, time)| (path.clone(), *time)),
             );
         }
-        let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
+        let files = merge_glob_files(
+            discoveries.into_iter().flat_map(|d| d.files).collect(),
+            &walked_mtimes,
+        );
         (
             files,
             walk_truncated,
@@ -230,16 +242,18 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     // Glob's public contract is newest-first. Sort before truncating so the cap
     // keeps the most recently modified matches instead of the lexically first.
-    sort_paths_by_cached_mtime_desc(&mut files, &project_root, &indexed_mtimes);
+    sort_paths_by_cached_mtime_desc(&mut files, &project_root, &indexed_mtimes, &walked_mtimes);
     // Backstop against a stale index (for example a borrowed snapshot that
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
-    // from the following matches, so present files keep their order.
-    let presence = crate::search_index::take_present_on_disk(
+    // from the following matches, so present files keep their order. Walked
+    // paths were just observed; checking them again could stall after discovery.
+    let presence = crate::search_index::take_present_on_disk_with_presence(
         files,
         DEFAULT_MAX_RESULTS,
         |path| path.as_path(),
         "glob",
+        |path| !walked_mtimes.contains_key(path) && crate::search_index::path_missing_on_disk(path),
     );
     let missing_on_disk = presence.dropped;
     let presence_budget_exhausted = presence.budget_exhausted;
@@ -386,6 +400,7 @@ fn glob_root(
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
+            walked_mtimes: HashMap::new(),
             walk_truncated: false,
             source: "task-output",
             entries_visited,
@@ -426,6 +441,7 @@ fn glob_root(
             entries_visited,
             files,
             indexed_mtimes,
+            walked_mtimes: HashMap::new(),
             walk_truncated: false,
             source: "index",
             walk_time: Duration::ZERO,
@@ -464,6 +480,7 @@ fn glob_root(
                     return GlobDiscovery {
                         files: outcome.files,
                         indexed_mtimes: HashMap::new(),
+                        walked_mtimes: outcome.walked_mtimes,
                         walk_truncated: outcome.walk_truncated,
                         source: "fallback",
                         entries_visited: outcome.entries_visited,
@@ -503,11 +520,19 @@ pub(crate) fn glob_root_files_for_test(
     (discovery.files, discovery.source, discovery.entries_visited)
 }
 
-fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
+fn merge_glob_files(
+    files: Vec<PathBuf>,
+    walked_mtimes: &HashMap<PathBuf, Option<SystemTime>>,
+) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for file in files {
-        if seen.insert(canonical_key(&file)) {
+        let key = if walked_mtimes.contains_key(&file) {
+            crate::inspect::job::normalize_path(&file)
+        } else {
+            crate::inspect::job::normalize_path(&canonical_key(&file))
+        };
+        if seen.insert(key) {
             deduped.push(file);
         }
     }
@@ -538,6 +563,7 @@ fn fallback_glob(
     GlobDiscovery {
         files: outcome.files,
         indexed_mtimes: HashMap::new(),
+        walked_mtimes: outcome.walked_mtimes,
         walk_truncated: outcome.walk_truncated,
         source: "fallback",
         entries_visited: outcome.entries_visited,
@@ -856,6 +882,232 @@ mod tests {
             text,
             "1 file matching **/*.rs\n\nsrc/a.rs\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)"
         );
+    }
+
+    /// A project and, outside it, a tree laid out like a crate registry, so a
+    /// glob of the tree takes the filesystem walk rather than the index.
+    fn registry_fixture(crates: usize) -> (tempfile::TempDir, AppContext, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let project = base.join("project");
+        let registry = base.join("registry");
+        std::fs::create_dir_all(&project).unwrap();
+        for index in 0..crates {
+            let source = registry.join(format!("crate-{index:03}/src"));
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("lib.rs"), "pub fn lib() {}\n").unwrap();
+            std::fs::write(source.parent().unwrap().join("Cargo.toml"), "[package]\n").unwrap();
+        }
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project),
+                ..Default::default()
+            },
+        );
+        (dir, ctx, registry)
+    }
+
+    fn glob_request(path: &Path, pattern: &str) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "registry-glob", "command": "glob", "path": path, "pattern": pattern
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn slow_large_walk_returns_an_honest_partial_not_read_blocked() {
+        let (_dir, ctx, registry) = registry_fixture(120);
+        // Each directory the walk enters takes 15 ms, so the whole tree needs
+        // about 3.6 s: longer than this request's budget allows.
+        let _slow = crate::bounded_io::slow_walk(&registry, Duration::from_millis(15));
+        let request = glob_request(&registry, "**/lib.rs");
+        let budget = crate::bounded_io::Budget::after(Duration::from_millis(1500));
+        let started = Instant::now();
+        let response = crate::bounded_io::with_budget(Some(budget), || handle_glob(&request, &ctx));
+        let elapsed = started.elapsed();
+        let body = &response.data;
+        assert!(response.success, "{body}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        assert_eq!(body["walk_truncated"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        let found = body["files"].as_array().unwrap().len();
+        assert!(found > 0 && found < 120, "a partial list: {body}");
+        let envelope = &body["files_list_envelope"];
+        assert!(
+            envelope.to_string().contains("\"walk\""),
+            "the list says the walk stopped it: {envelope}"
+        );
+        let text = body.to_string();
+        assert!(!text.contains("read_blocked"), "{text}");
+        assert!(!text.contains("Privacy"), "{text}");
+    }
+
+    #[test]
+    fn walk_stall_after_matches_keeps_them_and_names_the_stalled_directory() {
+        let (_dir, ctx, registry) = registry_fixture(6);
+        // Each crate is two directories (the crate and its src). The fifth
+        // directory the walk enters, the third crate, never answers; the two
+        // crates walked before it hold one match each.
+        let mut stall = crate::bounded_io::stall_walk_at(&registry, 5);
+        let request = glob_request(&registry, "**/lib.rs");
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(200), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(20))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        let stalled = stall.blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        stall.release();
+        let body = &response.data;
+        assert!(response.success, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        assert_eq!(body["walk_truncated"], true, "{body}");
+        assert_eq!(body["files"].as_array().unwrap().len(), 2, "{body}");
+        assert!(
+            body["files_list_envelope"].to_string().contains("\"walk\""),
+            "{body}"
+        );
+        let gaps = body["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "{body}");
+        assert_eq!(gaps[0]["kind"], "read_blocked");
+        assert_eq!(gaps[0]["path"], serde_json::json!(stalled));
+        let line = gaps[0]["reason"].as_str().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "read_blocked: {}: OS access did not finish within ",
+                stalled.display()
+            )),
+            "{line}"
+        );
+        assert!(
+            body["text"].as_str().unwrap().ends_with(line),
+            "the stall is the text's last line: {body}"
+        );
+        assert_eq!(
+            line.contains("Privacy & Security"),
+            cfg!(target_os = "macos"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn fallback_glob_does_not_reopen_discovered_paths_after_a_stall() {
+        let (_dir, ctx, registry) = registry_fixture(1);
+        let file = registry.join("crate-000/src/lib.rs");
+        let mut stall = crate::bounded_io::stall_walk_entry(&file);
+        let request = glob_request(&file, "*.rs");
+        crate::search_index::audit_work_reset();
+        let started = Instant::now();
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(100), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(2))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        let elapsed = started.elapsed();
+        stall.blocked.recv_timeout(Duration::from_secs(1)).unwrap();
+        stall.release();
+        let body = &response.data;
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert!(response.success, "{body}");
+        assert_eq!(body["files"], serde_json::json!([file]), "{body}");
+        assert_eq!(body["walk_truncated"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        let work = crate::search_index::audit_work();
+        assert_eq!(work.sort_stats, 0, "{work:?}");
+        assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
+        assert_eq!(work.presence_checks, 0, "{work:?}");
+    }
+
+    #[test]
+    fn walk_stall_before_any_match_is_the_read_blocked_error() {
+        let (_dir, ctx, registry) = registry_fixture(3);
+        let mut stall = crate::bounded_io::stall_walk_at(&registry, 1);
+        let request = glob_request(&registry, "**/lib.rs");
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(200), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(20))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        let stalled = stall.blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        stall.release();
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "read_blocked");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(&format!(
+                "read_blocked: {}: OS access did not finish within ",
+                stalled.display()
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn many_filtered_entries_in_one_directory_are_progress_not_a_stall() {
+        let (_dir, ctx, registry) = registry_fixture(1);
+        let junk = registry.join("junk");
+        std::fs::create_dir(&junk).unwrap();
+        // macOS resource-fork companions: the walker's entry filter drops
+        // every one, so none of them reaches the walk's own loop.
+        for index in 0..40 {
+            std::fs::write(junk.join(format!("._resource_{index:02}")), "").unwrap();
+        }
+        // 40 entries at 15 ms each is 0.6 s inside one directory, three times
+        // the stall window, while every check returns.
+        let _slow = crate::bounded_io::slow_walk_entries(&junk, Duration::from_millis(15));
+        let request = glob_request(&registry, "**/lib.rs");
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(200), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(20))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        let body = &response.data;
+        assert!(response.success, "{body}");
+        assert_ne!(body["complete"], false, "{body}");
+        assert_eq!(body["files"].as_array().map(Vec::len), Some(1), "{body}");
+        assert!(!body.to_string().contains("read_blocked"), "{body}");
+    }
+
+    #[test]
+    fn stalled_single_stat_is_read_blocked_with_hint_naming_its_path() {
+        let (_dir, ctx, registry) = registry_fixture(1);
+        let target = registry.join("crate-000");
+        let block = crate::bounded_io::block_stat(&target);
+        let request = glob_request(&target, "**/lib.rs");
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(200), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(20))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        block
+            .reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the stat must have started");
+        drop(block);
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "read_blocked");
+        let message = response.data["message"].as_str().unwrap();
+        let hint = if cfg!(target_os = "macos") {
+            "; on macOS, check ck-aft access in Privacy & Security, then retry"
+        } else {
+            ""
+        };
+        let prefix = format!(
+            "read_blocked: {}: OS access did not finish within ",
+            target.display()
+        );
+        assert!(message.starts_with(&prefix), "{message}");
+        assert!(message.ends_with(&format!(" s{hint}")), "{message}");
     }
 }
 
