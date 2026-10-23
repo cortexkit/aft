@@ -2943,6 +2943,7 @@ pub enum SemanticRefreshEvent {
     },
     Completed {
         added_entries: Vec<EmbeddingEntry>,
+        refused_rows: std::collections::BTreeMap<PathBuf, usize>,
         updated_metadata: Vec<(PathBuf, FileFreshness)>,
         completed_paths: Vec<PathBuf>,
     },

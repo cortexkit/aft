@@ -1812,6 +1812,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
             }
             SemanticRefreshEvent::Completed {
                 mut added_entries,
+                mut refused_rows,
                 mut updated_metadata,
                 mut completed_paths,
             } => {
@@ -1838,6 +1839,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 added_entries.retain(|entry| !stale.contains(entry.file()));
                 updated_metadata.retain(|(path, _)| !stale.contains(path));
                 completed_paths.retain(|path| !stale.contains(path));
+                refused_rows.retain(|path, _| completed_paths.contains(path));
                 // Rows are only installed together with the freshness record of
                 // their file. A row without one (a file deleted while its batch
                 // was in flight) would be unreachable by every later freshness
@@ -1852,6 +1854,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     .as_mut()
                 {
                     index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
+                    index.apply_refused_rows_update(refused_rows);
                 }
                 mark_semantic_refresh_success(ctx, &completed_paths);
                 view_refresh_completed = true;
@@ -7622,6 +7625,7 @@ mod tests {
         );
         event_tx
             .send(SemanticRefreshEvent::Completed {
+                refused_rows: Default::default(),
                 added_entries: update.added_entries,
                 updated_metadata: update.updated_metadata,
                 completed_paths: update.completed_paths,
@@ -7767,6 +7771,7 @@ mod tests {
         );
         event_tx
             .send(SemanticRefreshEvent::Completed {
+                refused_rows: Default::default(),
                 added_entries: update.added_entries,
                 updated_metadata: update.updated_metadata,
                 completed_paths: update.completed_paths,
@@ -7845,6 +7850,7 @@ mod tests {
                 }
             } else {
                 SemanticRefreshEvent::Completed {
+                    refused_rows: Default::default(),
                     added_entries: first.added_entries,
                     updated_metadata: first.updated_metadata,
                     completed_paths: first.completed_paths,
@@ -7873,6 +7879,7 @@ mod tests {
             .unwrap();
         event_tx
             .send(SemanticRefreshEvent::Completed {
+                refused_rows: Default::default(),
                 added_entries: second.added_entries,
                 updated_metadata: second.updated_metadata,
                 completed_paths: second.completed_paths,

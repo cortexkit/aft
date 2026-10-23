@@ -192,6 +192,9 @@ impl AppContext {
                                     "refreshing_count": refreshing_count,
                                     "entries": idx.entry_count(),
                                     "dimension": idx.dimension(),
+                                    "skipped_rows": idx.skipped_rows(),
+                                    "refused_rows_summary": idx.refused_rows_summary(),
+                                    "skipped_row_reason": if idx.skipped_rows() > 0 { Some(idx.skipped_row_reason()) } else { None },
                                     "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
                                     "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
                                 })

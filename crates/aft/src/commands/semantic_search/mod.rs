@@ -1950,6 +1950,11 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
+        if let Ok(index) = ctx.semantic_index().try_read() {
+            if let Some(index) = index.as_ref() {
+                disclose_skipped_semantic_rows(data, index);
+            }
+        }
         // Runtime readiness means the resident index can be queried, not that
         // this query covered the checkout. Do not contradict its named gaps
         // with a later, generic `semantic: ready` footer.
@@ -1982,6 +1987,33 @@ impl SearchLaneStatus {
             serde_json::json!(self.omitted_lanes()),
         );
         data.insert("enrichment".to_string(), callgraph_enrichment_json(ctx));
+    }
+}
+
+fn disclose_skipped_semantic_rows(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    index: &SemanticIndex,
+) {
+    let Some(summary) = index.refused_rows_summary() else {
+        return;
+    };
+    append_reply_paragraph(data, &summary);
+    data.insert("complete".to_string(), serde_json::json!(false));
+    data.insert("status".to_string(), serde_json::json!("partial"));
+    data.insert("semantic_status".to_string(), serde_json::json!("partial"));
+    let gap = data
+        .entry("semantic_gap")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(gap) = gap.as_object_mut() {
+        gap.insert(
+            "skipped_rows".to_string(),
+            serde_json::json!(index.skipped_rows()),
+        );
+        gap.insert(
+            "reason".to_string(),
+            serde_json::json!(index.skipped_row_reason()),
+        );
+        gap.insert("summary".to_string(), serde_json::json!(summary));
     }
 }
 
@@ -3283,7 +3315,7 @@ fn handle_external_semantic_or_hybrid_search(
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
 
-    search_response(
+    let mut response = search_response(
         req,
         SearchResponseParts {
             query: &params.query,
@@ -3308,7 +3340,11 @@ fn handle_external_semantic_or_hybrid_search(
             warnings,
             extras,
         },
-    )
+    );
+    if let (Some(data), Some(index)) = (response.data.as_object_mut(), semantic_index) {
+        disclose_skipped_semantic_rows(data, index);
+    }
+    response
 }
 
 fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex) -> bool {
@@ -8704,6 +8740,44 @@ mod tests {
             refreshing: Vec::new(),
             accounting: Default::default(),
         };
+    }
+
+    #[test]
+    fn skipped_semantic_rows_disclose_partial_coverage_without_ready_footer() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("healthy.rs"),
+            "pub fn healthy_value() {}\n",
+        )
+        .unwrap();
+        let ctx = test_context(root.path());
+        install_ready_semantic_lane(&ctx, root.path());
+        install_ready_search_index(&ctx, root.path());
+        ctx.semantic_index()
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .apply_refused_rows_update(std::collections::BTreeMap::from([(
+                root.path().join("poison.rs"),
+                1,
+            )]));
+        let response = response_value(handle_semantic_search(
+            &semantic_request("healthy_.*", 10),
+            &ctx,
+        ));
+        assert_eq!(response["complete"], false, "{response}");
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["semantic_gap"]["skipped_rows"], 1);
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "semantic coverage is partial: 1 skipped row; provider refused the input"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("poison.rs"), "{text}");
+        assert!(!text.contains("semantic: ready"), "{text}");
     }
 
     fn install_ready_search_index(ctx: &AppContext, project_root: &Path) {

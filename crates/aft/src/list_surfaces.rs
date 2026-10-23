@@ -307,6 +307,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "semantic_index.rs",
+        enclosing_item: "refused_rows_summary",
+        location_or_primitive: ".take(5)",
+        reason: "Diagnostic preview of refused-input paths; skipped rows and omitted file counts are disclosed alongside the first five paths.",
+    },
+    ExclusionEntry {
         file: "bash_permissions/scan.rs",
         enclosing_item: "top_level_directory_targets, MAX_CWD_PATHS, insert",
         location_or_primitive: "MAX_CWD_PATHS",

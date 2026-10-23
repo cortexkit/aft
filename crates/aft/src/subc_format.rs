@@ -4138,6 +4138,12 @@ fn format_status(data: &Value) -> String {
         if let Some(model) = model {
             s = format!("{s} [{model}]");
         }
+        if let Some(summary) = data
+            .pointer("/semantic_index/refused_rows_summary")
+            .and_then(Value::as_str)
+        {
+            s = format!("{s}; {summary}");
+        }
         s
     };
     let callgraph = data
@@ -4391,6 +4397,16 @@ mod move_format_tests {
 mod status_memory_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn status_text_reports_skipped_semantic_coverage() {
+        let summary =
+            "semantic coverage is partial: 1 skipped row; provider refused the input: poison.rs";
+        let text = format_status(&serde_json::json!({"semantic_index": {
+            "status": "ready", "model": "example", "skipped_rows": 1, "refused_rows_summary": summary
+        }}));
+        assert!(text.contains(summary), "{text}");
+    }
 
     #[test]
     fn status_text_renders_compact_memory_block() {

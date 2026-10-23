@@ -207,7 +207,7 @@ def semantic_bin_metrics(path: Path) -> JsonObject:
     data = path.read_bytes()
     version_raw, offset = _take(data, 0, 1)
     version = version_raw[0]
-    if version != 7:
+    if version not in (7, 8):
         raise ValueError(f"unsupported semantic.bin version {version}")
     dimension, offset = _u32(data, offset)
     rows, offset = _u32(data, offset)
@@ -239,6 +239,12 @@ def semantic_bin_metrics(path: Path) -> JsonObject:
         max_embed_chars = max(max_embed_chars, embed_chars)
         _, offset = _take(data, offset, dimension * 4)
 
+    if version >= 8:
+        _, offset = _take(data, offset, 8)  # total skipped rows
+        refused_files, offset = _u32(data, offset)
+        for _ in range(refused_files):
+            offset = _skip_string(data, offset)
+            _, offset = _take(data, offset, 8)  # refused rows in this file
     if offset != len(data):
         raise ValueError(f"semantic.bin trailing bytes: {len(data) - offset}")
     return {

@@ -5744,6 +5744,7 @@ mod watcher_filter_tests {
 
             event_tx
                 .send(SemanticRefreshEvent::Completed {
+                    refused_rows: Default::default(),
                     added_entries: Vec::new(),
                     updated_metadata: Vec::new(),
                     completed_paths: vec![files[BREAKER_TRIP_THRESHOLD - 1].clone()],
