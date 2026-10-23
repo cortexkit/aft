@@ -4279,7 +4279,7 @@ fn search_candidate_file(
         Ok(content) => content,
         Err(error) => {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
-                floor_disclosure.record_source_exclusion(&file.path);
+                floor_disclosure.record_matched_source_exclusion(&file.path);
             }
             if error.kind() == std::io::ErrorKind::TimedOut {
                 deadline.reached.store(true, Ordering::Relaxed);

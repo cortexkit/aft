@@ -256,7 +256,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         match ctx.validate_read_path(&req.id, req.session(), &path) {
             Ok(_) => admitted_files.push(path),
             Err(response) if response.data["code"] == "denied_floor" => {
-                crate::context::confinement::capture().record_floor(&path);
+                crate::context::confinement::capture().record_matched_floor(&path);
             }
             Err(response) => return response,
         }

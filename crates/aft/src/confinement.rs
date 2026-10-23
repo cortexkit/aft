@@ -16,6 +16,7 @@ thread_local! {
             requests: Vec::new(),
             gate: None,
             floor_omissions: None,
+            floor_filter_root: None,
         })
     };
     #[cfg(test)]
@@ -30,6 +31,7 @@ pub(crate) struct Fence {
     requests: Vec<String>,
     gate: Option<Arc<ReadGate>>,
     floor_omissions: Option<Arc<parking_lot::Mutex<FloorOmissions>>>,
+    floor_filter_root: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -41,6 +43,7 @@ struct FloorOmissions {
 impl PartialEq for Fence {
     fn eq(&self, other: &Self) -> bool {
         self.requests == other.requests
+            && self.floor_filter_root == other.floor_filter_root
             && match (&self.floor_omissions, &other.floor_omissions) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
@@ -64,15 +67,26 @@ impl std::fmt::Debug for Fence {
 }
 
 impl Fence {
+    pub(crate) fn for_floor_filter_root(mut self, root: &Path) -> Self {
+        self.floor_filter_root = Some(root.to_path_buf());
+        self
+    }
+
+    /// The caller already matched this candidate with its discovery filters.
+    pub(crate) fn record_matched_floor(&self, path: &Path) {
+        if let Some(omissions) = &self.floor_omissions {
+            omissions.lock().paths.insert(path.to_path_buf());
+        }
+    }
+
     pub(crate) fn record_floor(&self, path: &Path) {
         if let Some(omissions) = &self.floor_omissions {
             let is_dir = path.is_dir();
             let mut omissions = omissions.lock();
             if is_dir
-                || omissions
-                    .filter
-                    .as_ref()
-                    .is_none_or(|(root, filter)| filter.matches(root, path))
+                || omissions.filter.as_ref().is_none_or(|(root, filter)| {
+                    filter.matches(self.floor_filter_root.as_deref().unwrap_or(root), path)
+                })
             {
                 omissions.paths.insert(path.to_path_buf());
             }
@@ -85,6 +99,15 @@ impl Fence {
                 || crate::db::file_identity::is_live_sqlite_file(path))
         {
             self.record_floor(path);
+        }
+    }
+
+    pub(crate) fn record_matched_source_exclusion(&self, path: &Path) {
+        if self.floor_omissions.is_some()
+            && (crate::project_content::storage_root_for_path(path).is_some()
+                || crate::db::file_identity::is_live_sqlite_file(path))
+        {
+            self.record_matched_floor(path);
         }
     }
 
