@@ -796,6 +796,7 @@ pub(crate) fn retry_lane_pause_while<T>(
     mut attempt: impl FnMut() -> Result<T, String>,
     current: &mut impl FnMut() -> bool,
 ) -> Result<T, String> {
+    let _refusal_run = EmbeddingRefusalRunScope::new();
     let _prepared = PreparedPauseJobScope::new();
     let may_wait = LANE_PAUSE_RETRY_POLICY.with(|policy| policy.borrow().is_some())
         && crate::executor::current_job_cancellation().is_none()
@@ -1486,8 +1487,9 @@ const ROW_TOO_LONG_MARKER_SUFFIX: &str = "]";
 const MAX_ROW_SHRINK_ATTEMPTS: usize = 4;
 const PROVIDER_REFUSAL_MARKER: &str = "[provider-refused-input]";
 pub(crate) const PROVIDER_REFUSAL_REASON: &str = "provider refused the input";
-// Stop at one half of the original batch: widespread refusals usually mean
-// a bad model or request configuration, not a handful of unembeddable rows.
+// A few refused rows must not poison a short request. Only widespread refusals
+// across a whole build or refresh indicate a bad model or request configuration.
+const MIN_REFUSED_ROWS_BEFORE_ABORT: usize = 8;
 const MAX_REFUSED_ROWS_DENOMINATOR: usize = 2;
 const ROW_SHRINK_RATIO_MARGIN: f64 = 0.9;
 const BUILD_PER_ITEM_EMA_ALPHA: f64 = 0.25;
@@ -1505,6 +1507,59 @@ struct BuildEmbeddingRowMetadata {
 struct AdaptiveBuildRow {
     metadata: BuildEmbeddingRowMetadata,
     vector: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EmbeddingRefusalRun {
+    attempted: usize,
+    refused: usize,
+}
+
+thread_local! {
+    static EMBEDDING_REFUSAL_RUN: RefCell<Option<EmbeddingRefusalRun>> = const { RefCell::new(None) };
+}
+
+/// Nested batch and retry helpers join the caller's run instead of resetting
+/// its allowance. The outermost scope clears it before another job can start.
+pub(crate) struct EmbeddingRefusalRunScope {
+    owns_run: bool,
+    same_thread: std::marker::PhantomData<Rc<()>>,
+}
+
+impl EmbeddingRefusalRunScope {
+    pub(crate) fn new() -> Self {
+        let owns_run = EMBEDDING_REFUSAL_RUN.with(|run| {
+            let mut run = run.borrow_mut();
+            if run.is_some() {
+                false
+            } else {
+                *run = Some(EmbeddingRefusalRun::default());
+                true
+            }
+        });
+        Self {
+            owns_run,
+            same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for EmbeddingRefusalRunScope {
+    fn drop(&mut self) {
+        if self.owns_run {
+            EMBEDDING_REFUSAL_RUN.with(|run| run.borrow_mut().take());
+        }
+    }
+}
+
+fn provider_refusal_limit_exceeded() -> bool {
+    EMBEDDING_REFUSAL_RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let run = run.as_mut().expect("embedding refusal run scope");
+        run.refused = run.refused.saturating_add(1);
+        run.refused > MIN_REFUSED_ROWS_BEFORE_ABORT
+            && run.refused > run.attempted / MAX_REFUSED_ROWS_DENOMINATOR
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3343,9 +3398,8 @@ impl SemanticEmbeddingModel {
         texts: Vec<String>,
         policy: Option<EmbeddingRequestPolicy>,
     ) -> Result<Vec<AdaptiveBuildRow>, String> {
-        let max_refused = texts.len() / MAX_REFUSED_ROWS_DENOMINATOR;
         let max_depth = texts.len().max(1).next_power_of_two().ilog2();
-        self.embed_rows_resilient_inner(texts, policy, max_depth, max_refused, &mut 0)
+        self.embed_rows_resilient_inner(texts, policy, max_depth)
     }
 
     fn embed_rows_resilient_inner(
@@ -3353,8 +3407,6 @@ impl SemanticEmbeddingModel {
         texts: Vec<String>,
         policy: Option<EmbeddingRequestPolicy>,
         remaining_depth: u32,
-        max_refused: usize,
-        refused: &mut usize,
     ) -> Result<Vec<AdaptiveBuildRow>, String> {
         let request_policy = policy.unwrap_or_else(|| {
             EmbeddingRequestPolicy::Build(self.build_request_budget(texts.len()))
@@ -3379,6 +3431,11 @@ impl SemanticEmbeddingModel {
             }
             Err(error) => {
                 if error.starts_with(PROVIDER_REFUSAL_MARKER) {
+                    if policy.is_some() {
+                        return Err(error
+                            .trim_start_matches(PROVIDER_REFUSAL_MARKER)
+                            .to_string());
+                    }
                     if texts.len() > 1 {
                         if remaining_depth == 0 {
                             return Err(error
@@ -3390,20 +3447,15 @@ impl SemanticEmbeddingModel {
                             texts[..midpoint].to_vec(),
                             policy,
                             remaining_depth - 1,
-                            max_refused,
-                            refused,
                         )?;
                         rows.extend(self.embed_rows_resilient_inner(
                             texts[midpoint..].to_vec(),
                             policy,
                             remaining_depth - 1,
-                            max_refused,
-                            refused,
                         )?);
                         return Ok(rows);
                     }
-                    *refused += 1;
-                    if *refused > max_refused {
+                    if provider_refusal_limit_exceeded() {
                         return Err(error
                             .trim_start_matches(PROVIDER_REFUSAL_MARKER)
                             .to_string());
@@ -3430,15 +3482,11 @@ impl SemanticEmbeddingModel {
                         texts[..right].to_vec(),
                         policy,
                         remaining_depth.saturating_sub(1),
-                        max_refused,
-                        refused,
                     )?;
                     let mut right_rows = self.embed_rows_resilient_inner(
                         texts[right..].to_vec(),
                         policy,
                         remaining_depth.saturating_sub(1),
-                        max_refused,
-                        refused,
                     )?;
                     left_rows.append(&mut right_rows);
                     return Ok(left_rows);
@@ -3496,6 +3544,7 @@ impl SemanticEmbeddingModel {
         clear_http_build_metadata();
         let mut rows = Vec::with_capacity(texts.len());
         let mut cursor = 0usize;
+        let mut attempted_until = 0usize;
 
         while cursor < texts.len() {
             let batch_size = self
@@ -3503,6 +3552,16 @@ impl SemanticEmbeddingModel {
                 .max(1)
                 .min(texts.len() - cursor);
             let batch = texts[cursor..cursor + batch_size].to_vec();
+            // Count input rows once, not each bisection probe or a timeout's
+            // smaller retry over rows already sent in the original request.
+            EMBEDDING_REFUSAL_RUN.with(|run| {
+                let mut run = run.borrow_mut();
+                let run = run.as_mut().expect("embedding refusal run scope");
+                run.attempted = run
+                    .attempted
+                    .saturating_add((cursor + batch_size).saturating_sub(attempted_until));
+            });
+            attempted_until = attempted_until.max(cursor + batch_size);
             let started = Instant::now();
             match self.embed_http_batch_overflow_resilient(batch) {
                 Ok(mut batch_rows) => {
@@ -3588,7 +3647,18 @@ impl SemanticEmbeddingModel {
 
     pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         if self.uses_http_embedding_backend() {
-            self.embed_build_http_adaptive(texts)
+            let _refusal_run = EmbeddingRefusalRunScope::new();
+            let checkpoint = EMBEDDING_REFUSAL_RUN.with(|run| *run.borrow());
+            let result = self.embed_build_http_adaptive(texts);
+            if result
+                .as_ref()
+                .is_err_and(|error| crate::synapse_embed::LanePause::from_error(error).is_some())
+            {
+                // The caller retains only completed outer batches on pause.
+                // Reattempting this batch must not count its discarded work twice.
+                EMBEDDING_REFUSAL_RUN.with(|run| *run.borrow_mut() = checkpoint);
+            }
+            result
         } else {
             let budget = self.build_request_budget(texts.len());
             self.embed_texts(texts, EmbeddingRequestPolicy::Build(budget))
@@ -6555,6 +6625,7 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        let _refusal_run = EmbeddingRefusalRunScope::new();
         let total_chunks = chunks.len();
         progress(0, total_chunks);
 
@@ -6704,6 +6775,7 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         C: FnMut() -> bool,
     {
+        let _refusal_run = EmbeddingRefusalRunScope::new();
         debug_assert!(project_root.is_absolute());
         let total_chunks = chunks.len();
         crate::cold_build_limiter::progress::phase("embedding", Some(file_metadata.len()));
@@ -11196,6 +11268,7 @@ pub(crate) fn embed_view_files_with_rows<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
+    let _refusal_run = EmbeddingRefusalRunScope::new();
     let resume = prepared_pause_job()
         .and_then(|job| job.borrow_mut().view.take())
         .filter(|state| {
@@ -17527,6 +17600,15 @@ public class Greeter {
         chunks: Vec<SemanticChunk>,
         model: &mut SemanticEmbeddingModel,
     ) -> Result<SemanticIndex, String> {
+        build_chunks_with_model_and_batch(root, chunks, model, 64)
+    }
+
+    fn build_chunks_with_model_and_batch(
+        root: &Path,
+        chunks: Vec<SemanticChunk>,
+        model: &mut SemanticEmbeddingModel,
+        max_batch_size: usize,
+    ) -> Result<SemanticIndex, String> {
         let file_metadata = chunks
             .iter()
             .map(|chunk| {
@@ -17549,7 +17631,7 @@ public class Greeter {
             chunks,
             file_metadata,
             &mut embed,
-            64,
+            max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
             &mut should_continue,
             elapsed_started,
@@ -17853,6 +17935,137 @@ public class Greeter {
     }
 
     #[test]
+    fn refused_singleton_refresh_completes_and_records_file() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("only.rs");
+        fs::write(&file, "pub fn healthy() {}\n").unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let mut index = SemanticIndex::build(
+            root.path(),
+            &[file.clone()],
+            &mut |texts| model.embed(texts),
+            64,
+        )
+        .unwrap();
+        assert_eq!(index.entry_count(), 1);
+        fs::write(&file, "pub fn AFT_POISON() {}\n").unwrap();
+        let chunks = collect_file_chunks(root.path(), &file).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].embed_text.contains("AFT_POISON"));
+        let summary = index
+            .refresh_stale_files(
+                root.path(),
+                &[file.clone()],
+                &mut |texts| model.embed(texts),
+                64,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(summary.changed, 1);
+        assert_eq!((index.entry_count(), index.skipped_rows()), (0, 1));
+        assert_eq!(
+            index.skipped_rows.refused,
+            BTreeMap::from([(file.clone(), 1)])
+        );
+        let requests = server.requests().len();
+        assert!(index
+            .refresh_stale_files(
+                root.path(),
+                &[file],
+                &mut |texts| model.embed(texts),
+                64,
+                &mut |_, _| {}
+            )
+            .unwrap()
+            .is_noop());
+        assert_eq!(server.requests().len(), requests);
+    }
+
+    #[test]
+    fn refused_singleton_last_build_batch_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut model =
+            SemanticEmbeddingModel::from_config(&overflow_http_config(&server)).unwrap();
+        let chunks = (0..65)
+            .map(|i| {
+                overflow_test_chunk(
+                    root.path(),
+                    i,
+                    if i == 64 {
+                        "AFT_POISON".into()
+                    } else {
+                        format!("healthy {i}")
+                    },
+                )
+            })
+            .collect();
+        let index = build_chunks_with_model(root.path(), chunks, &mut model).unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (64, 1));
+        assert_eq!(
+            server.requests().last().unwrap(),
+            &["AFT_POISON".to_string()]
+        );
+    }
+
+    #[test]
+    fn refused_singleton_batches_use_run_totals_and_reset_between_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut config = overflow_http_config(&server);
+        config.max_batch_size = 1;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let chunks = (0..41)
+            .map(|i| {
+                overflow_test_chunk(
+                    root.path(),
+                    i,
+                    if i >= 32 {
+                        "AFT_POISON".into()
+                    } else {
+                        format!("healthy {i}")
+                    },
+                )
+            })
+            .collect();
+        let index = build_chunks_with_model_and_batch(root.path(), chunks, &mut model, 1).unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (32, 9));
+
+        let before = server.requests().len();
+        let chunks = (0..16)
+            .map(|i| overflow_test_chunk(root.path(), i, "AFT_POISON".into()))
+            .collect();
+        let error =
+            build_chunks_with_model_and_batch(root.path(), chunks, &mut model, 1).unwrap_err();
+        assert!(error.contains("HTTP 400 Bad Request"), "{error}");
+        assert_eq!(server.requests().len() - before, 9);
+
+        let index = build_chunks_with_model_and_batch(
+            root.path(),
+            vec![overflow_test_chunk(root.path(), 0, "AFT_POISON".into())],
+            &mut model,
+            1,
+        )
+        .unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (0, 1));
+        EMBEDDING_REFUSAL_RUN.with(|run| assert!(run.borrow().is_none()));
+    }
+
+    #[test]
+    fn refused_adaptive_singletons_abort_at_the_run_floor() {
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut config = overflow_http_config(&server);
+        config.max_batch_size = 1;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let error = model.embed(vec!["AFT_POISON".into(); 16]).unwrap_err();
+        assert!(error.contains("HTTP 400 Bad Request"), "{error}");
+        assert_eq!(server.requests().len(), 9);
+        assert!(server.requests().iter().all(|rows| rows.len() == 1));
+    }
+
+    #[test]
     fn refused_rows_saved_index_is_reused_without_restart() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -17933,7 +18146,7 @@ public class Greeter {
     }
 
     #[test]
-    fn unknown_4xx_still_aborts_semantic_build() {
+    fn unknown_4xx_aborts_after_run_refusal_floor() {
         let root = tempfile::tempdir().expect("project root");
         let server = OverflowEmbeddingServer::rejecting_all(r#"{"error":"model not found"}"#);
         let config = overflow_http_config(&server);
@@ -17947,7 +18160,7 @@ public class Greeter {
             ),
         );
 
-        let error = build_chunks_with_model(root.path(), vec![chunk], &mut model).unwrap_err();
+        let error = build_chunks_with_model(root.path(), vec![chunk; 16], &mut model).unwrap_err();
 
         assert!(error.contains("HTTP 400 Bad Request"), "{error}");
         assert!(error.contains("model not found"), "{error}");

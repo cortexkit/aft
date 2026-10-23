@@ -1754,6 +1754,7 @@ fn catch_up_with_preparation_limiter<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
+    let _refusal_run = crate::semantic_index::EmbeddingRefusalRunScope::new();
     let mut progress = false;
     let mut telemetry = None;
     loop {

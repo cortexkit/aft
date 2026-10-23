@@ -769,6 +769,7 @@ impl SemanticPlane {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        let _refusal_run = crate::semantic_index::EmbeddingRefusalRunScope::new();
         let setup_started = Instant::now();
         let access = ViewAccess::Owner(owner.clone());
         if owner.registry().storage() != self.storage {
