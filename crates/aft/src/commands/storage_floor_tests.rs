@@ -785,3 +785,59 @@ fn storage_floor_external_grep_reports_search_root_relative_includes() {
     assert!(has_floor_skip(&response, &alias), "{response:?}");
     assert_eq!(response.data["complete"], false);
 }
+
+#[test]
+fn storage_floor_zoom_single_target_refuses_but_two_target_batch_continues() {
+    let f = Fixture::new();
+    let ordinary = f._root.path().join("allowed.rs");
+    let protected = f.store.with_file_name("secret.rs");
+    std::fs::write(&ordinary, "pub fn allowed() {}\n").unwrap();
+    std::fs::write(&protected, "pub fn secret() {}\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let mut command = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(f._root.path()));
+        let output = command.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut config = (*f.ctx.config()).clone();
+    config.revision_reads = true;
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    for reference in [None, Some("HEAD")] {
+        let mut params = json!({"targets": [{"file": protected, "symbols": "secret"}]});
+        if let Some(reference) = reference {
+            params["ref"] = json!(reference);
+        }
+        let single = super::zoom::handle_zoom(&request("zoom", params.clone()), &ctx);
+        assert!(!single.success, "ref={reference:?}: {single:?}");
+        assert_eq!(single.data["code"], "denied_floor");
+        params["targets"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"file": ordinary, "symbols": "allowed"}));
+        let batch = super::zoom::handle_zoom(&request("zoom", params), &ctx);
+        assert!(batch.success, "ref={reference:?}: {batch:?}");
+        assert_eq!(batch.data["targets"][0]["response"]["code"], "denied_floor");
+        assert_eq!(
+            batch.data["targets"][1]["response"]["success"], true,
+            "{batch:?}"
+        );
+    }
+}

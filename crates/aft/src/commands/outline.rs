@@ -145,7 +145,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let mut body = serde_json::json!({
             "text": rendered.text,
             "discovered": true,
-            "complete": skipped_files.is_empty() && !walk_incomplete && !rendered.truncated && !rendered.cut_short,
+            "complete": !skipped_files.iter().any(|file| file.reason == "denied_floor") && !walk_incomplete && !rendered.truncated && !rendered.cut_short,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -1747,7 +1747,6 @@ fn handle_outline_files_mode(
             && skipped_foreign_mounts == 0
             && skipped_files.is_empty()
             && unknown_lines.is_empty(),
-        "skipped_files": skipped_files,
         "line_count_gaps": unknown_lines,
         "entries_examined": entries_examined,
         "walk_truncated": walk_truncated,
@@ -1757,6 +1756,9 @@ fn handle_outline_files_mode(
         "unchecked_files": unchecked_files,
         "rollup_count": rollup_count,
     });
+    if !skipped_files.is_empty() {
+        response_data["skipped_files"] = serde_json::json!(skipped_files);
+    }
     if let Some(env) = envelope {
         response_data["files_list_envelope"] = serde_json::to_value(&env).unwrap();
     }

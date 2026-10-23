@@ -485,7 +485,10 @@ fn handle_zoom_targets(
                             // An access ask must reach the host unchanged so it
                             // can ask and retry; inside one batch entry nobody
                             // would see it.
-                            if crate::access_policy::is_access_request(&response) {
+                            // One explicit file also keeps its direct floor refusal.
+                            if crate::access_policy::is_access_request(&response)
+                                || (targets.len() == 1 && response.data["code"] == "denied_floor")
+                            {
                                 return response;
                             }
                             entries.push(serde_json::json!({
@@ -496,7 +499,9 @@ fn handle_zoom_targets(
                         }
                     }
                     Err(response) => {
-                        if crate::access_policy::is_access_request(&response) {
+                        if crate::access_policy::is_access_request(&response)
+                            || (targets.len() == 1 && response.data["code"] == "denied_floor")
+                        {
                             return response;
                         }
                         // Keep outside-root historical authorization failures
