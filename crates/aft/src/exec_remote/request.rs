@@ -11,6 +11,10 @@ pub struct PresetParams {
     pub weight_hint: Option<u32>,
     pub queue_wait_limit_s: Option<u64>,
     pub network: Option<super::types::Network>,
+    /// Files the runner copies back after the command, relative to `cwd`.
+    /// Non-empty only for a runner that advertises chunked return.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_paths: Vec<String>,
 }
 
 /// Frozen worker catalog routing and confinement fields; never tool arguments.
@@ -166,5 +170,22 @@ pub fn build_request(
     if let Some(seconds) = preset.queue_wait_limit_s {
         request = request.with_queue_wait_limit_s(seconds);
     }
+    if !preset.return_paths.is_empty() {
+        // Always name the cap rather than rely on the runner's default, so
+        // the limit the result reports is the one the runner applied.
+        request = request
+            .with_return_paths(preset.return_paths.clone())
+            .with_return_chunked(true)
+            .with_return_max_bytes(return_max_bytes());
+    }
     Ok(request)
+}
+
+/// Most bytes one job may copy back across all its `return_paths`: 10 MiB,
+/// and never more than the chunked-return capability allows.
+pub const RETURN_TOTAL_CAP_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The `return_max_bytes` every request with `return_paths` sends.
+pub fn return_max_bytes() -> u64 {
+    RETURN_TOTAL_CAP_BYTES.min(super::types::RETURN_CHUNKED_MAX_BYTES_CAP)
 }

@@ -4467,6 +4467,7 @@ mod grant_path_tests {
             requested_platform: None,
             requested_vcpus: None,
             requested_network: false,
+            return_paths: Vec::new(),
             connection_file: REMOTE_RUNON_CONNECTION
                 .lock()
                 .unwrap()
@@ -4594,7 +4595,23 @@ mod grant_path_tests {
         Arc<Executor>,
         Arc<AppContext>,
     ) {
-        let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
+        capture_fixture_with_claims(script, &["exec-remote/v1"]).await
+    }
+
+    /// [`capture_fixture`] with a runner that advertises `claims`.
+    #[cfg(unix)]
+    async fn capture_fixture_with_claims(
+        script: crate::exec_remote::wire_tests::Script,
+        claims: &[&str],
+    ) -> (
+        crate::exec_remote::wire_tests::Daemon,
+        tempfile::TempDir,
+        ProjectRootId,
+        Arc<Executor>,
+        Arc<AppContext>,
+    ) {
+        let daemon =
+            crate::exec_remote::wire_tests::daemon_with_capabilities(script, claims, 1).await;
         let (dir, root) = super::super::test_support::test_root("runon-capture");
         assert!(std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -5499,6 +5516,80 @@ mod grant_path_tests {
             .drain_completions_for_session(Some("deadline-session"))
             .iter()
             .any(|completion| completion.task_id == task_id));
+    }
+
+    /// A background runon with return_paths still replies at registration with
+    /// its task id; the requested files are copied back when the job ends and
+    /// its completion lists them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_runon_with_return_paths_replies_at_once_and_copies_back_at_completion() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, dir, root, executor, ctx) = capture_fixture_with_claims(
+            Script::GatedReturnVector("failed-missing"),
+            &["exec-remote/v1", "exec-remote-return/v2"],
+        )
+        .await;
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"make dist", "runon":"linux", "background":true, "timeout":600_000,
+                   "return_paths":["dist/hello.txt", "dist/absent.txt"]}),
+        );
+        daemon.wait_for_requests("exec.run", 1).await;
+        let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("background launch must answer before the runner accepts")
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap().to_owned();
+        assert_eq!(response.data["status"], "starting", "{response:?}");
+        let hello = dir.path().join("dist/hello.txt");
+        assert!(
+            !hello.exists(),
+            "nothing is copied back before the job ends"
+        );
+        let run = daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, body)| body["method"] == "exec.run")
+            .map(|(_, body)| body["params"].clone())
+            .unwrap();
+        assert_eq!(
+            run["return_paths"],
+            json!(["dist/hello.txt", "dist/absent.txt"])
+        );
+        assert_eq!(run["return_chunked"], true);
+
+        daemon.acceptance_gate.notify_one();
+        wait_for_task_state(&ctx, "completed", |registry| {
+            registry.is_task_terminal(&task_id)
+        })
+        .await;
+        wait_for_task_state(&ctx, "completion queued", |registry| {
+            registry.has_completions_for_session(Some("deadline-session"))
+        })
+        .await;
+        let completion = ctx
+            .bash_background()
+            .drain_completions_for_session(Some("deadline-session"))
+            .into_iter()
+            .find(|completion| completion.task_id == task_id)
+            .expect("the task's completion must reach the caller");
+        assert_eq!(std::fs::read(&hello).unwrap(), b"hello");
+        assert!(!dir.path().join("dist/absent.txt").exists());
+        assert!(
+            completion.output_preview.contains(
+                "Files requested back from the server (return_paths):\n  \
+                 dist/hello.txt: returned (5 bytes)\n  \
+                 dist/absent.txt: not returned (no such file on the server)"
+            ),
+            "{}",
+            completion.output_preview
+        );
     }
 
     /// A runner refusal after the early launch reply still reaches the caller

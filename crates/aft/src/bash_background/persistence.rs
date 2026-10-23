@@ -307,6 +307,12 @@ impl PinnedDir {
         &self.path
     }
 
+    /// The pinned directory's open handle, for `*at` calls relative to it.
+    #[cfg(unix)]
+    pub(crate) fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+
     fn modified(&self) -> io::Result<SystemTime> {
         #[cfg(test)]
         work_counts::record_stat();

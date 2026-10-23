@@ -3427,8 +3427,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "7356f39e4f1a5d671a61eb6e0980907615f67d0627e1868438983452a6bf2b58",
-      "catalog_digest": "7356f39e4f1a5d671a61eb6e0980907615f67d0627e1868438983452a6bf2b58",
+      "generation": "9a46f76484b448f5d2c267c4c84c66f8e7bc0c294dd615f7c7782886785cdb85",
+      "catalog_digest": "9a46f76484b448f5d2c267c4c84c66f8e7bc0c294dd615f7c7782886785cdb85",
       "tools": [
         {
           "name": "status",
@@ -3448,7 +3448,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
           "semantics": 2,
           "modes": [
             "classic",
@@ -3523,6 +3523,14 @@
               "runon": {
                 "type": "string",
                 "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
+              },
+              "return_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
@@ -4658,8 +4666,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "e11d20ee7161cb404fa6e462d67184efe8d7fb2f43e663ae852631f5aebe402b",
-      "catalog_digest": "e11d20ee7161cb404fa6e462d67184efe8d7fb2f43e663ae852631f5aebe402b",
+      "generation": "d63753d78b32085b9c71c125de5acc4ec13fc478409a3800ef4ac6b1106572b8",
+      "catalog_digest": "d63753d78b32085b9c71c125de5acc4ec13fc478409a3800ef4ac6b1106572b8",
       "tools": [
         {
           "name": "status",
@@ -4679,7 +4687,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
           "semantics": 2,
           "modes": [
             "classic",
@@ -4754,6 +4762,14 @@
               "runon": {
                 "type": "string",
                 "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
+              },
+              "return_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [

@@ -551,6 +551,10 @@ pub(crate) struct RemoteLaunch {
     pub session: String,
     pub requested_vcpus: Option<u32>,
     pub requested_network: bool,
+    /// Files to copy back after the command, relative to its workdir. Set
+    /// only for an explicit `runon` call that passed `return_paths`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub return_paths: Vec<String>,
 }
 
 /// Decide where a bash call that set `runon` runs, before anything is spawned.

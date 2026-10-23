@@ -1800,6 +1800,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                     requested_platform: None,
                     requested_vcpus: None,
                     requested_network: false,
+                    return_paths: Vec::new(),
                 },
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 "cargo test",

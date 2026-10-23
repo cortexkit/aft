@@ -1,5 +1,6 @@
 import {
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
   type BridgeRequestOptions,
@@ -536,7 +537,10 @@ export function createBashTool(
   // config (and not turned off by the project), decided once here; runner
   // health never adds or removes it.
   const remoteRuns = () => remoteRunsOffered(ctx.config);
-  const runonArg = { runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION) };
+  const runonArg = {
+    runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION),
+    return_paths: z.array(z.string()).max(64).optional().describe(BASH_RETURN_PATHS_DESCRIPTION),
+  };
   const args = {
     command: z
       .string()
@@ -683,6 +687,9 @@ export function createBashTool(
       // the engine refuses a remote run it cannot make by name, and a stale
       // `runon` must never quietly become a local run.
       const runon = args.runon;
+      // Forwarded like `runon`: the engine refuses it without `runon`, and
+      // a host fallback must not run the command and drop the request.
+      const returnPaths = args.return_paths;
       if (runon !== undefined && !remoteRunsOffered(ctx.config)) {
         throw new Error(
           "runon refused: remote execution or bash.runon_enabled is unavailable in this session",
@@ -733,6 +740,7 @@ export function createBashTool(
             wait: requestedWait,
             sandbox: args.sandbox,
             ...(runon !== undefined ? { runon } : {}),
+            ...(returnPaths !== undefined ? { return_paths: returnPaths } : {}),
           },
           callBashBridge,
           {
@@ -765,6 +773,13 @@ export function createBashTool(
         }
         if (runon !== undefined) {
           throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
+        }
+        if (returnPaths !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "return_paths",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
         }
         if (!bashCfg.host_fallback) throw error;
 

@@ -70,8 +70,13 @@ fn retry_waited_ms(remote: &RemoteTask) -> Option<u64> {
 /// The refusal text for a remote job. When the runner refused it for waiting
 /// behind this session's own earlier job in the same workspace, say so and
 /// name that job and its task instead of quoting the runner's queue report.
+/// When no runner that would take the job can copy files back, say that
+/// instead of suggesting a retry, which ck-motor refuses the same way.
 fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTask) -> String {
     let message = match &remote.workspace_holder {
+        _ if return_paths_unsupported(reason, detail) => {
+            RETURN_PATHS_UNSUPPORTED_MESSAGE.to_string()
+        }
         Some(holder) if reason == "queue_wait_exceeded" => format!(
             "runon refused: your earlier job {} in this workspace is still running (task {}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {} to end (bash_status shows it), then retry",
             holder.job_id, holder.task_id, holder.task_id
@@ -85,6 +90,19 @@ fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTas
         Some(job_id) => format!("{message}; remote job {job_id}"),
         None => message,
     }
+}
+
+/// ck-motor's final refusal of a job with `return_paths` whose runner (any
+/// Windows runner, or an older Linux one) does not copy files back: refused
+/// before start as `request_rejected` with exactly this detail. It decides
+/// this from the runner's Hello before sending the run, and an unchanged
+/// retry gets the same answer.
+const RETURN_PATHS_UNSUPPORTED_DETAIL: &str = "return_paths_unsupported";
+
+const RETURN_PATHS_UNSUPPORTED_MESSAGE: &str = "runon refused: return_paths is not supported on the runner that would take this job; the command was not run; an unchanged retry is refused the same way";
+
+fn return_paths_unsupported(reason: &str, detail: Option<&str>) -> bool {
+    reason == "request_rejected" && detail == Some(RETURN_PATHS_UNSUPPORTED_DETAIL)
 }
 
 /// The job IDs a `queue_wait_exceeded` refusal detail names as running, when
@@ -756,6 +774,26 @@ pub(crate) struct RemoteTask {
     /// waited behind an earlier job of this same session in the same workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_holder: Option<WorkspaceHolder>,
+    /// Files the caller asked the runner to copy back, relative to the
+    /// task's workdir (`return_paths`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_paths: Vec<String>,
+    /// The outcome for each of `return_paths`, saved once the runner's
+    /// manifest was handled or the job ended without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_files: Option<Vec<super::return_files::ReturnedPath>>,
+    /// The seq of the job's first returned-file chunk. A restart before the
+    /// manifest attaches again from here, because the staged bytes did not
+    /// survive the restart but the runner still replays them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_first_seq: Option<u64>,
+    /// Staging files and directories created for the returned files and
+    /// not yet placed or removed. A restart removes them from here.
+    #[serde(
+        default,
+        skip_serializing_if = "super::return_files::StagingRecord::is_empty"
+    )]
+    pub return_staging: super::return_files::StagingRecord,
 }
 
 /// This session's earlier remote job that still held the workspace when the
@@ -884,9 +922,19 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
 #[cfg(unix)]
 impl RemoteTask {
     fn point(&self) -> Option<ResumePoint> {
+        // Returned files are staged only in memory and private files that a
+        // restart discards, so resume before their first chunk until the
+        // manifest has been handled. This holds during gap recovery too: the
+        // saved terminal proof stays with the resume point, and the records
+        // buffered above the gap stay pending, while the chunks before the
+        // gap are fetched again.
+        let last_seq = match (self.return_first_seq, &self.returned_files) {
+            (Some(first), None) => self.last_seq.min(first.checked_sub(1)),
+            _ => self.last_seq,
+        };
         Some(ResumePoint {
             job_id: self.job_id?,
-            last_seq: self.last_seq,
+            last_seq,
             gap_recovery: self.gap_recovery.clone(),
         })
     }
@@ -970,6 +1018,12 @@ struct TaskSink {
     /// land another metadata write in that window.
     #[cfg(test)]
     before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
+    /// Stages the job's returned-file chunks until the runner's manifest
+    /// arrives, then places the files that verify.
+    returns: Option<super::return_files::ReturnReceiver>,
+    /// A handled manifest's report whose save failed, saved when the
+    /// consumer delivers the manifest again.
+    unsaved_return_report: Option<Vec<super::return_files::ReturnedPath>>,
 }
 
 /// Longest time the saved output cursor of a running remote task may lag the
@@ -992,14 +1046,43 @@ const PROGRESS_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 impl TaskSink {
     fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> io::Result<Self> {
-        let remote = task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?
-            .metadata
-            .remote
-            .clone()
-            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        let (remote, workdir, project_root) = {
+            let state = task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
+            (
+                state
+                    .metadata
+                    .remote
+                    .clone()
+                    .ok_or_else(|| io::Error::other("remote record absent"))?,
+                state.metadata.workdir.clone(),
+                state.metadata.project_root.clone(),
+            )
+        };
+        // Staged bytes do not survive a restart: remove the files an earlier
+        // AFT process staged, from the places it recorded. A restart before
+        // the manifest attaches again from the first chunk to stage afresh.
+        super::return_files::remove_recorded_staging(&remote.return_staging, &task.task_id);
+        let returns = if !remote.return_paths.is_empty() && remote.returned_files.is_none() {
+            Some(super::return_files::ReturnReceiver::new(
+                remote.return_paths.clone(),
+                exec::return_max_bytes(),
+                &workdir,
+                project_root.as_deref().unwrap_or(&workdir),
+                worktree_root_containing(&workdir).ok().flatten().as_deref(),
+                // Staged bytes live in the task's private control folder,
+                // which sandboxed commands cannot write.
+                resolve_task_layout(&task.paths.session_dir, &task.task_id)?
+                    .dirs
+                    .control
+                    .clone(),
+                &task.task_id,
+            )?)
+        } else {
+            None
+        };
         let stdout = open_task_artifact_for_remote(&task, TaskArtifact::Stdout)?;
         let stderr = open_task_artifact_for_remote(&task, TaskArtifact::Stderr)?;
         // Discard bytes beyond the saved checkpoint, but never extend a short
@@ -1050,6 +1133,8 @@ impl TaskSink {
             progress_clock: None,
             #[cfg(test)]
             before_checkpoint_write: None,
+            returns,
+            unsaved_return_report: None,
         };
         let losses: Vec<_> = [
             (RemoteOutputStream::Stdout, stdout_len, remote.stdout_len),
@@ -1103,6 +1188,9 @@ impl TaskSink {
                 state.metadata = previous;
                 return Err(error);
             }
+        }
+        if !remote.return_staging.is_empty() {
+            sink.commit(|r| r.return_staging = Default::default())?;
         }
         Ok(sink)
     }
@@ -1377,7 +1465,13 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 #[cfg(unix)]
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
+        // A resubmitted job returns its files afresh.
+        if let Some(returns) = self.returns.as_mut() {
+            returns.reset();
+        }
         self.commit(|r| {
+            r.return_first_seq = None;
+            r.return_staging = Default::default();
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
@@ -1485,10 +1579,66 @@ impl OutputSink for TaskSink {
         }
         self.progress(seq, None, offset + bytes.len() as u64)
     }
+    fn return_chunk(&mut self, chunk: &ReturnChunk) -> io::Result<()> {
+        let Some(mut returns) = self.returns.take() else {
+            return self.unknown_output(chunk.seq, &[]);
+        };
+        if !returns.received_chunk() {
+            // Saved before the cursor can pass the chunk, so a restart knows
+            // where to attach to receive the files again.
+            let seq = chunk.seq;
+            if let Err(error) = self.commit(|r| r.return_first_seq = Some(seq)) {
+                self.returns = Some(returns);
+                return Err(error);
+            }
+        }
+        returns.chunk(chunk, &mut |staging| self.record_staging(staging));
+        self.returns = Some(returns);
+        let unknown_len = self.output_progress.unknown_len;
+        self.progress(chunk.seq, None, unknown_len)
+    }
+    fn return_manifest(&mut self, manifest: &ReturnManifest) -> io::Result<()> {
+        let report = match self.unsaved_return_report.take() {
+            Some(report) => report,
+            None => match self.returns.take() {
+                Some(mut returns) => {
+                    returns.manifest(manifest, &mut |staging| self.record_staging(staging))
+                }
+                None => return self.unknown_output(manifest.seq, &[]),
+            },
+        };
+        let seq = manifest.seq;
+        let saved = report.clone();
+        let result = self.commit(|r| {
+            r.returned_files = Some(report);
+            // Every staging file was placed or removed with the report.
+            r.return_staging = Default::default();
+            r.last_seq = Some(seq);
+        });
+        if result.is_err() {
+            // The files are already placed. The consumer delivers this
+            // manifest again, and the same report is saved then.
+            self.unsaved_return_report = Some(saved);
+        }
+        result
+    }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
         #[cfg(test)]
         let clock = tests::task_draining_clock(&self.task);
+        // A job that ran but sent no manifest returned nothing. A refusal
+        // before start may be retried, so it leaves the request open.
+        let unreported = (!matches!(verdict, Verdict::RunLocally { .. }))
+            .then(|| {
+                self.returns
+                    .take()
+                    .map(|mut returns| returns.without_manifest())
+            })
+            .flatten();
         self.commit(|r| {
+            if let Some(report) = unreported {
+                r.returned_files = Some(report);
+                r.return_staging = Default::default();
+            }
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
             r.gap_recovery = None;
@@ -1511,6 +1661,16 @@ impl OutputSink for TaskSink {
 
 #[cfg(unix)]
 impl TaskSink {
+    /// Save staging files and directories in the task record before the
+    /// receiver creates them.
+    fn record_staging(&mut self, staging: &super::return_files::StagingRecord) -> io::Result<()> {
+        let staging = staging.clone();
+        self.commit(|r| {
+            r.return_staging.files.extend(staging.files);
+            r.return_staging.dirs.extend(staging.dirs);
+        })
+    }
+
     fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
         self.dirty
             .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
@@ -1722,6 +1882,10 @@ impl BgTaskRegistry {
             retry: None,
             output_incomplete: None,
             workspace_holder: None,
+            return_paths: launch.return_paths.clone(),
+            returned_files: None,
+            return_first_seq: None,
+            return_staging: Default::default(),
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -1835,6 +1999,7 @@ impl BgTaskRegistry {
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
                     network: launch.requested_network.then_some(Network::Outbound),
+                    return_paths: launch.return_paths,
                     ..Default::default()
                 },
             )
@@ -2546,8 +2711,12 @@ impl BgTaskRegistry {
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let metadata = state.metadata.clone();
         // Automatic prefix routing may fall back; an explicit remote demand
-        // must fail before any local launch state or process is created.
-        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon) {
+        // must fail before any local launch state or process is created. A
+        // refusal of return_paths is final too: running the command here
+        // would not copy back the files it was asked for.
+        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon)
+            || return_paths_unsupported(reason, refusal_detail)
+        {
             drop(state);
             drop(db);
             return self.refuse_remote_executor(task, reason, refusal_detail);
@@ -2581,6 +2750,15 @@ impl BgTaskRegistry {
             "ran locally on {}: remote refused: {reason}",
             local_os_name()
         ));
+        if metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| !remote.return_paths.is_empty())
+        {
+            let note = state.metadata.execution_note.as_mut().unwrap();
+            note.push('\n');
+            note.push_str(super::return_files::LOCAL_RUN_NOTE);
+        }
         if let Some(changes) = metadata
             .remote
             .as_ref()
@@ -2658,7 +2836,7 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         // Decide before even restoring a local launch plan: this also covers
         // a refusal persisted just before the previous AFT process stopped.
-        if remote.explicit_runon {
+        if remote.explicit_runon || return_paths_unsupported(reason, refusal_detail) {
             return self.refuse_remote_executor(task, reason, refusal_detail);
         }
         let restore = (|| {
@@ -3117,18 +3295,46 @@ fn append_output_loss(metadata: &mut PersistedTask) {
 pub(crate) fn remote_report(
     metadata: &crate::bash_background::persistence::PersistedTask,
 ) -> Option<String> {
-    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    let remote = metadata.remote.as_ref()?;
+    let terminal = remote.terminal.as_ref()?;
     if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
         || terminal.ran == Some(Ran::None)
     {
         return None;
     }
-    render_terminal_report(terminal)
+    let returned_files = remote.returned_files.as_deref().unwrap_or_default();
+    // A file that was copied back is not also listed as left on the server.
+    // ck-motor reports `workspace_changes` relative to the checkout root with
+    // `/` separators on every platform. On Linux the list comes from `git
+    // status --porcelain -z --untracked-files=all` (renames as their
+    // destination, untracked files included); on Windows it lists every
+    // changed file inside the checkout, git-ignored ones too. Both name a
+    // returned file by its checkout-relative path, so the same filter applies.
+    let copied_back: Vec<&str> = returned_files
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                super::return_files::ReturnOutcome::Returned { .. }
+            )
+        })
+        .filter_map(|entry| entry.checkout_path.as_deref())
+        .collect();
+    let returned =
+        (!returned_files.is_empty()).then(|| super::return_files::render_report(returned_files));
+    match (returned, render_terminal_report(terminal, &copied_back)) {
+        (Some(returned), Some(report)) => Some(format!("{returned}\n{report}")),
+        (returned, report) => returned.or(report),
+    }
 }
 
-/// [`remote_report`] for one terminal record.
+/// [`remote_report`] for one terminal record. `copied_back` names files,
+/// relative to the checkout as the runner reports them, that were copied back
+/// to this machine; they are left out of the changed-files list. The
+/// untracked-files list is printed as sent: ck-motor does not send it, and
+/// the contract does not state its path base.
 #[cfg(unix)]
-fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
+fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Option<String> {
     // Paths come from another machine; escaping keeps one per line.
     fn path(path: &str) -> String {
         path.escape_default().to_string()
@@ -3139,12 +3345,19 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
     let mut unreported: Vec<&str> = Vec::new();
 
-    match terminal.workspace_changes.as_deref() {
-        Some([]) => {}
+    let left_on_server = |paths: &'_ [String]| -> Vec<String> {
+        paths
+            .iter()
+            .filter(|path| !copied_back.contains(&path.as_str()))
+            .cloned()
+            .collect()
+    };
+    match terminal.workspace_changes.as_deref().map(left_on_server) {
+        Some(changes) if changes.is_empty() => {}
         Some(changes) => {
             let mut block =
                 String::from("These files changed on the server and were NOT copied back:");
-            for changed in changes {
+            for changed in &changes {
                 block.push_str(&format!("\n  {}", path(changed)));
             }
             blocks.push(block);
@@ -3299,6 +3512,7 @@ fn proves_no_start(error: &exec::Error) -> bool {
                 | subc_client_rs::CallError::CapabilityAmbiguous { .. }
                 | subc_client_rs::CallError::InvalidCapabilityIdentifier { .. }
         ) | exec::Error::Protocol(_)
+            | exec::Error::MissingCapability { .. }
     )
 }
 

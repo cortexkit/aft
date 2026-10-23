@@ -58,27 +58,49 @@ impl ExecRemoteClient {
     }
 
     pub async fn run(&self, request: &RunRequest) -> Result<RemoteStream, Error> {
-        if request.platform == Some(Platform::Windows) {
-            let catalog = self.consumer.catalog_list().await.map_err(|error| {
+        if request.platform == Some(Platform::Windows)
+            && !self.advertises(WINDOWS_CAPABILITY).await.map_err(|error| {
                 Error::Protocol(format!(
                     "runon \"windows\" capability discovery failed before launch: {error}"
                 ))
-            })?;
-            let advertised = catalog.modules.iter().any(|module| {
-                module.module_id == self.module_id
-                    && module.capabilities.as_ref().is_some_and(|capabilities| {
-                        capabilities
-                            .provides
-                            .iter()
-                            .any(|capability| capability == WINDOWS_CAPABILITY)
-                    })
+            })?
+        {
+            return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
+        }
+        // A runner without chunked return would run the command and drop the
+        // requested files, so refuse before submitting anything.
+        if !request.return_paths.is_empty()
+            && !self
+                .advertises(RETURN_CHUNKED_CAPABILITY)
+                .await
+                .map_err(|error| {
+                    Error::Protocol(format!(
+                        "return_paths capability discovery failed before launch: {error}"
+                    ))
+                })?
+        {
+            return Err(Error::MissingCapability {
+                feature: "return_paths",
+                capability: RETURN_CHUNKED_CAPABILITY,
             });
-            if !advertised {
-                return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
-            }
         }
         self.stream("exec.run", request, StreamConsumer::new())
             .await
+    }
+
+    /// Whether the module serving this route advertises `capability` in the
+    /// daemon catalog.
+    async fn advertises(&self, capability: &str) -> Result<bool, subc_client_rs::CallError> {
+        let catalog = self.consumer.catalog_list().await?;
+        Ok(catalog.modules.iter().any(|module| {
+            module.module_id == self.module_id
+                && module.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .provides
+                        .iter()
+                        .any(|provided| provided == capability)
+                })
+        }))
     }
 
     /// Resume from the last durably delivered seq, not from the last received
@@ -243,13 +265,13 @@ impl RemoteStream {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{CAPABILITY, WINDOWS_CAPABILITY};
+    use super::{CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
     /// `<name>/v<N>` grammar, so AFT must check for names that can exist on the wire.
     #[test]
     fn checked_capabilities_pass_the_daemon_grammar() {
-        for capability in [CAPABILITY, WINDOWS_CAPABILITY] {
+        for capability in [CAPABILITY, WINDOWS_CAPABILITY, RETURN_CHUNKED_CAPABILITY] {
             assert!(
                 subc_protocol::manifest::is_valid_capability_identifier(capability),
                 "{capability} is not a capability name the daemon admits"

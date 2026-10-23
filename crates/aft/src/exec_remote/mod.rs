@@ -14,7 +14,10 @@ pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
 // Only the Unix remote-dispatch path filters environment names.
 #[cfg(unix)]
 pub(crate) use request::denied_environment_name;
-pub use request::{build_request, FrozenParams, PresetParams, RootConfinement};
+pub use request::{
+    build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
+    RETURN_TOTAL_CAP_BYTES,
+};
 pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};
 
 #[derive(Debug)]
@@ -23,6 +26,13 @@ pub enum Error {
     Sink(std::io::Error),
     Transport(subc_client_rs::CallError),
     Connection(subc_client_rs::ConsumerError),
+    /// The request needs a feature the runner does not advertise, found
+    /// before anything was submitted, so the command did not run.
+    /// `feature` is the bash argument that needs it.
+    MissingCapability {
+        feature: &'static str,
+        capability: &'static str,
+    },
     /// No terminal proof is available. Query status and reattach when a job ID
     /// is known; never turn a transport/decode failure into permission to rerun.
     RecoveryRequired {
@@ -38,6 +48,13 @@ impl std::fmt::Display for Error {
             Self::Sink(error) => write!(f, "remote execution output sink: {error}"),
             Self::Transport(error) => write!(f, "remote execution route: {error}"),
             Self::Connection(error) => write!(f, "remote execution connection: {error}"),
+            Self::MissingCapability {
+                feature,
+                capability,
+            } => write!(
+                f,
+                "{feature} is unavailable: the build server doesn't offer copying files back yet (missing {capability})"
+            ),
             Self::RecoveryRequired { reason, .. } => write!(
                 f,
                 "remote execution needs re-attach, not resubmission: {reason}"
@@ -120,6 +137,8 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod return_vectors;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -1499,6 +1499,32 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
             out.insert("runon".to_string(), Value::String(demand.to_string()));
         }
     }
+    // `return_paths` is forwarded as written; the bash handler checks each
+    // path and refuses it without `runon`. Like a blank `runon`, an empty or
+    // null list asks for nothing.
+    if let Some(paths) = map_in.get("return_paths").filter(|value| !value.is_null()) {
+        let paths = match paths {
+            // Some models send a list as its JSON text.
+            Value::String(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_array)
+                .ok_or_else(|| {
+                    invalid_request("bash: 'return_paths' must be an array of strings")
+                })?,
+            other => other.clone(),
+        };
+        let valid = paths
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string));
+        if !valid {
+            return Err(invalid_request(
+                "bash: 'return_paths' must be an array of strings",
+            ));
+        }
+        if paths.as_array().is_some_and(|items| !items.is_empty()) {
+            out.insert("return_paths".to_string(), paths);
+        }
+    }
 
     Ok(Translated {
         command: "bash".into(),
@@ -4671,6 +4697,49 @@ mod tests {
             Path::new(workdir),
             Path::new("/project").join("scripts").as_path()
         );
+    }
+
+    #[test]
+    fn bash_return_paths_forward_as_written_and_empty_lists_drop() {
+        let root = std::path::Path::new("/tmp/project");
+        let translated = subc_translate_owned(
+            "bash",
+            serde_json::json!({"command": "make", "runon": "linux", "return_paths": ["dist/a.bin"]}),
+            root,
+        )
+        .expect("return_paths must translate");
+        // Relative to the command's workdir, so never resolved to the project.
+        assert_eq!(
+            translated.args.get("return_paths"),
+            Some(&serde_json::json!(["dist/a.bin"]))
+        );
+        let text = subc_translate_owned(
+            "bash",
+            serde_json::json!({"command": "make", "return_paths": "[\"out.json\"]"}),
+            root,
+        )
+        .expect("a list sent as JSON text must translate");
+        assert_eq!(
+            text.args.get("return_paths"),
+            Some(&serde_json::json!(["out.json"]))
+        );
+        for empty in [serde_json::json!([]), serde_json::Value::Null] {
+            let translated = subc_translate_owned(
+                "bash",
+                serde_json::json!({"command": "make", "return_paths": empty}),
+                root,
+            )
+            .unwrap();
+            assert!(!translated.args.contains_key("return_paths"));
+        }
+        for invalid in [serde_json::json!([1]), serde_json::json!("dist/a.bin")] {
+            assert!(subc_translate_owned(
+                "bash",
+                serde_json::json!({"command": "make", "return_paths": invalid}),
+                root,
+            )
+            .is_err());
+        }
     }
 
     #[test]

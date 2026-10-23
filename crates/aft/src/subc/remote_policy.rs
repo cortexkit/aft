@@ -471,6 +471,7 @@ pub(super) fn lookup(
                     requested_platform: None,
                     requested_vcpus: None,
                     requested_network: false,
+                    return_paths: Vec::new(),
                 })
         }
         RemoteSource::Worker(key) => {
@@ -492,6 +493,7 @@ pub(super) fn lookup(
                 requested_platform: None,
                 requested_vcpus: None,
                 requested_network: false,
+                return_paths: Vec::new(),
             })
         }
     }

@@ -1,6 +1,9 @@
 use super::*;
 use std::{collections::BTreeMap, io};
-use types::{Accepted, AttachRequest, Output, OutputStream, Started, StreamRecord, Uuid};
+use types::{
+    Accepted, AttachRequest, Output, OutputStream, ReturnChunk, ReturnManifest, Started,
+    StreamRecord, Uuid,
+};
 
 /// Durable resume cursor. `last_seq` is the last contiguous record committed
 /// by the sink, not the largest sequence observed on the connection.
@@ -63,6 +66,16 @@ pub trait OutputSink {
     /// or stderr. Checkpoint its sequence and raw bytes together, without
     /// attributing an unknown descriptor's bytes to either known stream.
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()>;
+    /// One piece of a file the request asked the runner to copy back. A sink
+    /// that does not place returned files only advances its cursor.
+    fn return_chunk(&mut self, chunk: &ReturnChunk) -> io::Result<()> {
+        self.unknown_output(chunk.seq, &[])
+    }
+    /// The runner's per-path outcome for the requested files, sent once just
+    /// before the terminal record.
+    fn return_manifest(&mut self, manifest: &ReturnManifest) -> io::Result<()> {
+        self.unknown_output(manifest.seq, &[])
+    }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()>;
 }
 
@@ -79,6 +92,8 @@ pub struct StreamConsumer {
 enum Pending {
     Output(Output),
     Started(Started),
+    ReturnChunk(ReturnChunk),
+    ReturnManifest(ReturnManifest),
     Unknown,
 }
 
@@ -121,6 +136,8 @@ impl StreamConsumer {
             StreamRecord::Accepted(_)
             | StreamRecord::Started(_)
             | StreamRecord::Output(_)
+            | StreamRecord::ReturnChunk(_)
+            | StreamRecord::ReturnManifest(_)
             | StreamRecord::Terminal(_) => self.consume(record, sink),
             _ => self.consume_unknown(seq, sink),
         }
@@ -221,6 +238,17 @@ impl StreamConsumer {
                 self.terminal = Some(verdict);
                 Ok(())
             }
+            StreamRecord::ReturnChunk(chunk) => {
+                self.check_job(chunk.job_id)?;
+                let seq = chunk.seq;
+                self.enqueue(seq, Pending::ReturnChunk(chunk), sink)
+            }
+            StreamRecord::ReturnManifest(manifest) => {
+                self.check_job(manifest.job_id)?;
+                let seq = manifest.seq;
+                self.skip_expired_return_chunks(&manifest)?;
+                self.enqueue(seq, Pending::ReturnManifest(manifest), sink)
+            }
             StreamRecord::Unknown { seq, .. } => self.consume_unknown(seq, sink),
             _ => Err(Error::Protocol(
                 "unknown typed record requires consume_bytes for its sequence".into(),
@@ -234,6 +262,44 @@ impl StreamConsumer {
         } else {
             Ok(())
         }
+    }
+
+    /// A replay after the runner stopped keeping a job's returned bytes sends
+    /// the manifest at its original seq and no chunks, so its seq jumps over
+    /// the chunks it used to send. The contract asks the caller to accept that
+    /// one gap: directly before the manifest, with nothing received inside
+    /// it. When a manifest still returns bytes, the missing seqs held those
+    /// bytes, so the ordinary gap recovery re-attaches to fetch them.
+    ///
+    /// ck-motor assigns the seqs of every `return_chunk` and of the manifest
+    /// in the same durable save that writes the terminal record, after output
+    /// collection has ended, and forwards seqs unchanged, so in an expired
+    /// replay the gap holds only chunks. A gap there can also be an ordinary
+    /// loss, such as the last output record lost in transit, which must be
+    /// recovered or reported, never skipped. So the gap is skipped only when
+    /// the manifest accounts for it: its expired entries (and any `read_error`
+    /// or unrecognised entries, which may also have had chunks) must be able
+    /// to fill exactly that many chunks, at least one record per started
+    /// [`RETURN_CHUNK_MAX_BYTES`] and at most one per byte of their known
+    /// sizes. A gap the manifest cannot account for, or one with a record
+    /// received inside it, keeps the ordinary gap recovery.
+    fn skip_expired_return_chunks(&mut self, manifest: &ReturnManifest) -> Result<(), Error> {
+        let next = self.next_seq()?;
+        if manifest.total_bytes != 0
+            || manifest.seq <= next
+            || self.pending.range(..manifest.seq).next().is_some()
+        {
+            return Ok(());
+        }
+        let gap = manifest.seq - next;
+        let (fewest, most) = expired_chunk_bounds(manifest);
+        if gap < fewest || gap > most {
+            return Ok(());
+        }
+        if let Some(point) = self.point.as_mut() {
+            point.last_seq = Some(manifest.seq - 1);
+        }
+        Ok(())
     }
 
     fn next_seq(&self) -> Result<u64, Error> {
@@ -284,6 +350,8 @@ impl StreamConsumer {
                     }
                     _ => sink.unknown_output(next, &output.bytes.0)?,
                 },
+                Pending::ReturnChunk(chunk) => sink.return_chunk(chunk)?,
+                Pending::ReturnManifest(manifest) => sink.return_manifest(manifest)?,
                 Pending::Unknown => sink.unknown_output(next, &[])?,
                 Pending::Started(started) => sink.started(started)?,
             }
@@ -347,4 +415,31 @@ impl StreamConsumer {
             self.recovery("stream ended without a known terminal record; re-attach to the job")
         })
     }
+}
+
+/// The fewest and most `return_chunk` records a replay can have dropped
+/// before `manifest`. Only expired entries lost their chunks for certain;
+/// `read_error` and unrecognised entries may have had some, up to their
+/// known size. An expired entry always carries its original size.
+fn expired_chunk_bounds(manifest: &ReturnManifest) -> (u64, u64) {
+    use super::types::{ReturnManifestOutcome, ReturnPathsFailureCause, RETURN_CHUNK_MAX_BYTES};
+    let mut fewest: u64 = 0;
+    let mut most: u64 = 0;
+    for entry in &manifest.files {
+        let ReturnManifestOutcome::Failed { cause, size } = &entry.outcome else {
+            continue;
+        };
+        let size = size.unwrap_or(0);
+        match cause {
+            ReturnPathsFailureCause::Expired => {
+                fewest = fewest.saturating_add(size.div_ceil(RETURN_CHUNK_MAX_BYTES as u64));
+                most = most.saturating_add(size);
+            }
+            ReturnPathsFailureCause::ReadError | ReturnPathsFailureCause::Unknown(_) => {
+                most = most.saturating_add(size);
+            }
+            _ => {}
+        }
+    }
+    (fewest, most)
 }

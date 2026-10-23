@@ -62,6 +62,9 @@ struct BashParams {
     /// Run the whole line on the remote runner this demand names.
     #[serde(default)]
     runon: Option<String>,
+    /// With `runon`: files the runner copies back, relative to `workdir`.
+    #[serde(default)]
+    return_paths: Vec<String>,
 }
 
 /// The hard kill for a bash request: the caller's explicit `timeout`, or the
@@ -215,6 +218,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    let mut remote = remote;
+    if let Err(response) = attach_return_paths(&req.id, ctx, &params, &workdir, &mut remote) {
+        return response;
+    }
     let duplicate_workdir = workdir.clone();
     let duplicate_project_root = ctx
         .config()
@@ -594,6 +601,85 @@ fn default_workdir(ctx: &AppContext) -> PathBuf {
         return root;
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Check `return_paths` and hand them to the remote launch, before anything
+/// runs. They need `runon`: only a remote run has files to copy back. Each
+/// path must name a file inside the project, checked exactly as `write`
+/// checks its path, including symlinks that lead out of it.
+fn attach_return_paths(
+    req_id: &str,
+    ctx: &AppContext,
+    params: &BashParams,
+    workdir: &Path,
+    remote: &mut Option<crate::bash_background::RemoteLaunch>,
+) -> Result<(), Response> {
+    use crate::bash_background::registry::return_files::{
+        check_requested_paths, resolve_destination, NotReturned,
+    };
+    if params.return_paths.is_empty() {
+        return Ok(());
+    }
+    let refused = |message: String| Response::error(req_id, "return_paths_refused", message);
+    let Some(launch) = remote.as_mut().filter(|_| params.runon.is_some()) else {
+        return Err(refused(
+            "return_paths refused: return_paths needs runon; a local command already writes its files here"
+                .into(),
+        ));
+    };
+    // ck-motor's Windows runners do not copy files back, and the demand
+    // already names the platform, so refuse before anything is submitted.
+    if launch.requested_platform == Some(crate::exec_remote::types::Platform::Windows) {
+        return Err(refused(
+            "return_paths refused: return_paths is not supported on Windows runners; the command did not run"
+                .into(),
+        ));
+    }
+    check_requested_paths(&params.return_paths).map_err(|message| {
+        refused(format!(
+            "return_paths refused: {message}; the command did not run"
+        ))
+    })?;
+    // The files are written into the project whether or not this session
+    // restricts other tools to it, so containment is checked here too.
+    let root = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| workdir.to_path_buf());
+    let root = std::fs::canonicalize(&root).map_err(|error| {
+        refused(format!(
+            "return_paths refused: cannot resolve the project root {}: {error}",
+            root.display()
+        ))
+    })?;
+    for path in &params.return_paths {
+        let shown = path.escape_default();
+        if let Err(response) = ctx.validate_path(req_id, &workdir.join(path)) {
+            let reason = response.data["message"]
+                .as_str()
+                .unwrap_or("the path is not allowed")
+                .to_string();
+            return Err(refused(format!(
+                "return_paths refused: {shown}: {reason}; the command did not run"
+            )));
+        }
+        match resolve_destination(&root, &workdir.join(path)) {
+            Ok(_) => {}
+            Err(NotReturned::LocalWrite { error }) => {
+                return Err(refused(format!(
+                    "return_paths refused: {shown}: {error}; the command did not run"
+                )))
+            }
+            Err(_) => {
+                return Err(refused(format!(
+                    "return_paths refused: {shown} resolves outside the project; the command did not run"
+                )))
+            }
+        }
+    }
+    launch.return_paths = params.return_paths.clone();
+    Ok(())
 }
 
 fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {

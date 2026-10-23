@@ -36,3 +36,23 @@ reports changed Git state, untracked files and ignored writes; one that reports
 them all unchanged; an older runner that does not report them; a detached HEAD;
 and a capped untracked list. Tests check each `.jcs` against its `.sha256`
 before decoding it with the locked crate.
+
+`return-chunked/*.{jcs,sha256}` (21 cases, 42 files) were copied byte-for-byte
+from the published `cortexkit-exec-remote-types` 0.2.10 crate,
+`test-vectors/exec-remote-v1/return-chunked/` (crate archive SHA-256
+`d6f124113e17808555d2d4473514ea278484cc35f17beba17c528aff041dfc50`, the
+checksum locked in `Cargo.lock`). They cover chunked returned files: accepted
+streams, per-path failures, retained and expired replays, and every stream
+refusal `ReturnAssembler` raises. Tests check each `.jcs` against its
+`.sha256` before decoding it with the locked crate, then feed it to the same
+receiver the remote bash task uses to place returned files.
+
+`motor/return-paths-unsupported.json` is the terminal record ck-motor sends
+when a job with `return_paths` would go to a runner that does not copy files
+back (any Windows runner, or an older Linux runner), written to ck-motor's
+stated shape: refused before start with reason `request_rejected`,
+`refusal_detail` exactly `return_paths_unsupported`, `ran: "none"`, and no
+`retry_after_ms`. ck-motor decides this from the runner's Hello before sending
+the run, and the refusal is final. It is not a published crate vector; it pins
+the record AFT maps to its "return_paths is not supported on the runner"
+refusal.

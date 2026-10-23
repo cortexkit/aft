@@ -211,6 +211,8 @@ pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
 }
 #[path = "remote.rs"]
 pub(crate) mod remote;
+#[path = "return_files.rs"]
+pub(crate) mod return_files;
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 

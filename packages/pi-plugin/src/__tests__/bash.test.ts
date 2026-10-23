@@ -470,6 +470,44 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("return_paths is forwarded unchanged beside runon, and absent when not given", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({ output: "ok", exit_code: 0 });
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]),
+    );
+    const bash = tools.get("bash")!;
+    const returnPaths = ["dist/app.bin", "out/report.json"];
+    await bash.execute(
+      "with-paths",
+      { command: "make dist", runon: "linux", return_paths: returnPaths },
+      undefined,
+      undefined,
+      { cwd: projectRoot, hasUI: false },
+    );
+    const withPaths = calls.at(-1) as [string, Record<string, unknown>];
+    expect(withPaths[1].runon).toBe("linux");
+    expect(withPaths[1].return_paths).toEqual(["dist/app.bin", "out/report.json"]);
+    await bash.execute(
+      "without-paths",
+      { command: "make dist", runon: "linux" },
+      undefined,
+      undefined,
+      {
+        cwd: projectRoot,
+        hasUI: false,
+      },
+    );
+    const withoutPaths = calls.at(-1) as [string, Record<string, unknown>];
+    expect(withoutPaths[1].runon).toBe("linux");
+    expect("return_paths" in withoutPaths[1]).toBe(false);
+  });
+
   test("runon refuses a module-down transport without host fallback", async () => {
     const tools = new Map<string, MockToolDef>();
     let sends = 0;

@@ -3,7 +3,11 @@
  * Shared by scripts/build-tool-schemas.ts and subc-tool-schemas-fresh.test.ts.
  */
 
-import { BASH_RUNON_DESCRIPTION, type BridgePool } from "@cortexkit/aft-bridge";
+import {
+  BASH_RETURN_PATHS_DESCRIPTION,
+  BASH_RUNON_DESCRIPTION,
+  type BridgePool,
+} from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "./config.js";
@@ -257,6 +261,12 @@ export function buildSubcToolSchemas(
     bashProperties.runon = {
       type: "string",
       description: BASH_RUNON_DESCRIPTION,
+    };
+    bashProperties.return_paths = {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 64,
+      description: BASH_RETURN_PATHS_DESCRIPTION,
     };
   }
 

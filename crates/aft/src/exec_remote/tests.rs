@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.7"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.10"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.7"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.10"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -524,6 +524,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         weight_hint: Some(16),
         queue_wait_limit_s: Some(0),
         network: None,
+        return_paths: Vec::new(),
     };
     let request = build_request(
         &worktree,
