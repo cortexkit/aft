@@ -17,6 +17,7 @@ use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
@@ -2240,6 +2241,119 @@ fn is_private_non_loopback_ip(ip: &std::net::IpAddr) -> bool {
     crate::url_fetch::is_private_or_reserved_ip(*ip)
 }
 
+/// Prefix that multimodal embedding deployments parse as an image payload.
+///
+/// NVIDIA's `*embed*` deployments are VLM-backed: any `input` string containing
+/// `data:<image-mime>;base64` — anywhere in the string, with or without a valid
+/// payload — is parsed as an image part. When the deployment has no VLM serving
+/// enabled the whole request is rejected with HTTP 400 (`image inputs require
+/// VLM serving to be enabled on this server`) or a base64 decode error, which
+/// fails every row in the batch and, with it, the entire semantic build.
+///
+/// Source code legitimately contains the prefix, for example
+/// `f"data:image/png;base64,{encode(image)}"` or a docstring naming the format,
+/// so this cannot be left to the repository's contents.
+const IMAGE_DATA_URI_PREFIX: &str = "data:image/";
+
+/// Neutralized form of [`IMAGE_DATA_URI_PREFIX`]. It keeps the mime type legible
+/// to the embedder while no longer matching the `data:<mime>;base64` grammar
+/// those parsers look for.
+const NEUTRALIZED_IMAGE_DATA_URI_PREFIX: &str = "data-uri:image/";
+
+/// Rewrite image data-URI prefixes so a remote embedder cannot mistake chunk
+/// text for an image input. Borrows the input when nothing needs rewriting, so
+/// the common case costs one substring scan and no allocation.
+///
+/// Only `data:image/` is rewritten. Other media types are left byte-identical:
+/// `data:text/plain;base64,...` and `data:application/json;base64,...` are
+/// accepted by those same deployments, and uppercase mime types do not match
+/// their parser.
+fn neutralize_image_data_uris(text: &str) -> Cow<'_, str> {
+    if !text.contains(IMAGE_DATA_URI_PREFIX) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace(IMAGE_DATA_URI_PREFIX, NEUTRALIZED_IMAGE_DATA_URI_PREFIX))
+}
+
+#[cfg(test)]
+mod image_data_uri_tests {
+    use super::neutralize_image_data_uris;
+    use std::borrow::Cow;
+
+    #[test]
+    fn borrows_text_without_an_image_data_uri() {
+        let text = "fn encode(image: &Tensor) -> String { image.base64() }";
+        let sanitized = neutralize_image_data_uris(text);
+        assert!(matches!(sanitized, Cow::Borrowed(_)));
+        assert_eq!(sanitized, text);
+    }
+
+    #[test]
+    fn rewrites_a_template_literal_from_source_code() {
+        let text = "image_url=f\"data:image/png;base64,{tensor_to_base64_string(image)}\"";
+        assert_eq!(
+            neutralize_image_data_uris(text),
+            "image_url=f\"data-uri:image/png;base64,{tensor_to_base64_string(image)}\""
+        );
+    }
+
+    #[test]
+    fn rewrites_every_occurrence_in_the_row() {
+        let text = "a=data:image/png;base64,AAA b=data:image/jpeg;base64,BBB";
+        assert_eq!(
+            neutralize_image_data_uris(text),
+            "a=data-uri:image/png;base64,AAA b=data-uri:image/jpeg;base64,BBB"
+        );
+    }
+
+    #[test]
+    fn rewrites_a_docstring_mention_without_payload() {
+        let text = "Data URI string (e.g., 'data:image/png;base64,...').";
+        assert_eq!(
+            neutralize_image_data_uris(text),
+            "Data URI string (e.g., 'data-uri:image/png;base64,...')."
+        );
+    }
+
+    #[test]
+    fn leaves_non_image_data_uris_untouched() {
+        for text in [
+            "data:text/plain;base64,AAAA",
+            "data:application/json;base64,e30=",
+            "data:audio/wav;base64,AAAA",
+        ] {
+            let sanitized = neutralize_image_data_uris(text);
+            assert!(matches!(sanitized, Cow::Borrowed(_)), "{text}");
+            assert_eq!(sanitized, text);
+        }
+    }
+
+    #[test]
+    fn leaves_uppercase_mime_untouched() {
+        // The backend parsers are case-sensitive; rewriting this would only
+        // churn bytes the backend already accepts.
+        let text = "data:IMAGE/PNG;base64,AAAA";
+        assert_eq!(neutralize_image_data_uris(text), text);
+    }
+
+    #[test]
+    fn serialized_body_carries_no_image_data_uri_prefix() {
+        let texts = vec![
+            "x = \"data:image/png;base64,AAAA\"".to_string(),
+            "plain chunk".to_string(),
+        ];
+        let sanitized: Vec<Cow<'_, str>> = texts
+            .iter()
+            .map(|text| neutralize_image_data_uris(text))
+            .collect();
+        let body = serde_json::json!({ "input": sanitized, "model": "m" });
+        let wire = serde_json::to_string(&body).expect("body serializes");
+        assert!(!wire.contains("data:image/"), "{wire}");
+        assert!(wire.contains("data-uri:image/png;base64,AAAA"), "{wire}");
+        assert!(wire.contains("plain chunk"), "{wire}");
+    }
+}
+
 fn build_openai_embeddings_endpoint(base_url: &str) -> String {
     if base_url.ends_with("/v1") {
         format!("{base_url}{DEFAULT_OPENAI_EMBEDDING_PATH}")
@@ -3555,8 +3669,15 @@ impl SemanticEmbeddingModel {
             } => {
                 let expected_text_count = texts.len();
                 let endpoint = build_openai_embeddings_endpoint(base_url);
+                // Chunk text is arbitrary file content, so neutralize image
+                // data-URI prefixes before they reach a backend that may parse
+                // them as an image part. See `neutralize_image_data_uris`.
+                let sanitized_texts: Vec<Cow<'_, str>> = texts
+                    .iter()
+                    .map(|text| neutralize_image_data_uris(text))
+                    .collect();
                 let body = serde_json::json!({
-                    "input": texts,
+                    "input": sanitized_texts,
                     "model": model,
                 });
 
