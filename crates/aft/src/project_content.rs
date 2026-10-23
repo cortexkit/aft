@@ -72,7 +72,7 @@ pub(crate) fn storage_root_for_path(path: &Path) -> Option<PathBuf> {
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .find(|root| path.starts_with(root))
+        .find(|root| crate::access_policy::floor_contains(&path, root))
         .cloned()
 }
 

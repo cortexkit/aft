@@ -406,7 +406,7 @@ impl BackupEntry {
                 {
                     reads.fetch_add(1, Ordering::Relaxed);
                 }
-                std::fs::read(path).map(Arc::from)
+                read_history_file(path).map(Arc::from)
             }
         }
     }
@@ -480,10 +480,11 @@ impl PathFingerprint {
 
     /// Fingerprint whatever is at `path` right now.
     pub fn of_path(path: &Path) -> Self {
-        if refuse_storage_path(path).is_err() {
+        let metadata = std::fs::symlink_metadata(path);
+        if refuse_storage_path_with_metadata(path, metadata.as_ref().ok()).is_err() {
             return Self::Other;
         }
-        match std::fs::symlink_metadata(path) {
+        match metadata {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
             Err(_) => Self::Other,
             Ok(metadata) if metadata.file_type().is_symlink() => std::fs::read_link(path)
@@ -567,13 +568,13 @@ impl CapturedRegularFile {
             return Ok(None);
         }
 
-        let mut bytes: Arc<[u8]> = read_captured_content(path)?.into();
+        let mut bytes: Arc<[u8]> = read_captured_content(path, &before)?.into();
         let mut metadata = std::fs::symlink_metadata(path)?;
         if !same_capture_stat(&before, &metadata) {
             if !metadata.is_file() {
                 return Ok(None);
             }
-            bytes = read_captured_content(path)?.into();
+            bytes = read_captured_content(path, &metadata)?.into();
             metadata = std::fs::symlink_metadata(path)?;
         }
 
@@ -652,8 +653,8 @@ impl DiskFileVersion {
     }
 }
 
-fn read_captured_content(path: &Path) -> std::io::Result<Vec<u8>> {
-    refuse_storage_path(path).map_err(std::io::Error::other)?;
+fn read_captured_content(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<Vec<u8>> {
+    refuse_storage_path_with_metadata(path, Some(metadata)).map_err(std::io::Error::other)?;
     #[cfg(test)]
     {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -4092,7 +4093,7 @@ impl BackupStore {
         if crate::production_storage::refuse_write(meta_path).is_err() {
             return;
         }
-        let content = match std::fs::read_to_string(meta_path) {
+        let content = match read_history_text(meta_path) {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -4136,7 +4137,7 @@ impl BackupStore {
 
     fn read_session_last_accessed(session_dir: &Path) -> Option<u64> {
         let marker = session_dir.join("session.json");
-        let content = std::fs::read_to_string(&marker).ok()?;
+        let content = read_history_text(&marker).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
         parsed.get("last_accessed").and_then(|v| v.as_u64())
     }
@@ -4673,11 +4674,10 @@ impl BackupStore {
             if !meta_path.exists() {
                 continue;
             }
-            let content =
-                std::fs::read_to_string(&meta_path).map_err(|error| AftError::IoError {
-                    path: meta_path.display().to_string(),
-                    message: error.to_string(),
-                })?;
+            let content = read_history_text(&meta_path).map_err(|error| AftError::IoError {
+                path: meta_path.display().to_string(),
+                message: error.to_string(),
+            })?;
             let meta = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
                 AftError::IoError {
                     path: meta_path.display().to_string(),
@@ -4859,7 +4859,7 @@ impl BackupStore {
         if !meta_path.exists() {
             return Ok(None);
         }
-        let content = std::fs::read_to_string(&meta_path)
+        let content = read_history_text(&meta_path)
             .map_err(|error| format!("failed to read {}: {}", meta_path.display(), error))?;
         #[cfg(test)]
         self.history_metadata_reads.fetch_add(1, Ordering::Relaxed);
@@ -4879,7 +4879,7 @@ impl BackupStore {
         // Old metadata can still contain fingerprints. New annotations are
         // best-effort and keyed by entry id, so stale sidecar rows cannot stamp
         // a different entry. A torn sidecar is an empty annotation, not an error.
-        let states = std::fs::read(dir.join("post-state.json"))
+        let states = read_history_file(dir.join("post-state.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
             .unwrap_or_default();
@@ -5466,7 +5466,7 @@ fn check_backup_meta_format(
 ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
     let version = match meta {
         Some(meta) => meta.get("schema_version").and_then(|value| value.as_u64()),
-        None => std::fs::read(meta_path)
+        None => read_history_file(meta_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|meta| meta.get("schema_version")?.as_u64()),
@@ -5587,10 +5587,45 @@ enum RestorePathState {
 // Snapshot and undo are also called without an AppContext. Check before any
 // content read, including the read that preserves an external edit during undo.
 fn refuse_storage_path(path: &Path) -> Result<(), AftError> {
-    if crate::project_content::storage_root_for_path(path).is_some() {
+    refuse_storage_path_with_metadata(path, None)
+}
+
+fn refuse_storage_path_with_metadata(
+    path: &Path,
+    metadata: Option<&std::fs::Metadata>,
+) -> Result<(), AftError> {
+    if crate::project_content::storage_root_for_path(path).is_some()
+        || match metadata {
+            Some(metadata) => {
+                crate::db::file_identity::is_live_sqlite_file_with_metadata(path, Some(metadata))
+            }
+            None => crate::db::file_identity::is_live_sqlite_file(path),
+        }
+    {
         return Err(AftError::DeniedFloor {
             path: path.display().to_string(),
         });
+    }
+    Ok(())
+}
+
+// History is stored under the storage root and must remain readable there.
+// Check its blobs and metadata for aliases to open SQLite files instead.
+fn read_history_file(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    refuse_live_history_file(path.as_ref())?;
+    std::fs::read(path)
+}
+
+fn read_history_text(path: impl AsRef<Path>) -> std::io::Result<String> {
+    refuse_live_history_file(path.as_ref())?;
+    std::fs::read_to_string(path)
+}
+
+fn refuse_live_history_file(path: &Path) -> std::io::Result<()> {
+    if crate::db::file_identity::is_live_sqlite_file(path) {
+        return Err(std::io::Error::other(AftError::DeniedFloor {
+            path: path.display().to_string(),
+        }));
     }
     Ok(())
 }
@@ -5624,7 +5659,7 @@ fn backup_entry_from_path(
             Some(target),
         )
     } else if metadata.is_file() {
-        let bytes: Arc<[u8]> = read_captured_content(path)
+        let bytes: Arc<[u8]> = read_captured_content(path, &metadata)
             .map_err(|error| AftError::IoError {
                 path: path.display().to_string(),
                 message: error.to_string(),
@@ -5823,6 +5858,8 @@ fn capture_path_state(path: &Path) -> Result<RestorePathState, AftError> {
         }
     };
 
+    refuse_storage_path_with_metadata(path, Some(&metadata))?;
+
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path).map_err(|error| AftError::IoError {
             path: path.display().to_string(),
@@ -5894,6 +5931,7 @@ fn restore_directory(path: &Path, mode: Option<u32>) -> std::io::Result<()> {
 /// Recreate `path` as a hard link to `source`, replacing a file or symlink
 /// already there. `source` must already be restored.
 fn restore_hard_link(path: &Path, source: &Path) -> std::io::Result<()> {
+    refuse_storage_path(source).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -5920,6 +5958,7 @@ fn restore_regular_file(
     content_bytes: &[u8],
     mode: Option<u32>,
 ) -> std::io::Result<()> {
+    refuse_storage_path(path).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -6005,7 +6044,7 @@ fn read_entry_disk_metadata(
     } else {
         backup_path.parent()?.join("meta.json")
     };
-    let content = std::fs::read_to_string(meta_path).ok()?;
+    let content = read_history_text(meta_path).ok()?;
     let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
     let entries = meta.get("entries")?.as_array()?;
     let entry = entries
@@ -6730,7 +6769,7 @@ fn legacy_numeric_backup_name(name: &str) -> bool {
 }
 
 fn is_legacy_flat_backup_entry(path_dir: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path_dir.join("meta.json")) else {
+    let Ok(contents) = read_history_text(path_dir.join("meta.json")) else {
         return false;
     };
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(&contents) else {
@@ -6776,6 +6815,54 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn backup_storage_floor_windows_path_spellings_without_live_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = project.path().join("AftStorage");
+        std::fs::create_dir(&storage).unwrap();
+        let verbatim = storage.canonicalize().unwrap();
+        let plain = crate::windows_path::normalize_windows_path(&verbatim);
+        std::fs::write(storage.join("aft.db"), "not a live SQLite database").unwrap();
+        let mut store = super::BackupStore::new();
+        store.set_storage_dir(verbatim.clone(), 72);
+        assert_eq!(store.storage_dir.as_ref(), Some(&verbatim));
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &verbatim,
+            vec![project.path().to_path_buf()],
+            project.path(),
+        );
+        for root in [
+            &storage,
+            &plain,
+            &verbatim,
+            &PathBuf::from(plain.to_string_lossy().to_uppercase()),
+        ] {
+            let path = root.join("aft.db");
+            assert!(!crate::db::file_identity::is_live_sqlite_file(&path));
+            assert_eq!(
+                store
+                    .snapshot("floor", &path, "refused")
+                    .unwrap_err()
+                    .code(),
+                "denied_floor"
+            );
+            for operation in [
+                crate::access_policy::AccessOperation::Read,
+                crate::access_policy::AccessOperation::Write,
+            ] {
+                assert_eq!(
+                    policy.decide(operation, &path, false),
+                    crate::access_policy::AccessDecision::Deny(
+                        crate::access_policy::AccessDenial::Floor
+                    )
+                );
+            }
+        }
+        assert_eq!(store.storage_dir.as_ref(), Some(&verbatim));
+    }
+
     #[test]
     fn backup_storage_floor_refuses_snapshot_without_path_validation() {
         let root = tempfile::tempdir().unwrap();

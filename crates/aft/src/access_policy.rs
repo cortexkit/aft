@@ -896,6 +896,12 @@ impl AccessPolicy {
                 return Some(floor.clone());
             }
         }
+        if crate::db::file_identity::is_live_sqlite_file(path) {
+            return Some(PolicyFloor {
+                path: path.to_path_buf(),
+                rule: FloorRule::AftStorage,
+            });
+        }
         let exceptions = match operation {
             AccessOperation::Read => &self.private_stores.read_allow,
             AccessOperation::Write => &self.private_stores.write_allow,
@@ -1140,12 +1146,12 @@ fn environment_private_store_denies(
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
 }
 
 #[cfg(windows)]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
@@ -1189,7 +1195,7 @@ fn floor_contains(path: &Path, prefix: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     use std::ffi::c_void;
     use std::os::unix::ffi::OsStrExt;
 

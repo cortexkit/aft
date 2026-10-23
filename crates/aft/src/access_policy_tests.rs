@@ -656,14 +656,12 @@ fn artifact_read_owned_live_sqlite_alias_is_refused() {
         &request("grep", json!({"path": artifact, "pattern": "."})),
         &ctx,
     );
-    assert!(grep.success, "{:?}", grep.data);
-    assert_eq!(grep.data["total_matches"], 0, "{:?}", grep.data);
+    assert_eq!(grep.data["code"], "denied_floor", "{:?}", grep.data);
     let glob = crate::commands::glob::handle_glob(
         &request("glob", json!({"path": artifact, "pattern": "*"})),
         &ctx,
     );
-    assert!(glob.success, "{:?}", glob.data);
-    assert_eq!(glob.data["total"], 0, "{:?}", glob.data);
+    assert_eq!(glob.data["code"], "denied_floor", "{:?}", glob.data);
     assert!(probe.paths().is_empty(), "{:?}", probe.paths());
 }
 

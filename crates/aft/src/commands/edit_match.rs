@@ -715,6 +715,10 @@ fn handle_glob_edit_match(
     let mut pending: Vec<PendingEdit> = Vec::new();
 
     for path in &paths {
+        let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
+            Ok(validated) => validated,
+            Err(resp) => return resp,
+        };
         let (source, capture) = match CapturedRegularFile::read_text(path) {
             Ok(Some((capture, source))) => (source, Some(capture)),
             Ok(None) => match std::fs::read_to_string(path) {
@@ -736,12 +740,6 @@ fn handle_glob_edit_match(
         let count = positions.len();
         let new_source = source.replace(match_str, replacement);
         let file_str = path.display().to_string();
-
-        // Backup before mutation
-        let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
-            Ok(validated) => validated,
-            Err(resp) => return resp,
-        };
 
         pending.push(PendingEdit {
             path: validated_path,
