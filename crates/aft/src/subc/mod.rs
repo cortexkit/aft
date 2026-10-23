@@ -13182,6 +13182,7 @@ pub(crate) mod test_support {
             output_incomplete: false,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
             live_descendants_summary: None,
         })
     }

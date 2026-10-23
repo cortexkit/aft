@@ -23,7 +23,7 @@ use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
-use super::process::LiveDescendant;
+use super::process::{LiveDescendant, LiveDescendantsUnavailable};
 use super::BgTaskStatus;
 
 #[cfg(test)]
@@ -1585,12 +1585,22 @@ pub struct PersistedTask {
     /// Used to detect when the OS reuses that PID for a different process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_start_time_ms: Option<u64>,
-    /// `Some` records a completed Unix sample, including an empty group. `None`
-    /// means sampling is unavailable (Windows and unsupported Unix targets).
+    /// `Some` records a completed check of the task's process group, including
+    /// an empty group. `None` means it could not be checked; the reason is in
+    /// `live_descendants_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub live_descendants_omitted: usize,
+    /// Why the last check of the process group failed or was not possible.
+    /// Cleared by a check that succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
+    /// AFT sent the kill signal to the task's process group (a timeout,
+    /// `bash_kill`, or a cancelled call), so any member still listed in
+    /// `live_descendants` survived that kill.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_kill_sent: bool,
     pub completion_delivered: bool,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
@@ -1724,6 +1734,8 @@ impl PersistedTask {
             child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
+            group_kill_sent: false,
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
@@ -1880,6 +1892,8 @@ impl From<BashTaskRow> for PersistedTask {
             child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
+            group_kill_sent: false,
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,

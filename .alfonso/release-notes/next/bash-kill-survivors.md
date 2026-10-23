@@ -1,0 +1,1 @@
+- When a command times out or is killed, AFT now reports any process it could not stop, such as one started with `sudo`, instead of a clean kill; see the `bash` docs for patterns that keep `sudo` commands killable (#830, thanks @iceteaSA).

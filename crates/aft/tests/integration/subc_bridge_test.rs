@@ -790,6 +790,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
         output_incomplete: false,
         live_descendants: Some(Vec::new()),
         live_descendants_omitted: 0,
+        live_descendants_unavailable: None,
         live_descendants_summary: None,
     })
 }
