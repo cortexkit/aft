@@ -61,7 +61,8 @@ fn integration_context_checkpoints_use_private_unbound_storage() {
         isolate(Config::default()),
     )
     .with_test_checkpoint_store();
-    let file = ctx.storage_dir().join("source.txt");
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("source.txt");
     std::fs::write(&file, "checkpoint bytes").unwrap();
     let info = ctx
         .checkpoint()

@@ -480,6 +480,9 @@ impl PathFingerprint {
 
     /// Fingerprint whatever is at `path` right now.
     pub fn of_path(path: &Path) -> Self {
+        if refuse_storage_path(path).is_err() {
+            return Self::Other;
+        }
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
             Err(_) => Self::Other,
@@ -650,6 +653,7 @@ impl DiskFileVersion {
 }
 
 fn read_captured_content(path: &Path) -> std::io::Result<Vec<u8>> {
+    refuse_storage_path(path).map_err(std::io::Error::other)?;
     #[cfg(test)]
     {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -1274,6 +1278,7 @@ impl BackupStore {
     }
 
     fn set_storage_dir_inner(&mut self, dir: PathBuf, harness: Option<String>, ttl_hours: u32) {
+        crate::project_content::register_storage_root(&dir);
         if self.storage_dir.as_ref() == Some(&dir) && self.storage_harness == harness {
             return;
         }
@@ -1892,6 +1897,9 @@ impl BackupStore {
         keys: &[PathBuf],
         save_external: &mut ExternalChangeSaver<'_>,
     ) -> Result<(Vec<RestoredFile>, Vec<String>, Option<String>), AftError> {
+        for key in keys {
+            refuse_storage_path(key)?;
+        }
         let mut directory_targets = Vec::new();
         let mut content_targets = Vec::new();
         let mut link_targets = Vec::new();
@@ -2155,6 +2163,7 @@ impl BackupStore {
         path: &Path,
         save_external: &mut ExternalChangeSaver<'_>,
     ) -> Result<RestoredLatest, AftError> {
+        refuse_storage_path(path)?;
         self.run_restore_maintenance()?;
         let key = canonicalize_key(path);
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
@@ -4153,6 +4162,7 @@ impl BackupStore {
         path: &Path,
         allow_missing: bool,
     ) -> Result<SnapshotDecision, AftError> {
+        refuse_storage_path(path)?;
         if !self.policy.enabled || self.policy.max_file_size == Some(0) {
             return Ok(SnapshotDecision::Skip(BackupSkippedReason::Disabled));
         }
@@ -5574,6 +5584,17 @@ enum RestorePathState {
     Directory,
 }
 
+// Snapshot and undo are also called without an AppContext. Check before any
+// content read, including the read that preserves an external edit during undo.
+fn refuse_storage_path(path: &Path) -> Result<(), AftError> {
+    if crate::project_content::storage_root_for_path(path).is_some() {
+        return Err(AftError::DeniedFloor {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn backup_entry_from_path(
     path: &Path,
     backup_id: String,
@@ -6756,6 +6777,71 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn backup_storage_floor_refuses_snapshot_without_path_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        std::fs::create_dir(&storage).unwrap();
+        let path = storage.join("aft.db");
+        std::fs::write(&path, "original").unwrap();
+        let identity = crate::db::file_identity::identity_of(&path);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut store = super::BackupStore::new();
+        store.set_storage_dir(storage, 72);
+        for enabled in [true, false] {
+            store.set_policy(super::BackupPolicy {
+                enabled,
+                ..Default::default()
+            });
+            let error = store.snapshot("floor", &path, "snapshot").unwrap_err();
+            assert_eq!(error.code(), "denied_floor");
+        }
+        assert!(super::CapturedRegularFile::read(&path).is_err());
+        assert_eq!(crate::db::file_identity::identity_of(&path), identity);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(store.tracked_files("floor").is_empty());
+        let neighbor = root.path().join("neighbor.txt");
+        std::fs::write(&neighbor, "normal").unwrap();
+        store.set_policy(Default::default());
+        assert!(store
+            .snapshot("floor", &neighbor, "normal")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn backup_storage_floor_refuses_old_undo_history() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        std::fs::create_dir(&storage).unwrap();
+        let path = storage.join("aft.db");
+        std::fs::write(&path, "original").unwrap();
+        let mut store = super::BackupStore::new();
+        store
+            .snapshot_with_op("floor", &path, "old snapshot", Some("old-op"))
+            .unwrap();
+        std::fs::write(&path, "current").unwrap();
+        crate::project_content::register_storage_root(&storage);
+        let identity = crate::db::file_identity::identity_of(&path);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            store.restore_latest("floor", &path).unwrap_err().code(),
+            "denied_floor"
+        );
+        assert_eq!(
+            store.restore_last_operation("floor").unwrap_err().code(),
+            "denied_floor"
+        );
+        assert_eq!(crate::db::file_identity::identity_of(&path), identity);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
     fn waiting_for_one_backup_file_does_not_block_another_session() {
         let storage = tempfile::tempdir().unwrap();
         let mut owner = BackupStore::new();
@@ -7165,18 +7251,19 @@ mod tests {
     use super::*;
     use crate::durability::{sync_count, take, EventKind};
 
-    fn durability_store() -> (BackupStore, tempfile::TempDir, PathBuf) {
+    fn durability_store() -> (BackupStore, tempfile::TempDir, tempfile::TempDir, PathBuf) {
         let storage = tempfile::tempdir().unwrap();
-        let path = storage.path().join("user.txt");
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("user.txt");
         fs::write(&path, "original").unwrap();
         let mut store = BackupStore::new();
         store.set_storage_dir(storage.path().to_path_buf(), 72);
-        (store, storage, path)
+        (store, storage, project, path)
     }
 
     #[test]
     fn durability_backup_count() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         take();
         store.snapshot("durability", &path, "first").unwrap();
         fs::write(&path, "first edit").unwrap();
@@ -7209,7 +7296,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn snapshot_history_loads_content_only_on_demand() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         let session = "history-work-count";
         let bytes = vec![0xff; 256 * 1024];
         std::fs::write(&path, &bytes).unwrap();
@@ -7235,7 +7322,7 @@ mod tests {
 
     #[test]
     fn snapshot_stack_hydration_reads_metadata_once() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         for _ in 0..20 {
             store
                 .snapshot("meta-work-count", &path, "baseline")
@@ -7261,9 +7348,9 @@ mod tests {
     #[test]
     fn operation_undo_content_read_counts_for_cold_and_warm_sessions() {
         for warm in [false, true] {
-            let (mut store, storage, _) = durability_store();
+            let (mut store, storage, project, _) = durability_store();
             let paths = (0..32)
-                .map(|i| storage.path().join(format!("file{i}.bin")))
+                .map(|i| project.path().join(format!("file{i}.bin")))
                 .collect::<Vec<_>>();
             let bytes = vec![0xff; 16 * 1024];
             for path in &paths {
@@ -7306,7 +7393,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lazy_backup_content_reads_changed_blob_with_preserved_mtime() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         store.snapshot("cache-change", &path, "baseline").unwrap();
         let key = canonicalize_key(&path);
         let first = store
@@ -7337,7 +7424,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn durability_first_backup_parent_order() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         take();
         store.snapshot("durability", &path, "first").unwrap();
         let events = take();
@@ -7385,7 +7472,7 @@ mod tests {
 
     #[test]
     fn durability_undo_count_and_file_before_metadata() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         for text in ["original", "edited"] {
             fs::write(&path, text).unwrap();
             store.snapshot("durability", &path, "edit").unwrap();
@@ -7414,7 +7501,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn durability_undo_syncs_read_only_restoration_using_writer_handle() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
         store.snapshot("durability", &path, "edit").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -7430,7 +7517,7 @@ mod tests {
     #[test]
     fn durability_torn_annotation_keeps_every_entry_undoable() {
         for torn in [Some(&b"{"[..]), Some(&b""[..]), None] {
-            let (mut store, storage, path) = durability_store();
+            let (mut store, storage, _project, path) = durability_store();
             for text in ["original", "first edit", "second edit"] {
                 fs::write(&path, text).unwrap();
                 store.snapshot("durability", &path, "edit").unwrap();
@@ -7462,7 +7549,7 @@ mod tests {
 
     #[test]
     fn durability_sidecar_overlays_and_prunes_only_retained_ids() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         store.snapshot("durability", &path, "edit").unwrap();
         fs::write(&path, "after edit").unwrap();
         store.record_post_mutation_states();
@@ -9310,8 +9397,9 @@ mod tests {
     #[test]
     fn root_repair_with_conflicts_still_migrates_moved_history_once() {
         let storage = tempfile::tempdir().unwrap();
-        let blocked_path = storage.path().join("blocked.txt");
-        let movable_path = storage.path().join("movable.txt");
+        let project = tempfile::tempdir().unwrap();
+        let blocked_path = project.path().join("blocked.txt");
+        let movable_path = project.path().join("movable.txt");
         fs::write(&movable_path, "current content").unwrap();
         let blocked_key = canonicalize_key(&blocked_path);
         let movable_key = canonicalize_key(&movable_path);
@@ -9384,7 +9472,8 @@ mod tests {
     #[test]
     fn deferred_root_repair_migrates_legacy_history_before_default_session_undo() {
         let storage = tempfile::tempdir().unwrap();
-        let path = storage.path().join("restored.txt");
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("restored.txt");
         fs::write(&path, "current content").unwrap();
         let key = canonicalize_key(&path);
         let legacy_dir = storage
@@ -9447,8 +9536,11 @@ mod tests {
     /// A file with one legacy backup entry in the root `backups/` directory,
     /// still waiting for root repair and the flat migration, plus a store
     /// bound to the Opencode harness of that storage directory.
-    fn legacy_root_history_fixture(storage: &Path) -> (BackupStore, PathBuf, PathBuf, PathBuf) {
-        let path = storage.join("restored.txt");
+    fn legacy_root_history_fixture(
+        storage: &Path,
+    ) -> (BackupStore, tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("restored.txt");
         fs::write(&path, "current content").unwrap();
         let key = canonicalize_key(&path);
         let root_entry = storage.join("backups").join(BackupStore::path_hash(&key));
@@ -9469,7 +9561,7 @@ mod tests {
             crate::harness::Harness::Opencode,
             72,
         );
-        (store, path, key, root_entry)
+        (store, project, path, key, root_entry)
     }
 
     /// Another holder of the backup namespace, taken between root repair and
@@ -9512,7 +9604,8 @@ mod tests {
     #[test]
     fn default_session_undo_waits_for_migration_deferred_by_busy_namespace() {
         let storage = tempfile::tempdir().unwrap();
-        let (mut store, path, key, root_entry) = legacy_root_history_fixture(storage.path());
+        let (mut store, _project, path, key, root_entry) =
+            legacy_root_history_fixture(storage.path());
 
         // The holder lets go once the undo is about to wait for it, so the undo
         // must wait rather than read the default session before its legacy
@@ -9553,7 +9646,8 @@ mod tests {
         budget: Option<Duration>,
     ) -> (Result<(BackupEntry, Option<String>), AftError>, Duration) {
         let storage = tempfile::tempdir().unwrap();
-        let (mut store, path, _key, root_entry) = legacy_root_history_fixture(storage.path());
+        let (mut store, _project, path, _key, root_entry) =
+            legacy_root_history_fixture(storage.path());
         let holder = NamespaceHolderAfterRepair::install(storage.path());
         let budget = budget.map(crate::bounded_io::Budget::after);
         let started = Instant::now();
@@ -9628,7 +9722,8 @@ mod tests {
     #[test]
     fn default_session_snapshot_keeps_unmigrated_history_reachable_by_undo() {
         let storage = tempfile::tempdir().unwrap();
-        let (mut store, path, key, _root_entry) = legacy_root_history_fixture(storage.path());
+        let (mut store, _project, path, key, _root_entry) =
+            legacy_root_history_fixture(storage.path());
 
         // The namespace is busy when the first default-session snapshot of the
         // file arrives, so the legacy entry for it has not been migrated yet.
@@ -9664,7 +9759,8 @@ mod tests {
     #[test]
     fn default_session_snapshot_sees_legacy_entry_moved_between_its_directory_checks() {
         let storage = tempfile::tempdir().unwrap();
-        let (mut store, path, key, root_entry) = legacy_root_history_fixture(storage.path());
+        let (mut store, _project, path, key, root_entry) =
+            legacy_root_history_fixture(storage.path());
         // The test marks this process's maintenance and flat migration as
         // complete, so only the snapshot's own check can notice the file's
         // legacy entry.
@@ -9728,7 +9824,8 @@ mod tests {
     #[test]
     fn default_session_snapshot_refuses_while_legacy_entry_cannot_be_moved() {
         let storage = tempfile::tempdir().unwrap();
-        let (mut store, path, key, root_entry) = legacy_root_history_fixture(storage.path());
+        let (mut store, _project, path, key, root_entry) =
+            legacy_root_history_fixture(storage.path());
         // Something unrelated already occupies the entry's harness location,
         // so root repair reports a conflict and leaves the legacy entry in
         // the root directory.
@@ -10560,7 +10657,8 @@ mod tests {
     #[test]
     fn append_only_v2_adds_one_content_file_at_steady_depth() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("append_only.txt");
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("append_only.txt");
         fs::write(&path, "v0").unwrap();
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.path().to_path_buf(), 72);
@@ -10606,7 +10704,8 @@ mod tests {
     #[test]
     fn legacy_stack_migrates_to_v2_on_next_write() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.txt");
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("legacy.txt");
         fs::write(&path, "current").unwrap();
         let key = canonicalize_key(&path);
         let session_dir = dir
@@ -11169,7 +11268,8 @@ mod tests {
     #[test]
     fn v2_missing_content_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing-content.txt");
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("missing-content.txt");
         fs::write(&path, "current").unwrap();
         let key = canonicalize_key(&path);
         let session_dir = dir
@@ -11218,7 +11318,8 @@ mod tests {
     #[test]
     fn v2_orphan_files_are_ignored_then_pruned() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("orphan.txt");
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("orphan.txt");
         fs::write(&path, "v0").unwrap();
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.path().to_path_buf(), 72);

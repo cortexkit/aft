@@ -195,7 +195,7 @@ fn access_policy_undo_checks_all_operation_locations_before_mutation() {
 }
 
 #[test]
-fn access_policy_private_store_only_has_own_root_carve_out() {
+fn access_policy_storage_floor_has_no_own_root_carve_out() {
     let store = tempfile::tempdir().unwrap();
     let root = store.path().join("own-worktree");
     std::fs::create_dir(&root).unwrap();
@@ -208,8 +208,9 @@ fn access_policy_private_store_only_has_own_root_carve_out() {
     };
     config.sandbox.write_allow = vec![store.path().to_path_buf()];
     let ctx = AppContext::new(Box::new(StubProvider), config);
-    assert_eq!(ctx.validate_path("own", &own).unwrap(), own);
     for result in [
+        ctx.validate_path("own", &own),
+        ctx.validate_read_path("own-read", "policy-session", &own),
         ctx.validate_path("sibling", &sibling),
         ctx.validate_read_path("read", "policy-session", &sibling),
     ] {
@@ -599,6 +600,36 @@ fn artifact_read_owned_hard_link_is_refused_by_grep_and_read() {
 
 #[cfg(unix)]
 #[test]
+fn artifact_read_owned_sqlite_suffix_alias_is_refused() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    for suffix in [".db", ".sqlite", "-wal", "-shm", "-journal"] {
+        let target = ctx
+            .config()
+            .storage_dir
+            .as_ref()
+            .unwrap()
+            .join(format!("store{suffix}"));
+        std::fs::write(&target, "not readable task output").unwrap();
+        std::fs::remove_file(&artifact).unwrap();
+        std::fs::hard_link(&target, &artifact).unwrap();
+        assert!(ctx
+            .bash_background()
+            .is_session_owned_artifact_path("policy-session", &artifact));
+        let response =
+            crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
+        assert!(!response.success, "{suffix}: {response:?}");
+        assert!(
+            matches!(
+                response.data["code"].as_str(),
+                Some("denied_floor" | "artifact_refused")
+            ),
+            "{response:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn artifact_read_owned_live_sqlite_alias_is_refused() {
     let (_directory, ctx, artifact) = artifact_read_context();
     let storage = ctx.config().storage_dir.clone().unwrap();
@@ -612,6 +643,9 @@ fn artifact_read_owned_live_sqlite_alias_is_refused() {
     assert!(ctx
         .bash_background()
         .is_session_owned_artifact_path("policy-session", &artifact));
+    let read =
+        crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
+    assert!(!read.success, "{read:?}");
     let probe = crate::project_content::Probe::new(&storage);
     assert!(ctx
         .bash_background()
@@ -717,9 +751,12 @@ fn artifact_read_search_symlinked_storage_matches_main_bytes() {
             .unwrap(),
     );
     assert_ne!(storage, crate::access_policy::policy_path(&storage));
-    assert!(ctx
-        .validate_read_path("policy-test", "policy-session", artifact.parent().unwrap())
-        .is_ok());
+    assert_eq!(
+        ctx.validate_read_path("policy-test", "policy-session", artifact.parent().unwrap())
+            .unwrap_err()
+            .data["code"],
+        "denied_floor"
+    );
 
     for path in [&artifact, &aliased_artifact] {
         assert_artifact_search_main_bytes(&ctx, path);

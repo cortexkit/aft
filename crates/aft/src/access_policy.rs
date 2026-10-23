@@ -886,6 +886,16 @@ impl AccessPolicy {
         {
             return Some(self.describe_floor(floor));
         }
+        // Project roots and capability grants cannot admit AFT's SQLite files:
+        // closing a second descriptor releases the process's SQLite locks.
+        // Ownership-checked task output keeps its separate, non-SQLite read path.
+        if !(operation == AccessOperation::Read && owned_artifact) {
+            if let Some(floor) = self.floor_rules.iter().find(|floor| {
+                matches!(floor.rule, FloorRule::AftStorage) && floor_contains(path, &floor.path)
+            }) {
+                return Some(floor.clone());
+            }
+        }
         let exceptions = match operation {
             AccessOperation::Read => &self.private_stores.read_allow,
             AccessOperation::Write => &self.private_stores.write_allow,
@@ -1561,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn private_store_grants_cannot_add_carve_outs() {
+    fn storage_floor_grants_and_project_roots_cannot_add_carve_outs() {
         let root = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
         // Production callers pass canonical policy identities. On macOS the temp
@@ -1591,7 +1601,7 @@ mod tests {
         policy.private_stores.read_allow.push(outside.clone());
         assert_eq!(
             policy.decide(AccessOperation::Read, &outside, false),
-            AccessDecision::Allow
+            AccessDecision::Deny(AccessDenial::Floor)
         );
         assert_eq!(
             policy.decide(AccessOperation::Write, &outside, false),

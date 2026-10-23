@@ -65,6 +65,17 @@ fn is_storage_path(path: &Path) -> bool {
         .any(|root| path.starts_with(root))
 }
 
+/// Resolve aliases without opening file contents before checking retained stores.
+pub(crate) fn storage_root_for_path(path: &Path) -> Option<PathBuf> {
+    let path = crate::access_policy::policy_path(path);
+    storage_roots()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|root| path.starts_with(root))
+        .cloned()
+}
+
 fn is_excluded_file(path: &Path) -> bool {
     crate::os_metadata::is_os_metadata_path(path)
         || has_sqlite_suffix(path) && !path.is_dir()
