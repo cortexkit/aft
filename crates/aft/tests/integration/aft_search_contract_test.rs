@@ -3157,3 +3157,175 @@ fn external_prose_query_finds_a_file_added_after_the_saved_index() {
         "the reply says the index was checked and what changed: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #826: aft_search replies an agent misreads. Each test below states the
+// honest reply and fails on the current engine, so each is ignored until its
+// fix lands. Run them with `-- issue_826 --include-ignored`.
+// ---------------------------------------------------------------------------
+
+/// Files that talk about `bash_watch`, waiting and detaching, but never
+/// contain the literal `bash_wait_detach(`.
+fn issue_826_bash_files() -> [(&'static str, &'static str); 3] {
+    [
+        (
+            "src/bash_watch.rs",
+            "/// bash_watch waits for a background bash task.\npub fn bash_watch(task_id: &str) -> bool {\n    wait_for(task_id)\n}\n\nfn wait_for(task_id: &str) -> bool {\n    !task_id.is_empty()\n}\n",
+        ),
+        (
+            "src/detach.rs",
+            "/// Detach a running bash command into the background.\npub fn detach_running(command: &str) {\n    drop(command);\n}\n",
+        ),
+        (
+            "docs/tools.md",
+            "# Tools\n\nUse bash_watch to wait for a background task.\nbash_watch(taskId) returns when the task exits.\n",
+        ),
+    ]
+}
+
+fn render_search(response: Response) -> (String, Value) {
+    let rendered = aft::subc_format::format_response("search", &response, false);
+    (rendered, response_value(response))
+}
+
+/// The bare identifier already answers "not found"; the same name followed by
+/// `(` must not come back as files labelled `[lexical match]` that do not
+/// contain it. Today the lexical lane's trigram overlap returns
+/// `src/detach.rs:1 [lexical match]` for a doc comment about detaching.
+#[test]
+#[ignore = "issue #826: a missing punctuated literal is answered with [lexical match] hits"]
+fn issue_826_missing_punctuated_literal_is_not_labelled_a_lexical_match() {
+    let files = issue_826_bash_files();
+    let (project, entries) = project_with_files(&files);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let (bare, _) = render_search(handle_semantic_search(
+        &request_with_top_k("bash_wait_detach", None, 10),
+        &ctx,
+    ));
+    assert!(
+        bare.starts_with(
+            "`bash_wait_detach` not found in this project, and no similar names were found."
+        ),
+        "the bare identifier keeps its not-found answer: {bare}"
+    );
+
+    let (rendered, response) = render_search(handle_semantic_search(
+        &request_with_top_k("bash_wait_detach(", None, 10),
+        &ctx,
+    ));
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        !rendered.contains("[lexical match]"),
+        "no file contains `bash_wait_detach(`, so no hit may be labelled a match:\n{rendered}"
+    );
+}
+
+/// A regex-only request ranks every matching file before it cuts the page,
+/// so the list trailer knows the exact number of file results. Today it says
+/// `shown 3 of ≥4 results` beside `Found 36 match across 12 file`.
+#[test]
+#[ignore = "issue #826: the regex route's trailer reports a floor although every file was ranked"]
+fn issue_826_regex_only_trailer_reports_the_ranked_file_total() {
+    let owned: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            (
+                format!("src/m{i}.rs"),
+                format!("pub fn handler_{i}() {{}}\n// handler_{i} helper\nlet handler_x = {i};\n"),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let (project, entries) = project_with_files(&files);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "issue-826-regex-only",
+        "command": "semantic_search",
+        "query": "",
+        "pattern": "handler_[0-9x]",
+        "top_k": 3,
+    }))
+    .expect("build pattern request");
+
+    let (rendered, response) = render_search(handle_semantic_search(&request, &ctx));
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["result_count"], 3, "{response}");
+    assert!(
+        rendered.contains("shown 3 of 12 results"),
+        "all 12 matching files were ranked before the page cut:\n{rendered}"
+    );
+}
+
+/// When the query embedding fails, the answer comes from a filesystem scan
+/// and the reply says so, yet the lane footer, read again after the answer,
+/// still prints `semantic: ready`. Both lines must come from the same record
+/// of what served this request.
+#[test]
+#[ignore = "issue #826: lane footer says ready beside a degraded answer"]
+fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
+    let (project, _source_file, _source) = project_with_needle();
+    let (base_url, handle) = start_mock_embedding_error_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_ready_semantic_lane(&ctx, project.path());
+
+    let (rendered, response) =
+        render_search(handle_semantic_search(&request("needle_symbol"), &ctx));
+    handle.join().expect("embedding server thread");
+
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["fully_degraded"], true, "{response}");
+    assert_eq!(response["semantic_unavailable"], true, "{response}");
+    assert!(
+        rendered.contains("Search status: fully degraded"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|line| line == "semantic: ready"),
+        "the semantic lane did not serve this answer, so the footer may not call it ready:\n{rendered}"
+    );
+}
+
+/// The trigram lane is not resident but its saved cache is valid. Planning
+/// treats that lane as still loading and answers from a filesystem scan; the
+/// footer, observed afterwards with a different rule, calls it ready. This is
+/// the reported `Search status: fully degraded` beside `trigram: ready`.
+#[test]
+#[ignore = "issue #826: trigram footer says ready while the answer was a filesystem scan"]
+fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (project, _source_file, _source) = git_project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(project.path(), storage.path());
+    let (base_url, handle) = start_mock_embedding_error_server();
+    let ctx = openai_context_with_storage(project.path(), storage.path(), base_url);
+    let canonical = std::fs::canonicalize(project.path()).expect("canonical root");
+    ctx.set_canonical_cache_root(canonical.clone());
+    ctx.memoized_artifact_cache_key(&canonical);
+    install_ready_semantic_lane(&ctx, project.path());
+
+    let (rendered, response) =
+        render_search(handle_semantic_search(&request("needle_symbol"), &ctx));
+    handle.join().expect("embedding server thread");
+
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["fully_degraded"], true, "{response}");
+    assert!(
+        rendered.contains("Search status: fully degraded"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|line| line == "trigram: ready"),
+        "the trigram index did not serve this answer, so the footer may not call it ready:\n{rendered}"
+    );
+}
