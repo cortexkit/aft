@@ -447,6 +447,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a background-launch error previews at most eight of the caller's slot holders, counts omitted own holders and other sessions' holders, and shortens command labels with an ellipsis; this is actionable refusal context, not a paginated task-result list",
     },
     ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "kill_survivors_line",
+        location_or_primitive: "KILL_SURVIVORS_NAMED .take()",
+        reason: "the one-line kill-survivor notice names the first three surviving processes and counts the rest with +N more; every listed survivor stays in the structured live_descendants field",
+    },
+    ExclusionEntry {
+        file: "bash_background/process.rs",
+        enclosing_item: "live_process_group_members, bounded_command, macos_argv",
+        location_or_primitive: "LIVE_DESCENDANT_CAP truncate, LIVE_DESCENDANT_COMMAND_CAP .take(), MAX_ARGS",
+        reason: "a process-group check keeps at most 16 members and reports the exact omitted count in live_descendants_omitted; each member's command line is shortened with an ellipsis; this is task status detail, not a paginated result list",
+    },
+    ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics",
         location_or_primitive: "storage_retention map removal under HEALTH_METRICS_BUDGET_BYTES",
