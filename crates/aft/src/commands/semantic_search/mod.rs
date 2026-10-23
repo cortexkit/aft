@@ -185,6 +185,35 @@ fn with_first_search_index_load_wait_budget_for_test<T>(
     let _reset = Reset(previous);
     action()
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Called on the searching thread each time the trigram wait sees a load
+    /// still in flight, just before it drains the loader. Tests use it to
+    /// publish an index at a known point in the request instead of racing a
+    /// sleeping publisher thread against the wait budget.
+    static SEARCH_INDEX_LOAD_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `action` with `hook` installed as the trigram-load wait hook on this
+/// thread, and removes it (dropping anything it captured) when `action` ends.
+#[cfg(test)]
+fn with_search_index_load_wait_hook_for_test<T>(
+    hook: impl FnMut() + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    action()
+}
 const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
 const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
@@ -1982,6 +2011,24 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
+        // These labels are observed after the reply was built. A reply that
+        // opens by saying its results came from a bounded walk because the
+        // trigram index was still loading must not end with `trigram: ready`
+        // because the load finished while the walk ran.
+        let walked_while_trigram_loading = data
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.starts_with(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
+        let relabelled;
+        let lanes = if walked_while_trigram_loading && self.trigram.is_ready() {
+            relabelled = Self {
+                trigram: IndexObservation::building(),
+                semantic: self.semantic.clone(),
+            };
+            &relabelled
+        } else {
+            self
+        };
         // Runtime readiness means the resident index can be queried, not that
         // this query covered the checkout. Do not contradict its named gaps
         // with a later, generic `semantic: ready` footer.
@@ -1991,7 +2038,7 @@ impl SearchLaneStatus {
                 .map(|reason| format!("semantic: unavailable: {reason}"))
                 .unwrap_or_else(|| "semantic: partial (checkout coverage gaps)".to_string())
         });
-        let labels = self.text(ctx);
+        let labels = lanes.text(ctx);
         let labels = labels
             .lines()
             .map(|line| {
@@ -2008,10 +2055,10 @@ impl SearchLaneStatus {
                 *text = serde_json::json!(format!("{current}\n{labels}"));
             }
         }
-        data.insert("lanes".to_string(), self.lanes_json());
+        data.insert("lanes".to_string(), lanes.lanes_json());
         data.insert(
             "omitted_lanes".to_string(),
-            serde_json::json!(self.omitted_lanes()),
+            serde_json::json!(lanes.omitted_lanes()),
         );
         data.insert("enrichment".to_string(), callgraph_enrichment_json(ctx));
     }
@@ -2159,6 +2206,7 @@ fn handle_semantic_search_inner(
             "unavailable",
             reason,
             "identity provisional",
+            false,
             false,
             Vec::new(),
             &project_root,
@@ -6204,6 +6252,7 @@ fn artifact_contention_fallback_response(
         ),
         "artifact contention",
         false,
+        false,
         Vec::new(),
         project_root,
         top_k,
@@ -6309,10 +6358,21 @@ fn semantic_unavailable_or_fallback_response(
         detail,
         footer_reason,
         false,
+        trigram_index_still_loading(&engine_plan.readiness),
         warnings,
         project_root,
         top_k,
     )
+}
+
+/// Whether the plan was made while the trigram index was still loading, so a
+/// lexical answer for it comes from a bounded file walk instead of the index.
+fn trigram_index_still_loading(readiness: &extensions::Readiness<'_>) -> bool {
+    !readiness.lexical_index
+        && readiness
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("trigram:building"))
 }
 
 fn semantic_unavailable_extras(
@@ -6336,6 +6396,7 @@ fn semantic_unavailable_grep_fallback_response(
     detail: String,
     footer_reason: &str,
     borrowed_loading: bool,
+    trigram_loading: bool,
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
@@ -6361,18 +6422,20 @@ fn semantic_unavailable_grep_fallback_response(
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
+    let mut walk_cut_warnings = Vec::new();
     if fallback.file_cap_reached {
-        warnings.push(format!(
+        walk_cut_warnings.push(format!(
             "Degraded grep reached its {}-file scan cap; additional files were not scanned.",
             fallback.file_limit
         ));
     }
     if fallback.walk_budget_reached {
-        warnings.push(
+        walk_cut_warnings.push(
             "Degraded grep reached its 10-second walk budget; additional files were not scanned."
                 .to_string(),
         );
     }
+    warnings.extend(walk_cut_warnings.iter().cloned());
     warnings
         .push("Semantic search unavailable; returning lexical-only fallback results.".to_string());
 
@@ -6422,6 +6485,22 @@ fn semantic_unavailable_grep_fallback_response(
         crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
     }
 
+    let mut text =
+        format_grep_lexical_unavailable_text(&detail, result, project_root, footer_reason);
+    if trigram_loading {
+        // The trigram index was still loading when the plan was made, so these
+        // results come from a capped file walk, not the index. Lead with that,
+        // and with any cap the walk hit, so a short list is not read as every
+        // match in the project. The lane footer added later also keeps saying
+        // the trigram lane was building (see `SearchLaneStatus::attach_labels`).
+        let mut lead = TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE.to_string();
+        for warning in &walk_cut_warnings {
+            lead.push('\n');
+            lead.push_str(warning);
+        }
+        text = format!("{lead}\n\n{text}");
+    }
+
     search_response(
         req,
         SearchResponseParts {
@@ -6432,14 +6511,9 @@ fn semantic_unavailable_grep_fallback_response(
             interpreted_as: "literal",
             query_kind: query_kind_label(shape.kind),
             semantic_status,
-            status: "ready",
+            status: if trigram_loading { "partial" } else { "ready" },
             complete: false,
-            text: format_grep_lexical_unavailable_text(
-                &detail,
-                result,
-                project_root,
-                footer_reason,
-            ),
+            text,
             results: result_values,
             more_available,
             engine_capped: result.engine_capped,
@@ -6865,6 +6939,12 @@ fn search_index_ready_with_budget(
             return Ok(false);
         }
 
+        #[cfg(test)]
+        SEARCH_INDEX_LOAD_WAIT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         crate::runtime_drain::drain_search_index_events(ctx);
         if search_cancellation_requested() {
             return Err(SearchIndexWaitError::Cancelled);
@@ -10447,20 +10527,26 @@ mod tests {
         install_ready_semantic_lane(&ctx, project.path());
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
-        let root = project.path().to_path_buf();
-        let publisher = std::thread::spawn(move || {
-            let index = SearchIndex::build(&root);
-            std::thread::sleep(Duration::from_millis(40));
-            tx.send(index).unwrap();
-        });
-        let response =
-            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(2), || {
-                response_value(handle_semantic_search(
-                    &semantic_request("isPrefixBoundThinkingModel", 50),
-                    &ctx,
-                ))
-            });
-        publisher.join().unwrap();
+        // Build before the request so the build's own duration cannot use up
+        // the wait budget on a loaded machine. The loader then publishes only
+        // once the request is waiting on it: the load is still in flight when
+        // readiness is sampled, and lands during the wait.
+        let mut pending = Some((tx, SearchIndex::build(project.path())));
+        let response = with_search_index_load_wait_hook_for_test(
+            move || {
+                if let Some((tx, index)) = pending.take() {
+                    tx.send(index).unwrap();
+                }
+            },
+            || {
+                with_first_search_index_load_wait_budget_for_test(Duration::from_secs(2), || {
+                    response_value(handle_semantic_search(
+                        &semantic_request("isPrefixBoundThinkingModel", 50),
+                        &ctx,
+                    ))
+                })
+            },
+        );
         assert_eq!(response["success"], true, "{response}");
         assert!(ctx.search_index().read().unwrap().as_ref().is_some_and(SearchIndex::is_ready),
             "exact search must drain the borrowed loader even when semantic readiness skips the admission wait");
@@ -10493,21 +10579,23 @@ mod tests {
         install_ready_semantic_lane(&ctx, project.path());
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
-        let root = project.path().to_path_buf();
-        let publisher = std::thread::spawn(move || {
-            let index = SearchIndex::build(&root);
-            // Publish well after the request has embedded and failed.
-            std::thread::sleep(Duration::from_millis(400));
-            tx.send(index).unwrap();
-        });
-        let response =
-            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(5), || {
-                response_value(handle_semantic_search(
-                    &semantic_request("isPrefixBoundThinkingModel", 50),
-                    &ctx,
-                ))
-            });
-        publisher.join().unwrap();
+        // As above: built up front, published once the request waits on it.
+        let mut pending = Some((tx, SearchIndex::build(project.path())));
+        let response = with_search_index_load_wait_hook_for_test(
+            move || {
+                if let Some((tx, index)) = pending.take() {
+                    tx.send(index).unwrap();
+                }
+            },
+            || {
+                with_first_search_index_load_wait_budget_for_test(Duration::from_secs(5), || {
+                    response_value(handle_semantic_search(
+                        &semantic_request("isPrefixBoundThinkingModel", 50),
+                        &ctx,
+                    ))
+                })
+            },
+        );
         crate::semantic_index::clear_embedding_backend_retry_status(project.path());
         assert_eq!(response["success"], true, "{response}");
         assert!(
@@ -10523,6 +10611,84 @@ mod tests {
             47,
             "{response}"
         );
+    }
+
+    /// When the trigram load outlasts the wait budget, the plan is made without
+    /// the index and a failed query embedding falls back to a capped file walk
+    /// that can miss most matches. Here the load then lands during the request,
+    /// after the plan, as it did on a slow CI machine: the reply must still say
+    /// its results came from a bounded walk and that the walk hit its file cap,
+    /// and its lane footer must not claim the trigram lane was ready.
+    #[test]
+    fn exact_search_past_the_trigram_wait_budget_discloses_the_bounded_walk() {
+        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let port = addr.port();
+        let project = exact_lane::tests::large_identifier_project();
+        let ctx = test_context(project.path());
+        ctx.set_cache_role(true, None);
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.base_url = Some(format!("http://127.0.0.1:{port}/v1"));
+        });
+        install_ready_semantic_lane(&ctx, project.path());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        // A zero budget makes the planning wait see the load in flight once and
+        // give up. The loader publishes at the request's next wait, after the
+        // plan was made without the index.
+        let mut waits_seen = 0;
+        let mut pending = Some((tx, SearchIndex::build(project.path())));
+        let response = with_search_index_load_wait_hook_for_test(
+            move || {
+                waits_seen += 1;
+                if waits_seen >= 2 {
+                    if let Some((tx, index)) = pending.take() {
+                        tx.send(index).unwrap();
+                    }
+                }
+            },
+            || {
+                with_first_search_index_load_wait_budget_for_test(Duration::ZERO, || {
+                    handle_semantic_search(
+                        &semantic_request("isPrefixBoundThinkingModel", 50),
+                        &ctx,
+                    )
+                })
+            },
+        );
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        let rendered = crate::subc_format::format_response("search", &response, false);
+        let response = response_value(response);
+        assert_eq!(response["success"], true, "{response}");
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(SearchIndex::is_ready),
+            "the load must land during the request for this case: {response}"
+        );
+        assert!(
+            response["results"].as_array().unwrap().len() < 47,
+            "the plan must have been made before the index was loaded: {response}"
+        );
+        assert!(
+            rendered.starts_with(&format!(
+                "{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\nDegraded grep reached its 1000-file scan cap; additional files were not scanned.\n\n"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line == "trigram: building"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.lines().any(|line| line == "trigram: ready"),
+            "{rendered}"
+        );
+        assert_eq!(response["lanes"]["trigram"]["status"], "building");
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["complete"], false);
     }
 
     #[test]
