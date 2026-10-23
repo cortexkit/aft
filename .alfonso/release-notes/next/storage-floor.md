@@ -1,1 +1,1 @@
-Agent file tools now refuse AFT's own storage files even when the storage folder is inside an authorized project.
+- File tools (read, write, edit, apply_patch, delete, move, grep and glob) and undo now refuse AFT's own storage files even when the storage folder is inside an authorized project, so they can't disturb its live databases.
