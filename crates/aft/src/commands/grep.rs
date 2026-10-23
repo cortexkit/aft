@@ -133,7 +133,9 @@ pub(crate) mod work_probe {
 }
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_grep_inner)
+    crate::context::confinement::with_floor_disclosure(|| {
+        crate::bounded_io::command(req, ctx, handle_grep_inner)
+    })
 }
 
 fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -235,6 +237,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
     let project_root = grep_executor::project_root(ctx);
+    crate::context::confinement::set_floor_filter(&project_root, &filters);
     // Search roots that are files: naming a file as `path` prints its lines
     // whatever kind of file it is.
     let file_roots: Vec<PathBuf> = scope

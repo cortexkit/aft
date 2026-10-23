@@ -463,6 +463,20 @@ pub(crate) fn assert_artifact_read_policy(
         let mut req = request(command, params(path));
         req.session_id = Some(session.into());
         let denied = handler(&req, &ctx);
+        if command == "outline" && req.params["files"].is_array() {
+            assert!(denied.success, "{:?}", denied.data);
+            assert_eq!(denied.data["content_files"], json!([]));
+            assert!(
+                denied.data["skipped_files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["reason"] == "denied_floor"),
+                "{:?}",
+                denied.data
+            );
+            continue;
+        }
         assert!(!denied.success, "{command} leaked: {:?}", denied.data);
         assert_eq!(
             denied.data["code"], "denied_floor",

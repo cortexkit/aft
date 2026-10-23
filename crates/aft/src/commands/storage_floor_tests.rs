@@ -67,6 +67,20 @@ impl Fixture {
     }
 }
 
+fn has_floor_skip(response: &Response, path: &Path) -> bool {
+    let expected = crate::access_policy::policy_path(path);
+    response.data["skipped_files"]
+        .as_array()
+        .is_some_and(|files| {
+            files.iter().any(|file| {
+                file["reason"] == "denied_floor"
+                    && file["file"].as_str().is_some_and(|file| {
+                        crate::access_policy::policy_path(Path::new(file)) == expected
+                    })
+            })
+        })
+}
+
 fn request(command: &str, params: serde_json::Value) -> RawRequest {
     RawRequest {
         id: "storage-floor".into(),
@@ -436,4 +450,269 @@ fn storage_floor_identity_check_stats_ordinary_file_once() {
         assert!(!crate::db::file_identity::is_live_sqlite_file(&f.neighbor));
     });
     assert_eq!(stats, std::collections::BTreeMap::from([(f.neighbor, 1)]));
+}
+
+#[test]
+fn storage_floor_glob_edit_match_skips_store_files_before_reading() {
+    let mut f = Fixture::new();
+    f.ctx = f.ctx.with_test_checkpoint_store();
+    let nonmatching = f.store.with_file_name("metadata.txt");
+    std::fs::write(&nonmatching, "unrelated storage metadata\n").unwrap();
+    let protected = [&f.store, &nonmatching];
+    let before = protected
+        .iter()
+        .map(|path| crate::file_identity::metadata(path).unwrap())
+        .collect::<Vec<_>>();
+    crate::backup::reset_capture_read_count(&f.store);
+    crate::backup::reset_capture_read_count(&nonmatching);
+    let response = super::edit_match::handle_edit_match(
+        &request(
+            "edit_match",
+            json!({"file": "**/*", "match": "original", "replacement": "changed"}),
+        ),
+        &f.ctx,
+    );
+    assert!(response.success, "{response:?}");
+    assert_eq!(std::fs::read_to_string(&f.neighbor).unwrap(), "changed\n");
+    assert_eq!(response.data["total_files"], 1);
+    assert_eq!(response.data["complete"], false);
+    let rendered = crate::subc_format::format_response("edit", &response, false);
+    assert!(
+        rendered.contains("metadata.txt: denied_floor"),
+        "{rendered}"
+    );
+    for (path, before) in protected.iter().zip(before) {
+        assert!(has_floor_skip(&response, path), "{response:?}");
+        let after = crate::file_identity::metadata(path).unwrap();
+        assert_eq!(before.1, after.1);
+        assert_eq!(before.0.modified().unwrap(), after.0.modified().unwrap());
+        assert_eq!(crate::backup::capture_read_count(path), 0);
+    }
+}
+
+#[test]
+fn storage_floor_glob_edit_match_reports_skips_on_preview_and_no_match() {
+    let f = Fixture::new();
+    for params in [
+        json!({"file": "**/*", "match": "original", "replacement": "changed", "preview": true}),
+        json!({"file": "**/*", "match": "original", "replacement": "original"}),
+        json!({"file": "**/*", "match": "not present anywhere", "replacement": "changed"}),
+    ] {
+        let response = super::edit_match::handle_edit_match(&request("edit_match", params), &f.ctx);
+        assert_ne!(response.data["code"], "denied_floor", "{response:?}");
+        assert!(response.data["skipped_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reason"] == "denied_floor"));
+        assert!(
+            crate::subc_format::format_response("edit", &response, false)
+                .contains("aft.db: denied_floor")
+        );
+        assert_eq!(std::fs::read_to_string(&f.neighbor).unwrap(), "original\n");
+    }
+}
+
+#[test]
+fn storage_floor_outline_lists_skip_protected_leaves_without_opening_them() {
+    let f = Fixture::new();
+    let ordinary = f._root.path().join("allowed.rs");
+    let protected = f.store.with_file_name("secret.rs");
+    std::fs::write(&ordinary, "pub fn allowed() {}\n").unwrap();
+    std::fs::write(&protected, "pub fn secret() {}\n").unwrap();
+    for params in [
+        json!({"directory": f._root.path()}),
+        json!({"target": f._root.path(), "files": true}),
+        json!({"files": [protected, ordinary]}),
+    ] {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            (*f.ctx.config()).clone(),
+        );
+        #[cfg(unix)]
+        let ordinary_opens = crate::bounded_io::tests::watch_opens(&ordinary);
+        #[cfg(unix)]
+        let protected_opens = crate::bounded_io::tests::watch_opens(&protected);
+        let response = super::outline::handle_outline(&request("outline", params), &ctx);
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::Ordering;
+            assert_eq!(
+                protected_opens.opens.load(Ordering::Relaxed),
+                0,
+                "protected leaf opened"
+            );
+            assert!(
+                ordinary_opens.opens.load(Ordering::Relaxed) > 0,
+                "ordinary-file open control"
+            );
+        }
+        assert!(response.success, "{response:?}");
+        assert!(
+            response.data["text"].as_str().unwrap().contains("allowed"),
+            "{response:?}"
+        );
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["skipped_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["reason"] == "denied_floor"
+                    && item["file"].as_str().unwrap().ends_with("secret.rs")),
+            "{response:?}"
+        );
+    }
+    let explicit =
+        super::outline::handle_outline(&request("outline", json!({"file": protected})), &f.ctx);
+    assert_eq!(explicit.data["code"], "denied_floor");
+}
+
+#[test]
+fn storage_floor_revision_zoom_batch_keeps_floor_refusal_target_local() {
+    let f = Fixture::new();
+    let ordinary = f._root.path().join("allowed.rs");
+    let protected = f.store.with_file_name("secret.rs");
+    std::fs::write(&ordinary, "pub fn allowed() {}\n").unwrap();
+    std::fs::write(&protected, "pub fn secret() {}\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let mut command = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(f._root.path()));
+        let output = command.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut config = (*f.ctx.config()).clone();
+    config.revision_reads = true;
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let response = super::zoom::handle_zoom(
+        &request(
+            "zoom",
+            json!({"ref": "HEAD", "targets": [
+                {"file": protected, "symbols": "secret"}, {"file": ordinary, "symbols": "allowed"}
+            ]}),
+        ),
+        &ctx,
+    );
+    assert!(response.success, "{response:?}");
+    assert_eq!(
+        response.data["targets"][0]["response"]["code"],
+        "denied_floor"
+    );
+    assert_eq!(
+        response.data["targets"][1]["response"]["success"], true,
+        "{response:?}"
+    );
+}
+
+#[test]
+fn storage_floor_grep_and_glob_report_walk_exclusions_without_aborting() {
+    let f = Fixture::new();
+    let unrelated_db = f._root.path().join("ordinary.db");
+    std::fs::write(&unrelated_db, "original\n").unwrap();
+    for response in [
+        super::grep::handle_grep(&request("grep", json!({"pattern": "original"})), &f.ctx),
+        super::glob::handle_glob(&request("glob", json!({"pattern": "**/*"})), &f.ctx),
+    ] {
+        assert!(response.success, "{response:?}");
+        assert!(
+            has_floor_skip(&response, f.store.parent().unwrap()),
+            "{response:?}"
+        );
+        assert!(!has_floor_skip(&response, &unrelated_db));
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("neighbor.txt"),
+            "{response:?}"
+        );
+    }
+}
+
+#[test]
+fn storage_floor_grep_and_glob_report_new_live_alias_in_cached_index() {
+    let f = Fixture::new();
+    let alias = f._root.path().join("stale.txt");
+    std::fs::write(&alias, "original\n").unwrap();
+    let index = crate::search_index::SearchIndex::build(f._root.path());
+    assert!(index.is_ready());
+    assert!(index.snapshot().has_file_in_scope(&alias));
+    *f.ctx.search_index().write().unwrap() = Some(index);
+    std::fs::remove_file(&f.store).unwrap();
+    let connection = rusqlite::Connection::open(&f.store).unwrap();
+    connection
+        .execute_batch("CREATE TABLE source(value TEXT);")
+        .unwrap();
+    let _connection =
+        crate::db::file_identity::IdentityConnection::new(connection, "cached alias list fixture");
+    std::fs::remove_file(&alias).unwrap();
+    std::fs::hard_link(&f.store, &alias).unwrap();
+    #[cfg(unix)]
+    let alias_opens = crate::bounded_io::tests::watch_opens(&alias);
+    for response in [
+        super::grep::handle_grep(&request("grep", json!({"pattern": "original"})), &f.ctx),
+        super::glob::handle_glob(&request("glob", json!({"pattern": "**/*"})), &f.ctx),
+    ] {
+        #[cfg(unix)]
+        assert_eq!(
+            alias_opens.opens.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "indexed live alias opened"
+        );
+        assert!(response.success, "{response:?}");
+        assert!(has_floor_skip(&response, &alias), "{response:?}");
+        assert_eq!(response.data["complete"], false);
+    }
+}
+
+#[test]
+fn storage_floor_list_skip_disclosure_keeps_cut_trailer_last() {
+    let f = Fixture::new();
+    for index in 0..120 {
+        std::fs::write(
+            f._root.path().join(format!("entry{index:03}.txt")),
+            "original\n",
+        )
+        .unwrap();
+    }
+    for (tool, envelope_key, response) in [
+        (
+            "grep",
+            "matches_list_envelope",
+            super::grep::handle_grep(&request("grep", json!({"pattern": "original"})), &f.ctx),
+        ),
+        (
+            "glob",
+            "files_list_envelope",
+            super::glob::handle_glob(&request("glob", json!({"pattern": "**/*"})), &f.ctx),
+        ),
+    ] {
+        assert!(response.success, "{response:?}");
+        assert!(has_floor_skip(&response, f.store.parent().unwrap()));
+        let envelope = serde_json::from_value(response.data[envelope_key].clone()).unwrap();
+        let trailer =
+            crate::subc_format::render_envelope_trailer(&envelope).expect("cut list trailer");
+        let rendered = crate::subc_format::format_response(tool, &response, false);
+        assert!(rendered.contains("denied_floor"), "{rendered}");
+        assert!(rendered.ends_with(&trailer), "{rendered}");
+    }
 }

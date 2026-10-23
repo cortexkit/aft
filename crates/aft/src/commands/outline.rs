@@ -145,7 +145,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let mut body = serde_json::json!({
             "text": rendered.text,
             "discovered": true,
-            "complete": !walk_incomplete && !rendered.truncated && !rendered.cut_short,
+            "complete": skipped_files.is_empty() && !walk_incomplete && !rendered.truncated && !rendered.cut_short,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -1492,6 +1492,11 @@ fn build_outline_gitignore(
     root: &Path,
     ignore_file: &Path,
 ) -> Option<Arc<ignore::gitignore::Gitignore>> {
+    if crate::project_content::storage_root_for_path(ignore_file).is_some()
+        || crate::db::file_identity::is_live_sqlite_file(ignore_file)
+    {
+        return None;
+    }
     if !ignore_file.is_file() {
         return None;
     }
@@ -1563,10 +1568,15 @@ fn handle_outline_files_mode(
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
     let mut empty_targets = Vec::new();
+    let mut skipped_files = Vec::new();
 
     for target in targets {
         let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&target)) {
             Ok(path) => path,
+            Err(response) if multiple_targets && response.data["code"] == "denied_floor" => {
+                skipped_files.push(SkippedFile::new(&target, "denied_floor"));
+                continue;
+            }
             Err(response) => return response,
         };
         // In a confined call, refuse a directory outside the confined root or
@@ -1599,6 +1609,18 @@ fn handle_outline_files_mode(
         discovery
             .files
             .retain(|file| !is_read_excluded(&excluded, Path::new(file)));
+        let mut admitted_files = Vec::new();
+        for file in std::mem::take(&mut discovery.files) {
+            match ctx.validate_read_path(&req.id, req.session(), Path::new(&file)) {
+                Ok(_) => admitted_files.push(file),
+                Err(response) if response.data["code"] == "denied_floor" => {
+                    skipped_files.push(SkippedFile::new(file, "denied_floor"));
+                    discovery.ignored_entries += 1;
+                }
+                Err(response) => return response,
+            }
+        }
+        discovery.files = admitted_files;
         entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
@@ -1723,7 +1745,9 @@ fn handle_outline_files_mode(
         "complete": !walk_truncated
             && !collection_truncated
             && skipped_foreign_mounts == 0
+            && skipped_files.is_empty()
             && unknown_lines.is_empty(),
+        "skipped_files": skipped_files,
         "line_count_gaps": unknown_lines,
         "entries_examined": entries_examined,
         "walk_truncated": walk_truncated,
@@ -2584,10 +2608,22 @@ fn outline_many_files(
     excluded: &HashSet<PathBuf>,
     budget: MultiFileBudget,
 ) -> Result<(RenderedOutline, Vec<SkippedFile>), Response> {
-    let paths = files
-        .iter()
-        .map(|file| ctx.validate_read_path(req_id, session_id, Path::new(file)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = Vec::new();
+    let mut admitted_files = Vec::new();
+    // Keep request indices so denied leaves and parse failures share one list.
+    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        match ctx.validate_read_path(req_id, session_id, Path::new(file)) {
+            Ok(path) => {
+                paths.push(path);
+                admitted_files.push((index, file));
+            }
+            Err(response) if response.data["code"] == "denied_floor" => {
+                skipped_files.push((index, SkippedFile::new(file, "denied_floor")));
+            }
+            Err(response) => return Err(response),
+        }
+    }
     let display_root = project_root
         .filter(|root| paths.iter().all(|path| path.starts_with(root)))
         .map(Path::to_path_buf)
@@ -2595,11 +2631,10 @@ fn outline_many_files(
 
     // Visit files in rendering order (stable, so equal display paths keep
     // their request order) so that the budget check below can stop early.
-    let mut ordered = files
-        .iter()
+    let mut ordered = admitted_files
+        .into_iter()
         .zip(paths)
-        .enumerate()
-        .map(|(index, (file, path))| {
+        .map(|((index, file), path)| {
             let rel_path = display_path(&path, file, display_root.as_deref());
             (index, file, path, rel_path)
         })
@@ -2608,7 +2643,6 @@ fn outline_many_files(
 
     let mut writer = MultiFileTreeWriter::new(&budget);
     // Skipped files are reported in request order, keyed by request index.
-    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
     // One parser for the whole batch, sharing the provider's symbol cache:
     // the syntax check below leaves its tree in this parser's tree cache, and
     // symbol extraction for the same file then reuses that tree instead of

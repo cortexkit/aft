@@ -1166,11 +1166,20 @@ pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
         ) -> i32;
     }
 
-    // Windows accepts case aliases even for missing final components. Compare
-    // whole components with the OS's ordinal case rules, without following a
-    // final symlink or losing non-UTF-8 names through string conversion.
-    let path = crate::inspect::job::normalize_path(path);
-    let prefix = crate::inspect::job::normalize_path(prefix);
+    // Resolve short-name aliases and missing descendants through their nearest
+    // existing ancestor. Preserve a final symlink's location for unlink checks.
+    let path = if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => policy_path(parent).join(name),
+            _ => policy_path(path),
+        }
+    } else {
+        policy_path(path)
+    };
+    let prefix = policy_path(prefix);
     let mut components = path.components();
     prefix.components().all(|expected| {
         let Some(actual) = components.next() else {

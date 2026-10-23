@@ -302,7 +302,12 @@ pub(crate) fn format_response_unbounded(
 
     let data = &response.data;
     if !response.success {
-        return format_error(bare_name, data, ctx);
+        let text = format_error(bare_name, data, ctx);
+        return if matches!(bare_name, "edit" | "grep" | "glob") {
+            append_ast_skipped_files(text, data.get("skipped_files"))
+        } else {
+            text
+        };
     }
 
     let mut text = match bare_name {
@@ -342,6 +347,9 @@ pub(crate) fn format_response_unbounded(
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
     };
+    if bare_name == "edit" {
+        text = append_ast_skipped_files(text, data.get("skipped_files"));
+    }
     if matches!(bare_name, "read" | "outline" | "zoom") {
         if let Some(header) = revision_header(data) {
             text = if text.is_empty() {
@@ -1809,9 +1817,15 @@ fn format_glob_response(data: &Value) -> String {
         .get("files_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
     if let Some(env) = envelope {
-        append_glob_envelope_trailer(base, &env)
+        let trailer = render_envelope_trailer(&env).map(|trailer| format!("\n\n{trailer}"));
+        let base = trailer
+            .as_ref()
+            .and_then(|trailer| base.strip_suffix(trailer))
+            .unwrap_or(base);
+        let base = append_ast_skipped_files(base.to_string(), data.get("skipped_files"));
+        append_glob_envelope_trailer(&base, &env)
     } else {
-        base.to_string()
+        append_ast_skipped_files(base.to_string(), data.get("skipped_files"))
     }
 }
 
@@ -1877,6 +1891,7 @@ fn format_grep(data: &Value) -> String {
         }
     };
 
+    let base = append_ast_skipped_files(base, data.get("skipped_files"));
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             if base.is_empty() {

@@ -3593,6 +3593,7 @@ impl SearchIndexSnapshot {
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = make_deadline();
         let io_budget = crate::bounded_io::current();
+        let floor_disclosure = crate::context::confinement::capture();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
             let Some(max_files) = max_files else {
@@ -3636,6 +3637,7 @@ impl SearchIndexSnapshot {
                             let file_truncated = AtomicBool::new(false);
                             let rows = search_candidate_file(
                                 file,
+                                &floor_disclosure,
                                 &matcher,
                                 allowance,
                                 allowance,
@@ -3663,6 +3665,7 @@ impl SearchIndexSnapshot {
                     let file_truncated = AtomicBool::new(false);
                     let rows = search_candidate_file(
                         batch[file],
+                        &floor_disclosure,
                         &matcher,
                         need,
                         need,
@@ -3732,6 +3735,7 @@ impl SearchIndexSnapshot {
                         }
                         search_candidate_file(
                             file,
+                            &floor_disclosure,
                             &matcher,
                             max_results,
                             stop_after,
@@ -3765,6 +3769,7 @@ impl SearchIndexSnapshot {
                 }
                 matches.extend(search_candidate_file(
                     file,
+                    &floor_disclosure,
                     &matcher,
                     max_results,
                     stop_after,
@@ -4243,6 +4248,7 @@ enum MatchVisit {
 
 fn search_candidate_file(
     file: &FileEntry,
+    floor_disclosure: &crate::context::confinement::Fence,
     matcher: &SearchMatcher,
     max_results: usize,
     stop_after: usize,
@@ -4272,6 +4278,9 @@ fn search_candidate_file(
     let content = match read_indexed_file_bytes(&file.path, deadline.read_at) {
         Ok(content) => content,
         Err(error) => {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                floor_disclosure.record_source_exclusion(&file.path);
+            }
             if error.kind() == std::io::ErrorKind::TimedOut {
                 deadline.reached.store(true, Ordering::Relaxed);
                 engine_capped.store(true, Ordering::Relaxed);
@@ -7011,7 +7020,7 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
 /// Read an indexed file for grep verification. Keep the original I/O error so
 /// callers distinguish a missing entry from blocked access or a scan timeout.
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    crate::bounded_io::read(path, deadline)
+    crate::project_content::read_bounded(path, deadline, false)
 }
 
 /// Whether an I/O error says the path does not exist (including a path whose

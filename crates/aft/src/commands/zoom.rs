@@ -499,12 +499,12 @@ fn handle_zoom_targets(
                         if crate::access_policy::is_access_request(&response) {
                             return response;
                         }
-                        // A forbidden historical read refuses the call, rather
-                        // than being presented as a missing symbol in the batch.
+                        // Keep outside-root historical authorization failures
+                        // at call scope; floor refusals remain target-local.
                         if revision.is_some()
                             && matches!(
                                 response.data.get("code").and_then(|value| value.as_str()),
-                                Some("path_outside_root" | "denied_floor")
+                                Some("path_outside_root")
                             )
                         {
                             return response;

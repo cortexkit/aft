@@ -1,1 +1,1 @@
-- File tools (read, write, edit, apply_patch, delete, move, grep and glob) and undo now refuse AFT's own storage files, including hard links to its live databases, even when the storage folder is inside an authorized project, so they can't disturb those databases.
+- File tools and undo refuse direct access to AFT's own storage files and live database aliases, even inside an authorized project; multi-file reads and glob edits skip and report protected files without blocking ordinary project files.

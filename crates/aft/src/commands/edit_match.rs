@@ -662,6 +662,44 @@ fn handle_glob_edit_match(
     replacement: &str,
     op_id: &str,
 ) -> Response {
+    let mut skipped_files = Vec::new();
+    let mut response = handle_glob_edit_match_inner(
+        req,
+        ctx,
+        pattern,
+        match_str,
+        replacement,
+        op_id,
+        &mut skipped_files,
+    );
+    if !skipped_files.is_empty() {
+        response.data["skipped_files"] = serde_json::json!(skipped_files);
+        response.data["complete"] = serde_json::json!(false);
+    }
+    response
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GlobEditSkipReason {
+    DeniedFloor,
+}
+
+#[derive(serde::Serialize)]
+struct SkippedGlobEditFile {
+    file: String,
+    reason: GlobEditSkipReason,
+}
+
+fn handle_glob_edit_match_inner(
+    req: &RawRequest,
+    ctx: &AppContext,
+    pattern: &str,
+    match_str: &str,
+    replacement: &str,
+    op_id: &str,
+    skipped_files: &mut Vec<SkippedGlobEditFile>,
+) -> Response {
     // Resolve glob relative to project root (or cwd)
     let config = ctx.config();
     let root = config
@@ -717,6 +755,13 @@ fn handle_glob_edit_match(
     for path in &paths {
         let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
             Ok(validated) => validated,
+            Err(resp) if resp.data["code"] == "denied_floor" => {
+                skipped_files.push(SkippedGlobEditFile {
+                    file: path.display().to_string(),
+                    reason: GlobEditSkipReason::DeniedFloor,
+                });
+                continue;
+            }
             Err(resp) => return resp,
         };
         let (source, capture) = match CapturedRegularFile::read_text(path) {

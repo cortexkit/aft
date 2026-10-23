@@ -1128,6 +1128,7 @@ fn target_walk_builder(
         crate::context::confinement::SEARCH_IGNORE_FILES,
     );
     let ignore_root = ignore_ancestors.then(|| search_root.to_path_buf());
+    let floor_disclosure = crate::context::confinement::capture();
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
@@ -1137,6 +1138,7 @@ fn target_walk_builder(
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
             {
+                floor_disclosure.record_source_exclusion(entry.path());
                 return false;
             }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {

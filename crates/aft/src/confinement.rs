@@ -5,7 +5,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::Value;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,6 +15,7 @@ thread_local! {
         RefCell::new(Fence {
             requests: Vec::new(),
             gate: None,
+            floor_omissions: None,
         })
     };
     #[cfg(test)]
@@ -28,11 +29,23 @@ thread_local! {
 pub(crate) struct Fence {
     requests: Vec<String>,
     gate: Option<Arc<ReadGate>>,
+    floor_omissions: Option<Arc<parking_lot::Mutex<FloorOmissions>>>,
+}
+
+#[derive(Default)]
+struct FloorOmissions {
+    paths: BTreeSet<PathBuf>,
+    filter: Option<(PathBuf, crate::search_index::PathFilters)>,
 }
 
 impl PartialEq for Fence {
     fn eq(&self, other: &Self) -> bool {
         self.requests == other.requests
+            && match (&self.floor_omissions, &other.floor_omissions) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
             && match (&self.gate, &other.gate) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
@@ -51,6 +64,30 @@ impl std::fmt::Debug for Fence {
 }
 
 impl Fence {
+    pub(crate) fn record_floor(&self, path: &Path) {
+        if let Some(omissions) = &self.floor_omissions {
+            let is_dir = path.is_dir();
+            let mut omissions = omissions.lock();
+            if is_dir
+                || omissions
+                    .filter
+                    .as_ref()
+                    .is_none_or(|(root, filter)| filter.matches(root, path))
+            {
+                omissions.paths.insert(path.to_path_buf());
+            }
+        }
+    }
+
+    pub(crate) fn record_source_exclusion(&self, path: &Path) {
+        if self.floor_omissions.is_some()
+            && (crate::project_content::storage_root_for_path(path).is_some()
+                || crate::db::file_identity::is_live_sqlite_file(path))
+        {
+            self.record_floor(path);
+        }
+    }
+
     fn active(&self) -> bool {
         !self.requests.is_empty()
     }
@@ -74,6 +111,31 @@ impl Fence {
         gate.denied.lock().insert(path.to_path_buf());
         false
     }
+}
+
+/// Carry omission reporting through the same helper-thread scope as read policy.
+pub(crate) fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response {
+    let omissions = Arc::new(parking_lot::Mutex::new(FloorOmissions::default()));
+    let mut fence = capture();
+    fence.floor_omissions = Some(omissions.clone());
+    let mut response = inherit(fence, run);
+    let omissions = omissions.lock();
+    if !omissions.paths.is_empty() {
+        response.data["skipped_files"] =
+            serde_json::json!(omissions.paths.iter().map(|path| {
+            serde_json::json!({"file": path.display().to_string(), "reason": "denied_floor"})
+        }).collect::<Vec<_>>());
+        response.data["complete"] = serde_json::json!(false);
+    }
+    response
+}
+
+pub(crate) fn set_floor_filter(root: &Path, filter: &crate::search_index::PathFilters) {
+    FENCE.with(|fence| {
+        if let Some(omissions) = &fence.borrow().floor_omissions {
+            omissions.lock().filter = Some((root.to_path_buf(), filter.clone()));
+        }
+    });
 }
 
 /// The read policy one confined call checks walked paths against, snapshotted

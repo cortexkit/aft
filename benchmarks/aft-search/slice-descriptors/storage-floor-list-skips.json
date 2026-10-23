@@ -1,0 +1,6 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "paging",
+  "slice_class": "ranking",
+  "fixtures": ["harness-goldens"]
+}

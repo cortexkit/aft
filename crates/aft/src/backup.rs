@@ -6817,6 +6817,77 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 mod tests {
     #[cfg(windows)]
     #[test]
+    fn backup_storage_floor_windows_short_names_and_missing_descendants() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let project = tempfile::tempdir().unwrap();
+        let storage = project.path().join("AFT Storage Long Folder Name");
+        std::fs::create_dir(&storage).unwrap();
+        let long = storage.canonicalize().unwrap();
+        let plain = crate::windows_path::normalize_windows_path(&long);
+        let input = plain
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: input is NUL-terminated; a null output requests the buffer size.
+        let required = unsafe { GetShortPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(
+            required > 0,
+            "GetShortPathNameW: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut output = vec![0u16; required as usize];
+        // SAFETY: output has the requested number of writable UTF-16 elements.
+        let written = unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), required) };
+        assert!(written > 0 && written < required);
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&output[..written as usize]));
+        if short
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&plain.to_string_lossy())
+        {
+            eprintln!(
+                "SKIPPED Windows short-name storage-floor case: this volume has 8.3 names disabled"
+            );
+            return;
+        }
+        std::fs::write(long.join("aft.db"), "not live SQLite").unwrap();
+        for configured in [&long, &short] {
+            let mut store = super::BackupStore::new();
+            store.set_storage_dir(configured.clone(), 72);
+            let policy = crate::access_policy::AccessPolicy::from_config(
+                &crate::config::Config::default(),
+                configured,
+                vec![project.path().to_path_buf()],
+                project.path(),
+            );
+            for root in [&long, &short] {
+                for suffix in [Path::new("aft.db"), Path::new("missing/new.db")] {
+                    let path = root.join(suffix);
+                    assert!(!crate::db::file_identity::is_live_sqlite_file(&path));
+                    assert_eq!(
+                        store
+                            .snapshot("floor", &path, "refused")
+                            .unwrap_err()
+                            .code(),
+                        "denied_floor"
+                    );
+                    assert_eq!(
+                        policy.decide(crate::access_policy::AccessOperation::Read, &path, false),
+                        crate::access_policy::AccessDecision::Deny(
+                            crate::access_policy::AccessDenial::Floor
+                        ),
+                        "target={path:?}, storage={configured:?}"
+                    );
+                }
+            }
+            assert_eq!(store.storage_dir.as_ref(), Some(configured));
+        }
+        println!("Windows short-name storage-floor case exercised: {short:?} == {long:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn backup_storage_floor_windows_path_spellings_without_live_identity() {
         let project = tempfile::tempdir().unwrap();
         let storage = project.path().join("AftStorage");

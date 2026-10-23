@@ -38,7 +38,9 @@ const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_glob_inner)
+    crate::context::confinement::with_floor_disclosure(|| {
+        crate::bounded_io::command(req, ctx, handle_glob_inner)
+    })
 }
 
 fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -53,13 +55,16 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    if let Err(error) = build_path_filters(&[pattern.to_string()], &[]) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("glob: invalid pattern: {}", error),
-        );
-    }
+    let filters = match build_path_filters(&[pattern.to_string()], &[]) {
+        Ok(filters) => filters,
+        Err(error) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("glob: invalid pattern: {}", error),
+            )
+        }
+    };
 
     let project_root = ctx
         .config()
@@ -67,6 +72,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = crate::bounded_io::canonicalize(&project_root).unwrap_or(project_root);
+    crate::context::confinement::set_floor_filter(&project_root, &filters);
     let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
         Some(path) => match resolve_path_or_multi(
             path,
@@ -245,6 +251,17 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             skipped_foreign_mounts,
         )
     };
+    let mut admitted_files = Vec::new();
+    for path in files {
+        match ctx.validate_read_path(&req.id, req.session(), &path) {
+            Ok(_) => admitted_files.push(path),
+            Err(response) if response.data["code"] == "denied_floor" => {
+                crate::context::confinement::capture().record_floor(&path);
+            }
+            Err(response) => return response,
+        }
+    }
+    files = admitted_files;
     crate::slog_debug!(
         "perf glob phases: source={} walk={:.3}ms entries_visited={} scope_probe={:.3}ms discovery_total={:.3}ms",
         source,
