@@ -85,9 +85,9 @@ pub fn live_process_group_members(
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     #[cfg(target_os = "linux")]
-    let mut members = linux_process_group_members(pgid)?;
+    return linux_process_group_members(pgid);
     #[cfg(target_os = "macos")]
-    let mut members = macos_process_group_members(pgid)?;
+    return macos_process_group_members(pgid);
     #[cfg(windows)]
     {
         let _ = pgid;
@@ -97,14 +97,6 @@ pub fn live_process_group_members(
     {
         let _ = pgid;
         return Err(LiveDescendantsUnavailable::UnsupportedPlatform);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        members.sort_by_key(|member| member.pid);
-        let omitted = members.len().saturating_sub(LIVE_DESCENDANT_CAP);
-        members.truncate(LIVE_DESCENDANT_CAP);
-        Ok((members, omitted))
     }
 }
 
@@ -268,25 +260,47 @@ fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
     }
 }
 
+/// Describe at most [`LIVE_DESCENDANT_CAP`] group members, lowest pid first,
+/// and count the rest without describing them. Listing a member is cheap (its
+/// pid and group); describing it reads its command line and owner, so that work
+/// stops at the cap however large the group is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bounded_members<C>(
+    mut candidates: Vec<(u32, C)>,
+    mut describe: impl FnMut(u32, C) -> Option<LiveDescendant>,
+) -> (Vec<LiveDescendant>, usize) {
+    candidates.sort_by_key(|(pid, _)| *pid);
+    let mut rest = candidates.into_iter();
+    let members = rest
+        .by_ref()
+        .filter_map(|(pid, candidate)| describe(pid, candidate))
+        .take(LIVE_DESCENDANT_CAP)
+        .collect();
+    (members, rest.count())
+}
+
 #[cfg(target_os = "linux")]
 fn linux_process_group_members(
     pgid: i32,
-) -> Result<Vec<LiveDescendant>, LiveDescendantsUnavailable> {
+) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
     // An empty group needs no /proc walk. EPERM still means the group exists
     // and must be enumerated, including reparented descendants.
     if pgid > 0 && unsafe { libc::kill(-pgid, 0) } == -1 && io_group_missing() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     #[cfg(test)]
     PROC_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     // A group that exists but cannot be listed is not an empty group.
     let entries =
         std::fs::read_dir("/proc").map_err(|_| LiveDescendantsUnavailable::ListingFailed)?;
-    Ok(entries
+    let candidates = entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| linux_process_member(pid, pgid))
-        .collect())
+        .filter_map(|pid| Some((pid, linux_group_member_comm(pid, pgid)?)))
+        .collect();
+    Ok(bounded_members(candidates, |pid, comm| {
+        Some(linux_describe_member(pid, comm))
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -297,8 +311,10 @@ fn io_group_missing() -> bool {
 #[cfg(all(test, target_os = "linux"))]
 thread_local! { static PROC_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+/// The command name of a live (not zombie) process in `expected_pgid`, or
+/// `None` for any other process.
 #[cfg(target_os = "linux")]
-fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> {
+fn linux_group_member_comm(pid: u32, expected_pgid: i32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let open = stat.find('(')?;
     let close = stat.rfind(") ")?;
@@ -307,9 +323,11 @@ fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> 
     let state = fields.next()?;
     let _ppid = fields.next()?;
     let pgrp = fields.next()?.parse::<i32>().ok()?;
-    if pgrp != expected_pgid || state == "Z" {
-        return None;
-    }
+    (pgrp == expected_pgid && state != "Z").then_some(comm)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_describe_member(pid: u32, comm: String) -> LiveDescendant {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     let mut args = cmdline
         .split(|byte| *byte == 0)
@@ -339,19 +357,19 @@ fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> 
                 .ok()
         })
         .map(user_name);
-    Some(LiveDescendant {
+    LiveDescendant {
         pid,
         comm,
         argv0,
         user,
         command: bounded_command(&args),
-    })
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn macos_process_group_members(
     pgid: i32,
-) -> Result<Vec<LiveDescendant>, LiveDescendantsUnavailable> {
+) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
     use std::ffi::{c_char, c_int, c_void};
 
     #[link(name = "proc")]
@@ -361,7 +379,7 @@ fn macos_process_group_members(
     }
 
     if pgid <= 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut pids = vec![0_u32; 16_384];
     let count = unsafe {
@@ -375,48 +393,49 @@ fn macos_process_group_members(
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     pids.truncate(count as usize);
-    Ok(pids
+    // kern.proc.pid answers for every user's processes. proc_name does not:
+    // it fails with EPERM for another user's process, and dropping the member
+    // on that failure hid exactly the processes a kill cannot reach. Only a
+    // process that is gone, a zombie, or in another group is left out.
+    let candidates = pids
         .into_iter()
         .filter(|pid| *pid != 0)
         .filter_map(|pid| {
-            // kern.proc.pid answers for every user's processes. proc_name
-            // does not: it fails with EPERM for another user's process, and
-            // dropping the member on that failure hid exactly the processes
-            // a kill cannot reach. Only a process that is gone is left out.
             let info = macos_kinfo(pid);
             match &info {
-                Some(info) if info.zombie || info.pgid != pgid => return None,
-                Some(_) => {}
-                None if !macos_pid_exists(pid) => return None,
-                None => {}
+                Some(info) if info.zombie || info.pgid != pgid => None,
+                None if !macos_pid_exists(pid) => None,
+                _ => Some((pid, info)),
             }
-            let mut name = [0 as c_char; 1024];
-            let name_len =
-                unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
-            let comm = if name_len > 0 {
-                unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                info.as_ref()
-                    .map(|info| info.comm.clone())
-                    .unwrap_or_else(|| "?".to_string())
-            };
-            let args = macos_argv(pid).unwrap_or_default();
-            let argv0 = args
-                .first()
-                .filter(|value| !value.is_empty())
-                .cloned()
-                .unwrap_or_else(|| comm.clone());
-            Some(LiveDescendant {
-                pid,
-                comm,
-                argv0,
-                user: info.map(|info| user_name(info.ruid)),
-                command: bounded_command(&args),
-            })
         })
-        .collect())
+        .collect();
+    Ok(bounded_members(candidates, |pid, info| {
+        let mut name = [0 as c_char; 1024];
+        let name_len =
+            unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
+        let comm = if name_len > 0 {
+            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            info.as_ref()
+                .map(|info| info.comm.clone())
+                .unwrap_or_else(|| "?".to_string())
+        };
+        let args = macos_argv(pid).unwrap_or_default();
+        let argv0 = args
+            .first()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| comm.clone());
+        Some(LiveDescendant {
+            pid,
+            comm,
+            argv0,
+            user: info.map(|info| user_name(info.ruid)),
+            command: bounded_command(&args),
+        })
+    }))
 }
 
 /// The fields AFT reads from a macOS `struct kinfo_proc`.
@@ -1176,7 +1195,7 @@ fn lifecycle_empty_group_avoids_proc_scan() {
     let pgid = child.id() as i32;
     child.wait().unwrap();
     PROC_SCAN_COUNT.with(|count| count.set(0));
-    assert!(linux_process_group_members(pgid).unwrap().is_empty());
+    assert!(linux_process_group_members(pgid).unwrap().0.is_empty());
     assert_eq!(
         PROC_SCAN_COUNT.with(std::cell::Cell::get),
         0,
@@ -1220,7 +1239,9 @@ fn macos_kinfo_reads_this_process() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_group_listing_includes_another_users_process() {
-    let members = macos_process_group_members(1).expect("group 1 can be listed");
+    let members = macos_process_group_members(1)
+        .expect("group 1 can be listed")
+        .0;
     let launchd = members
         .iter()
         .find(|member| member.pid == 1)
@@ -1240,7 +1261,8 @@ fn linux_member_records_owner_and_bounded_command() {
     let members = linux_process_group_members(pgid);
     let _ = child.kill();
     let _ = child.wait();
-    let members = members.unwrap();
+    let (members, omitted) = members.unwrap();
+    assert_eq!(omitted, 0);
     assert_eq!(members.len(), 1, "{members:?}");
     assert_eq!(members[0].command.as_deref(), Some("sleep 30"));
     assert_eq!(
@@ -1261,4 +1283,31 @@ fn bounded_command_cuts_long_command_lines() {
         Some("sleep 30")
     );
     assert_eq!(bounded_command(&[]), None);
+}
+
+/// Describing stops at the cap; the members past it are counted, not read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn bounded_members_stops_describing_at_the_cap() {
+    let total = LIVE_DESCENDANT_CAP + 5;
+    let candidates = (1..=total as u32).rev().map(|pid| (pid, ())).collect();
+    let mut described = 0;
+    let (members, omitted) = bounded_members(candidates, |pid, ()| {
+        described += 1;
+        Some(LiveDescendant {
+            pid,
+            comm: "sleep".into(),
+            argv0: "sleep".into(),
+            user: None,
+            command: None,
+        })
+    });
+    assert_eq!(described, LIVE_DESCENDANT_CAP);
+    assert_eq!(members.len(), LIVE_DESCENDANT_CAP);
+    assert_eq!(omitted, 5);
+    assert_eq!(members.first().map(|member| member.pid), Some(1));
+    assert_eq!(
+        members.last().map(|member| member.pid),
+        Some(LIVE_DESCENDANT_CAP as u32)
+    );
 }
