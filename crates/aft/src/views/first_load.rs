@@ -1329,6 +1329,9 @@ impl FirstLoadDriver for CheckoutDriver {
             .to_string();
         let _assembly = crate::pins::AssemblyPin::create_v2(&self.owner, &assembly_name, &[])
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        let mut unpublished =
+            super::generation::UnpublishedGenerations::new(&store, self.owner.registry());
+        unpublished.track_new(&assembly_name);
         let mut live = crate::pins::LivePin::create(&self.owner)
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
         live.protect(&manifest.ready_keys().collect::<Vec<_>>())
@@ -1362,6 +1365,7 @@ impl FirstLoadDriver for CheckoutDriver {
             &manifest.ready_keys().collect::<Vec<_>>(),
         )
         .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        unpublished.track_new(&name.to_string());
         for plane in &self.planes {
             plane.finish_generation(&self.owner, &assembly_name, &name.to_string())?;
         }
@@ -1376,7 +1380,11 @@ impl FirstLoadDriver for CheckoutDriver {
                 .ok_or_else(|| SiblingLoader::error("publication committed twice"))?;
             store
                 .commit_v2(prepared, None)
-                .map(|_| ())
+                .map(|outcome| {
+                    if outcome == super::manifest_v2::PublishV2::Published {
+                        unpublished.complete();
+                    }
+                })
                 .map_err(|error| SiblingLoader::error(error.to_string()))
         };
         let fence = self
@@ -1905,6 +1913,123 @@ mod callgraph_bridge_tests {
         fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
             Ok(vec![root.join("file.rs")])
         }
+    }
+
+    struct RejectAfterBuild {
+        directory: std::path::PathBuf,
+        panic: bool,
+    }
+
+    impl PublishFence for RejectAfterBuild {
+        fn publish(&self, _: &mut dyn FnMut() -> Result<(), PlaneError>) -> Result<(), PlaneError> {
+            let paths = std::fs::read_dir(&self.directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("derived-")
+                        && path.extension().is_some_and(|ext| ext == "sqlite")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                paths.len(),
+                1,
+                "the private build must finish before rejection"
+            );
+            std::fs::write(
+                format!("{}-journal", paths[0].display()),
+                b"interrupted journal",
+            )
+            .unwrap();
+            assert!(!self.panic, "injected first-load publication panic");
+            Err(SiblingLoader::error(SUPERSEDED_PUBLISH))
+        }
+    }
+
+    struct Accept;
+    impl PublishFence for Accept {
+        fn publish(
+            &self,
+            commit: &mut dyn FnMut() -> Result<(), PlaneError>,
+        ) -> Result<(), PlaneError> {
+            commit()
+        }
+    }
+
+    fn rejected_publication(panic: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("file.rs"),
+            "fn target() {} fn caller() { target(); }",
+        )
+        .unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "cleanup-family").unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", root.path())
+            .unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let driver = Arc::new(
+            CheckoutDriver::new(
+                owner.clone(),
+                Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                None,
+                Arc::new(Walker),
+                vec![bridge.clone()],
+            )
+            .with_adapters(vec![bridge.adapter.clone()]),
+        );
+        driver.set_publish_fence(Arc::new(RejectAfterBuild {
+            directory: owner.view_dir().to_path_buf(),
+            panic,
+        }));
+        let access = ViewAccess::Owner(owner.clone());
+        let loader = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()]);
+        let (snapshot, revision) = loader
+            .reconciled(&access, loader.seed(&access).unwrap())
+            .unwrap();
+        driver.install(&access, &snapshot, revision).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.build_own_generation(&access, &snapshot, false)
+        }));
+        if panic {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_err());
+        }
+        for entry in std::fs::read_dir(owner.view_dir()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with("derived-") && !name.starts_with("manifest-"),
+                "unpublished file remains: {name}"
+            );
+        }
+        driver.set_publish_fence(Arc::new(Accept));
+        let own = driver
+            .build_own_generation(&access, &snapshot, false)
+            .unwrap();
+        assert!(
+            super::super::resolve_derived_path(owner.view_dir(), own.name())
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn first_load_rejected_publication_removes_files_and_retry_succeeds() {
+        rejected_publication(false);
+    }
+
+    #[test]
+    fn first_load_panicked_publication_removes_files_and_retry_succeeds() {
+        rejected_publication(true);
     }
     #[test]
     fn real_callgraph_bridge_installs_reader_before_wait_reports_ready() {

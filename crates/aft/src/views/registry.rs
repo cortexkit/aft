@@ -988,7 +988,9 @@ impl ViewRegistration {
 
     /// The view's own pointer and manifests in `views/v2/<scope>`.
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
-        Ok(super::ViewStore::open_dir(self.view_dir.clone())?)
+        let view = super::ViewStore::open_dir(self.view_dir.clone())?;
+        view.recover_abandoned_derived(Some(self.registry()));
+        Ok(view)
     }
 
     /// Runs `create` inside the registry's handoff barrier, after confirming

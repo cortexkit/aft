@@ -183,6 +183,41 @@ fn validated_v2_reference_keys(
 }
 
 impl ViewStore {
+    pub(super) fn recover_abandoned_derived(
+        &self,
+        registry: Option<&super::registry::FamilyRegistry>,
+    ) {
+        static RECOVERED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+        let recovered = RECOVERED.get_or_init(Default::default);
+        let path = self
+            .view_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| self.view_dir().to_path_buf());
+        if !recovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone())
+        {
+            return;
+        }
+        // Sweep before a new private build can allocate another large output.
+        // Ordinary opens in this process need not repeat the directory census.
+        let result = if let Some(registry) = registry {
+            registry
+                .with_barrier(|_| Ok(self.sweep_generations_locked()?))
+                .map_err(|error| error.to_string())
+        } else {
+            self.sweep_generations().map_err(|error| error.to_string())
+        };
+        if let Err(error) = result {
+            recovered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+            log::warn!("view startup derived cleanup deferred: {error}");
+        }
+    }
+
     pub fn derived_path(&self, generation: &str) -> Result<PathBuf> {
         let owner = self.derived_owner(generation)?;
         Ok(self.view_dir().join(format!("derived-{owner}.sqlite")))
@@ -291,7 +326,11 @@ impl ViewStore {
             }
             let generation = name
                 .strip_prefix("derived-")
-                .and_then(|s| s.strip_suffix(".sqlite"))
+                .and_then(|s| {
+                    [".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
+                        .iter()
+                        .find_map(|suffix| s.strip_suffix(suffix))
+                })
                 .or_else(|| {
                     name.strip_prefix("manifest-")
                         .and_then(|s| s.strip_suffix(".json"))
@@ -426,14 +465,18 @@ impl ViewStore {
                 .extension()
                 .is_some_and(|extension| extension == "sqlite")
             {
-                &["", "-wal", "-shm"][..]
+                &["", "-wal", "-shm", "-journal"][..]
             } else {
                 &[""][..]
             };
             for suffix in suffixes {
                 let mut name = path.as_os_str().to_owned();
                 name.push(suffix);
-                removed |= fs::remove_file(PathBuf::from(name)).is_ok();
+                let candidate = PathBuf::from(name);
+                removed |= remove_artifact(&candidate).unwrap_or_else(|error| {
+                    log::warn!("view generation cleanup failed: {error}");
+                    false
+                });
             }
         }
         removed
@@ -888,7 +931,7 @@ pub(crate) fn clone_derived_for_test(source: &Path, destination: &Path) -> Resul
     clone_derived(source, destination).map(|_| ())
 }
 
-/// Delete an unpublished derived file set (main file, `-wal`, `-shm`) so the
+/// Delete an unpublished derived file set, including all SQLite sidecars, so the
 /// caller can build a fresh database at the same path. Refuses while this
 /// process has any SQLite connection on the path: deleting a file set under a
 /// live connection would detach it from its locks and shared-memory index.
@@ -907,17 +950,146 @@ fn remove_unpublished_derived_locked(path: &Path) -> Result<()> {
             path.display()
         )));
     }
-    for suffix in ["", "-wal", "-shm"] {
+    let mut failure = None;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut candidate = path.as_os_str().to_owned();
         candidate.push(suffix);
         let candidate = PathBuf::from(candidate);
-        match fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ViewError::io_at("removing", &candidate, error)),
+        if let Err(error) = remove_artifact(&candidate) {
+            log::warn!("view unpublished cleanup failed: {error}");
+            failure = Some(error);
         }
     }
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+fn remove_artifact(path: &Path) -> Result<bool> {
+    let bytes = fs::symlink_metadata(path).map_or(0, |metadata| metadata.len());
+    match fs::remove_file(path) {
+        Ok(()) => {
+            log::info!(
+                "view generation cleanup removed={} bytes={bytes}",
+                path.display()
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ViewError::io_at("removing", path, error)),
+    }
+}
+
+/// Declared before the writer so unwinding closes SQLite before unlinking.
+pub(super) struct UnpublishedDerived<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+/// Owns first-load artifacts across materialization, rename and pointer CAS.
+/// Published or reader-protected names are never removed by this guard.
+pub(super) struct UnpublishedGenerations<'a> {
+    view: &'a ViewStore,
+    registry: &'a super::registry::FamilyRegistry,
+    names: Vec<String>,
+}
+
+impl<'a> UnpublishedGenerations<'a> {
+    pub(super) fn new(view: &'a ViewStore, registry: &'a super::registry::FamilyRegistry) -> Self {
+        Self {
+            view,
+            registry,
+            names: Vec::new(),
+        }
+    }
+
+    pub(super) fn track_new(&mut self, generation: &str) {
+        // First-load names include an owner and sequence, not just a content hash.
+        // Also avoid claiming any artifact already present at the private path.
+        if !self
+            .view
+            .view_dir()
+            .join(format!("derived-{generation}.sqlite"))
+            .exists()
+            && !self
+                .view
+                .view_dir()
+                .join(format!("derived-{generation}.ref"))
+                .exists()
+        {
+            self.names.push(generation.to_owned());
+        }
+    }
+
+    pub(super) fn complete(&mut self) {
+        self.names.clear();
+    }
+}
+
+impl Drop for UnpublishedGenerations<'_> {
+    fn drop(&mut self) {
+        if self.names.is_empty() {
+            return;
+        }
+        let cleanup = || -> Result<()> {
+            let mut pointer = self.view.open_pointer_connection()?;
+            let transaction =
+                pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let current: String = transaction.query_row(
+                "SELECT generation FROM pointer WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            // Reference creation takes the same pointer write lock. Complete
+            // the bounded ownership census before deleting any artifact.
+            let mut owners = std::collections::HashSet::new();
+            for entry in
+                generation_directory_entries(self.view.view_dir(), GENERATION_DIRECTORY_LIMIT)?
+            {
+                let file_name = entry.file_name();
+                if let Some(generation) = file_name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("derived-"))
+                    .and_then(|name| name.strip_suffix(".ref"))
+                {
+                    owners.insert(self.view.derived_owner(generation)?);
+                }
+            }
+            let _barrier = crate::storage_retention::pin_barrier(self.view.view_dir())?;
+            for name in &self.names {
+                if name != &current
+                    && !owners.contains(name)
+                    && !crate::root_cache::protected_read_marker_exists(self.view.view_dir(), name)
+                {
+                    self.view.remove_generation_files(name);
+                }
+            }
+            Ok(())
+        };
+        // V2 pin admission uses the family registry, not the legacy retention
+        // barrier. Match the collector's registry-before-pointer lock order.
+        if let Err(error) = self.registry.with_barrier(|_| Ok(cleanup()?)) {
+            log::warn!("view first-load cleanup deferred: {error}");
+        }
+    }
+}
+
+impl<'a> UnpublishedDerived<'a> {
+    pub(super) fn new(path: &'a Path) -> Self {
+        Self { path, armed: true }
+    }
+
+    pub(super) fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnpublishedDerived<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = remove_unpublished_derived(self.path) {
+                log::warn!("view abandoned derived cleanup failed: {error}");
+            }
+        }
+    }
 }
 
 /// How a backup reached completion, for the clone log line and tests.
@@ -988,6 +1160,322 @@ pub(super) fn copy_all_pages(backup: &rusqlite::backup::Backup<'_, '_>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_file_set_removed(path: &Path) {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            assert!(
+                !PathBuf::from(format!("{}{suffix}", path.display())).exists(),
+                "unpublished file remains: {}{suffix}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_cleanup_removes_all_sidecars_after_close() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("unpublished.sqlite");
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&path, "cleanup-test").unwrap();
+        connection
+            .execute_batch("CREATE TABLE t(v); INSERT INTO t VALUES(1);")
+            .unwrap();
+        assert!(remove_unpublished_derived(&path).is_err());
+        assert!(path.exists());
+        drop(connection);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(
+                format!("{}{suffix}", path.display()),
+                b"unpublished sidecar",
+            )
+            .unwrap();
+        }
+        remove_unpublished_derived(&path).unwrap();
+        assert_file_set_removed(&path);
+    }
+
+    #[test]
+    fn crashed_private_build_child() {
+        let Some(storage) = std::env::var_os("AFT_TEST_CRASHED_DERIVED_STORAGE") else {
+            return;
+        };
+        let view = if std::env::var_os("AFT_TEST_CRASHED_DERIVED_V2").is_some() {
+            let root = PathBuf::from(&storage).join("project");
+            fs::create_dir_all(&root).unwrap();
+            let registry =
+                super::super::registry::FamilyRegistry::open(Path::new(&storage), "crash-family")
+                    .unwrap();
+            registry
+                .register_view_with_storage(registry.storage(), "crash-cleanup", &root)
+                .unwrap()
+                .view_store()
+                .unwrap()
+        } else {
+            ViewStore::open(storage, "crash-cleanup").unwrap()
+        };
+        let served = view.derived_path("served").unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&served, "served-crash-test")
+                .unwrap();
+        connection
+            .execute_batch("CREATE TABLE retained(v); INSERT INTO retained VALUES(42)")
+            .unwrap();
+        drop(connection);
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'served'", [])
+            .unwrap();
+        let _pin = crate::pins::AssemblyPin::create(
+            view.view_dir(),
+            "family",
+            "crash-cleanup",
+            "crashed",
+            &[],
+        )
+        .unwrap();
+        let path = view.derived_path("crashed").unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&path, "crash-test").unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(v); INSERT INTO t VALUES(randomblob(100000));").unwrap();
+        assert!(path.exists());
+        assert!(view.view_dir().join("derived-crashed.sqlite-wal").exists());
+        fs::write(
+            view.view_dir().join("derived-journal-only.sqlite-journal"),
+            b"interrupted journal",
+        )
+        .unwrap();
+        let _relaxed_pin = crate::pins::AssemblyPin::create(
+            view.view_dir(),
+            "family",
+            "crash-cleanup",
+            "relaxed",
+            &[],
+        )
+        .unwrap();
+        let relaxed = view.derived_path("relaxed").unwrap();
+        let (manifest, payload) = crash_materialization_fixture();
+        crate::views::materialization::materialize_from_blob_reader(
+            &relaxed,
+            &manifest,
+            &CrashColdReader {
+                path: relaxed.clone(),
+                payload,
+                exit: true,
+            },
+        )
+        .unwrap();
+        panic!("the relaxed materializer did not reach the crash hook");
+    }
+
+    struct CrashColdReader {
+        path: PathBuf,
+        payload: Vec<u8>,
+        exit: bool,
+    }
+
+    impl crate::callgraph_store::join::ManifestBlobReader for CrashColdReader {
+        fn read_callgraph_blob(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, crate::callgraph_store::join::ManifestJoinError>
+        {
+            if self.exit {
+                assert!(fs::metadata(&self.path).unwrap().len() > 0);
+                assert_eq!(crate::db::file_identity::open_connections(&self.path), 1);
+                assert!(!PathBuf::from(format!("{}-wal", self.path.display())).exists());
+                // Kill the process inside the relaxed writer, without running
+                // SQLite, generation-owner or assembly-pin destructors.
+                std::process::exit(77);
+            }
+            Ok(Some(self.payload.clone()))
+        }
+    }
+
+    fn crash_materialization_fixture() -> (crate::views::Manifest, Vec<u8>) {
+        let payload = crate::callgraph_store::join::CallgraphBlob::extract(
+            "export function target() {}",
+            "typescript",
+            "fixture",
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        let manifest = crate::views::Manifest::new([(
+            crate::views::RelPath::new(b"file.ts".to_vec()).unwrap(),
+            crate::views::ManifestEntry::Regular {
+                mode: 0o100644,
+                resolution_input: false,
+                planes: crate::views::RegularPlanes {
+                    semantic: None,
+                    callgraph: Some(blake3::hash(&payload).to_hex().to_string()),
+                },
+            },
+        )])
+        .unwrap();
+        (manifest, payload)
+    }
+
+    fn crash_restart(v2: bool) {
+        let storage = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "views::generation::tests::crashed_private_build_child",
+                "--nocapture",
+            ])
+            .env("AFT_TEST_CRASHED_DERIVED_STORAGE", storage.path());
+        if v2 {
+            command.env("AFT_TEST_CRASHED_DERIVED_V2", "1");
+        }
+        let status = command.status().unwrap();
+        assert_eq!(status.code(), Some(77));
+        let view = if v2 {
+            let registry =
+                super::super::registry::FamilyRegistry::open(storage.path(), "crash-family")
+                    .unwrap();
+            registry
+                .register_view_with_storage(
+                    registry.storage(),
+                    "crash-cleanup",
+                    &storage.path().join("project"),
+                )
+                .unwrap()
+                .view_store()
+                .unwrap()
+        } else {
+            ViewStore::open(storage.path(), "crash-cleanup").unwrap()
+        };
+        let path = view.derived_path("crashed").unwrap();
+        assert_file_set_removed(&path);
+        assert_file_set_removed(&view.derived_path("journal-only").unwrap());
+        let relaxed = view.derived_path("relaxed").unwrap();
+        assert_file_set_removed(&relaxed);
+        for generation in ["crashed", "relaxed"] {
+            let (metadata, keys) = crate::pins::pin_paths(view.view_dir(), generation);
+            assert!(!metadata.exists() && !keys.exists());
+        }
+        let served = crate::db::file_identity::IdentityConnection::open(
+            view.derived_path("served").unwrap(),
+            "served-restart-test",
+        )
+        .unwrap();
+        assert_eq!(
+            served
+                .query_row("SELECT v FROM retained", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        drop(served);
+        let (manifest, payload) = crash_materialization_fixture();
+        crate::views::materialization::materialize_from_blob_reader(
+            &relaxed,
+            &manifest,
+            &CrashColdReader {
+                path: relaxed.clone(),
+                payload,
+                exit: false,
+            },
+        )
+        .unwrap();
+        assert!(relaxed.exists());
+        remove_unpublished_derived(&relaxed).unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&path, "retry-test").unwrap();
+        connection
+            .execute_batch("CREATE TABLE retry(v); INSERT INTO retry VALUES(1)")
+            .unwrap();
+        drop(connection);
+        remove_unpublished_derived(&path).unwrap();
+    }
+
+    #[test]
+    fn startup_sweep_removes_crashed_files_and_retry_succeeds() {
+        crash_restart(false);
+    }
+
+    #[test]
+    fn startup_v2_sweep_removes_crashed_files_and_retry_succeeds() {
+        crash_restart(true);
+    }
+
+    #[test]
+    fn cancelled_cold_assembly_removes_files_and_retry_succeeds() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(project.path())
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "--quiet"]);
+        fs::write(
+            project.path().join("lib.rs"),
+            "pub fn target() {} pub fn caller() { target(); }",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        let request = crate::views::assembly::AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: "cancel-cold".into(),
+            scope: "cancel-cold".into(),
+            desired_head: "HEAD".into(),
+            changed_paths: Default::default(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        let prepared = crate::views::assembly::prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+        let generation = prepared.report().generation.clone().unwrap();
+        let view = ViewStore::open(storage.path(), "cancel-cold").unwrap();
+        let path = view.derived_path(&generation).unwrap();
+        assert!(path.exists());
+        fs::write(
+            format!("{}-journal", path.display()),
+            b"interrupted journal",
+        )
+        .unwrap();
+        drop(prepared);
+        assert_file_set_removed(&path);
+        assert!(view.current_generation().unwrap().is_none());
+        let mut cancelled_path = None;
+        let result = crate::views::assembly::prepare_checkout(&request, &mut |phase| {
+            if phase == "cas" {
+                let path = fs::read_dir(view.view_dir())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("derived-")
+                            && path.extension().is_some_and(|ext| ext == "sqlite")
+                    })
+                    .expect("cold database must exist at cancellation");
+                fs::write(format!("{}-journal", path.display()), b"cancelled journal").unwrap();
+                cancelled_path = Some(path);
+                return Err(ViewError::InvalidManifest(
+                    "injected publication cancellation".into(),
+                ));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_file_set_removed(&cancelled_path.unwrap());
+        let published = crate::views::assembly::publish_checkout(&request).unwrap();
+        assert!(published.published);
+        assert!(view
+            .derived_path(&published.generation.unwrap())
+            .unwrap()
+            .exists());
+    }
 
     #[test]
     fn reference_scan_rejects_non_ascii_keys_without_panicking() {

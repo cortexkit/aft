@@ -490,6 +490,8 @@ impl std::fmt::Display for GenerationName {
 }
 
 /// The outcome of a v2 pointer compare-and-swap.
+/// Names are observations, not reader leases; callers inspecting generations
+/// after the operation returns must acquire their own protection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PublishV2 {
     Published,
@@ -509,6 +511,7 @@ pub enum PublishV2 {
 pub struct PreparedV2 {
     generation: GenerationName,
     base: Option<String>,
+    _pin: crate::pins::QueryPin,
 }
 
 impl PreparedV2 {
@@ -534,6 +537,9 @@ impl ViewStore {
             )));
         }
         let name = generation.to_string();
+        // The generation sweeper also takes an IMMEDIATE pointer transaction.
+        // Admit protection under that exclusion before exposing a private manifest.
+        let pin = self.pin_prepared_generation(&name)?;
         let path = self.manifest_path(&name)?;
         write_bytes_once(&path, &bytes)?;
         observe(observer, DurabilityStep::ManifestWritten);
@@ -542,6 +548,7 @@ impl ViewStore {
         Ok(PreparedV2 {
             generation: generation.clone(),
             base: base.map(str::to_owned),
+            _pin: pin,
         })
     }
 
@@ -552,8 +559,13 @@ impl ViewStore {
         observer: Option<&dyn DurabilityObserver>,
     ) -> Result<PublishV2> {
         let name = prepared.generation.to_string();
-        let outcome =
-            self.compare_and_swap_pointer(&name, prepared.base.as_deref().unwrap_or_default())?;
+        // Keep both the private attempt and the resolved pointer generation
+        // protected through observer callbacks and return, not merely CAS.
+        let (outcome, _resolved_pin) = self.compare_and_swap_pointer_with_pin(
+            &name,
+            prepared.base.as_deref().unwrap_or_default(),
+            true,
+        )?;
         observe(observer, DurabilityStep::PointerCas);
         match outcome {
             super::PublishOutcome::Published => {
@@ -792,5 +804,220 @@ mod tests {
         assert_ne!(a.to_string(), b.to_string());
         assert!(a.same_content(&b));
         assert_eq!(GenerationName::parse(&a.to_string()), Some(a));
+    }
+
+    #[test]
+    fn registered_builder_name_probe_child() {
+        let Some(storage) = std::env::var_os("AFT_TEST_PRIVATE_BUILDER_STORAGE") else {
+            return;
+        };
+        let root = std::env::var_os("AFT_TEST_PRIVATE_BUILDER_ROOT").unwrap();
+        let registry = super::super::registry::FamilyRegistry::open(
+            Path::new(&storage),
+            "private-name-family",
+        )
+        .unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "shared-view", Path::new(&root))
+            .unwrap();
+        let name = GenerationName::for_manifest(&manifest()).unwrap();
+        println!(
+            "PRIVATE_BUILDER={}",
+            serde_json::to_string(&(name.to_string(), owner.view_dir())).unwrap()
+        );
+    }
+
+    #[test]
+    fn registered_builders_keep_equal_manifest_generation_paths_private() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "private-name-family")
+                .unwrap();
+        let first = registry
+            .register_view_with_storage(registry.storage(), "shared-view", root.path())
+            .unwrap();
+        let second = registry
+            .register_view_with_storage(registry.storage(), "shared-view", root.path())
+            .unwrap();
+        assert_eq!(first.view_dir(), second.view_dir());
+        let view = first.view_store().unwrap();
+        let manifest = manifest();
+        let a = GenerationName::for_manifest(&manifest).unwrap();
+        let b = GenerationName::for_manifest(&manifest).unwrap();
+        let a_path = view.derived_path(&a.to_string()).unwrap();
+        let b_path = view.derived_path(&b.to_string()).unwrap();
+        assert!(!a_path.exists() && !b_path.exists());
+        assert!(a.same_content(&b));
+        assert_ne!(
+            a_path, b_path,
+            "same-process builders must not share a destination"
+        );
+
+        let spawn = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "views::manifest_v2::tests::registered_builder_name_probe_child",
+                    "--nocapture",
+                ])
+                .env("AFT_TEST_PRIVATE_BUILDER_STORAGE", storage.path())
+                .env("AFT_TEST_PRIVATE_BUILDER_ROOT", root.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let children = [spawn(), spawn()];
+        let mut names = BTreeSet::from([a.to_string(), b.to_string()]);
+        for child in children {
+            let pid = child.id();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let record = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("PRIVATE_BUILDER="))
+                .unwrap();
+            let (name, view_dir): (String, std::path::PathBuf) =
+                serde_json::from_str(record).unwrap();
+            assert_eq!(view_dir, first.view_dir());
+            let parsed = GenerationName::parse(&name).unwrap();
+            assert_eq!(parsed.pid, pid);
+            assert!(a.same_content(&parsed));
+            assert!(!view.derived_path(&name).unwrap().exists());
+            assert!(
+                names.insert(name),
+                "different processes must not share a destination"
+            );
+        }
+        assert_eq!(names.len(), 4);
+    }
+
+    #[test]
+    fn prepared_manifests_stay_pinned_until_commit_resolves() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "prepared-builders")
+                .unwrap();
+        let registration = registry
+            .register_view_with_storage(storage.path(), "prepared", &storage.path().join("root"))
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let manifest = manifest();
+        let a = GenerationName::for_manifest(&manifest).unwrap();
+        let b = GenerationName::for_manifest(&manifest).unwrap();
+        let first = view.prepare_v2(&a, None, &manifest, None).unwrap();
+        let second = view.prepare_v2(&b, None, &manifest, None).unwrap();
+
+        view.sweep_generations().unwrap();
+        assert!(
+            view.load_manifest_v2(&a.to_string()).is_ok(),
+            "a prepared winner must survive a sweep before CAS"
+        );
+        assert!(
+            view.load_manifest_v2(&b.to_string()).is_ok(),
+            "an unresolved competing builder must remain protected"
+        );
+        assert_eq!(view.commit_v2(first, None).unwrap(), PublishV2::Published);
+
+        view.sweep_generations().unwrap();
+        assert!(view.load_manifest_v2(&b.to_string()).is_ok());
+        assert_eq!(
+            view.commit_v2(second, None).unwrap(),
+            PublishV2::EquivalentWinner {
+                current: a.to_string()
+            }
+        );
+
+        view.sweep_generations().unwrap();
+        assert!(view.load_manifest_v2(&a.to_string()).is_ok());
+        assert!(
+            !view.manifest_path(&b.to_string()).unwrap().exists(),
+            "the unpinned loser can be reclaimed after commit returns"
+        );
+    }
+
+    #[test]
+    fn resolved_equivalent_winner_stays_pinned_during_commit_observer() {
+        struct Supersede<'a> {
+            view: &'a ViewStore,
+            replacement: std::cell::RefCell<Option<PreparedV2>>,
+            winner: String,
+            attempt: String,
+            observed: std::cell::Cell<bool>,
+        }
+        impl DurabilityObserver for Supersede<'_> {
+            fn reached(&self, step: DurabilityStep) {
+                if step == DurabilityStep::PointerCas {
+                    self.observed.set(true);
+                    assert_eq!(
+                        self.view
+                            .commit_v2(self.replacement.borrow_mut().take().unwrap(), None)
+                            .unwrap(),
+                        PublishV2::Published
+                    );
+                    self.view.sweep_generations().unwrap();
+                    assert!(
+                        self.view.load_manifest_v2(&self.winner).is_ok(),
+                        "the resolved winner must survive until commit returns"
+                    );
+                    assert!(
+                        self.view.load_manifest_v2(&self.attempt).is_ok(),
+                        "the private attempt must survive until commit returns"
+                    );
+                }
+            }
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "resolved-builders")
+                .unwrap();
+        let registration = registry
+            .register_view_with_storage(storage.path(), "resolved", &storage.path().join("root"))
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let manifest = manifest();
+        let winner = GenerationName::for_manifest(&manifest).unwrap();
+        view.commit_v2(
+            view.prepare_v2(&winner, None, &manifest, None).unwrap(),
+            None,
+        )
+        .unwrap();
+        let attempt = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = view.prepare_v2(&attempt, None, &manifest, None).unwrap();
+        let mut replacement_manifest = manifest;
+        replacement_manifest.header_mut().head_tree = Some("replacement".into());
+        let replacement = GenerationName::for_manifest(&replacement_manifest).unwrap();
+        let observer = Supersede {
+            view: &view,
+            replacement: std::cell::RefCell::new(Some(
+                view.prepare_v2(
+                    &replacement,
+                    Some(&winner.to_string()),
+                    &replacement_manifest,
+                    None,
+                )
+                .unwrap(),
+            )),
+            winner: winner.to_string(),
+            attempt: attempt.to_string(),
+            observed: std::cell::Cell::new(false),
+        };
+        assert_eq!(
+            view.commit_v2(prepared, Some(&observer)).unwrap(),
+            PublishV2::EquivalentWinner {
+                current: winner.to_string()
+            }
+        );
+        assert!(observer.observed.get());
+        view.sweep_generations().unwrap();
+        assert!(!view.manifest_path(&winner.to_string()).unwrap().exists());
+        assert!(!view.manifest_path(&attempt.to_string()).unwrap().exists());
+        assert!(view.load_manifest_v2(&replacement.to_string()).is_ok());
     }
 }

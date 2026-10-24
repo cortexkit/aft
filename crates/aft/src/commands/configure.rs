@@ -12167,7 +12167,21 @@ mod tests {
         let view_dir = lazy_view_dir(storage, root);
         fs::remove_dir_all(&view_dir).unwrap();
 
-        // Pause checkpoint completion with a real SQLite writer on its file.
+        let ctx = lazy_bind(root, storage, "after-removal");
+        let generation = blob_removal_generation(storage, root).expect("republished at bind");
+        assert!(crate::views::read::derived_built(&view_dir, &generation));
+        assert!(ctx
+            .view_runtime_snapshot()
+            .is_some_and(|view| view.pending_paths.is_empty()));
+        assert_eq!(
+            blob_removal_payload_rows(storage, family),
+            2,
+            "both files were extracted again"
+        );
+
+        // Rebuilding from scratch flushes its database before bind returns, so
+        // there is no background checkpoint to pause. Publish an edit below and
+        // pause that generation's checkpoint with a real SQLite writer.
         // An exclusive rollback-journal transaction makes short-lived lock
         // contention observable without racing the scheduler.
         enum CheckpointObservation {
@@ -12208,17 +12222,22 @@ mod tests {
                     })),
                 },
             );
-        let ctx = lazy_bind(root, storage, "after-removal");
-        let generation = blob_removal_generation(storage, root).expect("republished at bind");
-        assert!(crate::views::read::derived_built(&view_dir, &generation));
-        assert!(ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.pending_paths.is_empty()));
-        assert_eq!(
-            blob_removal_payload_rows(storage, family),
-            2,
-            "both files were extracted again"
+        let source = fs::read_to_string(root.join("lib.rs")).unwrap();
+        fs::write(
+            root.join("lib.rs"),
+            format!("{source}\n// checkpoint synchronization fixture\n"),
+        )
+        .unwrap();
+        let checkpoint_publication = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .unwrap();
+        assert!(
+            checkpoint_publication.published,
+            "{checkpoint_publication:?}"
         );
+        let generation = checkpoint_publication
+            .generation
+            .expect("incremental checkpoint generation");
         begin_tx.send(()).unwrap();
         let locked_path = locked_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(

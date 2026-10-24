@@ -1340,7 +1340,8 @@ pub fn prepare_checkout_deferring(
                 Some(reason) => reason.as_str(),
                 None => "no_base",
             };
-            prepared.derived_checkpoint = Some((derived.clone(), open_derived_keeper(&derived)?));
+            // A cold writer durably finishes its private main file before it
+            // returns; unlike an incremental patch it needs no WAL keeper.
             if let Some((reason, detail)) = &cold_build {
                 record_cold_build(view.view_dir(), *reason);
                 if *reason == ColdBuildReason::LargeDiff {

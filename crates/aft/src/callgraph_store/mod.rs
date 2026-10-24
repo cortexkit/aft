@@ -12414,7 +12414,7 @@ fn create_secondary_indexes_sql() -> String {
         .join("\n")
 }
 
-fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
     let sql = SECONDARY_INDEXES
         .iter()
         .map(|(name, _)| format!("DROP INDEX IF EXISTS {name};"))
@@ -12424,7 +12424,7 @@ fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(&create_secondary_indexes_sql())?;
     Ok(())
 }

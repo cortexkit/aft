@@ -1046,6 +1046,15 @@ impl ViewStore {
              INSERT OR IGNORE INTO pointer (singleton, generation) VALUES (1, '');
              COMMIT;",
         )?;
+        drop(connection);
+        // Registered v2 views recover under their family registry's pin barrier.
+        if !self
+            .view_dir
+            .parent()
+            .is_some_and(|parent| parent.ends_with("v2"))
+        {
+            self.recover_abandoned_derived(None);
+        }
         Ok(())
     }
 
@@ -1063,6 +1072,25 @@ impl ViewStore {
         generation: &str,
         base_generation: &str,
     ) -> Result<PublishOutcome> {
+        self.compare_and_swap_pointer_with_pin(generation, base_generation, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn pin_prepared_generation(&self, generation: &str) -> Result<crate::pins::QueryPin> {
+        let mut connection = self.open_pointer_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pin = crate::pins::QueryPin::acquire(self.view_dir(), generation)
+            .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?;
+        transaction.commit()?;
+        Ok(pin)
+    }
+
+    fn compare_and_swap_pointer_with_pin(
+        &self,
+        generation: &str,
+        base_generation: &str,
+        protect_result: bool,
+    ) -> Result<(PublishOutcome, Option<crate::pins::QueryPin>)> {
         let mut connection = self.open_pointer_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
@@ -1070,18 +1098,38 @@ impl ViewStore {
             params![generation, base_generation],
         )?;
         if updated == 1 {
+            let pin = if protect_result {
+                Some(
+                    crate::pins::QueryPin::acquire(self.view_dir(), generation)
+                        .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?,
+                )
+            } else {
+                None
+            };
             transaction.commit()?;
-            Ok(PublishOutcome::Published)
+            Ok((PublishOutcome::Published, pin))
         } else {
             let current_generation: String = transaction.query_row(
                 "SELECT generation FROM pointer WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )?;
+            let pin = if protect_result && !current_generation.is_empty() {
+                Some(
+                    crate::pins::QueryPin::acquire(self.view_dir(), &current_generation)
+                        .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?,
+                )
+            } else {
+                None
+            };
             transaction.commit()?;
-            Ok(PublishOutcome::Conflict {
-                current_generation: (!current_generation.is_empty()).then_some(current_generation),
-            })
+            Ok((
+                PublishOutcome::Conflict {
+                    current_generation: (!current_generation.is_empty())
+                        .then_some(current_generation),
+                },
+                pin,
+            ))
         }
     }
 }

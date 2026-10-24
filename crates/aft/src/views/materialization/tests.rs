@@ -42,6 +42,21 @@ fn manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption() {
 thread_local! {
     // Offline paired measurements keep the old SQL lookup as an in-process control.
     pub(super) static PER_REFERENCE_LOOKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Paired offline controls exercise the previous WAL/index strategy on the
+    // same fixture without adding a production configuration switch.
+    pub(super) static COLD_BUILD_MODE: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+    pub(super) static COLD_WRITE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_cold_mode<T>(mode: (bool, bool), run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(bool, bool)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COLD_BUILD_MODE.set(self.0);
+        }
+    }
+    let _restore = Restore(COLD_BUILD_MODE.replace(Some(mode)));
+    run()
 }
 
 struct Fixture {
@@ -132,6 +147,168 @@ fn fixture() -> Fixture {
         base,
         next,
     }
+}
+
+struct FailingColdReader {
+    panic: bool,
+}
+
+impl join::ManifestBlobReader for FailingColdReader {
+    fn read_callgraph_blob(
+        &self,
+        _: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+        assert!(!self.panic, "injected cold build panic");
+        Err(join::ManifestJoinError::InvalidBlob(
+            "injected read failure".into(),
+        ))
+    }
+}
+
+fn assert_no_file_set(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        assert!(
+            !Path::new(&format!("{}{suffix}", path.display())).exists(),
+            "unpublished file remains: {}{suffix}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn cold_error_removes_files_and_retry_succeeds() {
+    let f = fixture();
+    let path = f.dir.path().join("failed.sqlite");
+    assert!(
+        materialize_from_blob_reader(&path, &f.base, &FailingColdReader { panic: false }).is_err()
+    );
+    assert_no_file_set(&path);
+    materialize_manifest_view_database(&path, &f.blobs, &f.base).unwrap();
+    assert!(path.is_file());
+}
+
+#[test]
+fn cold_panic_removes_files_and_retry_succeeds() {
+    let f = fixture();
+    let path = f.dir.path().join("panicked.sqlite");
+    assert!(std::panic::catch_unwind(|| {
+        materialize_from_blob_reader(&path, &f.base, &FailingColdReader { panic: true })
+    })
+    .is_err());
+    assert_no_file_set(&path);
+    materialize_manifest_view_database(&path, &f.blobs, &f.base).unwrap();
+}
+
+#[test]
+fn cold_sqlite_full_removes_files_and_retry_succeeds() {
+    let f = fixture();
+    let blobs = Connection::open(&f.blobs).unwrap();
+    let files = (0..300)
+        .map(|index| {
+            (
+                format!("f{index}.ts"),
+                format!("export function f{index}() {{ return {index}; }}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let manifest = manifest(&blobs, &files);
+    drop(blobs);
+    let path = f.dir.path().join("full.sqlite");
+    COLD_WRITE_LIMIT.set(true);
+    let result = materialize_manifest_view_database(&path, &f.blobs, &manifest);
+    COLD_WRITE_LIMIT.set(false);
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("full"), "{error}");
+    assert_no_file_set(&path);
+    materialize_manifest_view_database(&path, &f.blobs, &manifest).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[path = "cold_bench.rs"]
+mod cold_bench;
+
+#[test]
+fn private_cold_matches_legacy_every_table_and_index() {
+    let f = relinking_fixture();
+    let legacy = f.dir.path().join("legacy-cold.sqlite");
+    with_cold_mode((false, false), || {
+        materialize_manifest_view_database(&legacy, &f.blobs, &f.base).unwrap();
+    });
+    let private = f.dir.path().join("private-cold.sqlite");
+    materialize_manifest_view_database(&private, &f.blobs, &f.base).unwrap();
+    parity::assert_logical_parity(&private, &legacy);
+    let connection = Connection::open(&private).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert!(!private.with_extension("sqlite-wal").exists());
+}
+
+#[test]
+fn private_finish_syncs_the_owning_database_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("counted.sqlite");
+    let connection =
+        crate::db::wal_credit_probe::open_counted(&path, rusqlite::OpenFlags::default());
+    configure_private_connection(&connection).unwrap();
+    connection
+        .execute_batch(
+            "BEGIN; CREATE TABLE t(v); INSERT INTO t VALUES(randomblob(100000)); COMMIT;",
+        )
+        .unwrap();
+    let before = crate::db::wal_credit_probe::main_io_counts(&connection);
+    assert!(before.0 > 0, "the private build must have written pages");
+    assert_eq!(before.1, 0, "private writes must not sync each transaction");
+    finish_private_database(&connection).unwrap();
+    let after = crate::db::wal_credit_probe::main_io_counts(&connection);
+    assert!(
+        after.1 > before.1,
+        "publication must sync the owning VFS file"
+    );
+}
+
+#[test]
+fn private_finish_restores_journaling_and_full_synchronous_on_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restored-policy.sqlite");
+    let connection =
+        crate::db::file_identity::IdentityConnection::open(&path, "private-finish-policy-test")
+            .unwrap();
+    configure_private_connection(&connection).unwrap();
+    connection
+        .execute_batch("CREATE TABLE t(v); INSERT INTO t VALUES(1);")
+        .unwrap();
+    let journal_mode = || {
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+    };
+    let synchronous = || {
+        connection
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    assert_eq!(journal_mode(), "off");
+    assert_eq!(synchronous(), 0);
+
+    finish_private_database(&connection).unwrap();
+
+    // Finalization restores the owner's policy as well as syncing existing pages.
+    assert_eq!(journal_mode(), "delete");
+    assert_eq!(synchronous(), 2);
 }
 
 /// Logical content of a derived database: schema rows plus sorted, typed rows
