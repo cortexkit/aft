@@ -9,6 +9,7 @@ struct Database {
     checkpoints: Vec<(i64, i64, i64)>,
     wal_bytes: u64,
     main_bytes: u64,
+    journal_bytes: u64,
     pages: Vec<u32>,
     owners: BTreeMap<u32, String>,
 }
@@ -25,7 +26,9 @@ fn database_path(db: *mut ffi::sqlite3) -> PathBuf {
     if name.is_null() {
         return PathBuf::new();
     }
-    PathBuf::from(unsafe { CStr::from_ptr(name) }.to_string_lossy().as_ref())
+    absolute_sqlite_path(Path::new(
+        unsafe { CStr::from_ptr(name) }.to_string_lossy().as_ref(),
+    ))
 }
 
 pub(crate) unsafe fn probe_wal(db: *mut ffi::sqlite3, frames: i32) {
@@ -71,12 +74,12 @@ unsafe extern "C" fn hook(
     ffi::SQLITE_OK
 }
 
-pub(crate) fn observe(connection: &Connection, path: &Path) {
+pub(crate) fn observe(connection: &Connection, _path: &Path) {
     let mut publication = PUBLICATION.lock().unwrap();
     let Some(publication) = publication.as_mut() else {
         return;
     };
-    let path = path.canonicalize().unwrap();
+    let path = database_path(unsafe { connection.handle() });
     if !path.starts_with(&publication.root) {
         return;
     }
@@ -119,8 +122,11 @@ pub(super) fn written(path: &Path, wal: bool, buffer: *const c_void, amount: c_i
     let Some(publication) = publication.as_mut() else {
         return;
     };
+    let journal = !wal && path.to_str().unwrap().ends_with("-journal");
     let database_path = if wal {
         PathBuf::from(path.to_str().unwrap().strip_suffix("-wal").unwrap())
+    } else if journal {
+        PathBuf::from(path.to_str().unwrap().strip_suffix("-journal").unwrap())
     } else {
         path.to_path_buf()
     };
@@ -136,6 +142,8 @@ pub(super) fn written(path: &Path, wal: bool, buffer: *const c_void, amount: c_i
                 .pages
                 .push(u32::from_be_bytes(bytes.try_into().unwrap()));
         }
+    } else if journal {
+        database.journal_bytes += amount as u64;
     } else {
         database.main_bytes += amount as u64;
     }
@@ -214,7 +222,7 @@ fn derived_dirty_publication_probe() {
                 allow_blob_put: true,
                 callgraph: true,
             };
-            prepare_checkout(&request, &mut |_| Ok(()))
+            let base_report = prepare_checkout(&request, &mut |_| Ok(()))
                 .unwrap()
                 .commit()
                 .unwrap();
@@ -239,7 +247,7 @@ fn derived_dirty_publication_probe() {
             }
             let session = Session::install();
             *PUBLICATION.lock().unwrap() = Some(Publication {
-                root: storage.clone(),
+                root: crate::inspect::job::normalize_path(&storage),
                 databases: Default::default(),
             });
             let guard = PublicationGuard;
@@ -270,13 +278,27 @@ fn derived_dirty_publication_probe() {
                 eprintln!(
                     "PUBLICATION_DB {}",
                     serde_json::json!({
-                        "path": path.strip_prefix(&storage).unwrap(), "wal_hook_frames": database.hooks,
+                        "path": path.strip_prefix(&publication.root).unwrap(), "wal_hook_frames": database.hooks,
                         "checkpoints": database.checkpoints, "wal_bytes": database.wal_bytes,
                         "main_bytes": database.main_bytes, "frame_header_writes_by_owner": by_owner,
+                        "journal_bytes": database.journal_bytes,
                     })
                 );
             }
-            if let Some(generation) = report.generation.as_deref() {
+            if case == "noop" {
+                assert_eq!(report.generation, base_report.generation);
+            }
+            {
+                let generation = report
+                    .generation
+                    .as_deref()
+                    .or(base_report.generation.as_deref())
+                    .unwrap();
+                let manifest = report
+                    .manifest
+                    .as_ref()
+                    .or(base_report.manifest.as_ref())
+                    .unwrap();
                 let derived = view.derived_path(generation).unwrap();
                 assert_eq!(crate::db::file_identity::open_connections(&derived), 0);
                 let blobs = crate::blob_store::BlobStore::open(
@@ -286,12 +308,7 @@ fn derived_dirty_publication_probe() {
                 )
                 .unwrap();
                 let cold = directory.path().join("cold.sqlite");
-                materialize_manifest_view_database(
-                    &cold,
-                    blobs.path(),
-                    report.manifest.as_ref().unwrap(),
-                )
-                .unwrap();
+                materialize_manifest_view_database(&cold, blobs.path(), manifest).unwrap();
                 assert_eq!(snapshot(&derived), snapshot(&cold), "{size} {case}");
             }
         }

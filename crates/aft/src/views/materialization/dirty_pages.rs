@@ -25,6 +25,15 @@ thread_local! {
     static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
 }
 
+fn absolute_sqlite_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap().join(path)
+    };
+    crate::inspect::job::normalize_path(&absolute)
+}
+
 fn platform() -> *mut ffi::sqlite3_vfs {
     static PLATFORM: OnceLock<usize> = OnceLock::new();
     *PLATFORM.get_or_init(|| unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) as usize })
@@ -53,7 +62,9 @@ unsafe extern "C" fn open(
     if rc != ffi::SQLITE_OK || name.is_null() {
         return rc;
     }
-    let path = PathBuf::from(unsafe { CStr::from_ptr(name) }.to_string_lossy().as_ref());
+    let path = absolute_sqlite_path(Path::new(
+        unsafe { CStr::from_ptr(name) }.to_string_lossy().as_ref(),
+    ));
     let wal = flags & ffi::SQLITE_OPEN_WAL != 0;
     files().lock().unwrap().insert(file as usize, (path, wal));
     let original = unsafe { (*file).pMethods };
@@ -137,10 +148,11 @@ impl Session {
 
     fn start(target: &Path) -> Self {
         let session = Self::install();
+        let target = absolute_sqlite_path(target);
         CAPTURE.with(|capture| {
             assert!(capture.borrow().is_none());
             *capture.borrow_mut() = Some(Capture {
-                target: target.canonicalize().unwrap(),
+                target,
                 ..Default::default()
             });
         });
@@ -190,11 +202,20 @@ pub(in crate::views::materialization) fn observe(
     path: &Path,
 ) -> Option<BTreeMap<u32, String>> {
     publication::observe(connection, path);
+    if CAPTURE.with(|capture| capture.borrow().is_none()) {
+        return None;
+    }
+    let matching_path = absolute_sqlite_path(path);
     if !CAPTURE.with(|capture| {
-        capture
-            .borrow()
-            .as_ref()
-            .is_some_and(|capture| capture.target == path.canonicalize().unwrap())
+        let mut capture = capture.borrow_mut();
+        let capture = capture.as_mut().unwrap();
+        if capture.target != matching_path {
+            return false;
+        }
+        // Use SQLite's own filename after opening; resolving a live database
+        // through the filesystem could introduce another OS handle on Windows.
+        capture.target = absolute_sqlite_path(Path::new(connection.path().unwrap()));
+        true
     }) {
         return None;
     }
@@ -366,7 +387,15 @@ fn dense_one_function_edit_has_bounded_dirty_pages() {
         let before = rowids(&db);
         let session = Session::start(&db);
         apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
-        let frames = CAPTURE.with(|capture| capture.borrow().as_ref().unwrap().pages.len());
+        let frames = CAPTURE.with(|capture| {
+            let capture = capture.borrow();
+            let capture = capture.as_ref().unwrap();
+            assert!(
+                !capture.hook_frames.is_empty(),
+                "the edited writer must be observed"
+            );
+            capture.pages.len()
+        });
         drop(session);
         assert!(frames <= 128, "one-function edit at {size} files dirtied {frames} pages; unchanged graph rows must not churn checkout-wide indexes");
         assert_eq!(
