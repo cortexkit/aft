@@ -125,7 +125,7 @@ fn seam_search_suppresses_legacy_clauses_and_renders_trailer_when_envelope_prese
     let formatted_present = format_response_with_context("search", &resp_present, &ctx);
     assert!(!formatted_present.contains("more results available"));
     assert!(!formatted_present.contains("enumeration capped"));
-    assert!(formatted_present.contains("fully degraded"));
+    assert!(formatted_present.contains("answered by a filesystem scan"));
     assert!(formatted_present.contains("partial/incomplete"));
     assert!(formatted_present
         .contains("shown 10 of ≥11 results (budget) · narrow: offset, topK, path, includeTests"));

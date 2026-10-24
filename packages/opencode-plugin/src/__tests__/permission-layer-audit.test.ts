@@ -550,7 +550,10 @@ describe("permission audit regressions", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("aft_search rule denial explains the rule and falls back to the project index", async () => {
+  // A rule-denied external path is refused rather than answered from the
+  // current project: that answer's counts read as being about the denied path
+  // (issue #826). The refusal says the path was not searched.
+  test("aft_search rule denial explains the rule and refuses without searching", async () => {
     const { project, external } = await makeIndependentProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const ruleError = new DeniedError({
@@ -571,19 +574,44 @@ describe("permission audit regressions", () => {
 
     const first = await tools.aft_search.execute({ query: "needle", path: external }, sdkCtx);
     const second = await tools.aft_search.execute({ query: "needle", path: external }, sdkCtx);
-    const notice =
+    const refusal =
       `permission_denied: aft_search_external for ${external} is denied by this session's ` +
-      "permission rules (not a user choice); searching the project index only";
+      `permission rules (not a user choice). ${external} was not searched. To search the ` +
+      "current project instead, call aft_search again without `path`.";
 
-    expect(first).toContain(notice);
-    expect(first).toContain("project index hit");
-    expect(second).toContain(notice);
-    expect(calls).toEqual([
-      { command: "search", params: { query: "needle" } },
-      { command: "search", params: { query: "needle" } },
-    ]);
+    expect(parsePermissionDenied(first).message).toBe(refusal);
+    expect(parsePermissionDenied(second).message).toBe(refusal);
+    expect(first).not.toContain("project index hit");
+    expect(calls).toEqual([]);
     expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(1);
     expect(first).not.toContain('"action":"deny"');
+  });
+
+  // Issue #826: after a rule denial the plugin used to search the project
+  // without `path` and print that search's count, so "Found 0 match across 0
+  // file" read as an answer about the denied path. The reply must say that
+  // path was not searched.
+  test("issue 826: a rule-denied path reply says the path was not searched", async () => {
+    const { project, external } = await makeIndependentProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const ruleError = new DeniedError({
+      ruleset: [{ permission: "*", action: "deny", pattern: "*" }],
+    });
+    const { tools } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "Found 0 match across 0 file\n[interpreted_as: regex]\n[pattern: no match]",
+    }));
+    const reply = await tools.aft_search.execute(
+      { query: "bash_wait_detach(", path: external },
+      createSdkContext(
+        project,
+        recordingAsk(askCalls, { permission: "aft_search_external", error: ruleError }),
+        "permission-audit-issue-826-session",
+      ),
+    );
+
+    expect(reply).toContain(`${external} was not searched`);
+    expect(reply).not.toContain("Found 0 match");
   });
 
   test("aft_search rule denial has no fallback when the query is only the external path", async () => {

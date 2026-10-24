@@ -560,19 +560,22 @@ fn grep_footer(result: &GrepResult) -> String {
     // When the search stopped at the result cap, the count is a floor, not the
     // true total — say so in the agent-facing text (the JSON already carries
     // `truncated`). Otherwise the agent reads "Found N match" as exhaustive.
+    format!(
+        "Found {} match across {} file{}",
+        result.total_matches,
+        result.files_with_matches,
+        grep_footer_tags(result)
+    )
+}
+
+/// The tags `format_grep_text`'s footer puts after its counts: ` (capped)`
+/// when the count is a floor, then ` [index: <status>]` unless the index was
+/// ready. aft_search's ranked regex page ends its own count line with them.
+pub(crate) fn grep_footer_tags(result: &GrepResult) -> String {
     let cap_note = if result.truncated { " (capped)" } else { "" };
     match result.index_status {
-        IndexStatus::Ready => format!(
-            "Found {} match across {} file{}",
-            result.total_matches, result.files_with_matches, cap_note
-        ),
-        other => format!(
-            "Found {} match across {} file{} [index: {}]",
-            result.total_matches,
-            result.files_with_matches,
-            cap_note,
-            index_status_label(other)
-        ),
+        IndexStatus::Ready => cap_note.to_string(),
+        other => format!("{cap_note} [index: {}]", index_status_label(other)),
     }
 }
 

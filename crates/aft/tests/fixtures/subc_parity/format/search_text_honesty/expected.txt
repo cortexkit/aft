@@ -1,2 +1,2 @@
 1. src/main.ts
-Search status: fully degraded; partial/incomplete.
+Search status: answered by a filesystem scan; partial/incomplete.
