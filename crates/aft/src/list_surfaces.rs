@@ -454,9 +454,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "bash_background/process.rs",
-        enclosing_item: "bounded_members, safe_name, macos_argv",
-        location_or_primitive: "LIVE_DESCENDANT_CAP .take(), LIVE_DESCENDANT_NAME_CAP .take(), MAX_ARGS",
-        reason: "a process-group check keeps at most 16 members and reports the exact omitted count in live_descendants_omitted; each member's name is shortened with an ellipsis and its arguments are never kept; this is task status detail, not a paginated result list",
+        enclosing_item: "bounded_members, safe_name, macos_argv, capped_identities",
+        location_or_primitive: "LIVE_DESCENDANT_CAP .take(), LIVE_DESCENDANT_NAME_CAP .take(), MAX_ARGS, GROUP_IDENTITY_CAP .take()",
+        reason: "a process-group check keeps at most 16 members and reports the exact omitted count in live_descendants_omitted; each member's name is shortened with an ellipsis and its arguments are never kept; the record keeps at most 1,024 member identities for recognising the group later and flags when more were found; this is task status detail, not a paginated result list",
     },
     ExclusionEntry {
         file: "subc/health.rs",

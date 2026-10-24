@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::bash_background::process::test_hooks;
+use crate::bash_background::process::LIVE_DESCENDANT_CAP;
 
 const SESSION: &str = "session";
 
@@ -652,6 +653,132 @@ fn bash_kill_signals_a_finished_group_whose_recorded_leader_still_runs() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+/// More survivors than the 16 the task shows. Once the shown ones have
+/// exited, a member that was only counted ("+N more") is the one still
+/// running in the group, and `bash_kill` must still recognise the group as the
+/// task's and stop it: the display limit must not limit what AFT can stop.
+#[test]
+fn bash_kill_stops_a_survivor_that_was_only_counted_not_shown() {
+    const SURVIVORS: usize = 20;
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(
+        &registry,
+        dir.path(),
+        &format!(
+            ": > pids; i=0; while [ $i -lt {SURVIVORS} ]; do sh -c 'trap \"\" TERM; echo $$ >> pids; exec sleep 30' & i=$((i + 1)); done; while [ $(wc -l < pids) -lt {SURVIVORS} ]; do sleep 0.01; done"
+        ),
+    );
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let finished = loop {
+        let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+        if snapshot.info.status.is_terminal() && snapshot.live_descendants_omitted > 0 {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "the task did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut pids = std::fs::read_to_string(dir.path().join("pids"))
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    let shown = finished
+        .live_descendants
+        .clone()
+        .unwrap()
+        .iter()
+        .map(|member| member.pid as i32)
+        .collect::<Vec<_>>();
+    assert_eq!(shown, pids[..LIVE_DESCENDANT_CAP]);
+    assert_eq!(
+        finished.live_descendants_omitted,
+        SURVIVORS - LIVE_DESCENDANT_CAP
+    );
+    // The end-of-run check samples the group again 0.3 s and 2 s after the
+    // task ends. Let those finish, so the record under test is the one taken
+    // while every survivor was running.
+    std::thread::sleep(Duration::from_millis(3_000));
+
+    let (shown, counted_only) = pids.split_at(LIVE_DESCENDANT_CAP);
+    for pid in shown {
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+    for pid in shown {
+        wait_for_exit(*pid, "a shown survivor did not exit");
+    }
+    assert!(counted_only.iter().all(|pid| !process_exited(*pid)));
+
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+
+    assert!(
+        killed.kill_signaled,
+        "bash_kill must recognise the group by a survivor that was only counted"
+    );
+    for pid in counted_only {
+        wait_for_exit(*pid, "bash_kill left a counted survivor running");
+    }
+}
+
+/// A task record holding the most a group check can store (every identity at
+/// the cap, with its largest values, and the 16 shown members with names at
+/// their cap) stays small.
+#[test]
+fn a_task_record_at_the_identity_cap_stays_bounded() {
+    const MAX_RECORD_BYTES: usize = 96 * 1024;
+    let storage = tempfile::tempdir().unwrap();
+    let mut metadata = PersistedTask::starting(
+        "bash-0123456789abcdef".into(),
+        SESSION.into(),
+        "x".into(),
+        storage.path().into(),
+        None,
+        None,
+        true,
+        false,
+    );
+    let long_name = "n".repeat(crate::bash_background::process::LIVE_DESCENDANT_NAME_CAP);
+    metadata.live_descendants = Some(
+        (0..LIVE_DESCENDANT_CAP as u32)
+            .map(|pid| LiveDescendant {
+                pid: u32::MAX - pid,
+                comm: long_name.clone(),
+                argv0: long_name.clone(),
+                user: Some(long_name.clone()),
+                command: Some(format!("{long_name} …")),
+            })
+            .collect(),
+    );
+    metadata.live_descendants_omitted = usize::MAX;
+    metadata.group_member_identities = (0..crate::bash_background::process::GROUP_IDENTITY_CAP
+        as u32)
+        .map(|offset| ProcessIdentity {
+            pid: u32::MAX - offset,
+            started_at_ms: u64::MAX,
+        })
+        .collect();
+    metadata.group_member_identities_truncated = true;
+
+    let bytes = serde_json::to_vec(&metadata).unwrap().len();
+    eprintln!("task record at the identity cap: {bytes} bytes");
+    assert!(
+        bytes < MAX_RECORD_BYTES,
+        "a task record at the identity cap is {bytes} bytes"
+    );
+    let round_trip: PersistedTask =
+        serde_json::from_slice(&serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert_eq!(
+        round_trip.group_member_identities.len(),
+        crate::bash_background::process::GROUP_IDENTITY_CAP
+    );
+    assert!(round_trip.group_member_identities_truncated);
+}
+
 /// A pseudoterminal task's group is checked after AFT kills it, which it was
 /// not before: a TERM-ignoring survivor is named, not left unreported.
 #[test]

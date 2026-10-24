@@ -425,13 +425,11 @@ fn record_group_check(
                 .incomplete
                 .then_some(LiveDescendantsUnavailable::ListingIncomplete);
             if found_any {
-                metadata.group_member_identities = listing
-                    .members
-                    .iter()
-                    .filter_map(|member| ProcessIdentity::of(member.pid))
-                    .collect();
+                metadata.group_member_identities = listing.identities.clone();
+                metadata.group_member_identities_truncated = listing.identities_truncated;
             } else if !listing.incomplete {
                 metadata.group_member_identities.clear();
+                metadata.group_member_identities_truncated = false;
             }
         }
         Err(reason) => {

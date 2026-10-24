@@ -98,6 +98,32 @@ pub struct GroupListing {
     /// The group may have members the listing could not see or read, so
     /// `members` may be only part of it.
     pub incomplete: bool,
+    /// The identities of every member found, not only the ones in `members`,
+    /// up to [`GROUP_IDENTITY_CAP`]. A later kill uses them to recognise the
+    /// group as the task's while any member found here still runs.
+    pub identities: Vec<ProcessIdentity>,
+    /// More members were found than [`GROUP_IDENTITY_CAP`] identities kept.
+    pub identities_truncated: bool,
+}
+
+/// The most member identities one check keeps. Far above the members a task
+/// shows, so the display limit never limits which survivors a kill can stop,
+/// while a task record stays small (about 50 bytes per identity).
+pub const GROUP_IDENTITY_CAP: usize = 1_024;
+
+/// The identities of up to [`GROUP_IDENTITY_CAP`] of `pids`, in order, and
+/// whether some were left out. Only that many start times are read.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn capped_identities(
+    pids: impl ExactSizeIterator<Item = u32>,
+    mut identity: impl FnMut(u32) -> Option<ProcessIdentity>,
+) -> (Vec<ProcessIdentity>, bool) {
+    let truncated = pids.len() > GROUP_IDENTITY_CAP;
+    let identities = pids
+        .take(GROUP_IDENTITY_CAP)
+        .filter_map(&mut identity)
+        .collect();
+    (identities, truncated)
 }
 
 impl GroupListing {
@@ -107,6 +133,8 @@ impl GroupListing {
             members: Vec::new(),
             omitted: 0,
             incomplete: false,
+            identities: Vec::new(),
+            identities_truncated: false,
         }
     }
 
@@ -452,11 +480,17 @@ fn group_listing<C>(
     if incomplete && process_group_gone(pgid) {
         return GroupListing::clean();
     }
+    let mut candidates = candidates;
+    candidates.sort_by_key(|(pid, _)| *pid);
+    let (identities, identities_truncated) =
+        capped_identities(candidates.iter().map(|(pid, _)| *pid), ProcessIdentity::of);
     let (members, omitted) = bounded_members(candidates, describe);
     GroupListing {
         members,
         omitted,
         incomplete,
+        identities,
+        identities_truncated,
     }
 }
 
@@ -1519,6 +1553,7 @@ fn linux_member_records_owner_and_executable_name_only() {
         members,
         omitted,
         incomplete,
+        ..
     } = members.unwrap();
     assert!(!incomplete);
     assert_eq!(omitted, 0);
@@ -1579,4 +1614,28 @@ fn bounded_members_stops_describing_at_the_cap() {
         members.last().map(|member| member.pid),
         Some(LIVE_DESCENDANT_CAP as u32)
     );
+}
+
+/// One check keeps at most GROUP_IDENTITY_CAP identities, reads no start time
+/// past the cap, and says when members were left out.
+#[test]
+fn capped_identities_keeps_every_member_up_to_the_cap() {
+    let identity = |pid| {
+        Some(ProcessIdentity {
+            pid,
+            started_at_ms: u64::from(pid),
+        })
+    };
+    let (identities, truncated) = capped_identities(1..21_u32, identity);
+    assert_eq!(identities.len(), 20, "not limited to the members shown");
+    assert!(!truncated);
+
+    let mut read = 0;
+    let (identities, truncated) = capped_identities(0..(GROUP_IDENTITY_CAP as u32 + 76), |pid| {
+        read += 1;
+        identity(pid)
+    });
+    assert_eq!(identities.len(), GROUP_IDENTITY_CAP);
+    assert_eq!(read, GROUP_IDENTITY_CAP);
+    assert!(truncated);
 }
