@@ -272,6 +272,28 @@ fn candidate_text_is_bounded_relative_and_repeatable() {
 
 // ---- served path ---------------------------------------------------------
 
+#[test]
+fn audit01_raw_range_survives_crlf_and_invalid_prefix() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("raw.rs");
+    let mut source = b"// bad: \xff\r\n// second\r\n// third\r\n".to_vec();
+    let start = source.len();
+    source.extend_from_slice(b"pub fn selected() {\r\n    target();\r\n}\r\n");
+    std::fs::write(&file, &source).unwrap();
+    let symbol = CandidateResult::new_exact(
+        file,
+        Some(super::super::comparator::SymbolOffsetRange::new(
+            start,
+            source.len(),
+        )),
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    assert_eq!(
+        candidate_text(project.path(), &symbol, "anything"),
+        "raw.rs:4\nselected\npub fn selected() {\n    target();\n}"
+    );
+}
+
 fn page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
     serde_json::from_value(serde_json::json!({
         "id": "rerank-page-test",

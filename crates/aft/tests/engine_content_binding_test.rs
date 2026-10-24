@@ -203,6 +203,7 @@ fn test_three_request_invalidation_fixture_normative() {
 
     let gen1 = GenerationToken::new(100);
     let query = "exact phrase";
+    let key1 = fallback_lane_key(dir.path(), &gen1, query);
 
     // Request 1: serves with stability_void: false (counter 1)
     let r1 = lane
@@ -212,6 +213,7 @@ fn test_three_request_invalidation_fixture_normative() {
     assert!(!r1.stability_void);
     assert!(r1.void_disclosure.is_none());
     assert!(!r1.served_page_digest_mismatch);
+    let initial_epoch = memo_store.get_epoch(&key1).unwrap();
 
     // Edit file_a on disk to invalidate served-page digest
     fs::write(
@@ -236,7 +238,6 @@ fn test_three_request_invalidation_fixture_normative() {
         r2.void_disclosure.as_deref(),
         Some("content changed - page stability void")
     );
-    let key1 = fallback_lane_key(dir.path(), &gen1, query);
     assert!(
         memo_store.is_key_poisoned(&key1),
         "key K must be marked poisoned"
@@ -246,16 +247,17 @@ fn test_three_request_invalidation_fixture_normative() {
         "memo entry must be dropped"
     );
 
-    // Request 3: rebuilds at epoch 1 (counter 2), serves and must carry the disclosure and stability_void: true
+    // Request 3: rebuilds at a fresh epoch (counter 2), retaining the disclosure and stability_void.
     let r3 = lane
         .search(None, dir.path(), gen1.clone(), query, false, 0, 10, None)
         .expect("r3");
     assert_eq!(
         memo_store.verifier_call_count(),
         2,
-        "request 3 must rebuild at epoch 1"
+        "request 3 must rebuild at a fresh epoch"
     );
-    assert_eq!(memo_store.get_epoch(&key1), Some(1));
+    let rebuilt_epoch = memo_store.get_epoch(&key1).unwrap();
+    assert!(rebuilt_epoch > initial_epoch);
     assert!(
         r3.stability_void,
         "request 3 must carry stability_void: true"
@@ -266,14 +268,14 @@ fn test_three_request_invalidation_fixture_normative() {
     );
     assert!(!r3.results.is_empty(), "request 3 serves rebuilt results");
 
-    // Request 4: served from the epoch 1 entry (counter still 2) with the disclosure again
+    // Request 4: serves the rebuilt entry (counter still 2) with the disclosure again.
     let r4 = lane
         .search(None, dir.path(), gen1.clone(), query, false, 0, 10, None)
         .expect("r4");
     assert_eq!(
         memo_store.verifier_call_count(),
         2,
-        "request 4 must be served from epoch 1 entry without re-verifying"
+        "request 4 must serve the rebuilt entry without re-verifying"
     );
     assert!(r4.stability_void);
     assert_eq!(
@@ -286,23 +288,23 @@ fn test_three_request_invalidation_fixture_normative() {
     let gen2 = GenerationToken::new(101);
     let key2 = fallback_lane_key(dir.path(), &gen2, query);
 
-    // Next request builds at epoch 0 with stability_void: false and no disclosure
+    // A new generation gets a later store-wide epoch without inheriting poison.
     let r_gen2 = lane
         .search(None, dir.path(), gen2.clone(), query, false, 0, 10, None)
         .expect("r_gen2");
     assert_eq!(
         memo_store.verifier_call_count(),
         3,
-        "gen2 request must build at epoch 0"
+        "gen2 request must build a fresh entry"
     );
-    assert_eq!(memo_store.get_epoch(&key2), Some(0));
+    assert!(memo_store.get_epoch(&key2).unwrap() > rebuilt_epoch);
     assert!(!r_gen2.stability_void);
     assert!(r_gen2.void_disclosure.is_none());
 }
 
 #[test]
 fn test_mutation_red_clear_poison_on_rebuild() {
-    // If poison is cleared on rebuild at epoch 1, request 3 would have stability_void: false
+    // If poison is cleared on rebuild, request 3 would have stability_void: false.
     // Assert that a poisoned key MUST carry stability_void: true across rebuilds in same generation
     let poisoned = true;
     // Mutant behavior:
@@ -370,7 +372,7 @@ fn test_mutation_red_refuse_to_serve_poisoned_key() {
     let _ = memo.get_or_verify(&key, 0, 10, || panic!("no verifier"));
     assert!(memo.is_key_poisoned(&key));
 
-    // Rebuild at epoch 1
+    // Rebuild at a fresh epoch.
     let new_digest = compute_file_content_digest(&file_a).unwrap();
     let mut new_digests = HashMap::new();
     new_digests.insert(file_a.clone(), new_digest);

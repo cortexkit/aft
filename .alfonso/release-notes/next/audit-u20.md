@@ -1,0 +1,1 @@
+- Semantic search and project setup fixes from the u20 audit: test-support files classified consistently, snippet reads bounded on very long lines, stale setup warnings no longer published after a newer configure.

@@ -478,14 +478,13 @@ fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> boo
     !result.timed_out() || semantic_stale_generation_discards_for_test() > 0
 }
 
-// The watcher already coalesces filesystem events for 250 ms. Keep a short
-// worker window for corpus-build replay bursts without adding a second full debounce.
 // Quiet window before a semantic re-embed batch runs. Embedding costs ~1-2s
 // per collect under load, and nobody semantically searches a file within
 // seconds of editing it — a long window coalesces an agent's whole edit burst
 // into one collect instead of one per save. Freshness is preserved where it
 // matters: unembedded changed files are already excluded from results by the
-// stale-file mask, and grep/read see changes instantly.
+// stale-file mask, and grep/read see changes instantly. A batch is admitted
+// after at most four quiet windows even if requests keep arriving.
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
 
 /// Test seam: rigs that assert on semantic refresh timing override the quiet
@@ -831,6 +830,25 @@ fn start_project_watcher_with<W, E, F>(
         + Send
         + 'static,
 {
+    start_project_watcher_with_spawn(ctx, root_path, extra_watch_paths, attach, |builder, job| {
+        builder.spawn(job)
+    });
+}
+
+fn start_project_watcher_with_spawn<W, E, F, S>(
+    ctx: &AppContext,
+    root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
+    attach: F,
+    spawn: S,
+) where
+    W: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+        + Send
+        + 'static,
+    S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+{
     let generation = WATCHER_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
@@ -852,9 +870,9 @@ fn start_project_watcher_with<W, E, F>(
     let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
     let start_tx = sync_start.then_some(start_tx);
 
-    let join = thread::Builder::new()
-        .name("aft-watcher-filter".to_string())
-        .spawn(move || {
+    let join = spawn(
+        thread::Builder::new().name("aft-watcher-filter".to_string()),
+        Box::new(move || {
             log_ctx::with_session(session_id_for_bg, || {
                 let attach_with_start =
                     move |root: PathBuf,
@@ -881,8 +899,17 @@ fn start_project_watcher_with<W, E, F>(
                     attach_with_start,
                 );
             });
-        })
-        .expect("spawn watcher filter thread");
+        }),
+    );
+    let join = match join {
+        Ok(join) => join,
+        Err(error) => {
+            slog_warn!(
+                "watcher filter thread could not start for generation {generation}: {error}"
+            );
+            return;
+        }
+    };
 
     let watcher_thread_id = join.thread().id();
     ctx.install_watcher_runtime_with_thread_id(
@@ -1165,6 +1192,31 @@ fn semantic_quiet_gate_held() -> bool {
     true
 }
 
+struct SemanticRefreshDebounce {
+    quiet_window: Duration,
+    quiet_deadline: Instant,
+    batch_deadline: Instant,
+}
+
+impl SemanticRefreshDebounce {
+    fn new(now: Instant, quiet_window: Duration) -> Self {
+        Self {
+            quiet_window,
+            quiet_deadline: now + quiet_window,
+            // Allow save/format bursts to settle without postponing embedding forever.
+            batch_deadline: now + quiet_window.saturating_mul(4),
+        }
+    }
+
+    fn extend(&mut self, now: Instant) {
+        self.quiet_deadline = now + self.quiet_window;
+    }
+
+    fn deadline(&self) -> Instant {
+        self.quiet_deadline.min(self.batch_deadline)
+    }
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -1220,7 +1272,7 @@ fn spawn_semantic_refresh_worker(
                     SemanticRefreshRequest::Corpus => continue,
                 }
 
-                let mut deadline = Instant::now() + quiet_window;
+                let mut debounce = SemanticRefreshDebounce::new(Instant::now(), quiet_window);
                 #[cfg(any(test, feature = "test-timing-hooks"))]
                 let mut gate_was_held = false;
 
@@ -1228,9 +1280,12 @@ fn spawn_semantic_refresh_worker(
                     #[cfg(any(test, feature = "test-timing-hooks"))]
                     if semantic_quiet_gate_held() {
                         gate_was_held = true;
-                        deadline = Instant::now() + quiet_window;
+                        // Explicit test holds suspend admission and reset both clocks.
+                        debounce = SemanticRefreshDebounce::new(Instant::now(), quiet_window);
                     }
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    let Some(remaining) =
+                        debounce.deadline().checked_duration_since(Instant::now())
+                    else {
                         break;
                     };
                     #[cfg(any(test, feature = "test-timing-hooks"))]
@@ -1246,12 +1301,12 @@ fn spawn_semantic_refresh_worker(
                             if !corpus_requested {
                                 paths.extend(request_paths);
                             }
-                            deadline = Instant::now() + quiet_window;
+                            debounce.extend(Instant::now());
                         }
                         Ok(SemanticRefreshRequest::Corpus) if corpus_refresh_allowed => {
                             paths.clear();
                             corpus_requested = true;
-                            deadline = Instant::now() + quiet_window;
+                            debounce.extend(Instant::now());
                         }
                         Ok(SemanticRefreshRequest::Corpus) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -2122,17 +2177,42 @@ fn has_project_config(project_root: Option<&Path>, filenames: &[&str]) -> bool {
     filenames.iter().any(|file| root.join(file).exists())
 }
 
+fn read_pyproject(project_root: Option<&Path>) -> Option<toml::Value> {
+    let content = std::fs::read_to_string(project_root?.join("pyproject.toml")).ok()?;
+    toml::from_str(&content).ok()
+}
+
+fn pyproject_has_tool(pyproject: Option<&toml::Value>, tool_name: &str) -> bool {
+    pyproject
+        .and_then(|value| value.get("tool"))
+        .and_then(|tools| tools.get(tool_name))
+        .is_some_and(toml::Value::is_table)
+}
+
+#[cfg(test)]
 fn has_pyproject_tool(project_root: Option<&Path>, tool_name: &str) -> bool {
-    let Some(root) = project_root else {
-        return false;
-    };
-    let pyproject = root.join("pyproject.toml");
-    if !pyproject.exists() {
-        return false;
+    pyproject_has_tool(read_pyproject(project_root).as_ref(), tool_name)
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_pyproject_configuration_not_raw_markers() {
+    let root = tempfile::tempdir().unwrap();
+    for (text, expected) in [
+        ("[tool.ruff]\n", true),
+        ("[tool.ruff.lint]\nselect = ['E']\n", true),
+        ("[tool.\"ruff\"]\n", true),
+        ("# [tool.ruff]\n", false),
+        ("description = '[tool.ruff]'\n", false),
+        ("[tool.ruff]\ninvalid = [\n", false),
+    ] {
+        std::fs::write(root.path().join("pyproject.toml"), text).unwrap();
+        assert_eq!(
+            has_pyproject_tool(Some(root.path()), "ruff"),
+            expected,
+            "{text}"
+        );
     }
-    std::fs::read_to_string(pyproject)
-        .map(|content| content.contains(&format!("[tool.{tool_name}]")))
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -2171,9 +2251,22 @@ fn explicit_checker_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
     }
 }
 
+#[cfg(test)]
 fn formatter_candidates(
     lang: LangId,
     config: &crate::config::Config,
+) -> Vec<ConfigureToolCandidate> {
+    formatter_candidates_with_pyproject(
+        lang,
+        config,
+        read_pyproject(config.project_root.as_deref()).as_ref(),
+    )
+}
+
+fn formatter_candidates_with_pyproject(
+    lang: LangId,
+    config: &crate::config::Config,
+    pyproject: Option<&toml::Value>,
 ) -> Vec<ConfigureToolCandidate> {
     let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.formatter.get(lang_key(lang)) {
@@ -2218,10 +2311,10 @@ fn formatter_candidates(
         }
         LangId::Python => {
             if has_project_config(project_root, &["ruff.toml", ".ruff.toml"])
-                || has_pyproject_tool(project_root, "ruff")
+                || pyproject_has_tool(pyproject, "ruff")
             {
                 vec![configure_tool_candidate("ruff", "ruff config", true)]
-            } else if has_pyproject_tool(project_root, "black") {
+            } else if pyproject_has_tool(pyproject, "black") {
                 vec![configure_tool_candidate("black", "pyproject.toml", true)]
             } else {
                 Vec::new()
@@ -2272,7 +2365,11 @@ fn formatter_candidates(
     }
 }
 
-fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<ConfigureToolCandidate> {
+fn checker_candidates(
+    lang: LangId,
+    config: &crate::config::Config,
+    pyproject: Option<&toml::Value>,
+) -> Vec<ConfigureToolCandidate> {
     let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.checker.get(lang_key(lang)) {
         return explicit_checker_candidate(preferred);
@@ -2290,11 +2387,11 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         }
         LangId::Python => {
             if has_project_config(project_root, &["pyrightconfig.json"])
-                || has_pyproject_tool(project_root, "pyright")
+                || pyproject_has_tool(pyproject, "pyright")
             {
                 vec![configure_tool_candidate("pyright", "pyright config", true)]
             } else if has_project_config(project_root, &["ruff.toml", ".ruff.toml"])
-                || has_pyproject_tool(project_root, "ruff")
+                || pyproject_has_tool(pyproject, "ruff")
             {
                 vec![configure_tool_candidate("ruff", "ruff config", true)]
             } else {
@@ -2410,16 +2507,33 @@ fn detect_missing_tools_for_languages(
 fn detect_missing_tools_with_cache(
     languages: &HashSet<LangId>,
     config: &crate::config::Config,
+    tool_cache: HashMap<String, bool>,
+) -> Vec<crate::format::MissingTool> {
+    detect_missing_tools_with_loader(languages, config, tool_cache, read_pyproject)
+}
+
+fn detect_missing_tools_with_loader(
+    languages: &HashSet<LangId>,
+    config: &crate::config::Config,
     mut tool_cache: HashMap<String, bool>,
+    load: impl FnOnce(Option<&Path>) -> Option<toml::Value>,
 ) -> Vec<crate::format::MissingTool> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
+    // Formatter and checker selection must agree on one parsed Python snapshot.
+    // Invalid pyproject.toml contributes no candidates; separate tool config files
+    // and explicit formatter/checker settings are still considered.
+    let pyproject = if languages.contains(&LangId::Python) {
+        load(config.project_root.as_deref())
+    } else {
+        None
+    };
 
     for &lang in languages {
         let language = lang_key(lang);
 
         if should_warn_missing_formatters(config, lang) {
-            for candidate in formatter_candidates(lang, config) {
+            for candidate in formatter_candidates_with_pyproject(lang, config, pyproject.as_ref()) {
                 if let Some(warning) = missing_tool_warning(
                     "formatter_not_installed",
                     language,
@@ -2439,7 +2553,7 @@ fn detect_missing_tools_with_cache(
         }
 
         if should_warn_missing_checkers(config, lang) {
-            for candidate in checker_candidates(lang, config) {
+            for candidate in checker_candidates(lang, config, pyproject.as_ref()) {
                 if let Some(warning) = missing_tool_warning(
                     "checker_not_installed",
                     language,
@@ -2463,6 +2577,38 @@ fn detect_missing_tools_with_cache(
         (&left.kind, &left.language, &left.tool).cmp(&(&right.kind, &right.language, &right.tool))
     });
     warnings
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_python_warning_collection_uses_one_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        project_root: Some(root.path().to_path_buf()),
+        format_on_edit: true,
+        validate_on_edit: Some("syntax".to_string()),
+        ..Default::default()
+    };
+    let mut calls = 0;
+    let warnings = detect_missing_tools_with_loader(
+        &HashSet::from([LangId::Python]),
+        &config,
+        HashMap::from([("ruff".to_string(), false), ("pyright".to_string(), false)]),
+        |_| {
+            calls += 1;
+            Some(toml::from_str("[tool.ruff.lint]\nselect = ['E']\n[tool.pyright]\ntypeCheckingMode = 'strict'\n").unwrap())
+        },
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings.iter().any(|warning| warning.tool == "ruff"));
+    assert!(warnings.iter().any(|warning| warning.tool == "pyright"));
+    detect_missing_tools_with_loader(
+        &HashSet::from([LangId::TypeScript]),
+        &config,
+        HashMap::new(),
+        |_| panic!("non-Python discovery must not load pyproject"),
+    );
 }
 
 fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
@@ -2549,6 +2695,160 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 
     warnings.sort_by_key(|warning| warning.to_string());
     warnings
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarningBoundary {
+    Discovery,
+    Walking,
+    Tools,
+    ParsingTools,
+    Lsp,
+    ResolvingLsp,
+    Publication,
+}
+
+struct ConfigureWarningWork {
+    root: PathBuf,
+    config: Arc<Config>,
+    generation_flag: Arc<AtomicU64>,
+    generation: u64,
+    tx: crossbeam_channel::Sender<(u64, crate::protocol::ConfigureWarningsFrame)>,
+    session_id: Option<String>,
+}
+
+impl ConfigureWarningWork {
+    // Per-call observers let tests supersede a worker at real work boundaries;
+    // production supplies a no-op observer rather than a process-wide delay.
+    fn run(self, mut boundary: impl FnMut(WarningBoundary)) {
+        let current = || self.generation_flag.load(Ordering::SeqCst) == self.generation;
+        boundary(WarningBoundary::Discovery);
+        if !current() {
+            return;
+        }
+        boundary(WarningBoundary::Walking);
+        signal_configure_deferred_walk_start_for_test();
+        let flag = self.generation_flag.clone();
+        let generation = self.generation;
+        let source_files: Vec<PathBuf> =
+            crate::callgraph::walk_project_files_while(&self.root, move || {
+                flag.load(Ordering::SeqCst) == generation
+            })
+            .collect();
+        boundary(WarningBoundary::Tools);
+        if !current() {
+            return;
+        }
+        boundary(WarningBoundary::ParsingTools);
+        let languages: HashSet<LangId> = source_files
+            .iter()
+            .filter_map(|path| detect_language(path))
+            .collect();
+        let mut warnings = detect_missing_tools_for_languages(&languages, &self.config)
+            .into_iter()
+            .map(|warning| json!(warning))
+            .collect::<Vec<_>>();
+        boundary(WarningBoundary::Lsp);
+        if !current() {
+            return;
+        }
+        boundary(WarningBoundary::ResolvingLsp);
+        warnings.extend(detect_missing_lsp_binaries(&source_files, &self.config));
+        boundary(WarningBoundary::Publication);
+        // The consumer still filters the check/send race; obsolete discovery
+        // must not knowingly queue a frame.
+        if !current() {
+            return;
+        }
+        let frame = crate::protocol::ConfigureWarningsFrame::new_with_session_id(
+            self.session_id,
+            self.root.display().to_string(),
+            warnings,
+        );
+        let _ = self.tx.send((self.generation, frame));
+    }
+}
+
+#[cfg(test)]
+fn assert_warning_superseded_at(phase: WarningBoundary) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("one.rs"), "fn fixture() {}\n").unwrap();
+    let flag = Arc::new(AtomicU64::new(1));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut observed = Vec::new();
+    ConfigureWarningWork {
+        root: root.path().to_path_buf(),
+        config: Arc::new(Config::default()),
+        generation_flag: flag.clone(),
+        generation: 1,
+        tx,
+        session_id: None,
+    }
+    .run(|at| {
+        observed.push(at);
+        if at == phase {
+            flag.store(2, Ordering::SeqCst);
+        }
+    });
+    assert_eq!(
+        observed.contains(&WarningBoundary::Walking),
+        phase != WarningBoundary::Discovery
+    );
+    assert_eq!(
+        observed.contains(&WarningBoundary::ParsingTools),
+        matches!(phase, WarningBoundary::Lsp | WarningBoundary::Publication)
+    );
+    assert_eq!(
+        observed.contains(&WarningBoundary::ResolvingLsp),
+        phase == WarningBoundary::Publication
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "superseded worker queued a stale raw frame"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_warning_discovery_guard() {
+    assert_warning_superseded_at(WarningBoundary::Discovery);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_walk_guard() {
+    assert_warning_superseded_at(WarningBoundary::Walking);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_tool_guard() {
+    assert_warning_superseded_at(WarningBoundary::Tools);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_lsp_guard() {
+    assert_warning_superseded_at(WarningBoundary::Lsp);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_publication_guard() {
+    assert_warning_superseded_at(WarningBoundary::Publication);
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_warning_current_generation_publishes() {
+    let root = tempfile::tempdir().unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    ConfigureWarningWork {
+        root: root.path().to_path_buf(),
+        config: Arc::new(Config::default()),
+        generation_flag: Arc::new(AtomicU64::new(2)),
+        generation: 2,
+        tx,
+        session_id: None,
+    }
+    .run(|_| {});
+    assert_eq!(rx.try_recv().unwrap().0, 2);
 }
 
 type SearchIndexSymbolFile = (PathBuf, SystemTime);
@@ -4753,41 +5053,28 @@ fn handle_configure_inner(
     let warnings_pending = !root_too_broad && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
-        let warning_generation = configure_generation;
-        let walk_root = root_path.clone();
-        let project_root_display = root_path.display().to_string();
-        let config_for_bg = config_snapshot.clone();
         let session_id_for_bg = log_ctx::current_session();
-        let session_id_for_frame = session_id_for_bg.clone();
+        let work = ConfigureWarningWork {
+            root: root_path.clone(),
+            config: config_snapshot.clone(),
+            generation_flag: ctx.configure_generation_flag(),
+            generation: configure_generation,
+            tx: warning_tx,
+            session_id: session_id_for_bg.clone(),
+        };
         let run_deferred_walk = move || {
             log_ctx::with_session(session_id_for_bg, || {
                 delay_configure_deferred_walk_for_test();
-                signal_configure_deferred_walk_start_for_test();
-                let source_files: Vec<PathBuf> =
-                    crate::callgraph::walk_project_files(&walk_root).collect();
-                let detected_languages: HashSet<LangId> = source_files
-                    .iter()
-                    .filter_map(|path| detect_language(path))
-                    .collect();
-                let mut warnings =
-                    detect_missing_tools_for_languages(&detected_languages, &config_for_bg)
-                        .into_iter()
-                        .map(|warning| json!(warning))
-                        .collect::<Vec<_>>();
-                warnings.extend(detect_missing_lsp_binaries(&source_files, &config_for_bg));
-
-                let frame = crate::protocol::ConfigureWarningsFrame::new_with_session_id(
-                    session_id_for_frame,
-                    project_root_display,
-                    warnings,
-                );
-                let _ = warning_tx.send((warning_generation, frame));
+                work.run(|_| {});
             });
         };
         if run_configure_deferred_walk_synchronously_for_test() {
             run_deferred_walk();
         } else {
-            thread::spawn(run_deferred_walk);
+            thread::Builder::new()
+                .name("aft-configure-warnings".to_string())
+                .spawn(run_deferred_walk)
+                .expect("failed to spawn thread");
         }
     }
 
@@ -9144,6 +9431,60 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_refresh_debounce_caps_sustained_requests() {
+        let started = std::time::Instant::now();
+        let mut debounce =
+            super::SemanticRefreshDebounce::new(started, std::time::Duration::from_secs(15));
+        for seconds in [14, 28, 42, 56] {
+            debounce.extend(started + std::time::Duration::from_secs(seconds));
+        }
+        assert_eq!(
+            debounce.deadline(),
+            started + std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn semantic_refresh_debounce_retains_trailing_quiet_window() {
+        let started = std::time::Instant::now();
+        let quiet = std::time::Duration::from_secs(15);
+        let mut debounce = super::SemanticRefreshDebounce::new(started, quiet);
+        debounce.extend(started + std::time::Duration::from_secs(3));
+        assert_eq!(
+            debounce.deadline(),
+            started + std::time::Duration::from_secs(18)
+        );
+        debounce = super::SemanticRefreshDebounce::new(
+            started + std::time::Duration::from_secs(90),
+            quiet,
+        );
+        assert_eq!(
+            debounce.deadline(),
+            started + std::time::Duration::from_secs(105)
+        );
+    }
+
+    #[test]
+    fn watcher_spawn_failure_leaves_runtime_uninstalled() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        super::start_project_watcher_with_spawn(
+            &ctx,
+            root.path(),
+            Vec::new(),
+            |_root, _extra, _tx| -> Result<(), &'static str> {
+                panic!("attachment must not run without a worker thread")
+            },
+            |_builder, _job| Err(std::io::Error::other("injected thread exhaustion")),
+        );
+        assert!(!ctx.watcher_runtime_active());
+        assert!(ctx.watcher_rx().lock().is_none());
+        assert!(ctx.watcher().lock().is_none());
+    }
     #[test]
     fn prepared_cache_reuse_preserves_unknown_and_opt_out_intent() {
         let candidate = crate::config::Config::default();

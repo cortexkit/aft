@@ -169,7 +169,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, read_bounded_snippet_line, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
             },
         ],
     },

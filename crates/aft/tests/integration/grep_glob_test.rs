@@ -11,6 +11,17 @@ use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess}
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
+    // Ignore-rule fixtures need a real repository: a partial .git directory is
+    // corrupt metadata, not evidence that this project is outside Git.
+    if files.iter().any(|(path, _)| path.starts_with(".git/")) {
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(temp_dir.path())
+            .output()
+            .expect("initialize fixture repository");
+        assert!(output.status.success(), "{output:?}");
+    }
+
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
@@ -1966,6 +1977,30 @@ mod explicit_target_regressions {
             ),
             ("ignored-by-gitignore/report.log", "20 pass; 0 fail\n"),
         ])
+    }
+
+    #[test]
+    fn ignored_reports_fixture_has_valid_unborn_git_metadata() {
+        let project = ignored_reports_project();
+        let head = std::fs::read_to_string(project.path().join(".git/HEAD"))
+            .expect("ignore fixture must have a complete Git repository");
+        assert!(head.starts_with("ref: refs/heads/"), "{head}");
+        let inside = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(inside.status.success(), "{inside:?}");
+        assert_eq!(String::from_utf8(inside.stdout).unwrap().trim(), "true");
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            !head.status.success(),
+            "fixture should be an unborn repository"
+        );
     }
 
     fn reports_request(command: &str, path: Option<&str>) -> Value {
