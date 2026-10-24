@@ -10,7 +10,8 @@
     "crates/aft/src/commands/semantic_search/mod.rs",
     "crates/aft/src/commands/semantic_search/regex_route.rs",
     "packages/opencode-plugin/src/tools/semantic.ts",
+    "packages/pi-plugin/src/__tests__/semantic-renderers.test.ts",
     "packages/pi-plugin/src/tools/semantic.ts"
   ],
-  "note": "engine_unwired: aft_search reply wording only (absent-literal line and [similar] labels, lane footer from what served the answer, files-first count line and exact regex-route trailer, refusal for a rule-denied external path) Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+  "note": "The ranking-fenced semantic_search and plugin semantic.ts changes alter reply labels, a rule-denied path refusal, lane footers and envelope totals for issue 826. Ranking and routing are unchanged; benchmark rows must remain byte-identical. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
 }
