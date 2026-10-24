@@ -22776,7 +22776,8 @@ mod tests {
             "project_root": "/", "harness": "runner", "storage_dir": ctx._storage.path(),
         }));
         assert!(handle_configure_for_test(&req, &ctx).success);
-        let file = ctx._storage.path().join("readable.txt");
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("readable.txt");
         std::fs::write(&file, "explicit path still works\n").unwrap();
         let read = RawRequest {
             id: "read-root".into(),

@@ -551,9 +551,13 @@ fn scope_has_files_unbounded(
 ) -> Option<bool> {
     let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
-    let Some(builder) =
-        fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target, false)
-    else {
+    let Some(builder) = fallback_target_walk_builder(
+        search_root,
+        Arc::clone(&skipped),
+        ignored_target,
+        false,
+        Some(filter_root),
+    ) else {
         return Some(false);
     };
     let walker = builder.build();
@@ -1086,7 +1090,13 @@ pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {
-    target_walk_builder(search_root, skipped_foreign_mounts, false, false)
+    target_walk_builder(
+        search_root,
+        skipped_foreign_mounts,
+        false,
+        false,
+        Some(search_root),
+    )
 }
 
 /// The grep/glob directory walker for `search_root`, or `None` when a
@@ -1099,6 +1109,7 @@ fn fallback_target_walk_builder(
     skipped_foreign_mounts: Arc<AtomicUsize>,
     ignored_target: bool,
     ignore_ancestors: bool,
+    filter_root: Option<&Path>,
 ) -> Option<WalkBuilder> {
     if !crate::context::confinement::admits_walk_root(search_root) {
         return None;
@@ -1108,6 +1119,7 @@ fn fallback_target_walk_builder(
         skipped_foreign_mounts,
         ignored_target,
         ignore_ancestors,
+        filter_root,
     ))
 }
 
@@ -1118,6 +1130,7 @@ fn target_walk_builder(
     skipped_foreign_mounts: Arc<AtomicUsize>,
     ignored_target: bool,
     ignore_ancestors: bool,
+    filter_root: Option<&Path>,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
@@ -1128,6 +1141,9 @@ fn target_walk_builder(
         crate::context::confinement::SEARCH_IGNORE_FILES,
     );
     let ignore_root = ignore_ancestors.then(|| search_root.to_path_buf());
+    let floor_disclosure = filter_root
+        .map(|root| crate::context::confinement::capture().for_floor_filter_root(root))
+        .unwrap_or_default();
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
@@ -1137,6 +1153,7 @@ fn target_walk_builder(
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
             {
+                floor_disclosure.record_source_exclusion(entry.path());
                 return false;
             }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
@@ -1336,9 +1353,13 @@ fn diagnose_scope_counts_unbounded(
             return None;
         }
         let mut accepted = HashSet::new();
-        let Some(mut builder) =
-            fallback_target_walk_builder(&directory, Arc::clone(&skipped), ignored_target, false)
-        else {
+        let Some(mut builder) = fallback_target_walk_builder(
+            &directory,
+            Arc::clone(&skipped),
+            ignored_target,
+            false,
+            Some(filter_root),
+        ) else {
             continue;
         };
         builder.max_depth(Some(1));
@@ -1557,6 +1578,7 @@ fn walk_files_unbounded(
         Arc::clone(&skipped_foreign_mounts),
         ignored_target,
         ignore_ancestors,
+        Some(filter_root),
     ) else {
         return FallbackWalkOutcome {
             files: Vec::new(),
@@ -1705,6 +1727,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         Arc::clone(&skipped_foreign_mounts),
         ignored_target,
         false,
+        Some(filter_root),
     ) else {
         return FallbackWalkProgress::default();
     };

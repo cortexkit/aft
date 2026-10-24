@@ -81,3 +81,6 @@ mod url_resolution;
 pub mod write;
 pub mod writes_census;
 pub mod zoom;
+
+#[cfg(test)]
+mod storage_floor_tests;

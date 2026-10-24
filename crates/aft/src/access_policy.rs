@@ -42,6 +42,10 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
+pub(crate) fn scope_matches(scope: &Option<crate::db::access_grants::ScopeKey>) -> bool {
+    REQUEST_SCOPE.with(|slot| *slot.borrow() == *scope)
+}
+
 /// Published crate sources (registry and git dependencies) and toolchains:
 /// immutable package sources a worker reads when changing code against them.
 /// Each entry is the home's environment variable, its default directory under
@@ -355,12 +359,14 @@ pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
 
 thread_local! {
     static ASK_ROUTE: std::cell::RefCell<Option<AskRoute>> = const { std::cell::RefCell::new(None) };
+    static ASK_ROUTE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
 
 impl Drop for AskRouteGuard {
     fn drop(&mut self) {
+        ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
         ASK_ROUTE.with(|slot| {
             slot.replace(self.0.take());
         });
@@ -368,10 +374,15 @@ impl Drop for AskRouteGuard {
 }
 
 pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
+    ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     AskRouteGuard(
         ASK_ROUTE.with(|slot| slot.replace(route)),
         std::marker::PhantomData,
     )
+}
+
+pub(crate) fn ask_route_generation() -> u64 {
+    ASK_ROUTE_GENERATION.with(|generation| generation.get())
 }
 
 pub(crate) fn current_ask_route() -> AskRoute {
@@ -674,6 +685,14 @@ impl AccessPolicy {
             path
         })
         .collect();
+        if config.cache_dir.is_some() {
+            let path = policy_path(&crate::root_cache::cache_root(config));
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule: FloorRule::AftStorage,
+            });
+            deny.push(path);
+        }
         if let Some(path) = &config.semantic.subc_connection_file {
             let path = expand_home(path, home);
             let path = policy_path(&if path.is_absolute() {
@@ -781,10 +800,31 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
-        if self
-            .floor_for_path(operation, path, owned_artifact)
-            .is_some()
-        {
+        self.decide_inner(operation, path, owned_artifact, false)
+    }
+
+    pub(crate) fn decide_resolved(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+    ) -> AccessDecision {
+        self.decide_inner(operation, path, owned_artifact, true)
+    }
+
+    fn decide_inner(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+        resolved: bool,
+    ) -> AccessDecision {
+        let floor = if resolved {
+            self.floor_for_path_using(operation, path, owned_artifact, floor_contains_resolved)
+        } else {
+            self.floor_for_path(operation, path, owned_artifact)
+        };
+        if floor.is_some() {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
         let exceptions = match operation {
@@ -873,6 +913,16 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> Option<PolicyFloor> {
+        self.floor_for_path_using(operation, path, owned_artifact, floor_contains)
+    }
+
+    fn floor_for_path_using(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+        contains: fn(&Path, &Path) -> bool,
+    ) -> Option<PolicyFloor> {
         if crate::bash_background::registry::is_task_environment(path) {
             return Some(PolicyFloor {
                 path: path.to_path_buf(),
@@ -882,9 +932,25 @@ impl AccessPolicy {
         if let Some(floor) = self
             .absolute_floor
             .iter()
-            .find(|floor| floor_contains(path, floor))
+            .find(|floor| contains(path, floor))
         {
             return Some(self.describe_floor(floor));
+        }
+        // Project roots and capability grants cannot admit AFT's SQLite files:
+        // closing a second descriptor releases the process's SQLite locks.
+        // Ownership-checked task output keeps its separate, non-SQLite read path.
+        if !(operation == AccessOperation::Read && owned_artifact) {
+            if let Some(floor) = self.floor_rules.iter().find(|floor| {
+                matches!(floor.rule, FloorRule::AftStorage) && contains(path, &floor.path)
+            }) {
+                return Some(floor.clone());
+            }
+        }
+        if crate::db::file_identity::is_live_sqlite_file(path) {
+            return Some(PolicyFloor {
+                path: path.to_path_buf(),
+                rule: FloorRule::AftStorage,
+            });
         }
         let exceptions = match operation {
             AccessOperation::Read => &self.private_stores.read_allow,
@@ -901,7 +967,7 @@ impl AccessPolicy {
                 .private_stores
                 .deny
                 .iter()
-                .find(|floor| floor_contains(path, floor))
+                .find(|floor| contains(path, floor))
                 .map(|floor| self.describe_floor(floor));
         }
         None
@@ -1130,14 +1196,38 @@ fn environment_private_store_denies(
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
 }
 
 #[cfg(windows)]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
+    // Resolve short-name aliases and missing descendants through their nearest
+    // existing ancestor. Preserve a final symlink's location for unlink checks.
+    let path = if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => policy_path(parent).join(name),
+            _ => policy_path(path),
+        }
+    } else {
+        policy_path(path)
+    };
+    let prefix = policy_path(prefix);
+    floor_contains_resolved(&path, &prefix)
+}
 
+/// Compare identities that were already resolved for this request's snapshot.
+#[cfg(not(windows))]
+pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
+    floor_contains(path, prefix)
+}
+
+#[cfg(windows)]
+pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         #[link_name = "CompareStringOrdinal"]
@@ -1149,10 +1239,6 @@ fn floor_contains(path: &Path, prefix: &Path) -> bool {
             ignore_case: i32,
         ) -> i32;
     }
-
-    // Windows accepts case aliases even for missing final components. Compare
-    // whole components with the OS's ordinal case rules, without following a
-    // final symlink or losing non-UTF-8 names through string conversion.
     let path = crate::inspect::job::normalize_path(path);
     let prefix = crate::inspect::job::normalize_path(prefix);
     let mut components = path.components();
@@ -1179,7 +1265,7 @@ fn floor_contains(path: &Path, prefix: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     use std::ffi::c_void;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1561,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn private_store_grants_cannot_add_carve_outs() {
+    fn storage_floor_grants_and_project_roots_cannot_add_carve_outs() {
         let root = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
         // Production callers pass canonical policy identities. On macOS the temp
@@ -1591,7 +1677,7 @@ mod tests {
         policy.private_stores.read_allow.push(outside.clone());
         assert_eq!(
             policy.decide(AccessOperation::Read, &outside, false),
-            AccessDecision::Allow
+            AccessDecision::Deny(AccessDenial::Floor)
         );
         assert_eq!(
             policy.decide(AccessOperation::Write, &outside, false),

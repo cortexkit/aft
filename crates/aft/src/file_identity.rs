@@ -46,7 +46,7 @@ impl FileIdentity {
         }
         #[cfg(windows)]
         {
-            windows_identity(file)
+            windows_identity(file).0
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -72,24 +72,32 @@ impl FileIdentity {
 /// Like `std::fs::metadata` (follows symlinks), plus the identity of the same
 /// file.
 pub(crate) fn metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {
-    stat(path, true)
+    stat(path, true).map(|(metadata, identity, _)| (metadata, identity))
 }
 
 /// Like `std::fs::symlink_metadata` (describes a symlink itself rather than
 /// its target), plus the identity of the same file.
 pub(crate) fn symlink_metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {
-    stat(path, false)
+    stat(path, false).map(|(metadata, identity, _)| (metadata, identity))
+}
+
+/// Read identity and link count in the same metadata query. SQLite alias
+/// admission uses the count to avoid refreshing sidecars for ordinary files.
+pub(crate) fn metadata_with_link_count(path: &Path) -> io::Result<(Metadata, FileIdentity, u64)> {
+    stat(path, true)
 }
 
 #[cfg(unix)]
-fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentity)> {
+fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentity, u64)> {
+    use std::os::unix::fs::MetadataExt;
     let metadata = if follow_symlinks {
         std::fs::metadata(path)?
     } else {
         std::fs::symlink_metadata(path)?
     };
     let identity = FileIdentity::of_unix_metadata(&metadata);
-    Ok((metadata, identity))
+    let links = metadata.nlink();
+    Ok((metadata, identity, links))
 }
 
 /// One handle supplies both the metadata and the identity, so they always
@@ -98,7 +106,7 @@ fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentit
 /// it neither blocks a concurrent writer's rename over the file nor costs
 /// more than the metadata read it replaces.
 #[cfg(windows)]
-fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentity)> {
+fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentity, u64)> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -116,7 +124,8 @@ fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentit
     {
         Ok(file) => {
             let metadata = file.metadata()?;
-            Ok((metadata, FileIdentity::of_file(&file)))
+            let (identity, links) = windows_identity(&file);
+            Ok((metadata, identity, links))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
         // `std::fs::metadata` falls back to reading the directory entry when
@@ -128,23 +137,23 @@ fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentit
             } else {
                 std::fs::symlink_metadata(path)?
             };
-            Ok((metadata, FileIdentity::Unavailable))
+            Ok((metadata, FileIdentity::Unavailable, 1))
         }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentity)> {
+fn stat(path: &Path, follow_symlinks: bool) -> io::Result<(Metadata, FileIdentity, u64)> {
     let metadata = if follow_symlinks {
         std::fs::metadata(path)?
     } else {
         std::fs::symlink_metadata(path)?
     };
-    Ok((metadata, FileIdentity::Unavailable))
+    Ok((metadata, FileIdentity::Unavailable, 1))
 }
 
 #[cfg(windows)]
-fn windows_identity(file: &File) -> FileIdentity {
+fn windows_identity(file: &File) -> (FileIdentity, u64) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -154,14 +163,17 @@ fn windows_identity(file: &File) -> FileIdentity {
     // successful call initializes the structure before it is read below.
     let info = unsafe {
         if GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) == 0 {
-            return FileIdentity::Unavailable;
+            return (FileIdentity::Unavailable, 1);
         }
         info.assume_init()
     };
-    FileIdentity::Known {
-        volume: u64::from(info.dwVolumeSerialNumber),
-        index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    }
+    (
+        FileIdentity::Known {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        },
+        u64::from(info.nNumberOfLinks),
+    )
 }
 
 /// Atomically replaces the file at `path` with `contents` of the same length,

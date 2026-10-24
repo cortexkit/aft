@@ -47,6 +47,9 @@ pub enum AftError {
         path: String,
         message: String,
     },
+    DeniedFloor {
+        path: String,
+    },
 }
 
 impl AftError {
@@ -64,6 +67,7 @@ impl AftError {
             AftError::ScopeNotFound { .. } => "scope_not_found",
             AftError::MemberNotFound { .. } => "member_not_found",
             AftError::IoError { .. } => "io_error",
+            AftError::DeniedFloor { .. } => "denied_floor",
         }
     }
 
@@ -81,6 +85,9 @@ impl AftError {
 impl fmt::Display for AftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AftError::DeniedFloor { path } => {
+                write!(f, "path '{}' is denied by the access policy floor", path)
+            }
             AftError::SymbolNotFound { name, file } => {
                 write!(f, "symbol '{}' not found in {}", name, file)
             }

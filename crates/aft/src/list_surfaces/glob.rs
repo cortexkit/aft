@@ -22,8 +22,8 @@ pub const MAX_DISPLAY_DIRECTORIES: usize = 6;
 ///
 /// Parameters:
 /// - `shown`: rendered file count after display-only selectors (from the seam `rendered_glob_file_count`)
-/// - `total`: post-filter total file count from discovery (pre-cap floor if capped, or exact file count)
-/// - `executor_capped`: true if discovery hit `DEFAULT_MAX_RESULTS`
+/// - `total`: admitted file count, a proved lower bound when an unchecked tail remains
+/// - `executor_capped`: true if the page/refill window left candidates unchecked
 /// - `walk_truncated`: true if directory traversal stopped early
 /// - `skipped_foreign_mounts`: count of foreign filesystem mounts skipped
 pub fn build_glob_envelope(

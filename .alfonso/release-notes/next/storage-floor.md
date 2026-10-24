@@ -1,0 +1,1 @@
+- File tools and undo refuse direct access to AFT's own storage files and live database aliases, even inside an authorized project; multi-file reads and glob edits skip and report protected files without blocking ordinary project files.
