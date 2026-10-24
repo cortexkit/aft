@@ -645,6 +645,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
         apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
+        clear_stored_compression_commands(&mut conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         return Ok(conn);
     }
@@ -676,6 +677,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
             )?;
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
+            clear_stored_compression_commands(&mut conn)?;
             Ok::<(), OpenError>(())
         })();
         match result {
@@ -807,6 +809,42 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
 
 fn ensure_additive_indexes(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(ADDITIVE_INDEXES)
+}
+
+/// `host_state` key recording that shell command text written to
+/// `compression_events.command` by earlier builds has been cleared.
+const COMPRESSION_COMMANDS_CLEARED_KEY: &str = "aft.compression_event_commands_cleared";
+
+/// Clear command text that earlier builds stored with each compression event.
+/// Nothing reads that column, and a command can carry an inline credential.
+/// This is a data change, not a format change: the column stays (older builds
+/// still insert into it), so the schema version and reader floor are unchanged.
+/// Runs once per database on a writable open; the marker in `host_state` makes
+/// later opens a single indexed read.
+fn clear_stored_compression_commands(conn: &mut Connection) -> rusqlite::Result<()> {
+    let marker_exists = |conn: &Connection| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM host_state WHERE key = ?1)",
+            [COMPRESSION_COMMANDS_CLEARED_KEY],
+            |row| row.get::<_, bool>(0),
+        )
+    };
+    if marker_exists(conn)? {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another opener may have finished the cleanup while this one waited.
+    if !marker_exists(&tx)? {
+        tx.execute(
+            "UPDATE compression_events SET command = NULL WHERE command IS NOT NULL",
+            [],
+        )?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        state::set_host_state(&tx, COMPRESSION_COMMANDS_CLEARED_KEY, "1", now_ms)?;
+    }
+    tx.commit()
 }
 
 fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
@@ -1778,6 +1816,62 @@ mod tests {
         let conn = open(&path).unwrap();
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert_eq!(schema_version_row_count(&conn), 1);
+    }
+
+    #[test]
+    fn writable_open_clears_stored_compression_commands_once() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let commands = |conn: &Connection| -> Vec<Option<String>> {
+            let mut stmt = conn
+                .prepare("SELECT command FROM compression_events ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        // A database last written by a build that still stored command text.
+        let conn = open(&path).unwrap();
+        insert_compression_event(&conn, 1, "opencode", Some("s"), "p", "bash", Some("t1")).unwrap();
+        conn.execute(
+            "DELETE FROM host_state WHERE key = ?1",
+            [COMPRESSION_COMMANDS_CLEARED_KEY],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = open_readonly(&path).unwrap();
+        assert_eq!(commands(&reader), [Some("echo ok".to_string())]);
+        drop(reader);
+
+        let conn = open(&path).unwrap();
+        assert_eq!(commands(&conn), [None]);
+        let row = compression_events::CompressionEventRow {
+            harness: "opencode",
+            session_id: Some("s"),
+            project_key: "p",
+            tool: "bash",
+            task_id: Some("t2"),
+            compressor: "generic",
+            original_bytes: 10,
+            compressed_bytes: 5,
+            original_tokens: 3,
+            compressed_tokens: 2,
+            created_at: 2,
+        };
+        compression_events::insert_compression_event(&conn, &row).unwrap();
+        assert_eq!(commands(&conn), [None, None]);
+
+        // Later opens only read the marker.
+        conn.execute(
+            "UPDATE compression_events SET command = 'kept' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&path).unwrap();
+        assert_eq!(commands(&conn), [Some("kept".to_string()), None]);
     }
 
     #[test]

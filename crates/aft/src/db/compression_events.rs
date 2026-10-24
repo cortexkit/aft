@@ -11,7 +11,6 @@ pub struct CompressionEventRow<'a> {
     pub project_key: &'a str,
     pub tool: &'a str,
     pub task_id: Option<&'a str>,
-    pub command: Option<&'a str>,
     pub compressor: &'a str,
     pub original_bytes: i64,
     pub compressed_bytes: i64,
@@ -241,10 +240,10 @@ pub fn insert_compression_event(
     let inserted = conn.execute(
         r#"
         INSERT OR IGNORE INTO compression_events (
-            harness, session_id, project_key, tool, task_id, command, compressor,
+            harness, session_id, project_key, tool, task_id, compressor,
             original_bytes, compressed_bytes, original_tokens, compressed_tokens, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         "#,
         params![
             row.harness,
@@ -252,7 +251,6 @@ pub fn insert_compression_event(
             row.project_key,
             row.tool,
             row.task_id,
-            row.command,
             row.compressor,
             row.original_bytes,
             row.compressed_bytes,
@@ -1727,7 +1725,6 @@ mod tests {
             project_key,
             tool: "bash",
             task_id: Some(task_id),
-            command: Some("echo ok"),
             compressor: "zstd",
             original_bytes: i64::from(original_tokens) * 4,
             compressed_bytes: i64::from(compressed_tokens) * 4,

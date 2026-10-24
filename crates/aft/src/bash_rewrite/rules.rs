@@ -818,7 +818,9 @@ fn decline_cat_read(
     predicate: &'static str,
 ) -> crate::bash_rewrite::RewriteDecision {
     let candidate = resolved_path_candidate(ctx, path);
-    crate::slog_warn!(
+    // Routine: a cat outside the project root (a host temp folder, say) or of
+    // an unreadable shape simply runs as native bash.
+    crate::slog_debug!(
         "bash rewrite rule cat declined: read declined: predicate={} resolved_candidate={:?}",
         predicate,
         candidate

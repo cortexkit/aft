@@ -187,6 +187,29 @@ pub(crate) fn render_nearest_miss_detail(source: &str, needle: &str) -> String {
     detail
 }
 
+/// Longest searched text a not-found error repeats as-is.
+const SEARCHED_TEXT_ECHO_CHARS: usize = 120;
+
+/// How a not-found error names the text it searched for. One short line is
+/// quoted as-is. Anything longer shows only its first line, cut to
+/// [`SEARCHED_TEXT_ECHO_CHARS`], and its size: the caller already has the
+/// text, and repeating a large one doubles its cost in the transcript.
+pub(crate) fn describe_searched_text(text: &str) -> String {
+    if !text.contains('\n') && text.chars().count() <= SEARCHED_TEXT_ECHO_CHARS {
+        return format!("'{text}'");
+    }
+    let first: String = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(SEARCHED_TEXT_ECHO_CHARS)
+        .collect();
+    let lines = text.lines().count();
+    let noun = if lines == 1 { "line" } else { "lines" };
+    format!("'{first}…' ({lines} {noun}, {} bytes)", text.len())
+}
+
 pub(crate) fn render_edit_not_found_detail(
     source: &str,
     old_string: &str,

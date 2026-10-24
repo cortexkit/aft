@@ -29,7 +29,9 @@ use sha2::{Digest, Sha256};
 
 // Warn-level log capture is shared across all integration test modules via a
 // single process-global, thread-local-capturing logger. See test_helpers.
-use crate::test_helpers::{init_test_logger, take_logs, user_config, AftProcess};
+use crate::test_helpers::{
+    init_test_logger, init_test_logger_with_level, take_logs, user_config, AftProcess,
+};
 
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     AppContext::new(
@@ -922,8 +924,8 @@ fn respects_experimental_flag() {
 /// rewrite is a transparent optimization. Returning the read error would
 /// surprise the agent because bash itself has no project_root restriction.
 #[test]
-fn rewrite_target_failure_logs_warning_before_fallthrough() {
-    init_test_logger();
+fn rewrite_target_failure_logs_decline_before_fallthrough() {
+    init_test_logger_with_level(log::LevelFilter::Debug);
 
     let dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -950,7 +952,7 @@ fn rewrite_target_failure_logs_warning_before_fallthrough() {
 
 #[test]
 fn rewrite_shape_decline_log_names_predicate_and_resolved_candidate() {
-    init_test_logger();
+    init_test_logger_with_level(log::LevelFilter::Debug);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized.txt");
@@ -971,6 +973,33 @@ fn rewrite_shape_decline_log_names_predicate_and_resolved_candidate() {
                 && line.contains(&format!("resolved_candidate={resolved:?}"))
         }),
         "expected predicate-specific shape decline log, got {logs:?}"
+    );
+}
+
+/// `cat` on a file outside the project root (a host temp folder such as
+/// `$TMPDIR/opencode/...`) is an expected, routine decline: the command runs as
+/// native bash and the agent sees ordinary `cat` output. It should not write a
+/// WARN line to the log on every call; the dispatcher already records each
+/// decline, with its reason, at debug level.
+#[test]
+fn routine_out_of_root_cat_decline_is_not_a_warning() {
+    init_test_logger();
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().join("opencode").join("tool-output.txt");
+    fs::create_dir_all(outside_path.parent().unwrap()).unwrap();
+    fs::write(&outside_path, "hello\n").unwrap();
+    let ctx = context(dir.path(), true);
+
+    assert!(rewrite(&format!("cat {}", outside_path.display()), &ctx).is_none());
+
+    let logs = take_logs();
+    assert!(
+        !logs
+            .iter()
+            .any(|line| line.contains("bash rewrite rule cat declined")),
+        "routine decline logged at WARN: {logs:?}"
     );
 }
 

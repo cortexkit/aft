@@ -750,6 +750,7 @@ fn bash_background_completion_redaction_preserves_short_recovery_trailers() {
             stderr_path: cache.stderr_path.clone(),
             include_stderr_path: false,
             artifact_access: cache.artifact_access.clone(),
+            failed_exit: false,
         });
         recovery.byte_truncated = true;
         recovery.had_inner_drop = true;

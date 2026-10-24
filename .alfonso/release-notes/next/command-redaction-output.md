@@ -1,0 +1,1 @@
+- AFT no longer stores command text with compression statistics, masks secrets typed inline in commands in its log, keeps up to 20 failure lines from the middle of long failed output, and names a missed edit by its first line and size.

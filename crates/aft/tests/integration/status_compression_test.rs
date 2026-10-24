@@ -58,7 +58,6 @@ fn insert_event(
         project_key: &project_key,
         tool: "bash",
         task_id: Some(task_id),
-        command: Some("echo status-compression"),
         compressor: "test",
         original_bytes: i64::from(original_tokens),
         compressed_bytes: i64::from(compressed_tokens),

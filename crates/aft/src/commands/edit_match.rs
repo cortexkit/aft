@@ -762,8 +762,9 @@ fn handle_glob_edit_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in any files matching '{}'",
-                match_str, pattern
+                "edit_match: {} not found in any files matching '{}'",
+                crate::fuzzy_match::describe_searched_text(match_str),
+                pattern
             ),
         );
     }
@@ -1166,6 +1167,46 @@ mod tests {
 
     use super::{handle_edit_match, restore_glob_checkpoint};
 
+    /// A failed edit should name the miss, not paste the whole `match` text
+    /// back: the caller already has it, and a large one doubles its cost in
+    /// the transcript. The nearest-miss excerpt that follows is already
+    /// bounded (ten lines of at most 240 characters).
+    #[test]
+    fn not_found_error_does_not_repeat_a_large_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small.rs");
+        fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let needle: String = (0..400)
+            .map(|index| format!("    let absent_{index} = 0;\n"))
+            .collect();
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "miss",
+            "command": "edit_match",
+            "file": path.display().to_string(),
+            "match": needle,
+            "replacement": "x",
+        }))
+        .unwrap();
+        let response = handle_edit_match(&request, &ctx);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "match_not_found");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            !message.contains(&needle),
+            "{} byte match repeated in a {} byte error",
+            needle.len(),
+            message.len()
+        );
+        assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+        assert!(
+            message.starts_with(
+                "edit_match: '    let absent_0 = 0;…' (400 lines, 9490 bytes) not found in "
+            ),
+            "{message}"
+        );
+    }
+
     /// A failed match with a 64 KiB or 256 KiB `match` against a large file
     /// used to spend seconds in the whitespace-reflow pass, whose window scan
     /// cost file lines × match lines. The pass now scans linearly: the reply
@@ -1221,7 +1262,8 @@ mod tests {
             assert_eq!(
                 response.data["message"].as_str().unwrap(),
                 format!(
-                    "edit_match: '{needle}' not found in {}{}",
+                    "edit_match: {} not found in {}{}",
+                    crate::fuzzy_match::describe_searched_text(&needle),
                     path.display(),
                     crate::fuzzy_match::render_edit_not_found_detail(&source, &needle, "x")
                 ),
@@ -1539,8 +1581,8 @@ fn handle_single_file_edit_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in {}{}",
-                match_str,
+                "edit_match: {} not found in {}{}",
+                crate::fuzzy_match::describe_searched_text(match_str),
                 file,
                 crate::fuzzy_match::render_edit_not_found_detail(&source, match_str, replacement,),
             ),

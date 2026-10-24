@@ -225,7 +225,9 @@ const KILL_IN_FLIGHT_WAIT: Duration =
     Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 2);
 
 fn log_bash_spawn(task_id: &str, pid: u32, session: &str, root: &Path, command: &str) {
-    let command: String = command
+    // Mask before shortening: a credential cut by the length limit would no
+    // longer match its pattern.
+    let command: String = crate::log_redact::redact_command(command)
         .chars()
         .take(200)
         .map(|character| match character {
@@ -807,6 +809,9 @@ struct RecoveryContext {
     stderr_path: Option<String>,
     include_stderr_path: bool,
     artifact_access: ArtifactRecoveryAccess,
+    /// The command exited non-zero, so the reply cap keeps failure lines
+    /// from the middle of the output it cuts.
+    failed_exit: bool,
 }
 
 fn optional_string_bytes(value: Option<&String>) -> u64 {
@@ -2581,6 +2586,7 @@ impl BgTaskRegistry {
                 raw.truncated,
                 disk_truncation,
                 artifact_access,
+                matches!(metadata.exit_code, Some(code) if code != 0),
             )
         };
         normalize_piped_display_output(&mut rendered.output_preview);
@@ -11737,7 +11743,6 @@ impl BgTaskRegistry {
             project_key: &project_key,
             tool: "bash",
             task_id: Some(&metadata.task_id),
-            command: Some(&metadata.command),
             compressor: if metadata.compressed {
                 "registry"
             } else {
@@ -12655,6 +12660,7 @@ fn render_compressed_with_recovery(
     input_truncated: bool,
     disk_truncation: DiskTruncation,
     artifact_access: ArtifactRecoveryAccess,
+    failed_exit: bool,
 ) -> TerminalOutputCache {
     // Preserve a single canonical trailing newline. A bare `.trim_end()` strips
     // the legitimate final newline that `echo` and most commands emit, so
@@ -12688,6 +12694,7 @@ fn render_compressed_with_recovery(
         stderr_path: stderr_path.clone(),
         include_stderr_path,
         artifact_access: artifact_access.clone(),
+        failed_exit,
     };
 
     let (output_preview, output_truncated) =
@@ -12706,13 +12713,14 @@ fn render_compressed_with_recovery(
 
 fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) -> (String, bool) {
     let final_lines = recovery.final_lines.clone();
+    let failed = recovery.failed_exit;
     render_body_with_recovery_marker_at_cap(
         body,
         recovery,
         FINAL_OUTPUT_CAP_BYTES,
-        |input| super::output::cap_final_output_preserving(input, None, &final_lines),
+        |input| super::output::cap_final_output_preserving(input, None, &final_lines, failed),
         |input, marker| {
-            super::output::cap_final_output_preserving(input, Some(marker), &final_lines)
+            super::output::cap_final_output_preserving(input, Some(marker), &final_lines, failed)
         },
     )
 }
@@ -13046,6 +13054,7 @@ fn render_raw_passthrough(
         stderr_path: stderr_path.clone(),
         include_stderr_path,
         artifact_access: artifact_access.clone(),
+        failed_exit: false,
     };
     let (output_preview, output_truncated) =
         render_raw_body_with_recovery_marker(&raw.text, &mut recovery);
@@ -16913,6 +16922,7 @@ mod tests {
                 task_id: "bash-test".to_string(),
                 readable: true,
             },
+            failed_exit: false,
         };
 
         let marker = recovery_marker(&recovery).expect("disk truncation must emit marker");
@@ -18969,6 +18979,53 @@ mod tests {
         assert!(!legacy
             .text
             .contains("test result: FAILED. 64 passed; 3 failed"));
+    }
+
+    /// A command no compressor recognises gets only the reply byte cap, which
+    /// keeps a 6 KiB head and at most twenty tail lines. The compressor-level
+    /// failure rescue never runs for it, so for a failed command the cap itself
+    /// keeps the failure lines it cuts from the middle, under the same label,
+    /// before the final line. A successful command's reply is unchanged.
+    #[test]
+    fn reply_cap_keeps_failure_lines_from_the_middle_of_unrecognised_output() {
+        let stdout: String = (1..=3000)
+            .map(|index| match index {
+                1500 => "FAILED: step 1500 could not open fixture\n".to_string(),
+                2200 => "ERROR: step 2200 lost its connection\n".to_string(),
+                _ => format!("step {index:04} processed\n"),
+            })
+            .collect();
+        let (foreground, _completion) =
+            cargo_verdict_agent_text("./scripts/run-steps.sh", &stdout, "", 1);
+        let shown = |text: &str| {
+            text.lines()
+                .filter(|line| line.starts_with("step "))
+                .count()
+        };
+        for failure in [
+            "FAILED: step 1500 could not open fixture",
+            "ERROR: step 2200 lost its connection",
+        ] {
+            assert!(
+                foreground.contains(failure),
+                "{failure:?} dropped; {} ordinary lines shown:\n{foreground}",
+                shown(&foreground)
+            );
+        }
+        assert!(
+            foreground.contains(&format!(
+                "{}\nFAILED: step 1500 could not open fixture\nERROR: step 2200 lost its connection\nstep 3000 processed\n",
+                crate::compress::PRESERVED_FAILURES_LABEL
+            )),
+            "{foreground}"
+        );
+        let (succeeded, _completion) =
+            cargo_verdict_agent_text("./scripts/run-steps.sh", &stdout, "", 0);
+        assert!(
+            !succeeded.contains(crate::compress::PRESERVED_FAILURES_LABEL),
+            "{succeeded}"
+        );
+        assert!(!succeeded.contains("FAILED: step 1500"));
     }
 
     #[test]
@@ -22448,6 +22505,60 @@ mod tests {
         );
         assert!(registry.kill(&task_id, session).is_ok());
         registry.shutdown();
+    }
+
+    /// What the durable log file receives for a background spawn: the captured
+    /// line passed through the same redactor `TeeWriter` applies. Inline
+    /// credentials in common shell shapes must not reach the file, and the
+    /// ordinary commands beside them must survive unchanged.
+    #[test]
+    fn spawn_log_masks_inline_command_credentials() {
+        let root = Path::new("/project");
+        let durable = |command: &str| -> String {
+            let ((), lines) = crate::logging::capture_log_lines(|| {
+                log_bash_spawn("bgb_test", 1, "session", root, command)
+            });
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            crate::log_redact::aft_redactor(&lines[0]).into_owned()
+        };
+        // The token body is 36 characters; only 15 survive the 200-character
+        // cut, too few for the GitHub token pattern to recognise.
+        let cut_token_body = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let cut_token_command = format!("#{} ghp_{cut_token_body}", "x".repeat(179));
+        let mut problems = Vec::new();
+        for (command, secret) in [
+            ("GITHUB_TOKEN=plainvalue123 gh api /user", "plainvalue123"),
+            ("export OPENAI_API_KEY=plainvalue123", "plainvalue123"),
+            ("export DB_PASSWORD='plain value 123'", "plain value 123"),
+            ("PGPASSWORD=plainvalue123 psql -h db", "plainvalue123"),
+            (
+                "docker login --password plainvalue123 -u me",
+                "plainvalue123",
+            ),
+            ("cargo login --token plainvalue123", "plainvalue123"),
+            ("mysql -u root -pplainvalue123 app", "plainvalue123"),
+            (cut_token_command.as_str(), &cut_token_body[..15]),
+        ] {
+            let line = durable(command);
+            if line.contains(secret) {
+                problems.push(format!("secret survived: {line}"));
+            }
+        }
+        for command in [
+            "cargo test -p agent-file-tools --lib -- log_redact",
+            "git log -p -3 -- crates/aft/src/log_redact.rs",
+            "ssh -p 2222 deploy@host",
+            "TOKENIZERS_PARALLELISM=false MAX_TOKENS=4096 python train.py",
+            "GIT_AUTHOR_NAME=Someone GH_SHIM_BYPASS=1 git commit -m x",
+            "export GITHUB_TOKEN=$GH_TOKEN",
+            "gcloud secrets versions access latest --secret=prod-db",
+        ] {
+            let line = durable(command);
+            if !line.ends_with(&format!("cmd={command}")) {
+                problems.push(format!("mangled: {line}"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[cfg(unix)]

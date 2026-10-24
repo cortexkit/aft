@@ -477,9 +477,9 @@ fn resolve_edit_with_offsets(
 
         if fuzzy_matches.is_empty() {
             let message = format!(
-                "batch: edit[{}] match '{}' not found in file{}",
+                "batch: edit[{}] match {} not found in file{}",
                 index,
-                match_str,
+                crate::fuzzy_match::describe_searched_text(match_str),
                 crate::fuzzy_match::render_edit_not_found_detail(source, match_str, replacement),
             );
             return Err(Response::error(req_id, "batch_edit_failed", message));
@@ -773,6 +773,42 @@ mod a03_tests {
             "edits": edits, "preview": preview, "include_diff_content": true
         }))
         .unwrap()
+    }
+
+    /// The host `edit` tool sends a single-file `oldString` miss through this
+    /// batch path. Its error should name the miss without pasting the whole
+    /// match back; the nearest-miss excerpt that follows is already bounded.
+    #[test]
+    fn not_found_error_does_not_repeat_a_large_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small.rs");
+        std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let needle: String = (0..400)
+            .map(|index| format!("    let absent_{index} = 0;\n"))
+            .collect();
+        let response = handle_batch(
+            &request(
+                &path,
+                serde_json::json!([{"match": needle, "replacement": "x"}]),
+                false,
+            ),
+            &ctx,
+        );
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "batch_edit_failed");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            !message.contains(&needle),
+            "{} byte match repeated in a {} byte error",
+            needle.len(),
+            message.len()
+        );
+        assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+        assert!(
+            message.starts_with("batch: edit[0] match '    let absent_0 = 0;…' (400 lines, 9490 bytes) not found in "),
+            "{message}"
+        );
     }
 
     #[test]

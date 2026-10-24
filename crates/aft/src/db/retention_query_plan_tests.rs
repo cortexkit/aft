@@ -290,7 +290,6 @@ fn retention_and_hot_query_plans_on_unanalyzed_history() {
             project_key: "p65",
             tool: "bash",
             task_id: Some("new"),
-            command: None,
             compressor: "test",
             original_bytes: 100,
             compressed_bytes: 50,

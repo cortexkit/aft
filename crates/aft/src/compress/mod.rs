@@ -578,6 +578,10 @@ fn dropped_failure_or_error_blocks(result: &CompressionResult) -> bool {
         .any(|class| result.dropped_by_class.get(&class).copied().unwrap_or(0) > 0)
 }
 
+/// The line that introduces failure lines AFT kept from output it otherwise
+/// shortened, so the agent can tell them from the command's own lines.
+pub(crate) const PRESERVED_FAILURES_LABEL: &str = "[raw failure lines preserved by AFT]";
+
 fn append_missing_failure_lines(
     mut result: CompressionResult,
     raw_output: &str,
@@ -602,7 +606,8 @@ fn append_missing_failure_lines(
     if !text.is_empty() {
         text.push('\n');
     }
-    text.push_str("[raw failure lines preserved by AFT]\n");
+    text.push_str(PRESERVED_FAILURES_LABEL);
+    text.push('\n');
     text.push_str(&missing_failure_lines.join("\n"));
     if let Some(final_line) = final_line {
         text.push('\n');
@@ -671,7 +676,7 @@ pub(crate) fn text_has_failure_signal(text: &str) -> bool {
         .any(|(line, lower)| line_has_failure_signal_lower(line.trim(), lower.trim()))
 }
 
-fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
+pub(crate) fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
     line.contains("error[")
         || lower.contains("error:")
         || line.contains("Error")
