@@ -42,6 +42,10 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
+pub(crate) fn scope_matches(scope: &Option<crate::db::access_grants::ScopeKey>) -> bool {
+    REQUEST_SCOPE.with(|slot| *slot.borrow() == *scope)
+}
+
 /// Published crate sources (registry and git dependencies) and toolchains:
 /// immutable package sources a worker reads when changing code against them.
 /// Each entry is the home's environment variable, its default directory under
@@ -355,12 +359,14 @@ pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
 
 thread_local! {
     static ASK_ROUTE: std::cell::RefCell<Option<AskRoute>> = const { std::cell::RefCell::new(None) };
+    static ASK_ROUTE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
 
 impl Drop for AskRouteGuard {
     fn drop(&mut self) {
+        ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
         ASK_ROUTE.with(|slot| {
             slot.replace(self.0.take());
         });
@@ -368,10 +374,15 @@ impl Drop for AskRouteGuard {
 }
 
 pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
+    ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     AskRouteGuard(
         ASK_ROUTE.with(|slot| slot.replace(route)),
         std::marker::PhantomData,
     )
+}
+
+pub(crate) fn ask_route_generation() -> u64 {
+    ASK_ROUTE_GENERATION.with(|generation| generation.get())
 }
 
 pub(crate) fn current_ask_route() -> AskRoute {
@@ -781,10 +792,31 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
-        if self
-            .floor_for_path(operation, path, owned_artifact)
-            .is_some()
-        {
+        self.decide_inner(operation, path, owned_artifact, false)
+    }
+
+    pub(crate) fn decide_resolved(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+    ) -> AccessDecision {
+        self.decide_inner(operation, path, owned_artifact, true)
+    }
+
+    fn decide_inner(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+        resolved: bool,
+    ) -> AccessDecision {
+        let floor = if resolved {
+            self.floor_for_path_using(operation, path, owned_artifact, floor_contains_resolved)
+        } else {
+            self.floor_for_path(operation, path, owned_artifact)
+        };
+        if floor.is_some() {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
         let exceptions = match operation {
@@ -873,6 +905,16 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> Option<PolicyFloor> {
+        self.floor_for_path_using(operation, path, owned_artifact, floor_contains)
+    }
+
+    fn floor_for_path_using(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+        contains: fn(&Path, &Path) -> bool,
+    ) -> Option<PolicyFloor> {
         if crate::bash_background::registry::is_task_environment(path) {
             return Some(PolicyFloor {
                 path: path.to_path_buf(),
@@ -882,7 +924,7 @@ impl AccessPolicy {
         if let Some(floor) = self
             .absolute_floor
             .iter()
-            .find(|floor| floor_contains(path, floor))
+            .find(|floor| contains(path, floor))
         {
             return Some(self.describe_floor(floor));
         }
@@ -891,7 +933,7 @@ impl AccessPolicy {
         // Ownership-checked task output keeps its separate, non-SQLite read path.
         if !(operation == AccessOperation::Read && owned_artifact) {
             if let Some(floor) = self.floor_rules.iter().find(|floor| {
-                matches!(floor.rule, FloorRule::AftStorage) && floor_contains(path, &floor.path)
+                matches!(floor.rule, FloorRule::AftStorage) && contains(path, &floor.path)
             }) {
                 return Some(floor.clone());
             }
@@ -917,7 +959,7 @@ impl AccessPolicy {
                 .private_stores
                 .deny
                 .iter()
-                .find(|floor| floor_contains(path, floor))
+                .find(|floor| contains(path, floor))
                 .map(|floor| self.describe_floor(floor));
         }
         None
@@ -1152,20 +1194,6 @@ pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        #[link_name = "CompareStringOrdinal"]
-        fn compare_string_ordinal(
-            left: *const u16,
-            left_len: i32,
-            right: *const u16,
-            right_len: i32,
-            ignore_case: i32,
-        ) -> i32;
-    }
-
     // Resolve short-name aliases and missing descendants through their nearest
     // existing ancestor. Preserve a final symlink's location for unlink checks.
     let path = if path
@@ -1180,6 +1208,31 @@ pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
         policy_path(path)
     };
     let prefix = policy_path(prefix);
+    floor_contains_resolved(&path, &prefix)
+}
+
+/// Compare identities that were already resolved for this request's snapshot.
+#[cfg(not(windows))]
+pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
+    floor_contains(path, prefix)
+}
+
+#[cfg(windows)]
+pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "CompareStringOrdinal"]
+        fn compare_string_ordinal(
+            left: *const u16,
+            left_len: i32,
+            right: *const u16,
+            right_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+    let path = crate::inspect::job::normalize_path(path);
+    let prefix = crate::inspect::job::normalize_path(prefix);
     let mut components = path.components();
     prefix.components().all(|expected| {
         let Some(actual) = components.next() else {

@@ -194,7 +194,10 @@ impl ReadGate {
         use crate::access_policy::{AccessDecision, AccessOperation};
         let identity = crate::access_policy::policy_path(path);
         identity.starts_with(&self.root)
-            && self.policy.decide(AccessOperation::Read, &identity, false) == AccessDecision::Allow
+            && self
+                .policy
+                .decide_resolved(AccessOperation::Read, &identity, false)
+                == AccessDecision::Allow
     }
 }
 

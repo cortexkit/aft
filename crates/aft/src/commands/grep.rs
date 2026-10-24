@@ -133,8 +133,10 @@ pub(crate) mod work_probe {
 }
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::context::confinement::with_floor_disclosure(|| {
-        crate::bounded_io::command(req, ctx, handle_grep_inner)
+    ctx.with_read_policy_snapshot(&req.id, || {
+        crate::context::confinement::with_floor_disclosure(|| {
+            crate::bounded_io::command(req, ctx, handle_grep_inner)
+        })
     })
 }
 

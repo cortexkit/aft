@@ -61,6 +61,10 @@ pub struct OutlineEntry {
 ///
 /// Output is capped at 30KB; if exceeded, truncates with a narrowing hint.
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
+    ctx.with_read_policy_snapshot(&req.id, || handle_outline_with_snapshot(req, ctx))
+}
+
+fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
     super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
@@ -1492,12 +1496,12 @@ fn build_outline_gitignore(
     root: &Path,
     ignore_file: &Path,
 ) -> Option<Arc<ignore::gitignore::Gitignore>> {
+    if !ignore_file.is_file() {
+        return None;
+    }
     if crate::project_content::storage_root_for_path(ignore_file).is_some()
         || crate::db::file_identity::is_live_sqlite_file(ignore_file)
     {
-        return None;
-    }
-    if !ignore_file.is_file() {
         return None;
     }
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
@@ -3034,14 +3038,24 @@ fn collect_outline_files_breadth_first_with_device_lookup(
     ignored_entries: &mut usize,
 ) -> usize {
     let root_stack = root_ignore_stack.clone();
-    let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack)]);
+    let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack, false)]);
     let mut entries_examined = 0usize;
 
-    while let Some((current, ignore_stack)) = pending.pop_front() {
+    while let Some((current, inherited_ignores, load_child_rules)) = pending.pop_front() {
+        if entries_examined >= ENTRY_BUDGET {
+            *collection_truncated = true;
+            return entries_examined;
+        }
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             return entries_examined;
         }
+        // Load rules only for directories the entry budget lets us enter.
+        let ignore_stack = if load_child_rules {
+            inherited_ignores.for_child_directory(&current)
+        } else {
+            inherited_ignores
+        };
         let Ok(entries) = std::fs::read_dir(&current) else {
             *collection_truncated = true;
             continue;
@@ -3099,7 +3113,7 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             match boundary.should_descend(&path) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
-                    pending.push_back((path.clone(), ignore_stack.for_child_directory(&path)));
+                    pending.push_back((path, ignore_stack.clone(), true));
                 }
                 Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {

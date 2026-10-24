@@ -841,3 +841,62 @@ fn storage_floor_zoom_single_target_refuses_but_two_target_batch_continues() {
         );
     }
 }
+
+#[test]
+fn storage_floor_read_list_policy_is_loaded_once_per_call() {
+    let f = Fixture::new();
+    for index in 0..160 {
+        std::fs::write(
+            f._root.path().join(format!("item{index:03}.rs")),
+            "pub fn item() {}\n",
+        )
+        .unwrap();
+    }
+    let index = crate::search_index::SearchIndex::build(f._root.path());
+    *f.ctx.search_index().write().unwrap() = Some(index);
+    for (tool, params) in [
+        ("glob", json!({"pattern":"**/*.rs"})),
+        ("outline", json!({"directory": f._root.path()})),
+        ("outline", json!({"target": f._root.path(), "files":true})),
+    ] {
+        let mut req = request(tool, params);
+        req.id = format!("policy-once-{tool}");
+        for _ in 0..2 {
+            let probe = crate::context::policy_load_probe::Probe::new(&req.id);
+            let response = if tool == "glob" {
+                super::glob::handle_glob(&req, &f.ctx)
+            } else {
+                super::outline::handle_outline(&req, &f.ctx)
+            };
+            assert!(response.success, "{response:?}");
+            let loads = probe.counts();
+            assert_eq!((loads.policies, loads.grants), (1, 0), "{loads:?}");
+        }
+    }
+}
+
+#[test]
+fn storage_floor_glob_unexamined_tail_is_not_an_exact_total() {
+    let f = Fixture::new();
+    for index in 0..180 {
+        std::fs::write(
+            f._root.path().join(format!("item{index:03}.rs")),
+            "pub fn item() {}\n",
+        )
+        .unwrap();
+    }
+    *f.ctx.search_index().write().unwrap() =
+        Some(crate::search_index::SearchIndex::build(f._root.path()));
+    let response = super::glob::handle_glob(&request("glob", json!({"pattern":"**/*.rs"})), &f.ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["files"].as_array().unwrap().len(), 100);
+    assert_eq!(response.data["candidate_count"], 180);
+    assert_eq!(response.data["unexamined_files"], 80);
+    assert!(response.data["total"].is_null());
+    assert_eq!(response.data["total_lower_bound"], 100);
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(
+        response.data["files_list_envelope"]["total"],
+        json!({"kind":"at_least", "value":100})
+    );
+}

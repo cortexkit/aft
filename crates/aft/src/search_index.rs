@@ -7074,9 +7074,27 @@ pub(crate) fn take_present_on_disk<T>(
     path_of: impl Fn(&T) -> &Path,
     surface: &str,
 ) -> PresentOnDisk<T> {
+    match take_present_on_disk_with_admission(items, limit, path_of, surface, |_| {
+        Ok::<_, std::convert::Infallible>(true)
+    }) {
+        Ok((present, _)) => present,
+        Err(error) => match error {},
+    }
+}
+
+/// Apply admission only to the bounded page/refill window. The untouched tail
+/// remains unexamined, so callers cannot advertise it as an admitted total.
+pub(crate) fn take_present_on_disk_with_admission<T, E>(
+    items: impl IntoIterator<Item = T>,
+    limit: usize,
+    path_of: impl Fn(&T) -> &Path,
+    surface: &str,
+    mut admit: impl FnMut(&T) -> Result<bool, E>,
+) -> Result<(PresentOnDisk<T>, usize), E> {
     let stat_budget = limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET);
     let mut present = Vec::new();
     let mut dropped = 0usize;
+    let mut rejected = 0usize;
     let mut unexamined = 0usize;
     let mut stats = 0usize;
     let mut budget_exhausted = false;
@@ -7097,8 +7115,10 @@ pub(crate) fn take_present_on_disk<T>(
             if dropped_examples.len() < 3 {
                 dropped_examples.push(path_of(&item).display().to_string());
             }
-        } else {
+        } else if admit(&item)? {
             present.push(item);
+        } else {
+            rejected += 1;
         }
     }
     if dropped > 0 {
@@ -7107,12 +7127,15 @@ pub(crate) fn take_present_on_disk<T>(
             dropped_examples.join(", ")
         );
     }
-    PresentOnDisk {
-        present,
-        dropped,
-        unexamined,
-        budget_exhausted,
-    }
+    Ok((
+        PresentOnDisk {
+            present,
+            dropped,
+            unexamined,
+            budget_exhausted,
+        },
+        rejected,
+    ))
 }
 
 pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
