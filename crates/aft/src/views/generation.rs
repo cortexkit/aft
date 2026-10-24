@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{
     de::{Error as _, SeqAccess, Visitor},
     Deserialize, Deserializer,
@@ -372,14 +372,25 @@ impl ViewStore {
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy();
-                    let registered: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM members WHERE scope = ?1 AND view_dir = ?2)",
-                        rusqlite::params![
-                            scope.as_ref(),
-                            self.view_dir().to_string_lossy().as_ref()
-                        ],
-                        |row| row.get(0),
-                    )?;
+                    let registered_dir: Option<String> = tx
+                        .query_row(
+                            "SELECT view_dir FROM members WHERE scope = ?1",
+                            [scope.as_ref()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    // SQLite compares text literally, but Windows registration
+                    // and traversal can spell the same directory differently.
+                    // Compare complete normalized paths, not string prefixes.
+                    let registered = registered_dir.is_some_and(|directory| {
+                        crate::production_storage::comparison_key(
+                            Path::new(&directory),
+                            cfg!(windows),
+                        ) == crate::production_storage::comparison_key(
+                            self.view_dir(),
+                            cfg!(windows),
+                        )
+                    });
                     if !registered {
                         return Ok(GenerationSweep::default());
                     }
@@ -1948,6 +1959,56 @@ mod ownership_tests {
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn v2_sweep_accepts_equivalent_windows_directory_spellings() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "0000000000000001",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let mut view = registration.view_store().unwrap();
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"obsolete").unwrap();
+        // Traversal can retain forward separators where registration used
+        // backslashes. These spellings identify the same registered directory.
+        view.view_dir = PathBuf::from(view.view_dir().to_string_lossy().replace('\\', "/"));
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!old.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v2_sweep_rejects_a_different_registered_directory() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "0000000000000001",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let mut view = registration.view_store().unwrap();
+        let alternate = storage.path().join("other/views/v2/0000000000000001");
+        super::super::ViewStore::open_dir(alternate.clone()).unwrap();
+        view.view_dir = alternate;
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"not owned by this registration").unwrap();
+        assert_eq!(view.sweep_generations().unwrap(), 0);
+        assert!(
+            old.exists(),
+            "path normalization must not remove the directory ownership guard"
+        );
+    }
+
     #[test]
     fn post_publication_sweep_drops_superseded_refs_but_keeps_current_owner() {
         let temp = tempfile::tempdir().unwrap();
