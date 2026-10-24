@@ -111,27 +111,8 @@ pub fn cmp_alignment(a: &Alignment, b: &Alignment) -> Ordering {
         .then_with(|| b.occurrence_list().cmp(&a.occurrence_list()))
 }
 
-/// Whether a relative path indicates a test file according to AFT conventions.
 pub fn is_test_path(relative_path: &str) -> bool {
-    let normalized = relative_path.replace('\\', "/");
-    if normalized
-        .split('/')
-        .any(|segment| matches!(segment, "__tests__" | "__test__" | "tests"))
-    {
-        return true;
-    }
-    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
-    let lower = file.to_ascii_lowercase();
-    if lower.contains(".test.") || lower.contains(".spec.") {
-        return true;
-    }
-    lower.ends_with("_test.rs")
-        || lower.ends_with("_test.go")
-        || lower.ends_with("_test.py")
-        || lower.ends_with("_test.rb")
-        || lower.ends_with("_test.exs")
-        || lower.ends_with("_spec.rb")
-        || (lower.starts_with("test_") && lower.ends_with(".py"))
+    super::path_is_hidden_test_file(Path::new(relative_path), Path::new(""))
 }
 
 /// Check if string contains at least one alphabetic word of 3+ letters.
@@ -571,7 +552,7 @@ pub fn discover_anchored_candidate_files(
                 fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.to_path_buf());
             canonical_path.starts_with(&canonical_root)
         })
-        .filter(|file| include_tests || !is_test_path(&file.path.to_string_lossy()))
+        .filter(|file| super::path_allowed_by_include_tests(&file.path, search_root, include_tests))
         .map(|file| file.path.clone())
         .collect()
 }

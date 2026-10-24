@@ -100,7 +100,6 @@ pub fn register_lane(registry: &mut LaneRegistry, lane: Arc<dyn SearchLane>) {
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -7866,27 +7865,156 @@ fn snippet_read_plans(
 
 fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
     let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
     let mut lines = Vec::new();
     let mut nonempty_lines = 0usize;
-
-    // Read each source once and stop after every requested symbol range and
-    // FileSummary budget is satisfied. Any error before that boundary discards
-    // the whole partial read, matching the previous read_to_string behavior.
-    for (line_index, line) in std::io::BufReader::new(file).lines().enumerate() {
-        let line = line.ok()?;
-        if !line.trim().is_empty() {
-            nonempty_lines += 1;
-        }
-        // Snippet lines are display text: a minified or single-line data file
-        // must not carry its whole content into the reply.
-        lines.push(snippet_bounds::cap_owned_snippet_line(line));
-
-        if plan.is_satisfied(line_index, nonempty_lines) {
+    while let Some((line, nonempty)) = read_bounded_snippet_line(&mut reader).ok()? {
+        nonempty_lines += usize::from(nonempty);
+        lines.push(line);
+        if plan.is_satisfied(lines.len() - 1, nonempty_lines) {
             break;
         }
     }
-
     Some(lines)
+}
+
+#[derive(Default)]
+struct SnippetWhitespace {
+    pending: [u8; 4],
+    used: usize,
+    expected: usize,
+    nonempty: bool,
+}
+
+impl SnippetWhitespace {
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.nonempty {
+                break;
+            }
+            if self.used == 0 {
+                if byte < 0x80 {
+                    self.nonempty = !(byte as char).is_whitespace();
+                    continue;
+                }
+                self.expected = match byte {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => {
+                        self.nonempty = true;
+                        continue;
+                    }
+                };
+            } else if byte & 0xc0 != 0x80 {
+                self.nonempty = true;
+                continue;
+            }
+            self.pending[self.used] = byte;
+            self.used += 1;
+            if self.used == self.expected {
+                self.nonempty = std::str::from_utf8(&self.pending[..self.used])
+                    .map_or(true, |text| !text.chars().next().unwrap().is_whitespace());
+                self.used = 0;
+            }
+        }
+    }
+}
+
+fn read_bounded_snippet_line(
+    reader: &mut impl std::io::BufRead,
+) -> std::io::Result<Option<(String, bool)>> {
+    // Four bytes per displayed character plus an incomplete trailing scalar
+    // retain enough source for the existing character cap and marker. Discarded
+    // bytes are still scanned for whitespace so summary line selection is unchanged.
+    let byte_limit = snippet_bounds::SNIPPET_LINE_MAX_CHARS * 4 + 3;
+    let mut retained = Vec::with_capacity(byte_limit);
+    let mut whitespace = SnippetWhitespace::default();
+    let mut any = false;
+    let mut discarded = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            if !any {
+                return Ok(None);
+            }
+            break;
+        }
+        any = true;
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let count = newline.unwrap_or(chunk.len());
+        whitespace.observe(&chunk[..count]);
+        let keep = count.min(byte_limit - retained.len());
+        retained.extend_from_slice(&chunk[..keep]);
+        discarded |= keep < count;
+        reader.consume(count + usize::from(newline.is_some()));
+        if newline.is_some() {
+            if !discarded && retained.last() == Some(&b'\r') {
+                retained.pop();
+            }
+            break;
+        }
+    }
+    let nonempty = whitespace.nonempty || whitespace.used != 0;
+    let text = String::from_utf8_lossy(&retained).into_owned();
+    Ok(Some((
+        snippet_bounds::cap_owned_snippet_line(text),
+        nonempty,
+    )))
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_snippet_long_line_has_bounded_allocation_work() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("long.rs");
+    fs::write(&file, "x".repeat(16 * 1024 * 1024)).unwrap();
+    let plan = SnippetReadPlan {
+        fixed_last_line: Some(0),
+        summary_nonempty_lines: 0,
+    };
+    let (lines, bytes) =
+        crate::test_allocations::count_bytes(|| read_bounded_snippet_lines(&file, plan).unwrap());
+    assert!(bytes <= 64 * 1024, "line buffering allocated {bytes} bytes");
+    assert!(lines[0].ends_with(snippet_bounds::SNIPPET_LINE_TRUNCATED_MARKER));
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_snippet_preserves_unicode_whitespace_across_buffers() {
+    for capacity in 1..=4 {
+        let mut reader = std::io::BufReader::with_capacity(
+            capacity,
+            std::io::Cursor::new("\u{2003}\u{3000}\r\nx\n".as_bytes()),
+        );
+        assert_eq!(
+            read_bounded_snippet_line(&mut reader).unwrap(),
+            Some(("\u{2003}\u{3000}".to_string(), false))
+        );
+        assert_eq!(
+            read_bounded_snippet_line(&mut reader).unwrap(),
+            Some(("x".to_string(), true))
+        );
+        assert_eq!(read_bounded_snippet_line(&mut reader).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_snippet_preserves_four_byte_characters_at_limit() {
+    let source = format!("{}\r\n", "🙂".repeat(600));
+    let mut reader = std::io::BufReader::with_capacity(1, std::io::Cursor::new(source.as_bytes()));
+    assert_eq!(
+        read_bounded_snippet_line(&mut reader).unwrap(),
+        Some((
+            format!(
+                "{}{}",
+                "🙂".repeat(snippet_bounds::SNIPPET_LINE_MAX_CHARS),
+                snippet_bounds::SNIPPET_LINE_TRUNCATED_MARKER
+            ),
+            true
+        ))
+    );
 }
 
 fn enrich_snippets_from_source_with_context(
@@ -12859,10 +12987,11 @@ mod tests {
     }
 
     #[test]
-    fn bounded_snippet_reader_ignores_invalid_utf8_only_beyond_required_range() {
+    fn bounded_snippet_reader_preserves_valid_text_and_replaces_invalid_utf8_in_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("invalid-tail.rs");
-        std::fs::write(&path, b"line0\nline1\n\xff\n").expect("write fixture");
+        std::fs::write(&path, b"line0\nline1\nbefore\xffafter\nlater\xff\n")
+            .expect("write fixture");
 
         let mut valid_prefix = vec![snippet_hit(
             path.clone(),
@@ -12885,7 +13014,11 @@ mod tests {
             0.5,
         )];
         let invalid_incomplete = enrich_snippets_from_source(&mut invalid_range, dir.path());
-        assert!(invalid_range[0].snippet.is_empty());
+        assert_eq!(invalid_range.len(), 1);
+        assert_eq!(
+            invalid_range[0].snippet,
+            "line0\nline1\nbefore\u{fffd}after"
+        );
         assert!(!invalid_incomplete);
     }
 

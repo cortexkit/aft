@@ -243,8 +243,32 @@ impl ExactMemoStore {
         if entries.len() < MAX_EXACT_MEMO_ENTRIES || entries.contains_key(key) {
             return;
         }
-        entries.clear();
-        self.lifecycle.write().clear();
+        // Payload capacity is independent of lifecycle history. Advancing the
+        // evicted payload's epoch never resets an unrelated active verifier.
+        let victim = entries
+            .keys()
+            .next()
+            .cloned()
+            .expect("full memo has a payload");
+        let entry = entries.remove(&victim).expect("selected payload exists");
+        let mut lifecycle = self.lifecycle.write();
+        let state = lifecycle.entry(victim).or_default();
+        state.current_epoch = state.current_epoch.max(entry.epoch) + 1;
+    }
+
+    fn invalidate_observed_entry(&self, key: &MemoKey, entry: &Arc<MemoEntry>) {
+        let _admission = self.in_flight.lock();
+        let mut entries = self.entries.write();
+        if entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            entries.remove(key);
+            let mut lifecycle = self.lifecycle.write();
+            let state = lifecycle.entry(key.clone()).or_default();
+            state.poisoned = true;
+            state.current_epoch += 1;
+        }
     }
 
     /// Read the internal epoch of a key if present.
@@ -281,14 +305,13 @@ impl ExactMemoStore {
         Ok(())
     }
 
-    /// Serve a requested [offset, offset + top_k) interval from memo or run verifier.
+    /// Serve the requested page from a cached exact set, or run its verifier.
     ///
-    /// Lifecycle invariants:
-    /// - At most one verification per (K, epoch).
-    /// - Served-page digest mismatch: prints "content changed - page stability void",
-    ///   sets stability_void: true, drops the entry and poisons K without re-verifying.
-    /// - Rebuild at epoch 1: preserves the poisoned flag (does NOT clear poison on rebuild).
-    /// - Poisoned key is served with stability_void: true and disclosure.
+    /// One verifier is active per key/epoch; failed attempts remain retryable.
+    /// A digest mismatch retires only the observed payload. Detached old pages
+    /// report void stability without invalidating a newer replacement payload.
+    /// Poison survives rebuilds because pages across changed source contents
+    /// cannot be treated as one stable set.
     pub fn get_or_verify<F>(
         &self,
         key: &MemoKey,
@@ -298,6 +321,21 @@ impl ExactMemoStore {
     ) -> Result<ServeOutcome, MemoError>
     where
         F: FnOnce() -> Result<VerifiedExactSet, MemoError>,
+    {
+        self.get_or_verify_with_miss_hook(key, offset, top_k, verifier, || {})
+    }
+
+    fn get_or_verify_with_miss_hook<F, H>(
+        &self,
+        key: &MemoKey,
+        offset: usize,
+        top_k: usize,
+        verifier: F,
+        miss_hook: H,
+    ) -> Result<ServeOutcome, MemoError>
+    where
+        F: FnOnce() -> Result<VerifiedExactSet, MemoError>,
+        H: FnOnce(),
     {
         // 1. Check if we have an active entry
         let existing_entry = self.entries.read().get(key).cloned();
@@ -318,13 +356,7 @@ impl ExactMemoStore {
             {
                 // Digest mismatch!
                 // Drops the entry and poisons K without re-verifying (counter still unchanged).
-                self.entries.write().remove(key);
-                {
-                    let mut lifecycle = self.lifecycle.write();
-                    let state = lifecycle.entry(key.clone()).or_default();
-                    state.poisoned = true;
-                    state.current_epoch += 1;
-                }
+                self.invalidate_observed_entry(key, &entry);
 
                 return Ok(ServeOutcome {
                     results: page.to_vec(),
@@ -355,8 +387,14 @@ impl ExactMemoStore {
             });
         }
 
-        // 2. Cache miss: keep the per-root query memo bounded before admitting a new key.
-        self.make_room_for(key);
+        miss_hook();
+        // Admission, publication and eviction share this gate. Store lock order
+        // is admission -> entries -> lifecycle; disk verification holds none.
+        let mut in_flight = self.in_flight.lock();
+        if self.entries.read().contains_key(key) {
+            drop(in_flight);
+            return self.get_or_verify(key, offset, top_k, verifier);
+        }
         let (epoch, is_poisoned) = {
             let mut lifecycle = self.lifecycle.write();
             let state = lifecycle.entry(key.clone()).or_default();
@@ -364,7 +402,6 @@ impl ExactMemoStore {
         };
 
         let flight_key = (key.clone(), epoch);
-        let mut in_flight = self.in_flight.lock();
         if in_flight.contains(&flight_key) {
             while in_flight.contains(&flight_key) {
                 if crate::executor::current_job_cancelled() {
@@ -401,13 +438,27 @@ impl ExactMemoStore {
         ));
 
         // Publish before dropping the permit so same-key waiters observe the entry.
-        self.entries.write().insert(key.clone(), entry.clone());
-        self.lifecycle
-            .write()
-            .entry(key.clone())
-            .or_default()
-            .verified_epochs
-            .insert(epoch);
+        {
+            let _admission = self.in_flight.lock();
+            let current_epoch = self
+                .lifecycle
+                .read()
+                .get(key)
+                .map(|state| state.current_epoch);
+            if current_epoch != Some(epoch) {
+                return Err(MemoError::VerificationFailed(
+                    "exact verification superseded by memo lifecycle change".to_string(),
+                ));
+            }
+            self.make_room_for(key);
+            self.entries.write().insert(key.clone(), entry.clone());
+            self.lifecycle
+                .write()
+                .entry(key.clone())
+                .or_default()
+                .verified_epochs
+                .insert(epoch);
+        }
         drop(permit);
 
         // Slice served page
@@ -440,6 +491,7 @@ impl ExactMemoStore {
 
     /// Drop all entries and reset state.
     pub fn clear(&self) {
+        let _admission = self.in_flight.lock();
         self.entries.write().clear();
         self.lifecycle.write().clear();
     }
@@ -448,6 +500,176 @@ impl ExactMemoStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit01_empty_set() -> Result<VerifiedExactSet, MemoError> {
+        Ok(VerifiedExactSet {
+            results: Vec::new(),
+            file_digests: HashMap::new(),
+            bound_disclosure: None,
+            stability_void: false,
+        })
+    }
+
+    fn audit01_key(query: &str) -> MemoKey {
+        MemoKey::new(
+            "/project",
+            GenerationToken::new_with_str("generation"),
+            query,
+            false,
+        )
+    }
+
+    #[test]
+    fn audit01_memo_rechecks_publication_after_initial_miss() {
+        let memo = Arc::new(ExactMemoStore::new());
+        let key = audit01_key("race");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let pending = {
+            let memo = Arc::clone(&memo);
+            let key = key.clone();
+            std::thread::spawn(move || {
+                memo.get_or_verify_with_miss_hook(
+                    &key,
+                    0,
+                    1,
+                    || panic!("a published entry must suppress a second verifier"),
+                    || {
+                        reached_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            })
+        };
+        reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        memo.get_or_verify(&key, 0, 1, audit01_empty_set).unwrap();
+        assert!(memo.in_flight.lock().is_empty());
+        release_tx.send(()).unwrap();
+        assert!(pending
+            .join()
+            .expect("pending request must serve publication")
+            .is_ok());
+        assert_eq!(memo.verifier_call_count(), 1);
+    }
+
+    #[test]
+    fn audit01_capacity_keeps_poison_and_active_epoch() {
+        let memo = Arc::new(ExactMemoStore::new());
+        for index in 0..MAX_EXACT_MEMO_ENTRIES {
+            memo.get_or_verify(
+                &audit01_key(&format!("fill-{index}")),
+                0,
+                1,
+                audit01_empty_set,
+            )
+            .unwrap();
+        }
+        let poisoned = memo.entries.read().keys().next().unwrap().clone();
+        memo.lifecycle.write().insert(
+            poisoned.clone(),
+            KeyLifecycleState {
+                current_epoch: 9,
+                poisoned: true,
+                ..Default::default()
+            },
+        );
+        memo.entries.write().insert(
+            poisoned.clone(),
+            Arc::new(MemoEntry::new(
+                Vec::new(),
+                HashMap::new(),
+                None,
+                false,
+                9,
+                true,
+            )),
+        );
+        let active = audit01_key("active");
+        memo.lifecycle.write().insert(
+            active.clone(),
+            KeyLifecycleState {
+                current_epoch: 7,
+                ..Default::default()
+            },
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let memo = Arc::clone(&memo);
+            let active = active.clone();
+            std::thread::spawn(move || {
+                memo.get_or_verify(&active, 0, 1, || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    audit01_empty_set()
+                })
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        memo.get_or_verify(&audit01_key("overflow"), 0, 1, audit01_empty_set)
+            .unwrap();
+        let active_epoch = memo
+            .lifecycle
+            .read()
+            .get(&active)
+            .map(|state| state.current_epoch);
+        let poison_state = memo.lifecycle.read().get(&poisoned).cloned();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(active_epoch, Some(7));
+        let poison_state = poison_state.expect("eviction must retain lifecycle history");
+        assert!(poison_state.poisoned);
+        assert_eq!(poison_state.current_epoch, 10);
+        assert!(
+            memo.get_or_verify(&poisoned, 0, 1, audit01_empty_set)
+                .unwrap()
+                .stability_void
+        );
+        assert!(memo.entry_count() <= MAX_EXACT_MEMO_ENTRIES);
+    }
+
+    #[test]
+    fn audit01_epoch_replaced_before_publication_is_rejected() {
+        let memo = ExactMemoStore::new();
+        let key = audit01_key("epoch");
+        assert!(memo
+            .get_or_verify(&key, 0, 1, || {
+                memo.clear();
+                audit01_empty_set()
+            })
+            .is_err());
+        assert!(!memo.has_live_entry(&key));
+        assert!(memo.in_flight.lock().is_empty());
+    }
+
+    #[test]
+    fn audit01_stale_reader_cannot_erase_replacement() {
+        let memo = ExactMemoStore::new();
+        for index in 0..MAX_EXACT_MEMO_ENTRIES {
+            memo.get_or_verify(
+                &audit01_key(&format!("fill-{index}")),
+                0,
+                1,
+                audit01_empty_set,
+            )
+            .unwrap();
+        }
+        let observed = memo.entries.read().keys().next().unwrap().clone();
+        let old = memo.entries.read().get(&observed).unwrap().clone();
+        memo.get_or_verify(&audit01_key("overflow"), 0, 1, audit01_empty_set)
+            .unwrap();
+        memo.get_or_verify(&observed, 0, 1, audit01_empty_set)
+            .unwrap();
+        let replacement = memo.entries.read().get(&observed).unwrap().clone();
+        memo.invalidate_observed_entry(&observed, &old);
+        assert!(memo
+            .entries
+            .read()
+            .get(&observed)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &replacement)));
+        assert_eq!(memo.get_epoch(&observed), Some(1));
+        assert!(!memo.is_key_poisoned(&observed));
+    }
 
     #[test]
     fn exact_memo_hit_clones_only_the_served_page() {

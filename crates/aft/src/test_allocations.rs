@@ -11,6 +11,7 @@ struct CountingAllocator;
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATION_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -39,6 +40,7 @@ fn record_allocation(bytes: usize) {
     }
     if COUNTING.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get() + 1));
+        let _ = ALLOCATION_BYTES.try_with(|total| total.set(total.get().saturating_add(bytes)));
     }
 }
 
@@ -52,12 +54,20 @@ pub(crate) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     }
 
     ALLOCATION_COUNT.with(|count| count.set(0));
+    ALLOCATION_BYTES.with(|bytes| bytes.set(0));
     COUNTING.with(|counting| counting.set(true));
     let guard = CountingGuard;
     let result = operation();
     drop(guard);
     let count = ALLOCATION_COUNT.with(Cell::get);
     (result, count)
+}
+
+/// Total heap allocation volume on this thread, including reallocations.
+/// Unlike allocation counts, this also catches one oversized reservation.
+pub(crate) fn count_bytes<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+    let (result, _) = count(operation);
+    (result, ALLOCATION_BYTES.with(Cell::get))
 }
 
 /// Includes Rayon worker allocations; only use in isolated, single-test runs.

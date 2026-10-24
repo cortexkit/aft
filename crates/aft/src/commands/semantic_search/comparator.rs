@@ -123,110 +123,45 @@ pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Orderi
         Ordering::Equal => {}
         ord => return ord,
     }
-    // (1) Definition hit: true > false
-    let a_def = a.evidence.kind == EvidenceKind::Definition;
-    let b_def = b.evidence.kind == EvidenceKind::Definition;
-    match b_def.cmp(&a_def) {
-        Ordering::Equal => {
-            if a_def && b_def {
-                match source_before_data(a, b) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-                // Two declarations of the member a `receiver.member` query
-                // names: the one in a file whose path names the receiver
-                // (`ctx.set_harness` -> `context.rs`) is more likely to be on
-                // the receiver's type, so it sorts first.
-                match b
-                    .evidence
-                    .receiver_in_path
-                    .cmp(&a.evidence.receiver_in_path)
-                {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
-        }
-        ord => return ord,
-    }
-
-    // (2) E1 verbatim: E1 hit > non-E1, more occurrences first
-    let a_e1 = a.evidence.kind == EvidenceKind::E1;
-    let b_e1 = b.evidence.kind == EvidenceKind::E1;
-    match b_e1.cmp(&a_e1) {
-        Ordering::Equal => {
-            if a_e1 && b_e1 {
-                match source_before_data(a, b) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-                match b.evidence.occurrences.cmp(&a.evidence.occurrences) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
-        }
-        ord => return ord,
-    }
-
-    // (3) Anchored hit: Anchored > non-anchored
-    let a_anchored = a.evidence.kind == EvidenceKind::Anchored;
-    let b_anchored = b.evidence.kind == EvidenceKind::Anchored;
-    match b_anchored.cmp(&a_anchored) {
-        Ordering::Equal => {
-            if a_anchored && b_anchored {
-                match source_before_data(a, b) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-                // (3a) larger matched-run character total
-                match b.evidence.matched_span.cmp(&a.evidence.matched_span) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-
-                // (3b) fewer gap characters
-                match a.evidence.gap_chars.cmp(&b.evidence.gap_chars) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
-        }
-        ord => return ord,
-    }
-
-    // (4) E2 window: E2 > non-E2, narrower window first
-    let a_e2 = a.evidence.kind == EvidenceKind::E2;
-    let b_e2 = b.evidence.kind == EvidenceKind::E2;
-    match b_e2.cmp(&a_e2) {
-        Ordering::Equal => {
-            if a_e2 && b_e2 {
-                match source_before_data(a, b) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-                match a.evidence.window_lines.cmp(&b.evidence.window_lines) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
-        }
-        ord => return ord,
-    }
-
-    // (5) exact-form hit over variant hit: true > false
-    match b.evidence.exact_form.cmp(&a.evidence.exact_form) {
-        Ordering::Equal => {}
-        ord => return ord,
-    }
-
-    // (6) non-generated over generated: false > true
-    a.evidence.generated.cmp(&b.evidence.generated)
+    compare_exact_strength(&a.evidence, &b.evidence)
+        .then_with(|| b.evidence.exact_form.cmp(&a.evidence.exact_form))
+        .then_with(|| a.evidence.generated.cmp(&b.evidence.generated))
 }
 
-/// Source file (`data_file == false`) before data file.
-fn source_before_data(a: &CandidateResult, b: &CandidateResult) -> Ordering {
-    a.evidence.data_file.cmp(&b.evidence.data_file)
+/// Shared exact strength: kind, source before data, then the kind's metrics.
+/// Ranking-only prose agreement and exact-form/generated preferences stay in
+/// the rank comparator; they do not establish strict exact confidence.
+pub(crate) fn compare_exact_strength(
+    a: &super::evidence_descriptor::EvidenceDescriptor,
+    b: &super::evidence_descriptor::EvidenceDescriptor,
+) -> Ordering {
+    let rank = |kind| match kind {
+        EvidenceKind::Definition => 0,
+        EvidenceKind::E1 => 1,
+        EvidenceKind::Anchored => 2,
+        EvidenceKind::E2 => 3,
+        EvidenceKind::None => 4,
+    };
+    let kind = rank(a.kind).cmp(&rank(b.kind));
+    if kind != Ordering::Equal {
+        return kind;
+    }
+    if a.kind != EvidenceKind::None {
+        let source = a.data_file.cmp(&b.data_file);
+        if source != Ordering::Equal {
+            return source;
+        }
+    }
+    match a.kind {
+        EvidenceKind::Definition => b.receiver_in_path.cmp(&a.receiver_in_path),
+        EvidenceKind::E1 => b.occurrences.cmp(&a.occurrences),
+        EvidenceKind::Anchored => b
+            .matched_span
+            .cmp(&a.matched_span)
+            .then_with(|| a.gap_chars.cmp(&b.gap_chars)),
+        EvidenceKind::E2 => a.window_lines.cmp(&b.window_lines),
+        EvidenceKind::None => Ordering::Equal,
+    }
 }
 
 /// Compare score-free tail fields (9)-(11):

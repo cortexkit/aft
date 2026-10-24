@@ -13,7 +13,6 @@ use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
-use crate::inspect::job::is_test_file;
 use crate::query_shape::{extract_content_tokens, minimum_content_token_window};
 use crate::search_index::{
     read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,
@@ -277,7 +276,7 @@ impl ExactLane {
         let matches = snapshot.whole_corpus_exact_pass_scoped(
             query,
             project_root,
-            Some(&|path| include_tests || !path.to_str().map_or(false, is_test_file)),
+            Some(&|path| super::path_allowed_by_include_tests(path, project_root, include_tests)),
             scope,
         );
 
@@ -342,7 +341,7 @@ impl ExactLane {
 
         // Filter tests if needed
         if !include_tests {
-            files.retain(|p| !p.to_str().map_or(false, is_test_file));
+            files.retain(|p| super::path_allowed_by_include_tests(p, project_root, false));
         }
 
         // Prefer source over documentation/data; retain byte-wise path order
@@ -759,7 +758,91 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
         current_offset += segment.len();
     }
 
+    // Approximate bodies must not borrow evidence from the next declaration.
+    for index in 0..symbols.len().saturating_sub(1) {
+        symbols[index].1.end = symbols[index].1.end.min(symbols[index + 1].1.start);
+    }
     symbols
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_approximate_span_stops_at_next_declaration() {
+    let source = "pub fn first() { }\n\npub fn second() { target_phrase(); }\n";
+    let symbols = scan_symbols_in_text(source);
+    assert_eq!(symbols.len(), 2);
+    assert!(symbols[0].1.end <= symbols[1].1.start);
+    assert!(!source[symbols[0].1.start..symbols[0].1.end].contains("target_phrase"));
+    assert!(source[symbols[1].1.start..symbols[1].1.end].contains("target_phrase"));
+}
+
+#[cfg(test)]
+fn audit01_visibility_counts(
+    root: &Path,
+    paths: &[&str],
+    include_tests: bool,
+) -> (usize, usize, usize) {
+    std::fs::create_dir_all(root).unwrap();
+    let mut index = crate::search_index::SearchIndex::new();
+    for relative in paths {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = "pub fn visible() { needle_phrase(); }\n";
+        std::fs::write(&path, text).unwrap();
+        index.index_file(&path, text.as_bytes());
+    }
+    let lane = ExactLane::new();
+    let ready = lane.execute_ready_mode(&index.snapshot(), root, "needle_phrase", include_tests);
+    let fallback = lane.execute_fallback_mode(
+        root,
+        "needle_phrase",
+        include_tests,
+        &FallbackExactOptions::default(),
+    );
+    let anchored = super::anchored_lane::discover_anchored_candidate_files(
+        &index,
+        root,
+        &["needle_phrase".to_string()],
+        include_tests,
+    );
+    (
+        ready.file_digests.len(),
+        fallback.verified_set.file_digests.len(),
+        anchored.len(),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_nested_checkout_visibility() {
+    for ancestor in ["tests", "__tests__"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(ancestor).join("product");
+        assert_eq!(
+            audit01_visibility_counts(&root, &["src/lib.rs"], false),
+            (1, 1, 1)
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_shared_test_support_visibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = [
+        "src/lib.rs",
+        "src/FooTest.java",
+        "src/FooTest.kt",
+        "fixtures/helper.rs",
+    ];
+    assert_eq!(
+        audit01_visibility_counts(temp.path(), &paths, false),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        audit01_visibility_counts(temp.path(), &paths, true),
+        (4, 4, 4)
+    );
 }
 
 fn extract_field_identifier(line: &str) -> Option<String> {

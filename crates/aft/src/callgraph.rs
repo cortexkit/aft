@@ -3878,6 +3878,28 @@ pub(crate) fn walk_project_files_while(
     walk_project_files_filtered_while(root, |_| true, keep_walking)
 }
 
+#[cfg(test)]
+#[test]
+fn audit01_walk_cancellation_observes_unsupported_entries() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["one.unsupported", "two.unsupported", "three.unsupported"] {
+        std::fs::write(root.path().join(name), "").unwrap();
+    }
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    let files = walk_project_files_while(root.path(), move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        false
+    })
+    .collect::<Vec<_>>();
+    assert!(files.is_empty());
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "cancellation must run before source-file filtering"
+    );
+}
+
 /// Walk all non-excluded files under a root, using the same bounded iterator
 /// and ignore rules as the source-file census. Caller-excluded paths are pruned
 /// before descent.
