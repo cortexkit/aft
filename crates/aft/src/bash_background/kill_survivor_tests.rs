@@ -410,10 +410,13 @@ fn a_survivors_arguments_never_reach_the_record_status_or_notice() {
         .live_descendants
         .clone()
         .expect("the group was checked");
-    assert!(
-        members.iter().any(|member| member.comm == "sh"),
-        "the survivor must still be reported: {members:?}"
-    );
+    let worker = members
+        .iter()
+        .find(|member| member.argv0 == "sh")
+        .unwrap_or_else(|| panic!("the survivor must still be reported: {members:?}"));
+    // `comm` is the executable's own name: `sh` on Linux, `bash` on macOS.
+    let shown = format!("{} …", worker.comm);
+    assert_eq!(worker.command.as_deref(), Some(shown.as_str()));
     let surfaces = [
         ("task record", record),
         ("status", serde_json::to_string(&snapshot).unwrap()),
@@ -435,7 +438,7 @@ fn a_survivors_arguments_never_reach_the_record_status_or_notice() {
         }
     }
     let summary = snapshot.live_descendants_summary.unwrap_or_default();
-    assert!(summary.contains(", `sh …`"), "{summary}");
+    assert!(summary.contains(&format!(", `{shown}`")), "{summary}");
 }
 
 #[test]
