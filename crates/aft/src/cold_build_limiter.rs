@@ -330,6 +330,10 @@ fn acquire_blocking_while_inner(
             return Some(permit);
         }
         if !logged {
+            #[cfg(test)]
+            if let Some(observer) = limiter.refusal_observer.lock().unwrap().as_ref() {
+                let _ = observer.send(kind.to_owned());
+            }
             match request {
                 Some(request) => crate::slog_info!(
                     "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
@@ -376,6 +380,8 @@ pub(crate) struct ColdBuildLimiter {
     /// second hot-path lock. Rotation still uses `admission_state` below.
     waiting_by_class: [AtomicUsize; ADMISSION_CLASS_COUNT],
     admission_state: Mutex<AdmissionState>,
+    #[cfg(test)]
+    refusal_observer: Mutex<Option<crossbeam_channel::Sender<String>>>,
 }
 
 #[derive(Debug)]
@@ -507,7 +513,16 @@ impl ColdBuildLimiter {
                 holders_by_root: BTreeMap::new(),
                 queued: BTreeMap::new(),
             }),
+            #[cfg(test)]
+            refusal_observer: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_refusals_for_test(&self) -> crossbeam_channel::Receiver<String> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *self.refusal_observer.lock().unwrap() = Some(tx);
+        rx
     }
 
     pub(crate) fn limit(&self) -> usize {

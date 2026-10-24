@@ -15394,6 +15394,31 @@ mod tests {
         }
     }
 
+    fn search_index_completion(ctx: &AppContext) -> crossbeam_channel::Receiver<SearchIndex> {
+        ctx.search_index_rx()
+            .read()
+            .unwrap()
+            .clone()
+            .expect("search index completion receiver")
+    }
+
+    fn install_search_index_completion(ctx: &AppContext, index: SearchIndex) {
+        assert!(index.ready, "search load published an unready index");
+        // The observing receiver consumes the publication. Restore it so the
+        // normal runtime drain still installs the index and retires its receiver.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(index).expect("restore search index completion");
+        *ctx.search_index_rx().write().unwrap() = Some(rx);
+        crate::runtime_drain::drain_build_completions(ctx);
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready));
+    }
+
     fn semantic_search_request(query: &str) -> RawRequest {
         serde_json::from_value(json!({
             "id": "semantic-reload-query",
@@ -19762,10 +19787,25 @@ mod tests {
             || true,
         )
         .unwrap();
+        let cold_refusal = limiter.observe_refusals_for_test();
         assert!(super::start_artifact_loads(super::schedule_artifact_loads(
             &ctx, true, false
         )));
-        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        let completion = search_index_completion(&ctx);
+        // A slow disk may delay publication, but a warm load must not request
+        // a slot from the saturated cold-build limiter. The 30s deadline only
+        // bounds a stalled worker; the refusal event detects incorrect admission.
+        crossbeam_channel::select! {
+            recv(cold_refusal) -> refusal => {
+                panic!("warm search load requested a saturated cold-build slot: {refusal:?}");
+            }
+            recv(completion) -> index => {
+                install_search_index_completion(&ctx, index.expect("warm search load disconnected"));
+            }
+            default(Duration::from_secs(30)) => {
+                panic!("timed out waiting for warm search publication or cold-build refusal");
+            }
+        }
     }
 
     #[test]
@@ -20131,12 +20171,28 @@ mod tests {
                 .expect("hold limiter permit")
             })
             .collect::<Vec<_>>();
+        let cold_refusal = limiter.observe_refusals_for_test();
 
         let starts = super::schedule_artifact_loads(&ctx, true, false);
         assert!(starts.0.is_some());
         assert!(starts.1.is_none());
         assert!(super::start_artifact_loads(starts));
-        std::thread::sleep(Duration::from_millis(150));
+        let completion = search_index_completion(&ctx);
+        crossbeam_channel::select! {
+            recv(cold_refusal) -> refusal => {
+                assert_eq!(
+                    refusal.expect("cold search load requested a slot"),
+                    "search index post-configure load"
+                );
+            }
+            recv(completion) -> index => {
+                let _ = index.expect("cold search load disconnected while waiting for permit");
+                panic!("cold search load published before permit release");
+            }
+            default(Duration::from_secs(30)) => {
+                panic!("timed out waiting for cold-build refusal before permit release");
+            }
+        }
         crate::runtime_drain::drain_build_completions(&ctx);
         assert!(
             ctx.search_index()
@@ -20154,7 +20210,10 @@ mod tests {
         );
 
         drop(held_permits.pop());
-        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        let index = completion
+            .recv_timeout(Duration::from_secs(30))
+            .expect("cold search publication did not arrive within 30s after permit release");
+        install_search_index_completion(&ctx, index);
     }
 
     #[test]
