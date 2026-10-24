@@ -539,6 +539,15 @@ fn checkpoint_derived(
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
+    #[cfg(test)]
+    unsafe {
+        super::materialization::probe_checkpoint(
+            connection.handle(),
+            busy,
+            log_frames,
+            checkpointed_frames,
+        )
+    };
     if let Some(root) = ledger_root {
         // A successful TRUNCATE returns zero counts, and this raw connection has
         // no WAL hook baseline. Leave the unknown quantity in the named residual

@@ -1,0 +1,1 @@
+Small call-graph updates now retain unchanged graph rows and update only changed fields, avoiding index-page writes across the checkout when editing a large file. Incremental results remain equivalent to a fresh call-graph build, with the same publication durability and ordering.
