@@ -24,22 +24,31 @@ use std::time::Instant;
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 pub const LIVE_DESCENDANT_CAP: usize = 16;
 
-/// Longest command line kept for one process-group member, in characters.
-pub const LIVE_DESCENDANT_COMMAND_CAP: usize = 120;
+/// Longest executable name kept for one process-group member, in characters.
+/// The kernel's own limit is shorter (15 on Linux, 32 on macOS); this guards
+/// the fallback paths.
+pub const LIVE_DESCENDANT_NAME_CAP: usize = 64;
+
+/// Appended to a member's shown command when it had arguments AFT left out.
+pub const OMITTED_ARGUMENTS_MARKER: &str = "…";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveDescendant {
     pub pid: u32,
     pub comm: String,
+    /// The first word of the process's first argument (normally the program
+    /// path it was started as). Never any later argument.
     pub argv0: String,
     /// Name of the user that owns the process (its real user ID), or the
     /// numeric ID when the account has no name. Absent when it could not be
     /// read, and on records written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// The process's command line, cut to [`LIVE_DESCENDANT_COMMAND_CAP`]
-    /// characters. Absent when it could not be read (macOS does not show
-    /// another user's arguments), and on older records.
+    /// The process's executable name, followed by `…` when it was started
+    /// with arguments. The arguments themselves are never kept: they can hold
+    /// a credential (`--token "$DEPLOY_TOKEN"`, a value read from a file) that
+    /// no pattern can recognise, and this field reaches the task record, the
+    /// status reply and the completion notice. Absent on older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
@@ -145,23 +154,57 @@ pub(crate) mod test_hooks {
     }
 }
 
-/// Cut a command line to [`LIVE_DESCENDANT_COMMAND_CAP`] characters.
+/// Cut a name to [`LIVE_DESCENDANT_NAME_CAP`] characters and mask anything in
+/// it that looks like a credential.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn bounded_command(args: &[String]) -> Option<String> {
-    let joined = args.join(" ");
-    let joined = joined.trim();
-    if joined.is_empty() {
+fn safe_name(name: &str) -> String {
+    let name = name.trim();
+    let name = if name.chars().count() <= LIVE_DESCENDANT_NAME_CAP {
+        name.to_string()
+    } else {
+        let mut cut = name
+            .chars()
+            .take(LIVE_DESCENDANT_NAME_CAP - 1)
+            .collect::<String>();
+        cut.push('…');
+        cut
+    };
+    crate::log_redact::aft_redactor(&name).into_owned()
+}
+
+/// The command shown for a group member: its executable name, plus
+/// [`OMITTED_ARGUMENTS_MARKER`] when it had arguments. See
+/// [`LiveDescendant::command`] for why the arguments are left out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shown_command(name: &str, has_arguments: bool) -> Option<String> {
+    let name = safe_name(name);
+    if name.is_empty() {
         return None;
     }
-    if joined.chars().count() <= LIVE_DESCENDANT_COMMAND_CAP {
-        return Some(joined.to_string());
-    }
-    let mut cut = joined
-        .chars()
-        .take(LIVE_DESCENDANT_COMMAND_CAP - 1)
-        .collect::<String>();
-    cut.push('…');
-    Some(cut)
+    Some(if has_arguments {
+        format!("{name} {OMITTED_ARGUMENTS_MARKER}")
+    } else {
+        name
+    })
+}
+
+/// Whether a process may have had arguments beyond its program name. An empty
+/// argument list means they could not be read (macOS hides another user's), so
+/// it counts as "may have".
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn arguments_may_be_present(args: &[String]) -> bool {
+    args.len() != 1
+}
+
+/// The first word of a process's first argument. A process can rewrite its
+/// arguments into one title string (`setproctitle`), so everything after the
+/// first whitespace may be argument text and is dropped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn safe_argv0(first_argument: Option<&String>, comm: &str) -> String {
+    let word = first_argument
+        .and_then(|argument| argument.split_whitespace().next())
+        .unwrap_or(comm);
+    safe_name(word)
 }
 
 /// The account name for a user ID, or the ID itself when it has no name.
@@ -337,11 +380,7 @@ fn linux_describe_member(pid: u32, comm: String) -> LiveDescendant {
     if args.last().is_some_and(String::is_empty) {
         args.pop();
     }
-    let argv0 = args
-        .first()
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .unwrap_or_else(|| comm.clone());
+    let argv0 = safe_argv0(args.first().filter(|value| !value.is_empty()), &comm);
     // /proc/<pid>/status is normally readable for every user's processes; its
     // Uid line lists the real, effective, saved and filesystem IDs. When it
     // cannot be read the owner is left unknown.
@@ -359,10 +398,10 @@ fn linux_describe_member(pid: u32, comm: String) -> LiveDescendant {
         .map(user_name);
     LiveDescendant {
         pid,
-        comm,
+        command: shown_command(&comm, arguments_may_be_present(&args)),
+        comm: safe_name(&comm),
         argv0,
         user,
-        command: bounded_command(&args),
     }
 }
 
@@ -423,17 +462,13 @@ fn macos_process_group_members(
                 .unwrap_or_else(|| "?".to_string())
         };
         let args = macos_argv(pid).unwrap_or_default();
-        let argv0 = args
-            .first()
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .unwrap_or_else(|| comm.clone());
+        let argv0 = safe_argv0(args.first().filter(|value| !value.is_empty()), &comm);
         Some(LiveDescendant {
             pid,
-            comm,
+            command: shown_command(&comm, arguments_may_be_present(&args)),
+            comm: safe_name(&comm),
             argv0,
             user: info.map(|info| user_name(info.ruid)),
-            command: bounded_command(&args),
         })
     }))
 }
@@ -511,8 +546,9 @@ fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
 fn macos_argv(pid: u32) -> Option<Vec<String>> {
     const CTL_KERN: libc::c_int = 1;
     const KERN_PROCARGS2: libc::c_int = 49;
-    // Enough arguments to fill the bounded command line shown for a process.
-    const MAX_ARGS: usize = 64;
+    // Two are enough to tell whether there are arguments beyond the program
+    // name; their text is never kept.
+    const MAX_ARGS: usize = 2;
     let mut mib = [CTL_KERN, KERN_PROCARGS2, i32::try_from(pid).ok()?];
     let mut size = 0_usize;
     if unsafe {
@@ -1252,7 +1288,7 @@ fn macos_group_listing_includes_another_users_process() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_member_records_owner_and_bounded_command() {
+fn linux_member_records_owner_and_executable_name_only() {
     let mut command = std::process::Command::new("sleep");
     command.arg("30");
     start_new_session(&mut command);
@@ -1264,7 +1300,8 @@ fn linux_member_records_owner_and_bounded_command() {
     let (members, omitted) = members.unwrap();
     assert_eq!(omitted, 0);
     assert_eq!(members.len(), 1, "{members:?}");
-    assert_eq!(members[0].command.as_deref(), Some("sleep 30"));
+    assert_eq!(members[0].command.as_deref(), Some("sleep …"));
+    assert_eq!(members[0].argv0, "sleep");
     assert_eq!(
         members[0].user.as_deref(),
         Some(user_name(unsafe { libc::getuid() }).as_str())
@@ -1273,16 +1310,25 @@ fn linux_member_records_owner_and_bounded_command() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn bounded_command_cuts_long_command_lines() {
-    let long = vec!["x".repeat(LIVE_DESCENDANT_COMMAND_CAP + 10)];
-    let cut = bounded_command(&long).unwrap();
-    assert_eq!(cut.chars().count(), LIVE_DESCENDANT_COMMAND_CAP);
-    assert!(cut.ends_with('…'));
+fn shown_command_never_carries_arguments() {
+    assert_eq!(shown_command("sleep", true).as_deref(), Some("sleep …"));
+    assert_eq!(shown_command("sleep", false).as_deref(), Some("sleep"));
+    assert_eq!(shown_command("  ", true), None);
+    assert!(arguments_may_be_present(&[]));
+    assert!(!arguments_may_be_present(&["sleep".into()]));
+    assert!(arguments_may_be_present(&["sleep".into(), "30".into()]));
+    // A rewritten process title keeps only its first word.
     assert_eq!(
-        bounded_command(&["sleep".into(), "30".into()]).as_deref(),
-        Some("sleep 30")
+        safe_argv0(Some(&"worker --token abc123".to_string()), "sh"),
+        "worker"
     );
-    assert_eq!(bounded_command(&[]), None);
+    assert_eq!(safe_argv0(None, "sh"), "sh");
+    let long = "x".repeat(LIVE_DESCENDANT_NAME_CAP + 10);
+    let cut = safe_name(&long);
+    assert_eq!(cut.chars().count(), LIVE_DESCENDANT_NAME_CAP);
+    assert!(cut.ends_with('…'));
+    // Pattern masking still applies to the name itself.
+    assert!(!safe_name("ghp_abcdefghijklmnopqrstuvwxyz0123").contains("ghp_abc"));
 }
 
 /// Describing stops at the cap; the members past it are counted, not read.

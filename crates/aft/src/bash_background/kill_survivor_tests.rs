@@ -23,13 +23,22 @@ fn registry() -> BgTaskRegistry {
 }
 
 fn spawn_for_kill(registry: &BgTaskRegistry, dir: &Path, command: &str) -> String {
+    spawn_for_kill_with_env(registry, dir, command, HashMap::new())
+}
+
+fn spawn_for_kill_with_env(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    command: &str,
+    env: HashMap<String, String>,
+) -> String {
     registry
         .spawn(
             SpawnPlan::Unsandboxed,
             command,
             SESSION.to_string(),
             dir.to_path_buf(),
-            HashMap::new(),
+            env,
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.to_path_buf(),
             10,
@@ -118,10 +127,10 @@ fn timeout_kill_names_a_survivor_the_group_kill_could_not_reach() {
     let survivor = &members[0];
     assert_eq!(survivor.comm, "sleep");
     assert_eq!(survivor.user.as_deref(), Some(current_user().as_str()));
-    assert_eq!(survivor.command.as_deref(), Some("sleep 30"));
+    assert_eq!(survivor.command.as_deref(), Some("sleep …"));
     assert_eq!(snapshot.live_descendants_unavailable, None);
     let expected = format!(
-        "1 process survived the kill and is still running: pid {}, user {}, `sleep 30`. AFT cannot signal processes owned by another user.",
+        "1 process survived the kill and is still running: pid {}, user {}, `sleep …`. AFT cannot signal processes owned by another user.",
         survivor.pid,
         current_user()
     );
@@ -302,6 +311,66 @@ fn pty_kill_names_a_survivor_the_group_kill_could_not_reach() {
     );
 }
 
+/// A survivor's arguments can hold a credential: the expanded value of a
+/// secret-named variable, or one read from a file that no pattern can
+/// recognise. Neither may reach the task record, the status reply or the
+/// completion notice; the survivor is still reported, by its executable name.
+#[test]
+fn a_survivors_arguments_never_reach_the_record_status_or_notice() {
+    const ENV_SECRET: &str = "env-secret-7f3a9c41d2";
+    const LITERAL_SECRET: &str = "literal-secret-5b8e2d60aa";
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pw"), LITERAL_SECRET).unwrap();
+    let task_id = spawn_for_kill_with_env(
+        &registry,
+        dir.path(),
+        "exec sh -c 'trap \"\" TERM; touch ready; while :; do sleep 1; done' worker --token \"$DEPLOY_TOKEN\" --password=\"$(cat pw)\"",
+        HashMap::from([("DEPLOY_TOKEN".to_string(), ENV_SECRET.to_string())]),
+    );
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    test_hooks::deny_sigkill(pgid);
+
+    registry.kill_for_timeout(&task_id, SESSION).unwrap();
+    let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+    let completion = completion_for(&registry, &task_id);
+    let record =
+        std::fs::read_to_string(&registry.task_for_test(&task_id).unwrap().paths.json).unwrap();
+
+    let members = snapshot
+        .live_descendants
+        .clone()
+        .expect("the group was checked");
+    assert!(
+        members.iter().any(|member| member.comm == "sh"),
+        "the survivor must still be reported: {members:?}"
+    );
+    let surfaces = [
+        ("task record", record),
+        ("status", serde_json::to_string(&snapshot).unwrap()),
+        ("completion", serde_json::to_string(&completion).unwrap()),
+        (
+            "summary",
+            snapshot
+                .live_descendants_summary
+                .clone()
+                .unwrap_or_default(),
+        ),
+    ];
+    for (surface, text) in &surfaces {
+        for secret in [ENV_SECRET, LITERAL_SECRET] {
+            assert!(
+                !text.contains(secret),
+                "{surface} carries a survivor's argument {secret}: {text}"
+            );
+        }
+    }
+    let summary = snapshot.live_descendants_summary.unwrap_or_default();
+    assert!(summary.contains(", `sh …`"), "{summary}");
+}
+
 #[test]
 fn kill_survivors_line_names_the_first_three_and_counts_the_rest() {
     let member = |pid: u32, user: Option<&str>, command: Option<&str>| LiveDescendant {
@@ -389,11 +458,11 @@ fn timeout_kill_reports_a_root_owned_survivor_through_sudo() {
         .find(|member| member.comm == "sleep")
         .expect("the surviving root sleep was not reported");
     assert_eq!(sleep.user.as_deref(), Some("root"));
-    assert_eq!(sleep.command.as_deref(), Some("sleep 30"));
+    assert_eq!(sleep.command.as_deref(), Some("sleep …"));
     let summary = snapshot.live_descendants_summary.unwrap_or_default();
     assert!(
         summary.contains(" survived the kill and ")
-            && summary.contains(&format!("pid {}, user root, `sleep 30`", sleep.pid))
+            && summary.contains(&format!("pid {}, user root, `sleep …`", sleep.pid))
             && summary.ends_with("AFT cannot signal processes owned by another user."),
         "{summary}"
     );

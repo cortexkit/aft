@@ -322,7 +322,8 @@ process spawn (setup time does not count). Expiry sends SIGTERM to the Unix proc
 SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
 that leave the group (`setsid`, `setpgid`, Python `start_new_session=True`) survive; macOS has no
 tree kill. AFT cannot signal a process owned by another user, such as one started with `sudo`; on
-Linux and macOS the task's `live_descendants` and text name any such survivor (a null list comes with
+Linux and macOS the task's `live_descendants` and text name any such survivor by pid, owner and executable
+name (never its arguments, which can hold credentials; a null list comes with
 `live_descendants_unavailable`, the reason AFT could not check), so bound `sudo` commands yourself:
 `sudo -n timeout -k 1 <secs> <cmd>` shorter than AFT's limit, or
 `sudo -n bash -c "trap 'kill -KILL 0' TERM; <cmd> & wait"`. A bare foreground
