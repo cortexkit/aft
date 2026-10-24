@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::access_policy::{AccessOperation, GrantKind};
 use crate::backup::CapturedRegularFile;
 use crate::context::AppContext;
 use crate::edit::{self, validate_syntax};
@@ -736,6 +737,10 @@ fn handle_glob_edit_match_inner(
         );
     }
 
+    let policy = match ctx.access_policy(&req.id) {
+        Ok(policy) => policy,
+        Err(response) => return response,
+    };
     let config = ctx.config();
     let mut file_results: Vec<serde_json::Value> = Vec::new();
     let mut total_replacements: usize = 0;
@@ -753,17 +758,22 @@ fn handle_glob_edit_match_inner(
     let mut pending: Vec<PendingEdit> = Vec::new();
 
     for path in &paths {
-        let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
-            Ok(validated) => validated,
-            Err(resp) if resp.data["code"] == "denied_floor" => {
-                skipped_files.push(SkippedGlobEditFile {
-                    file: path.display().to_string(),
-                    reason: GlobEditSkipReason::DeniedFloor,
-                });
-                continue;
-            }
-            Err(resp) => return resp,
-        };
+        // Floors protect content reads too. Root and write authorization belong
+        // after matching, so unrelated glob candidates do not require permission.
+        if policy
+            .capability_floor(
+                AccessOperation::Write,
+                GrantKind::File,
+                &crate::access_policy::policy_path(path),
+            )
+            .is_some()
+        {
+            skipped_files.push(SkippedGlobEditFile {
+                file: path.display().to_string(),
+                reason: GlobEditSkipReason::DeniedFloor,
+            });
+            continue;
+        }
         let (source, capture) = match CapturedRegularFile::read_text(path) {
             Ok(Some((capture, source))) => (source, Some(capture)),
             Ok(None) => match std::fs::read_to_string(path) {
@@ -782,6 +792,17 @@ fn handle_glob_edit_match_inner(
             continue;
         }
 
+        let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
+            Ok(validated) => validated,
+            Err(resp) if resp.data["code"] == "denied_floor" => {
+                skipped_files.push(SkippedGlobEditFile {
+                    file: path.display().to_string(),
+                    reason: GlobEditSkipReason::DeniedFloor,
+                });
+                continue;
+            }
+            Err(resp) => return resp,
+        };
         let count = positions.len();
         let new_source = source.replace(match_str, replacement);
         let file_str = path.display().to_string();
@@ -1367,6 +1388,73 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             b"second TARGET\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_edit_skips_non_matching_symlink_outside_project_root() {
+        assert_glob_edit_outside_symlink(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_edit_refuses_matching_symlink_outside_project_root() {
+        assert_glob_edit_outside_symlink(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_glob_edit_outside_symlink(outside_matches: bool) {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_file = project.path().join("a.txt");
+        let outside_file = outside.path().join("outside.txt");
+        let outside_source = if outside_matches {
+            "outside TARGET\n"
+        } else {
+            "unrelated\n"
+        };
+        fs::write(&inside_file, "inside TARGET\n").unwrap();
+        fs::write(&outside_file, outside_source).unwrap();
+        std::os::unix::fs::symlink(&outside_file, project.path().join("z.txt")).unwrap();
+        let outside_modified = fs::metadata(&outside_file).unwrap().modified().unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(StubProvider),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                restrict_to_project_root: true,
+                ..Config::default()
+            },
+        );
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "glob-outside-symlink",
+            "command": "edit_match",
+            "file": "*.txt",
+            "match": "TARGET",
+            "replacement": "DONE",
+            "replace_all": true
+        }))
+        .unwrap();
+
+        let response = handle_edit_match(&request, &ctx);
+        if outside_matches {
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "path_outside_root", "{response:?}");
+            assert_eq!(fs::read_to_string(&inside_file).unwrap(), "inside TARGET\n");
+        } else {
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["total_files"], 1, "{response:?}");
+            assert_eq!(fs::read_to_string(&inside_file).unwrap(), "inside DONE\n");
+        }
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), outside_source);
+        assert_eq!(
+            fs::metadata(&outside_file).unwrap().modified().unwrap(),
+            outside_modified
         );
     }
 
