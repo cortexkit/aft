@@ -311,6 +311,27 @@ const CASES: ParityCase[] = [
     project: { bash: { watch_sync_max_ms: 1800000 } },
   },
   {
+    name: "bash_memory_limit_project_raise",
+    user: { bash: { memory_limit_mib: 64 } },
+    project: { bash: { memory_limit_mib: 128 } },
+  },
+  {
+    name: "bash_memory_limit_project_tighten",
+    harness: "pi",
+    user: { bash: { memory_limit_mib: 64 } },
+    project: { bash: { memory_limit_mib: 32 } },
+  },
+  {
+    name: "bash_memory_limit_harness_override",
+    harness: "opencode",
+    user: { bash: { memory_limit_mib: 64 }, harnesses: { opencode: { bash: { memory_limit_mib: 128 } } } },
+    project: { bash: { memory_limit_mib: 256 }, harnesses: { opencode: { bash: { memory_limit_mib: 192 } } } },
+  },
+  {
+    name: "bash_memory_limit_zero",
+    user: { bash: { memory_limit_mib: 0 } },
+  },
+  {
     // `bash.worker_wait_max_ms` only changes how long a worker waits, so a
     // project may set it, and a harness block overrides it like any bash key.
     name: "bash_worker_wait_project_override",

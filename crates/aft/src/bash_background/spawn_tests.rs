@@ -36,6 +36,7 @@ fn spawn(registry: &BgTaskRegistry, root: &Path, command: &str, background: bool
             root.to_owned(),
             HashMap::new(),
             super::super::HardKill::After(Duration::from_secs(60)),
+            None,
             root.to_owned(),
             if background {
                 super::super::TaskSlot::Background { max: 100 }

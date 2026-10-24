@@ -112,11 +112,12 @@ pub(crate) fn spawn_pty_for_command(
     wake_tx: crossbeam_channel::Sender<()>,
     io_handles: &mut TaskIoHandles,
     spawned_pgid: &mut Option<i32>,
+    memory_monitor: &mut Option<super::memory_limit::Monitor>,
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
         let _ = shell_kind;
-        let args = if let Some(prepared) = spawn_plan.prepared_task() {
+        let mut args = if let Some(prepared) = spawn_plan.prepared_task() {
             vec![
                 OsString::from("-c"),
                 OsString::from(prepared.command_text()?),
@@ -124,11 +125,24 @@ pub(crate) fn spawn_pty_for_command(
         } else {
             vec![OsString::from("-c"), OsString::from(user_command)]
         };
+        let program = if memory_monitor.is_some() {
+            let mut gated = vec![
+                OsString::from("-c"),
+                OsString::from("read -r ready || exit 125; exec \"$@\""),
+                OsString::from("aft-memory-gate"),
+                shell_path.as_os_str().to_owned(),
+            ];
+            gated.append(&mut args);
+            args = gated;
+            std::ffi::OsStr::new("/bin/sh")
+        } else {
+            shell_path.as_os_str()
+        };
         try_spawn_pty(
             spawn_plan,
             task_id,
             session_id,
-            shell_path.as_os_str(),
+            program,
             &args,
             paths,
             workdir,
@@ -138,6 +152,7 @@ pub(crate) fn spawn_pty_for_command(
             wake_tx,
             io_handles,
             spawned_pgid,
+            memory_monitor,
         )
     }
     #[cfg(windows)]
@@ -151,7 +166,11 @@ pub(crate) fn spawn_pty_for_command(
             shell_candidates()
         };
         let attempt = crate::windows_shell::spawn_pty_candidates(&candidates, |shell| {
-            let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
+            let wrapper_body = if memory_monitor.is_some() {
+                shell.memory_gated_wrapper_bytes(user_command, &paths.exit)
+            } else {
+                shell.wrapper_script_bytes(user_command, &paths.exit)
+            };
             let wrapper_path = windows_wrapper_path(paths, shell);
             if let Err(error) = crate::private_storage::write(&wrapper_path, wrapper_body) {
                 return Err(crate::windows_shell::PtyAttemptError::Wrapper(format!(
@@ -189,6 +208,8 @@ pub(crate) fn spawn_pty_for_command(
                 wake_tx.clone(),
                 io_handles,
                 spawned_pgid,
+                memory_monitor,
+                shell.uses_memory_file_gate(),
             )
             .map_err(crate::windows_shell::PtyAttemptError::Spawn)
         });
@@ -236,6 +257,8 @@ fn try_spawn_pty(
     wake_tx: crossbeam_channel::Sender<()>,
     io_handles: &mut TaskIoHandles,
     spawned_pgid: &mut Option<i32>,
+    memory_monitor: &mut Option<super::memory_limit::Monitor>,
+    #[cfg(windows)] memory_file_gate: bool,
 ) -> Result<PtyRuntime, String> {
     let (command, profile_handle) = crate::sandbox_spawn::pty_command_for_plan(
         spawn_plan,
@@ -299,6 +322,9 @@ fn try_spawn_pty(
     let child_pid = child.child.as_ref().unwrap().process_id();
     // Preserve group identity for scratch cleanup even if setup returns no runtime.
     *spawned_pgid = child_pid.map(|pid| pid as i32);
+    if let Some(monitor) = memory_monitor.as_mut() {
+        monitor.attach(child_pid.ok_or("memory cap launch PID missing")?)?;
+    }
     let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;
@@ -310,12 +336,30 @@ fn try_spawn_pty(
         .unwrap()
         .try_clone_reader()
         .map_err(|error| format!("clone PTY reader failed: {error}"))?;
-    let writer = child
+    let mut writer = child
         .master
         .as_ref()
         .unwrap()
         .take_writer()
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
+    if memory_monitor.is_some() {
+        use std::io::Write;
+        #[cfg(windows)]
+        if memory_file_gate {
+            crate::windows_shell::release_memory_file_gate(&paths.exit)?;
+        }
+        #[cfg(unix)]
+        let ready: &[u8] = b"\n";
+        #[cfg(windows)]
+        let ready: &[u8] = if memory_file_gate {
+            b""
+        } else {
+            b"aft-memory-ready\n"
+        };
+        writer
+            .write_all(ready)
+            .map_err(|error| format!("memory cap launch gate failed: {error}"))?;
+    }
 
     let reader_done = Arc::new(AtomicBool::new(false));
     let reader_eof = Arc::new(AtomicBool::new(false));
@@ -868,6 +912,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         crossbeam_channel::unbounded().0,
         &mut handles,
         &mut spawned_pgid,
+        &mut None,
     );
     let pid = pid.load(Ordering::SeqCst);
     assert_ne!(pid, 0);
@@ -907,6 +952,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
                 crossbeam_channel::unbounded().0,
                 &mut handles,
                 &mut spawned_pgid,
+                &mut None,
             )
         })
     }));

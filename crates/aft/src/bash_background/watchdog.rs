@@ -66,7 +66,7 @@ struct Subscription {
     awaiting_reader: HashMap<String, Instant>,
 }
 
-type TimeoutKill = (BgTaskRegistry, std::sync::Arc<BgTask>);
+type TimeoutKill = (BgTaskRegistry, std::sync::Arc<BgTask>, Option<String>);
 
 fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
     static KILLS: std::sync::OnceLock<
@@ -87,7 +87,7 @@ fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
             match thread::Builder::new()
                 .name(format!("aft-bash-timeout-{index}"))
                 .spawn(move || {
-                    for (registry, task) in rx {
+                    for (registry, task, memory_reason) in rx {
                         struct Reset(std::sync::Arc<BgTask>);
                         impl Drop for Reset {
                             fn drop(&mut self) {
@@ -97,7 +97,12 @@ fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
                         let _reset = Reset(task.clone());
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if !task.is_terminal() {
-                                let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);
+                                if let Some(reason) = memory_reason {
+                                    registry.kill_for_memory(&task, reason);
+                                } else {
+                                    let _ =
+                                        registry.kill_for_timeout(&task.task_id, &task.session_id);
+                                }
                             }
                         }));
                     }
@@ -113,12 +118,30 @@ fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
 }
 
 fn schedule_timeout_kill(registry: &BgTaskRegistry, task: &std::sync::Arc<BgTask>) {
+    schedule_limit_kill(registry, task, None);
+}
+
+pub(super) fn schedule_memory_kill(
+    registry: &BgTaskRegistry,
+    task: &std::sync::Arc<BgTask>,
+    reason: String,
+) {
+    schedule_limit_kill(registry, task, Some(reason));
+}
+
+fn schedule_limit_kill(
+    registry: &BgTaskRegistry,
+    task: &std::sync::Arc<BgTask>,
+    memory_reason: Option<String>,
+) {
     if task.timeout_kill_queued.swap(true, Ordering::SeqCst) {
         return;
     }
-    if !timeout_kills()
-        .is_some_and(|queue| queue.try_send((registry.clone(), task.clone())).is_ok())
-    {
+    if !timeout_kills().is_some_and(|queue| {
+        queue
+            .try_send((registry.clone(), task.clone(), memory_reason))
+            .is_ok()
+    }) {
         task.timeout_kill_queued.store(false, Ordering::SeqCst);
     }
 }
@@ -261,6 +284,10 @@ pub(super) fn run_pass(
     let tasks = registry.running_tasks();
     awaiting_reader.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
     for task in tasks {
+        if let Some(reason) = registry.memory_limit_exceeded(&task) {
+            schedule_memory_kill(registry, &task, reason);
+            continue;
+        }
         if leave_to_reader_wake(registry, &task, pass_cause, awaiting_reader) {
             continue;
         }

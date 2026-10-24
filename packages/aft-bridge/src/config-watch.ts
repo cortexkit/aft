@@ -44,6 +44,7 @@ export interface ResolvedBashForLiveReload {
   subagent_background: boolean;
   watch_sync_max_ms: number;
   worker_wait_max_ms: number;
+  memory_limit_mib?: number;
   env: Record<string, string>;
 }
 
@@ -134,6 +135,7 @@ export function aftLiveConfigKeys<C>(
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),
+    bashKey<C>("memory_limit_mib", resolveBash),
     bashKey<C>("env", resolveBash),
     bashKey<C>("changed_files", resolveBash),
   ];

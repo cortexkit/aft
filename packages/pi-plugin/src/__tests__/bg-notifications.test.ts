@@ -75,6 +75,21 @@ describe("Pi background notifications", () => {
     }
   });
 
+  test("failed memory-cap completion shows its reason without a capture warning", () => {
+    const reason = "Command stopped: exceeded the 64 MiB memory cap (test enforcement).";
+    expect(
+      formatSystemReminder([
+        {
+          task_id: "bash-memory",
+          command: "allocate",
+          status: "failed",
+          exit_code: 137,
+          status_reason: reason,
+        },
+      ]),
+    ).toContain(reason);
+  });
+
   test("formats system reminder bullets with status and duration", () => {
     expect(
       formatSystemReminder([

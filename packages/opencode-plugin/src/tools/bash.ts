@@ -767,6 +767,13 @@ export function createBashTool(
           throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
         }
         if (!bashCfg.host_fallback) throw error;
+        if (bashCfg.memory_limit_mib !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "bash.memory_limit_mib",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
+        }
 
         const projectRoot = projectRootFor(context);
         const pattern = bashHostFallbackAskPattern(command, projectRoot, fallbackCause);

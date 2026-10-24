@@ -407,6 +407,12 @@
               "default": 1800000,
               "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe."
             },
+            "memory_limit_mib": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits."
+            },
             "linux_scope": {
               "type": "boolean",
               "default": false,
@@ -1261,6 +1267,12 @@
                     "minimum": 60000,
                     "default": 1800000,
                     "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe."
+                  },
+                  "memory_limit_mib": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "description": "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits."
                   },
                   "linux_scope": {
                     "type": "boolean",

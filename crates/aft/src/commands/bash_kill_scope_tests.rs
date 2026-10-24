@@ -44,6 +44,7 @@ impl Tasks {
                 self.dir.path().into(),
                 HashMap::new(),
                 HardKill::After(Duration::from_secs(30)),
+                None,
                 self.dir.path().into(),
                 if background {
                     crate::bash_background::TaskSlot::Background { max: 10 }
@@ -373,6 +374,7 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
                 project.path().into(),
                 HashMap::new(),
                 HardKill::After(Duration::from_secs(30)),
+                None,
                 harness_dir.clone(),
                 crate::bash_background::TaskSlot::Background { max: 10 },
                 true,

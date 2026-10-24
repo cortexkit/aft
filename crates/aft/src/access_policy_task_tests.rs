@@ -651,6 +651,7 @@ fn access_policy_head_cannot_control_live_worker_task() {
                     config.project_root.clone().unwrap(),
                     std::collections::HashMap::new(),
                     crate::bash_background::HardKill::After(std::time::Duration::from_secs(30)),
+                    None,
                     config.storage_dir.clone().unwrap(),
                     10,
                     true,

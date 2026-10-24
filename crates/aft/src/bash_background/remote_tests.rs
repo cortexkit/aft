@@ -264,6 +264,7 @@ fn start_with_launch(
             dir.into(),
             HashMap::from([("BUILD_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
             hard_kill,
+            None,
             dir.into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -430,6 +431,7 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
                     dir.path().into(),
                     HashMap::new(),
                     HardKill::After(Duration::from_secs(30)),
+                    None,
                     dir.path().into(),
                     TaskSlot::Foreground,
                     true,
@@ -445,6 +447,7 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
                     dir.path().into(),
                     HashMap::new(),
                     HardKill::After(Duration::from_secs(30)),
+                    None,
                     dir.path().into(),
                     10,
                     true,
@@ -460,6 +463,7 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
                     dir.path().into(),
                     HashMap::new(),
                     HardKill::After(Duration::from_secs(30)),
+                    None,
                     dir.path().into(),
                     10,
                     true,
@@ -482,6 +486,7 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
                         dir.path().into(),
                         HashMap::new(),
                         HardKill::After(Duration::from_secs(30)),
+                        None,
                         dir.path().into(),
                         TaskSlot::Background { max: 10 },
                         true,
@@ -561,6 +566,7 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
             dir.path().into(),
             HashMap::new(),
             HardKill::After(Duration::from_secs(60)),
+            None,
             dir.path().into(),
             1,
             false,
@@ -581,6 +587,7 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
             dir.path().into(),
             HashMap::new(),
             HardKill::After(Duration::from_secs(60)),
+            None,
             dir.path().into(),
             slot,
             false,
@@ -689,6 +696,102 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
 }
 
 #[tokio::test]
+async fn memory_limit_delayed_fallback_keeps_submitted_cap_after_reload() {
+    let daemon = daemon(Script::GatedAcceptanceThenRefused, "exec-remote/v1").await;
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    ensure_git_fixture(project.path());
+    let ctx = super::super::memory_limit_tests::memory_request_context(
+        project.path(),
+        storage.path(),
+        Some(64),
+    );
+    let submitted = {
+        let _pin = ctx.pin_config();
+        super::super::memory_limit_tests::spawn_memory_request(
+            &ctx,
+            "memory-fallback-a",
+            Some(launch(daemon.connection.clone())),
+        )
+    };
+    assert!(submitted.success, "{submitted:?}");
+    let task_id = submitted.data["task_id"].as_str().unwrap().to_owned();
+    let (saved_layout, saved_digest) = {
+        let task = ctx.bash_background().task(&task_id).unwrap();
+        let digest = task
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .fallback_digest
+            .clone()
+            .unwrap();
+        (
+            resolve_task_layout(&task.paths.session_dir, &task_id).unwrap(),
+            digest,
+        )
+    };
+
+    let mut reloaded = ctx.config().as_ref().clone();
+    reloaded.bash.memory_limit_mib = None;
+    ctx.set_config(reloaded);
+    let newer = {
+        let _pin = ctx.pin_config();
+        super::super::memory_limit_tests::spawn_memory_request(&ctx, "memory-fallback-b", None)
+    };
+    assert!(newer.success, "{newer:?}");
+    daemon.acceptance_gate.notify_one();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    let task = ctx.bash_background().task(&task_id).unwrap();
+    let state = task.state.lock().unwrap();
+    assert!(state.metadata.local_fallback_started);
+    assert_eq!(
+        state
+            .metadata
+            .memory_policy
+            .as_ref()
+            .map(|policy| policy.mib),
+        Some(64),
+        "fallback lost the cap from its submitted request"
+    );
+    drop(state);
+    let (_, _, _, _, saved_cap) =
+        crate::sandbox_spawn::restore_local_launch(&saved_layout, &saved_digest).unwrap();
+    assert_eq!(
+        saved_cap,
+        Some(64),
+        "private fallback snapshot lost its admitted cap"
+    );
+}
+
+#[tokio::test]
+async fn memory_limit_replayed_fallback_keeps_saved_cap() {
+    let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot_cap(
+        dir.path(),
+        daemon.connection.clone(),
+        "exit 0",
+        Some(64),
+    );
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    let metadata = read_task(&paths.json).unwrap();
+    assert!(metadata.local_fallback_started);
+    assert_eq!(
+        metadata.memory_policy.as_ref().map(|policy| policy.mib),
+        Some(64)
+    );
+}
+
+#[tokio::test]
 async fn bash_changed_files_new_runon_completion_keeps_local_window() {
     assert_new_remote_changed_files(false).await;
 }
@@ -728,25 +831,10 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     launch.explicit_runon = !fallback;
     let task_id = {
         let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
-        ctx.bash_background()
-            .spawn_remote(
-                launch,
-                SpawnPlan::Unsandboxed,
-                "printf local-change > local.txt; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done",
-                resolve_posix_shell(),
-                "session".into(),
-                project.path().into(),
-                HashMap::from([(
-                    "CHANGED_FILES_RELEASE".into(),
-                    storage.path().join("release").display().to_string(),
-                )]),
-                crate::bash_background::HardKill::from_timeout_ms(Some(20_000)),
-                storage.path().into(),
-                crate::bash_background::TaskSlot::Background { max: 10 },
-                true,
-                false,
-                Some(project.path().into()),
-            )
+        ctx.bash_background().spawn_remote(launch, SpawnPlan::Unsandboxed, "printf local-change > local.txt; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done", resolve_posix_shell(), "session".into(), project.path().into(), HashMap::from([(
+            "CHANGED_FILES_RELEASE".into(),
+            storage.path().join("release").display().to_string(),
+        )]), crate::bash_background::HardKill::from_timeout_ms(Some(20_000)), None, storage.path().into(), crate::bash_background::TaskSlot::Background { max: 10 }, true, false, Some(project.path().into()))
             .unwrap()
     };
     if fallback {
@@ -2145,6 +2233,7 @@ async fn exec_remote_bash_from_a_jailed_worker_is_submitted_unchanged() {
                 dir.path().into(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().into(),
                 crate::bash_background::TaskSlot::Background { max: 10 },
                 true,
@@ -2187,6 +2276,7 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
             dir.path().into(),
             env,
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dir.path().into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -2683,6 +2773,7 @@ async fn exec_remote_launch_is_fenced_by_a_refused_startup_receipt() {
             dir.path().into(),
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dir.path().into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -4000,6 +4091,15 @@ fn persist_accepted_with_snapshot(
     connection: PathBuf,
     command: &str,
 ) -> (BgTaskRegistry, String, TaskPaths) {
+    persist_accepted_with_snapshot_cap(dir, connection, command, None)
+}
+
+fn persist_accepted_with_snapshot_cap(
+    dir: &Path,
+    connection: PathBuf,
+    command: &str,
+    memory_limit_mib: Option<u64>,
+) -> (BgTaskRegistry, String, TaskPaths) {
     let registry = registry();
     let layout = allocate_task_layout(dir, "session").unwrap();
     let task_id = layout.paths.task_id.clone();
@@ -4030,6 +4130,7 @@ fn persist_accepted_with_snapshot(
         &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
         &shell,
         false,
+        memory_limit_mib,
     )
     .unwrap();
     let mut metadata = PersistedTask::starting(
@@ -4248,11 +4349,12 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
         } else {
             let layout = resolve_task_layout(&paths.session_dir, &task_id).unwrap();
             let remote = task.state.lock().unwrap().metadata.remote.clone().unwrap();
-            let (plan, shell_path, env, linux_scope) = crate::sandbox_spawn::restore_local_launch(
-                &layout,
-                remote.fallback_digest.as_deref().unwrap(),
-            )
-            .unwrap();
+            let (plan, shell_path, env, linux_scope, memory_limit_mib) =
+                crate::sandbox_spawn::restore_local_launch(
+                    &layout,
+                    remote.fallback_digest.as_deref().unwrap(),
+                )
+                .unwrap();
             let request = exec::build_request(
                 dir.path(),
                 dir.path(),
@@ -4272,6 +4374,7 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
                             shell_path,
                             env,
                             linux_scope,
+                            memory_limit_mib,
                             capture_pipeline: false,
                         },
                     )),
@@ -6176,6 +6279,7 @@ async fn bash_status_watch_and_task_line_distinguish_input_capture_from_queueing
             dir.path().into(),
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dir.path().into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -6423,6 +6527,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
             dir.path().into(),
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dir.path().into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -6742,6 +6847,7 @@ fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf)
                 "private-value-proof".into(),
             )]),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dir.into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -7479,6 +7585,7 @@ async fn start_saved_term_ignoring_task(
             storage.into(),
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -8052,6 +8159,7 @@ async fn bash_kill_scope_stops_a_task_that_falls_back_to_local_between_its_passe
             dir.path().into(),
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dir.path().into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -10391,6 +10499,7 @@ fn precommit_remote_handle_failure_removes_layout() {
             dir.path().into(),
             HashMap::new(),
             crate::bash_background::HardKill::Default,
+            None,
             dir.path().into(),
             crate::bash_background::TaskSlot::Foreground,
             true,
@@ -10955,6 +11064,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
             dirs[1].path().into(),
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             dirs[1].path().into(),
             10,
             true,

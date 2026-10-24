@@ -114,6 +114,20 @@ function findTraceEvent(eventName: string): Record<string, unknown> | undefined 
 }
 
 describe("OpenCode background notifications", () => {
+  test("failed memory-cap completion shows its reason without a capture warning", () => {
+    const reason = "Command stopped: exceeded the 64 MiB memory cap (test enforcement).";
+    expect(
+      formatSystemReminder([
+        {
+          task_id: "bash-memory",
+          command: "allocate",
+          status: "failed",
+          exit_code: 137,
+          status_reason: reason,
+        },
+      ]),
+    ).toContain(reason);
+  });
   test("PTY incomplete capture completion reminder preserves exit code and shows warning", () => {
     const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
     for (const exitCode of [0, 17]) {

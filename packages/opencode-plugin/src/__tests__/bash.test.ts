@@ -659,6 +659,22 @@ describe("OpenCode bash adapter", () => {
     expect(ask).not.toHaveBeenCalled();
   });
 
+  test("a memory cap refuses uncontained host fallback before asking", async () => {
+    const ask = mockAsk();
+    const { tool: bash } = createHarness(
+      () => {
+        throw new BridgeTransportUnavailableError("offline");
+      },
+      undefined,
+      false,
+      { bash: { host_fallback: true, memory_limit_mib: 64 } } as PluginContext["config"],
+    );
+    await expect(
+      bash.execute({ command: "printf should-not-run" }, createMockSdkContext({ ask })),
+    ).rejects.toThrow("bash.memory_limit_mib");
+    expect(ask).not.toHaveBeenCalled();
+  });
+
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
     const ask = mockAsk();
     const { tool: bash } = createHarness(

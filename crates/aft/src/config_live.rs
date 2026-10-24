@@ -932,6 +932,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("bash.compress", experimental_bash_compress);
     later!("bash.background", experimental_bash_background);
     live!("bash.linux_scope", bash.linux_scope);
+    live!("bash.memory_limit_mib", bash.memory_limit_mib);
     live!("bash.disclaim_privacy", bash.disclaim_privacy);
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
     live!("bash.host_fallback", bash.host_fallback);
@@ -1078,6 +1079,7 @@ fn classification_is_exhaustive(config: &Config) {
         watch_sync_max_ms: _,
         worker_wait_max_ms: _,
         linux_scope: _,
+        memory_limit_mib: _,
         disclaim_privacy: _,
         powershell_tool: _,
         env: _,

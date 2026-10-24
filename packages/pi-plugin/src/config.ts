@@ -371,6 +371,7 @@ export interface BashConfig {
    * config error.
    */
   worker_wait_max_ms?: number;
+  memory_limit_mib?: number;
   /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   linux_scope?: boolean;
   /** macOS agent commands do not inherit the supervisor's privacy grants. Default false. */
@@ -553,6 +554,8 @@ export interface ResolvedBashConfig {
   watch_sync_max_ms: number;
   /** Longest a delegated worker's wait blocks (ms). Defaults to 1800000; at least 60000. */
   worker_wait_max_ms: number;
+  /** Aggregate local-command ceiling in MiB; projects may only tighten it. */
+  memory_limit_mib?: number;
   /** Manual PowerShell registration fallback. Default false. */
   powershell_tool: boolean;
   /** User-configured environment; never populated from a project tier. */
@@ -642,6 +645,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     worker_wait_max_ms:
       (typeof top === "object" && top !== null ? top.worker_wait_max_ms : undefined) ??
       DEFAULT_WORKER_WAIT_MAX_MS,
+    memory_limit_mib: typeof top === "object" && top !== null ? top.memory_limit_mib : undefined,
     powershell_tool:
       typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
     env: typeof top === "object" && top !== null ? { ...(top.env ?? {}) } : {},
@@ -932,6 +936,7 @@ const BashFeaturesSchema = z.object({
     })
     .optional(),
   /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  memory_limit_mib: z.number().int().min(1).max(4_294_967_295).optional(),
   linux_scope: z.boolean().optional(),
   disclaim_privacy: z.boolean().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
@@ -1309,6 +1314,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       config.bash.db_schema_hints !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.worker_wait_max_ms !== undefined ||
+      config.bash.memory_limit_mib !== undefined ||
       config.bash.disclaim_privacy !== undefined ||
       config.bash.powershell_tool !== undefined ||
       config.bash.env !== undefined)
@@ -1335,6 +1341,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.watch_sync_max_ms !== undefined
         ? { watch_sync_max_ms: config.bash.watch_sync_max_ms }
+        : {}),
+      ...(config.bash.memory_limit_mib !== undefined
+        ? { memory_limit_mib: config.bash.memory_limit_mib }
         : {}),
       ...(config.bash.worker_wait_max_ms !== undefined
         ? { worker_wait_max_ms: config.bash.worker_wait_max_ms }
@@ -1879,7 +1888,13 @@ function mergeBashConfig(
     return { ...(value ?? {}) };
   };
 
-  return { ...expand(baseBash), ...expand(overrideBash) };
+  const base = expand(baseBash);
+  const override = expand(overrideBash);
+  const merged = { ...base, ...override };
+  if (typeof base.memory_limit_mib === "number" && typeof override.memory_limit_mib === "number") {
+    merged.memory_limit_mib = Math.min(base.memory_limit_mib, override.memory_limit_mib);
+  }
+  return merged;
 }
 
 function mergeExperimentalConfig(

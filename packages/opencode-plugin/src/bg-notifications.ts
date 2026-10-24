@@ -2444,9 +2444,10 @@ function formatCompletion(completion: BgCompletion): string {
   const descendantWarning = completion.live_descendants_summary
     ? `    ${completion.live_descendants_summary}`
     : "";
-  const captureWarning = completion.output_incomplete
-    ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
-    : "";
+  const captureWarning =
+    completion.output_incomplete || (completion.status === "failed" && completion.status_reason)
+      ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
+      : "";
   return [
     header,
     captureWarning,

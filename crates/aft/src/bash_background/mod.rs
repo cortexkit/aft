@@ -7,6 +7,7 @@ pub mod buffer;
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
+mod memory_limit;
 pub mod output;
 pub mod persistence;
 pub mod process;
@@ -1260,6 +1261,7 @@ pub(crate) fn spawn(
             workdir.clone(),
             env.clone(),
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir.clone(),
             slot,
             notify_on_completion,
@@ -1285,6 +1287,7 @@ pub(crate) fn spawn(
             workdir,
             env,
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -1303,6 +1306,7 @@ pub(crate) fn spawn(
             workdir,
             env,
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir,
             slot,
             notify_on_completion,

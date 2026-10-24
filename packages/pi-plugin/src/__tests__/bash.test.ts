@@ -1450,6 +1450,29 @@ describe("bash tool adapter", () => {
     expect(confirmations).toHaveLength(0);
   });
 
+  test("a memory cap refuses uncontained host fallback before asking", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const bridge = {
+      send: async () => {
+        throw new BridgeTransportUnavailableError("offline");
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        bash: { host_fallback: true, memory_limit_mib: 64 },
+      } as PluginContext["config"]),
+    );
+    await expect(
+      tools
+        .get("bash")!
+        .execute("call", { command: "printf should-not-run" }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: false,
+        }),
+    ).rejects.toThrow("bash.memory_limit_mib");
+  });
+
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
     const tools = new Map<string, MockToolDef>();
     const confirmations: unknown[] = [];

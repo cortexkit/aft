@@ -264,6 +264,37 @@ impl WindowsShell {
             WindowsShell::Cmd | WindowsShell::Posix(_) => script.into_bytes(),
         }
     }
+
+    pub(crate) fn memory_gated_wrapper_bytes(&self, command: &str, exit_path: &Path) -> Vec<u8> {
+        let gate = match self {
+            // PowerShell console reads can block during ConPTY initialization.
+            // A private file gate leaves terminal input available for the command.
+            Self::Pwsh | Self::Powershell => format!("$aftMemoryDeadline = [DateTime]::UtcNow.AddSeconds(30)\r\nwhile (-not (Test-Path -LiteralPath '{}')) {{ if ([DateTime]::UtcNow -ge $aftMemoryDeadline) {{ exit 125 }}; Start-Sleep -Milliseconds 10 }}\r\n", memory_gate_path(exit_path).display().to_string().replace('\'', "''")),
+            Self::Cmd => "@set /p _aft_memory_ready=\r\n@if not \"%_aft_memory_ready%\"==\"aft-memory-ready\" exit /B 125\r\n".into(),
+            Self::Posix(_) => "read -r _aft_memory_ready && [ \"$_aft_memory_ready\" = aft-memory-ready ] || exit 125\n".into(),
+        };
+        let script = format!("{gate}{}", self.wrapper_script(command, exit_path));
+        let mut bytes = if matches!(self, Self::Pwsh | Self::Powershell) {
+            vec![0xEF, 0xBB, 0xBF]
+        } else {
+            Vec::new()
+        };
+        bytes.extend_from_slice(script.as_bytes());
+        bytes
+    }
+
+    pub(crate) fn uses_memory_file_gate(&self) -> bool {
+        matches!(self, Self::Pwsh | Self::Powershell)
+    }
+}
+
+fn memory_gate_path(exit_path: &Path) -> PathBuf {
+    exit_path.with_extension("memory-ready")
+}
+
+pub(crate) fn release_memory_file_gate(exit_path: &Path) -> Result<(), String> {
+    crate::private_storage::write(&memory_gate_path(exit_path), b"")
+        .map_err(|error| format!("memory cap launch gate failed: {error}"))
 }
 
 /// All Windows shells that the PATH probe believes are reachable, returned

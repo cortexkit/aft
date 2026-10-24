@@ -455,6 +455,8 @@ pub struct RawBashFeatures {
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
+    #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
+    pub memory_limit_mib: Option<u64>,
     pub disclaim_privacy: Option<bool>,
     pub powershell_tool: Option<bool>,
     pub env: Option<BTreeMap<String, String>>,
@@ -1757,7 +1759,18 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.search = merge_project_search(base.search.take(), project.search);
     base.lsp = merge_lsp_config(base.lsp.take(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.take(), project.experimental);
-    base.bash = merge_bash_config(base.bash.take(), project_safe_bash(project.bash));
+    let ceiling = base
+        .bash
+        .as_ref()
+        .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib);
+    let mut project_bash = project_safe_bash(project.bash);
+    if let Some(RawBash::Features(features)) = &mut project_bash {
+        features.memory_limit_mib = match (ceiling, features.memory_limit_mib) {
+            (Some(user), Some(project)) => Some(user.min(project)),
+            (_, value) => value,
+        };
+    }
+    base.bash = merge_bash_config(base.bash.take(), project_bash);
     base.inspect = merge_inspect_config(base.inspect.take(), project.inspect);
     base.idle = merge_idle_config(base.idle.take(), project.idle);
     base.worktree = merge_worktree_config(base.worktree.take(), project.worktree);
@@ -2072,6 +2085,65 @@ fn runon_safety_switch_is_user_only_and_defaults_off() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn bash_memory_limit_parses_and_project_cannot_raise_it() {
+    let resolve = |user: &str, project: &str| {
+        serde_json::to_value(
+            resolve_config(&[
+                ConfigTier {
+                    tier: "user".into(),
+                    source: "user.jsonc".into(),
+                    doc: user.into(),
+                },
+                ConfigTier {
+                    tier: "project".into(),
+                    source: "project.jsonc".into(),
+                    doc: project.into(),
+                },
+            ])
+            .config
+            .bash,
+        )
+        .unwrap()["memory_limit_mib"]
+            .clone()
+    };
+    assert_eq!(
+        resolve(r#"{"bash":{"memory_limit_mib":64}}"#, "{}"),
+        serde_json::json!(64)
+    );
+    assert_eq!(
+        resolve(
+            r#"{"bash":{"memory_limit_mib":64}}"#,
+            r#"{"bash":{"memory_limit_mib":128}}"#
+        ),
+        serde_json::json!(64)
+    );
+    assert_eq!(
+        resolve(
+            r#"{"bash":{"memory_limit_mib":64}}"#,
+            r#"{"bash":{"memory_limit_mib":32}}"#
+        ),
+        serde_json::json!(32)
+    );
+    for project in [r#"{"bash":false}"#, r#"{"bash":{"memory_limit_mib":null}}"#] {
+        assert_eq!(
+            resolve(r#"{"bash":{"memory_limit_mib":64}}"#, project),
+            serde_json::json!(64)
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bash_memory_limit_rejects_invalid_values() {
+    assert!(resolve_config(&[]).config.bash.memory_limit_mib.is_none());
+    for value in ["0", "-1", "1.5", "true", "\"4GB\"", "4294967296"] {
+        let doc = format!("{{\"bash\":{{\"memory_limit_mib\":{value}}}}}");
+        assert!(serde_json::from_str::<RawAftConfig>(&doc).is_err(), "{doc}");
+    }
+}
+
 fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
     match (base, override_bash) {
         (None, None) => None,
@@ -2111,6 +2183,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                     .worker_wait_max_ms
                     .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
+                memory_limit_mib: override_features.memory_limit_mib.or(base.memory_limit_mib),
                 disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
                 env: override_features.env.or(base.env),
@@ -2140,6 +2213,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             watch_sync_max_ms: None,
             worker_wait_max_ms: None,
             linux_scope: None,
+            memory_limit_mib: None,
             disclaim_privacy: None,
             powershell_tool: None,
             env: None,
@@ -2274,6 +2348,16 @@ fn record_resource_loosening(
         }
     }
     const REASON: &str = "resource: project settings may only tighten the user budget";
+    let cap = |raw: &RawAftConfig| {
+        raw.bash
+            .as_ref()
+            .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib)
+    };
+    if let (Some(user), Some(project)) = (cap(base), cap(project)) {
+        if project > user {
+            push_drop(dropped, "bash.memory_limit_mib", tier, REASON);
+        }
+    }
     if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
         let floor = base
             .lsp
@@ -3035,6 +3119,7 @@ struct ResolvedBashConfig {
     watch_sync_max_ms: u64,
     worker_wait_max_ms: u64,
     linux_scope: bool,
+    memory_limit_mib: Option<u64>,
     disclaim_privacy: bool,
     powershell_tool: bool,
     env: BTreeMap<String, String>,
@@ -3054,6 +3139,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
+    config.bash.memory_limit_mib = bash.memory_limit_mib;
     config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
     config.bash.env = bash.env;
@@ -3139,6 +3225,7 @@ fn resolve_bash_config(
         watch_sync_max_ms,
         worker_wait_max_ms,
         linux_scope: top_linux_scope,
+        memory_limit_mib: top_features.and_then(|features| features.memory_limit_mib),
         disclaim_privacy: top_features
             .and_then(|features| features.disclaim_privacy)
             .unwrap_or(false),
@@ -3355,6 +3442,19 @@ where
         Some(0) => Err(de::Error::custom("must be a positive integer")),
         other => Ok(other),
     }
+}
+
+fn deserialize_opt_memory_limit_mib<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|value| value == 0 || value > 4_294_967_295) {
+        return Err(serde::de::Error::custom(
+            "expected memory limit in MiB from 1 to 4294967295",
+        ));
+    }
+    Ok(value)
 }
 
 fn deserialize_opt_positive_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
