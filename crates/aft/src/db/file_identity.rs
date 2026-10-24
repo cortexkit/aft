@@ -355,6 +355,22 @@ pub(crate) struct IdentityConnection {
 }
 
 impl IdentityConnection {
+    pub(crate) fn open_census(path: &Path, seam: &'static str) -> rusqlite::Result<Self> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, flags)?;
+        let connection = rusqlite::Connection::open_with_flags(
+            crate::db::lifecycle::census_open_path(path)?,
+            flags,
+        )?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        Ok(Self::new(connection, seam))
+    }
+
     pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
         super::lifecycle::production_write_gate(path.as_ref())?;
         let _guard = filesystem_guard();
@@ -920,6 +936,40 @@ mod tests {
         );
         drop(connection);
         assert_eq!(open_connections(&path), 0);
+    }
+
+    #[test]
+    fn census_connection_tracks_identity_without_creating_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("census.sqlite");
+        {
+            let connection = IdentityConnection::open(&path, "census fixture").unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .unwrap();
+            connection
+                .execute_batch("CREATE TABLE value (n INTEGER); INSERT INTO value VALUES (7);")
+                .unwrap();
+        }
+        assert_eq!(open_connections(&path), 0);
+        let before = std::fs::read(&path).unwrap();
+        let connection = IdentityConnection::open_census(&path, "census test").unwrap();
+        assert_eq!(
+            open_connections(&path),
+            1,
+            "URI opens must retain the real file identity"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT n FROM value", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+        drop(connection);
+        assert_eq!(open_connections(&path), 0);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[cfg(unix)]

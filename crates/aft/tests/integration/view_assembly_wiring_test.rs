@@ -593,6 +593,9 @@ fn killed_off_barrier_build_preserves_pointer_and_sweeps_generation() {
     .unwrap()
     .generation
     .unwrap();
+    // Drain the initial publication before testing who reclaims the killed
+    // build; otherwise its delayed checkpoint cleanup can legitimately win.
+    aft::views::wait_for_generation_maintenance_for_test(&storage.path().join("views/crash-view"));
     fs::write(project.path().join("tracked.rs"), "pub fn partial() {}\n").unwrap();
     commit(project.path(), "partial");
     let mut child = Command::new(std::env::current_exe().unwrap())

@@ -275,6 +275,26 @@ pub struct FamilyRegistry {
     inner: Arc<RegistryInner>,
 }
 
+/// A cleanup job keeps identity, not a publisher's writable connection alive.
+#[derive(Clone, Debug)]
+pub(crate) struct RegistryLocation {
+    storage: PathBuf,
+    family: String,
+    durable: Option<PathBuf>,
+}
+
+impl RegistryLocation {
+    pub(crate) fn open_for_sweep(&self) -> RegistryResult<Option<FamilyRegistry>> {
+        let registry = FamilyRegistry::open_existing_isolated(&self.storage, &self.family, false)?;
+        if let (Some(registry), Some(durable)) = (&registry, &self.durable) {
+            registry
+                .bind_durable_storage(durable)
+                .map_err(RegistryError::from)?;
+        }
+        Ok(registry)
+    }
+}
+
 impl FamilyRegistry {
     /// Opens the registry, creating it when absent.
     pub fn open(storage: &Path, family: &str) -> RegistryResult<Self> {
@@ -291,6 +311,69 @@ impl FamilyRegistry {
             return Ok(None);
         }
         Self::open_path(storage, family, path, false).map(Some)
+    }
+
+    pub(crate) fn location(&self) -> RegistryLocation {
+        RegistryLocation {
+            storage: self.storage().to_path_buf(),
+            family: self.family().to_owned(),
+            durable: self.durable_storage(),
+        }
+    }
+
+    pub(crate) fn open_existing_read_only(
+        storage: &Path,
+        family: &str,
+    ) -> RegistryResult<Option<Self>> {
+        Self::open_existing_isolated(storage, family, true)
+    }
+
+    fn open_existing_isolated(
+        storage: &Path,
+        family: &str,
+        read_only: bool,
+    ) -> RegistryResult<Option<Self>> {
+        let path = family_dir(storage, family)?.join(REGISTRY_FILE);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        crate::root_cache::check_cache_access(&path)?;
+        let flags = if read_only {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        };
+        let connection = if read_only {
+            TrackedConnection::open_census(&path, SqliteStore::BlobStore)?
+        } else {
+            TrackedConnection::open_path_with_flags(
+                &path,
+                flags
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                SqliteStore::BlobStore,
+            )?
+        };
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        connection.busy_timeout(Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS))?;
+        check_schema(&connection)?;
+        // Isolated maintenance handles never flush a publisher's deferred
+        // session updates, and closing them never checkpoints unrelated data.
+        Ok(Some(Self {
+            inner: Arc::new(RegistryInner {
+                storage: storage.to_path_buf(),
+                durable_storage: Mutex::new(None),
+                family: family.to_owned(),
+                path,
+                connection: Mutex::new(connection),
+                budget: Mutex::new(super::eviction::DiskBudget::default()),
+                size_caches: Mutex::default(),
+                ended_sessions: Mutex::new(Vec::new()),
+            }),
+        }))
     }
 
     fn open_path(
@@ -988,7 +1071,8 @@ impl ViewRegistration {
 
     /// The view's own pointer and manifests in `views/v2/<scope>`.
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
-        Ok(super::ViewStore::open_dir(self.view_dir.clone())?)
+        Ok(super::ViewStore::open_dir(self.view_dir.clone())?
+            .with_sweep_registry(self.registry.clone()))
     }
 
     /// Runs `create` inside the registry's handoff barrier, after confirming
@@ -1314,6 +1398,149 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_only_cleanup_does_not_retain_writers_or_change_closed_storage() {
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut files = std::collections::BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(dir) = pending.pop() {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        files.insert(
+                            entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                            fs::read(entry.path()).unwrap(),
+                        );
+                    }
+                }
+            }
+            files
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "quiescent",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let view_dir = view.view_dir().to_path_buf();
+        let pointer = view.pointer_path();
+        let registry_path = registry.path().to_path_buf();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let _hook = crate::storage_retention::observe_test_hook(
+            &view_dir,
+            Arc::new(move |step| {
+                if step == "post-publication-sweep" {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }),
+        );
+        let manifest =
+            crate::views::manifest_v2::ManifestV2::new(crate::views::manifest_v2::ManifestHeader {
+                producers: crate::views::manifest_v2::Producers {
+                    trigram: "t".into(),
+                    semantic: None,
+                    callgraph: "c".into(),
+                },
+                head_tree: None,
+                ignore_fingerprint: None,
+                segment: None,
+            });
+        let name = crate::views::manifest_v2::GenerationName::for_manifest(&manifest).unwrap();
+        view.commit_v2(view.prepare_v2(&name, None, &manifest, None).unwrap(), None)
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(view);
+        drop(registration);
+        drop(registry);
+        let writers_closed = crate::db::file_identity::open_connections(&registry_path) == 0
+            && crate::db::file_identity::open_connections(&pointer) == 0;
+        // No raw descriptor is used until every writer has closed.
+        let before = writers_closed.then(|| snapshot(storage.path()));
+        release_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
+        assert!(
+            writers_closed,
+            "background cleanup retained a publisher's writable registry"
+        );
+        let before = before.unwrap();
+        let after = snapshot(storage.path());
+        let changed: std::collections::BTreeSet<_> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "current-only cleanup changed unrelated storage: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn v2_generation_sweep_holds_registry_barrier_during_unlink() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let registry = FamilyRegistry::open(storage.path(), "0123456789abcdef").unwrap();
+        let registration = registry
+            .register_view_with_storage(storage.path(), "barrier", &root)
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"obsolete").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-delete"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }),
+        );
+        super::super::generation::schedule_generation_sweep(view.clone());
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let held = {
+            let mut connection = registry.connection();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            let blocked = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .err()
+                .is_some_and(|error| {
+                    error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                });
+            connection
+                .busy_timeout(Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS))
+                .unwrap();
+            blocked
+        };
+        release_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(held, "V2 unlink must exclude registry pin admission");
+        assert!(!old.exists());
+    }
 
     #[test]
     fn registration_is_idempotent_and_readers_leave_on_drop() {

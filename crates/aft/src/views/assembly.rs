@@ -130,6 +130,8 @@ pub struct PreparedAssembly {
     /// That row once the generation is published, waiting for
     /// `settle_status` to write it outside the publisher's commit barrier.
     committed_index_entry: Option<IndexEntry>,
+    committed_sweep: Option<ViewStore>,
+    post_publication_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -412,7 +414,7 @@ impl PreparedAssembly {
                             identity,
                         });
                     }
-                    self.files = None;
+                    self.committed_sweep = self.files.take().map(|(view, _)| view);
                     if retires_legacy_plane {
                         log::info!(
                             "views: root={} legacy plane retired at generation={}",
@@ -429,6 +431,9 @@ impl PreparedAssembly {
                             path,
                             connection,
                             self.profile.root.clone(),
+                            self.committed_sweep.clone().map(|view| {
+                                (view, std::sync::Arc::clone(&self.post_publication_ready))
+                            }),
                         );
                     }
                     self.profile.outcome = "published";
@@ -487,6 +492,15 @@ impl PreparedAssembly {
     /// earned (see [`IndexEntry::write`]), for the same reason: that write
     /// opens a shared SQLite file and may wait on another process.
     pub fn settle_status(&mut self) -> SettleOutcome {
+        if let Some(view) = self.committed_sweep.take() {
+            // The commit barrier is released before settlement. Release the
+            // assembly's pins too, so cleanup does not retain its old base.
+            self.pin.take();
+            self._base_pin.take();
+            self.post_publication_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            super::generation::schedule_generation_sweep(view);
+        }
         if let Some(entry) = self.committed_index_entry.take() {
             // `commit` has already closed the publication's I/O phases, so this
             // write is measured as its own interval and added to the same
@@ -960,6 +974,8 @@ pub fn prepare_checkout_deferring(
         derived_checkpoint: None,
         derived_index_entry: None,
         committed_index_entry: None,
+        committed_sweep: None,
+        post_publication_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
@@ -3168,6 +3184,182 @@ mod status_settlement_tests {
 
     fn pending(storage: &Path) -> usize {
         status(storage).summary().unwrap().pending_count
+    }
+
+    #[test]
+    fn views_post_publication_sweep_bounds_independent_generations() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let mut generations = Vec::new();
+        for index in 0..6 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let report = publish_checkout(&request(&root, storage.path(), "head")).unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            super::super::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            let remaining: Vec<_> = generations
+                .iter()
+                .filter(|generation| view.manifest_path(generation).unwrap().exists())
+                .collect();
+            assert_eq!(
+                remaining,
+                vec![generations.last().unwrap()],
+                "obsolete generations accumulated after commit {index}"
+            );
+            let databases = fs::read_dir(view.view_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("derived-") && name.ends_with(".sqlite"))
+                .count();
+            assert_eq!(
+                databases, 1,
+                "obsolete derived databases accumulated after commit {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn views_post_publication_sweep_catches_up_with_backlogged_publications() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            std::sync::Arc::new(move |step| {
+                if step == "post-publication-sweep"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                }
+            }),
+        );
+        let mut generations = Vec::new();
+        for index in 0..8 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut prepared =
+                prepare_checkout(&request(&root, storage.path(), "head"), &mut |_| Ok(())).unwrap();
+            // Only publication requests drive this fixture's cleanup; no
+            // checkpoint-close retry can conceal a lost pending request.
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            prepared.settle_status();
+            if index == 0 {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        assert!(generations
+            .iter()
+            .all(|generation| view.manifest_path(generation).unwrap().exists()));
+        release_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        for generation in &generations[..generations.len() - 1] {
+            assert!(
+                !view.manifest_path(generation).unwrap().exists(),
+                "backlogged generation survived: {generation}"
+            );
+            assert!(!view.derived_path(generation).unwrap().exists());
+        }
+        assert!(view
+            .derived_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn views_post_publication_sweep_runs_after_settlement_without_checkpoint() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        for index in 0..4 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut request = request(&root, storage.path(), &format!("head-{index}"));
+            request.callgraph = false;
+            let obsolete = view.trigram_path(&format!("unheld-{index}")).unwrap();
+            fs::write(&obsolete, b"obsolete trigram").unwrap();
+            let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+            // Exercise settlement's dispatch without a deferred keeper-close
+            // worker from this or a previous iteration also requesting cleanup.
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            assert!(
+                obsolete.exists(),
+                "cleanup started before the publisher released its commit barrier"
+            );
+            prepared.settle_status();
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            assert!(
+                !obsolete.exists(),
+                "settlement did not schedule post-publication cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn views_post_publication_sweep_preserves_pins_and_readers_until_released() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let publish = |index| {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let report = publish_checkout(&request(&root, storage.path(), "head")).unwrap();
+            assert!(report.published);
+            super::super::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            report.generation.unwrap()
+        };
+        let pinned = publish(0);
+        let pin = crate::pins::QueryPin::acquire(view.view_dir(), &pinned).unwrap();
+        let read = publish(1);
+        let reader = crate::root_cache::ReadMarker::create(view.view_dir(), &read).unwrap();
+        let current = publish(2);
+        for generation in [&pinned, &read, &current] {
+            assert!(view.manifest_path(generation).unwrap().exists());
+            assert!(view.derived_path(generation).unwrap().exists());
+        }
+        drop(pin);
+        drop(reader);
+        publish(3);
+        for generation in [&pinned, &read, &current] {
+            assert!(!view.manifest_path(generation).unwrap().exists());
+            assert!(!view.derived_path(generation).unwrap().exists());
+        }
     }
 
     /// A skip recorded for the served generation stays while a publication

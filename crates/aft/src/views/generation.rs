@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{
     de::{Error as _, SeqAccess, Visitor},
     Deserialize, Deserializer,
@@ -21,6 +21,107 @@ use super::{Result, ViewError, ViewStore};
 
 // Protection scans must finish within one common allowance before any unlink.
 const GENERATION_DIRECTORY_LIMIT: usize = 65_536;
+
+#[derive(Debug, Default)]
+pub(crate) struct GenerationSweep {
+    pub removed_generations: usize,
+    pub removed_bytes: u64,
+}
+
+impl GenerationSweep {
+    fn add(&mut self, other: Self) {
+        self.removed_generations += other.removed_generations;
+        self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
+    }
+}
+
+// Stat, rather than opening the file: a second descriptor on a live SQLite
+// inode can invalidate its process's locks when that descriptor is closed.
+fn unlink_generation_file(path: &Path) -> Option<u64> {
+    let bytes = fs::symlink_metadata(path).ok()?.len();
+    fs::remove_file(path).ok()?;
+    Some(bytes)
+}
+
+// A view has at most one cleanup worker. Publications arriving during a sweep
+// request another lap rather than starting competing pointer transactions.
+static GENERATION_SWEEPS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+static GENERATION_SWEEP_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
+
+pub(super) fn schedule_generation_sweep(view: ViewStore) {
+    let path = view.view_dir().to_path_buf();
+    let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut jobs = jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = jobs.get_mut(&path) {
+            *pending = true;
+            return;
+        }
+        jobs.insert(path.clone(), false);
+    }
+    let failed_path = path.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("aft-view-generation-sweep".into())
+        .spawn(move || loop {
+            #[cfg(test)]
+            crate::storage_retention::test_hook(&path, "post-publication-sweep");
+            // An obsolete .ref protects its owner for the whole first census.
+            // A second complete census can reclaim that now-unreferenced owner.
+            match view.sweep_generations_with_bytes().and_then(|mut removed| {
+                removed.add(view.sweep_generations_with_bytes()?);
+                Ok(removed)
+            }) {
+                Ok(removed) => log::info!(
+                    "views: post-publication removed_generations={} removed_bytes={} view={}",
+                    removed.removed_generations,
+                    removed.removed_bytes,
+                    path.display()
+                ),
+                Err(error) => log::warn!(
+                    "views: post-publication generation sweep deferred view={} error={error}",
+                    path.display()
+                ),
+            }
+            let mut jobs = jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if jobs
+                .get_mut(&path)
+                .is_some_and(|pending| std::mem::take(pending))
+            {
+                continue;
+            }
+            jobs.remove(&path);
+            GENERATION_SWEEP_SETTLED.notify_all();
+            break;
+        })
+    {
+        jobs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&failed_path);
+        GENERATION_SWEEP_SETTLED.notify_all();
+        log::warn!(
+            "views: generation sweep worker unavailable view={} error={error}",
+            failed_path.display()
+        );
+    }
+}
+
+pub(crate) fn wait_for_generation_sweep_for_test(path: &Path) {
+    let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
+    let (jobs, timeout) = GENERATION_SWEEP_SETTLED
+        .wait_timeout_while(jobs.lock().unwrap(), Duration::from_secs(20), |jobs| {
+            jobs.contains_key(path)
+        })
+        .unwrap();
+    assert!(
+        !timeout.timed_out() && !jobs.contains_key(path),
+        "generation sweep did not settle: {}",
+        path.display()
+    );
+}
 
 fn generation_directory_entries(directory: &Path, limit: usize) -> Result<Vec<fs::DirEntry>> {
     let entries = fs::read_dir(directory)?
@@ -250,21 +351,188 @@ impl ViewStore {
     /// Remove generation files only after checking both durable publication and
     /// liveness. A dead assembler can leave a derived file before any manifest.
     pub fn sweep_generations(&self) -> Result<usize> {
-        self.sweep_generations_impl(false)
+        self.sweep_generations_with_bytes()
+            .map(|removed| removed.removed_generations)
     }
 
-    pub(crate) fn sweep_generations_locked(&self) -> Result<usize> {
-        self.sweep_generations_impl(true)
+    pub(crate) fn sweep_generations_with_bytes(&self) -> Result<GenerationSweep> {
+        // Most publications have no obsolete files. A read-only preflight
+        // avoids opening writable coordination handles just to discover that.
+        if !self.has_superseded_artifacts()? {
+            return Ok(GenerationSweep::default());
+        }
+        if let Some(registry) = self.generation_sweep_registry()? {
+            // V2 pin admission takes the registry before the view pointer.
+            // Keep that order and hold the barrier through protection checks
+            // and unlink, just as the family collector does.
+            return registry
+                .with_barrier(|tx| {
+                    let scope = self
+                        .view_dir()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let registered_dir: Option<String> = tx
+                        .query_row(
+                            "SELECT view_dir FROM members WHERE scope = ?1",
+                            [scope.as_ref()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    // SQLite compares text literally, but Windows registration
+                    // and traversal can spell the same directory differently.
+                    // Compare complete normalized paths, not string prefixes.
+                    let registered = registered_dir.is_some_and(|directory| {
+                        crate::production_storage::comparison_key(
+                            Path::new(&directory),
+                            cfg!(windows),
+                        ) == crate::production_storage::comparison_key(
+                            self.view_dir(),
+                            cfg!(windows),
+                        )
+                    });
+                    if !registered {
+                        return Ok(GenerationSweep::default());
+                    }
+                    self.sweep_generations_locked()
+                        .map_err(super::registry::RegistryError::View)
+                })
+                .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())));
+        }
+        self.sweep_generations_bounded(false, GENERATION_DIRECTORY_LIMIT)
     }
 
-    fn sweep_generations_impl(&self, admission_locked: bool) -> Result<usize> {
-        self.sweep_generations_bounded(admission_locked, GENERATION_DIRECTORY_LIMIT)
+    fn sweep_generations_locked(&self) -> Result<GenerationSweep> {
+        self.sweep_generations_bounded(true, GENERATION_DIRECTORY_LIMIT)
     }
 
-    fn sweep_generations_bounded(&self, admission_locked: bool, limit: usize) -> Result<usize> {
+    fn generation_sweep_registry(&self) -> Result<Option<super::registry::FamilyRegistry>> {
+        if let Some(registry) = &self.sweep_registry {
+            return registry
+                .open_for_sweep()
+                .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?
+                .map(Some)
+                .ok_or_else(|| ViewError::InvalidManifest("V2 sweep registry disappeared".into()));
+        }
+        let Some(v2) = self
+            .view_dir()
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "v2"))
+        else {
+            return Ok(None);
+        };
+        let views = v2
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "views"))
+            .ok_or_else(|| ViewError::InvalidManifest("V2 view has no views root".into()))?;
+        let storage = views
+            .parent()
+            .ok_or_else(|| ViewError::InvalidManifest("V2 view has no storage root".into()))?;
+        // Registered publishers and the retention lane carry their registry.
+        // Resolve only raw V2 stores here; never sweep an unregistered V2 view
+        // using V1's unrelated retention barrier.
+        for entry in
+            generation_directory_entries(&storage.join("blobs/v2"), GENERATION_DIRECTORY_LIMIT)?
+        {
+            if !entry.file_type()?.is_dir()
+                || !entry.path().join(super::registry::REGISTRY_FILE).is_file()
+            {
+                continue;
+            }
+            let family = entry.file_name().to_string_lossy().into_owned();
+            let scope = self
+                .view_dir()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let found = (|| -> super::registry::RegistryResult<_> {
+                let Some(registry) =
+                    super::registry::FamilyRegistry::open_existing_read_only(storage, &family)?
+                else {
+                    return Ok(None);
+                };
+                let member = registry.member(&scope)?;
+                Ok(member
+                    .filter(|member| member.view_dir == self.view_dir())
+                    .map(|_| registry.location()))
+            })()
+            .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?;
+            if found.is_some() {
+                return found
+                    .unwrap()
+                    .open_for_sweep()
+                    .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?
+                    .map(Some)
+                    .ok_or_else(|| {
+                        ViewError::InvalidManifest("V2 sweep registry disappeared".into())
+                    });
+            }
+        }
+        Err(ViewError::InvalidManifest(format!(
+            "V2 view has no registry: {}",
+            self.view_dir().display()
+        )))
+    }
+
+    fn has_superseded_artifacts(&self) -> Result<bool> {
+        let connection = crate::db::file_identity::IdentityConnection::open_census(
+            &self.pointer_path(),
+            "views::generation::census_pointer",
+        )?;
+        let current: String = connection.query_row(
+            "SELECT generation FROM pointer WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current = (!current.is_empty()).then_some(current);
+        drop(connection);
+        for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let generation = name
+                .strip_prefix("derived-")
+                .and_then(|name| {
+                    name.strip_suffix(".sqlite")
+                        .or_else(|| name.strip_suffix(".ref"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("manifest-")
+                        .and_then(|name| name.strip_suffix(".json"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("trigram-")
+                        .and_then(|name| name.strip_suffix(".bin"))
+                })
+                .or_else(|| {
+                    name.strip_prefix(".manifest-").and_then(|name| {
+                        name.split_once(".json.tmp.")
+                            .map(|(generation, _)| generation)
+                    })
+                });
+            if generation.is_some_and(|generation| current.as_deref() != Some(generation)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn sweep_generations_bounded(
+        &self,
+        admission_locked: bool,
+        limit: usize,
+    ) -> Result<GenerationSweep> {
         // A publisher cannot add a reference after the ownership snapshot and
         // release its base pin before the sweep checks that pin.
-        let mut pointer = self.open_pointer_connection()?;
+        let mut pointer = crate::db::file_identity::IdentityConnection::open_with_flags(
+            self.pointer_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "views::generation::sweep_pointer",
+        )?;
+        pointer.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        pointer.busy_timeout(super::POINTER_BUSY_TIMEOUT)?;
         let ownership =
             pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current: String = ownership.query_row(
@@ -314,7 +582,7 @@ impl ViewStore {
                 generations.insert(generation.to_owned());
             }
         }
-        let mut removed = 0;
+        let mut removed = GenerationSweep::default();
         for generation in generations {
             // Even an obsolete reference protects its owner until the next sweep.
             // This keeps shared files alive without depending on directory order.
@@ -342,8 +610,8 @@ impl ViewStore {
                 if crate::pins::owner_is_live(&metadata.owner) {
                     continue;
                 }
-                let _ = fs::remove_file(metadata_path);
-                let _ = fs::remove_file(keys_path);
+                removed.removed_bytes += unlink_generation_file(&metadata_path).unwrap_or_default();
+                removed.removed_bytes += unlink_generation_file(&keys_path).unwrap_or_default();
             }
             if crate::root_cache::sweep_read_markers(self.view_dir(), &generation).protected {
                 continue;
@@ -353,15 +621,13 @@ impl ViewStore {
             // The pointer write transaction still excludes publication here.
             if let Some(paths) = temporaries.remove(&generation) {
                 for path in paths {
-                    let _ = fs::remove_file(path);
+                    removed.removed_bytes += unlink_generation_file(&path).unwrap_or_default();
                 }
             }
-            if self.try_remove_generation_files_policy(
+            removed.add(self.remove_generation_files_counted(
                 &generation,
                 derived_owners.contains(&generation),
-            ) {
-                removed += 1;
-            }
+            ));
         }
         Ok(removed)
     }
@@ -387,8 +653,18 @@ impl ViewStore {
     }
 
     fn try_remove_generation_files_policy(&self, generation: &str, keep_derived: bool) -> bool {
+        self.remove_generation_files_counted(generation, keep_derived)
+            .removed_generations
+            > 0
+    }
+
+    fn remove_generation_files_counted(
+        &self,
+        generation: &str,
+        keep_derived: bool,
+    ) -> GenerationSweep {
         if super::validate_generation(generation).is_err() {
-            return false;
+            return GenerationSweep::default();
         }
         // The identity registry enforces (rather than merely logs) the same
         // no-unlink-while-open boundary as callgraph generation deletion.
@@ -398,9 +674,10 @@ impl ViewStore {
                 &self.view_dir().join(format!("derived-{generation}.sqlite")),
             ) != 0
         {
-            return false;
+            return GenerationSweep::default();
         }
         let mut removed = false;
+        let mut removed_bytes = 0;
         for path in [
             Ok(self.view_dir().join(format!("derived-{generation}.sqlite"))),
             Ok(self.view_dir().join(format!("derived-{generation}.ref"))),
@@ -433,10 +710,16 @@ impl ViewStore {
             for suffix in suffixes {
                 let mut name = path.as_os_str().to_owned();
                 name.push(suffix);
-                removed |= fs::remove_file(PathBuf::from(name)).is_ok();
+                if let Some(bytes) = unlink_generation_file(&PathBuf::from(name)) {
+                    removed = true;
+                    removed_bytes += bytes;
+                }
             }
         }
-        removed
+        GenerationSweep {
+            removed_generations: usize::from(removed),
+            removed_bytes,
+        }
     }
 }
 
@@ -449,7 +732,6 @@ struct DeferredCheckpointJob {
 static DEFERRED_CHECKPOINTS: OnceLock<Mutex<HashMap<PathBuf, DeferredCheckpointJob>>> =
     OnceLock::new();
 static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-#[cfg(test)]
 static CHECKPOINT_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
 
 #[cfg(test)]
@@ -468,15 +750,17 @@ pub(crate) fn checkpoint_test_hooks() -> &'static Mutex<HashMap<PathBuf, Checkpo
     CHECKPOINT_TEST_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(test)]
 pub(crate) fn wait_for_derived_checkpoint_for_test(view_dir: &Path) {
-    let before_wait = checkpoint_test_hooks()
-        .lock()
-        .unwrap()
-        .get_mut(view_dir)
-        .and_then(|hooks| hooks.before_wait.take());
-    if let Some(before_wait) = before_wait {
-        before_wait();
+    #[cfg(test)]
+    {
+        let before_wait = checkpoint_test_hooks()
+            .lock()
+            .unwrap()
+            .get_mut(view_dir)
+            .and_then(|hooks| hooks.before_wait.take());
+        if let Some(before_wait) = before_wait {
+            before_wait();
+        }
     }
     let jobs = DEFERRED_CHECKPOINTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -573,6 +857,7 @@ pub(super) fn schedule_derived_checkpoint(
     path: PathBuf,
     connection: crate::db::file_identity::IdentityConnection,
     root: PathBuf,
+    cleanup: Option<(ViewStore, Arc<AtomicBool>)>,
 ) {
     let key = path.parent().unwrap_or(&path).to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -624,6 +909,17 @@ pub(super) fn schedule_derived_checkpoint(
             }
             // Include the keeper close: it may checkpoint even a superseded job.
             drop(connection);
+            // A publication sweep may have found this superseded keeper still
+            // open. Retry after closing it; no SQLite descriptor is opened to
+            // inspect the old derived database.
+            if let Some((view, ready)) = cleanup {
+                // Settlement arms cleanup only after releasing the publisher's
+                // locks and pins. If the keeper closed before it was armed,
+                // settlement's own sweep sees that close instead.
+                if ready.load(Ordering::Acquire) {
+                    schedule_generation_sweep(view);
+                }
+            }
             #[cfg(test)]
             {
                 let before_settled = checkpoint_test_hooks()
@@ -656,7 +952,6 @@ pub(super) fn schedule_derived_checkpoint(
             {
                 jobs.remove(&key);
             }
-            #[cfg(test)]
             CHECKPOINT_SETTLED.notify_all();
         });
     if let Err(error) = spawn {
@@ -1184,6 +1479,7 @@ mod tests {
             source.clone(),
             crate::db::file_identity::IdentityConnection::new(connection, "checkpoint test"),
             source.parent().unwrap().to_path_buf(),
+            None,
         );
 
         assert!(
@@ -1663,6 +1959,124 @@ mod ownership_tests {
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn v2_sweep_accepts_equivalent_windows_directory_spellings() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "0000000000000001",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let mut view = registration.view_store().unwrap();
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"obsolete").unwrap();
+        // Traversal can retain forward separators where registration used
+        // backslashes. These spellings identify the same registered directory.
+        view.view_dir = PathBuf::from(view.view_dir().to_string_lossy().replace('\\', "/"));
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!old.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v2_sweep_rejects_a_different_registered_directory() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "0000000000000001",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let mut view = registration.view_store().unwrap();
+        let alternate = storage.path().join("other/views/v2/0000000000000001");
+        super::super::ViewStore::open_dir(alternate.clone()).unwrap();
+        view.view_dir = alternate;
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"not owned by this registration").unwrap();
+        assert_eq!(view.sweep_generations().unwrap(), 0);
+        assert!(
+            old.exists(),
+            "path normalization must not remove the directory ownership guard"
+        );
+    }
+
+    #[test]
+    fn post_publication_sweep_drops_superseded_refs_but_keeps_current_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
+        let owner = view.derived_path("owner").unwrap();
+        fs::write(&owner, b"shared database").unwrap();
+        fs::write(view.manifest_path("owner").unwrap(), b"owner manifest").unwrap();
+        view.reuse_derived("superseded", "owner").unwrap();
+        view.reuse_derived("current", "owner").unwrap();
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'current'", [])
+            .unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(!view.view_dir().join("derived-superseded.ref").exists());
+        assert!(view.view_dir().join("derived-current.ref").exists());
+        assert!(owner.exists());
+        assert_eq!(view.derived_path("current").unwrap(), owner);
+        fs::write(
+            view.derived_path("independent").unwrap(),
+            b"independent database",
+        )
+        .unwrap();
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'independent'", [])
+            .unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(!owner.exists());
+        assert!(view.derived_path("independent").unwrap().exists());
+    }
+
+    #[test]
+    fn post_publication_sweep_preserves_cloned_pages_after_donor_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
+        let donor = view.derived_path("donor").unwrap();
+        let cloned = view.derived_path("cloned").unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&donor, "clone donor").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE state (value TEXT); INSERT INTO state VALUES ('retained');",
+            )
+            .unwrap();
+        clone_derived(&donor, &cloned).unwrap();
+        assert!(!view.view_dir().join("derived-cloned.ref").exists());
+        drop(connection);
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'cloned'", [])
+            .unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(!donor.exists());
+        assert_eq!(crate::db::file_identity::open_connections(&cloned), 0);
+        let reader =
+            crate::db::file_identity::IdentityConnection::open(&cloned, "clone survivor").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "retained"
+        );
+    }
+
     #[test]
     fn storage_retention_shared_derived_owner_keeps_manifest_until_unreferenced() {
         let temp = tempfile::tempdir().unwrap();
@@ -1724,6 +2138,13 @@ mod storage_retention_tests {
         let path = view.derived_path("old").unwrap();
         let connection =
             crate::db::file_identity::IdentityConnection::open(&path, "retention test").unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+        assert_eq!(
+            view.sweep_generations_with_bytes().unwrap().removed_bytes,
+            0
+        );
         assert_eq!(view.sweep_generations().unwrap(), 0);
         assert!(path.exists());
         drop(connection);

@@ -598,8 +598,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, write_retirement_witness, verify_retirement_witness",
-        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, write_retirement_witness, verify_retirement_witness",
+        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, 64-view generation batch, 16 diagnostic errors, take",
         reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed, remaining vanished views and stopped-early counts",
     },
     ExclusionEntry {
@@ -622,7 +622,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "views/generation.rs",
-        enclosing_item: "generation_directory_entries, blob_references_by_generation, sweep_generations_bounded, remove_generation_files",
+        enclosing_item: "generation_directory_entries, blob_references_by_generation, generation_sweep_registry, has_superseded_artifacts, sweep_generations_bounded, remove_generation_files",
         location_or_primitive: "take(limit.saturating_add(1)), take(GENERATION_DIRECTORY_LIMIT)",
         reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, while an incomplete temporary-file deletion pass only leaves garbage for a later pass",
     },

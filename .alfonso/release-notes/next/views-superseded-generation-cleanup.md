@@ -1,0 +1,1 @@
+Reclaim superseded V1 and V2 view generations after publication, give retention a fair bounded sweep across both layouts, and report reclaimed bytes while preserving pins, readers, shared derived owners, and live SQLite connections.
