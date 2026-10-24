@@ -58,8 +58,8 @@ use super::process::terminate_pgid;
 #[cfg(windows)]
 use super::process::terminate_pid;
 use super::process::{
-    is_process_alive, is_recorded_process_alive, live_process_group_members, LiveDescendant,
-    LiveDescendantsUnavailable,
+    is_process_alive, is_recorded_process_alive, live_process_group_members, GroupListing,
+    LiveDescendant, LiveDescendantsUnavailable,
 };
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
@@ -261,8 +261,9 @@ enum KillSignalPlan {
     Nothing,
     /// Another kill is signaling this task; wait for its outcome.
     AwaitOtherKill,
-    /// The task is already terminal but members of its process group were
-    /// still alive when it ended.
+    /// The task is already terminal and members of its process group were
+    /// still alive when it ended, or may be: its last check was incomplete or
+    /// missing and the group still answers.
     TerminalSurvivors { pgid: i32, live_count: usize },
     /// Signal a piped task's process group and reap its direct child.
     Piped {
@@ -368,9 +369,7 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
         }
         // Zombies cannot run or retain output pipes. An unreaped orphan may
         // still make killpg(0) succeed, but is not a live descendant to report.
-        if live_process_group_members(pgid)
-            .is_ok_and(|(members, omitted)| members.is_empty() && omitted == 0)
-        {
+        if live_process_group_members(pgid).is_ok_and(|listing| listing.is_clean()) {
             return;
         }
         #[cfg(test)]
@@ -391,17 +390,48 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
 #[cfg(not(unix))]
 fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
 
+/// Whether a finished task's process group may still hold processes that a
+/// kill should signal, when its last check named none. A clean check (`[]`
+/// with no reason) means the group was seen empty, and an empty group never
+/// regains members: a group answering under that id later is a different one,
+/// so it is left alone. An incomplete or missing check proves nothing, so the
+/// group is signalled whenever it still answers signal 0.
+fn finished_group_may_be_alive(metadata: &PersistedTask, pgid: i32) -> bool {
+    let seen_empty = metadata
+        .live_descendants
+        .as_ref()
+        .is_some_and(|members| members.is_empty())
+        && metadata.live_descendants_omitted == 0
+        && metadata.live_descendants_unavailable.is_none();
+    if seen_empty {
+        return false;
+    }
+    #[cfg(unix)]
+    return super::process::process_group_may_be_alive(pgid);
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
 /// Store the outcome of one check of a task's process group: the surviving
-/// members, or why they could not be listed. Never leaves both unset.
+/// members, why they could not be listed, or both when the listing was
+/// incomplete. An empty list is stored only for a clean check, so `[]` always
+/// means the group was seen to be empty.
 fn record_group_check(
     metadata: &mut PersistedTask,
-    check: &Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable>,
+    check: &Result<GroupListing, LiveDescendantsUnavailable>,
 ) {
     match check {
-        Ok((members, omitted)) => {
-            metadata.live_descendants = Some(members.clone());
-            metadata.live_descendants_omitted = *omitted;
-            metadata.live_descendants_unavailable = None;
+        Ok(listing) => {
+            let found_any = !listing.members.is_empty() || listing.omitted > 0;
+            metadata.live_descendants =
+                (found_any || !listing.incomplete).then(|| listing.members.clone());
+            metadata.live_descendants_omitted = listing.omitted;
+            metadata.live_descendants_unavailable = listing
+                .incomplete
+                .then_some(LiveDescendantsUnavailable::ListingIncomplete);
         }
         Err(reason) => {
             metadata.live_descendants = None;
@@ -623,8 +653,8 @@ pub struct BgCompletion {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
-    /// For a finished task, why `live_descendants` is null: the process group
-    /// could not be checked.
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -735,8 +765,9 @@ pub struct BgTaskSnapshot {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
-    /// Why `live_descendants` is null: the process group could not be checked.
-    /// Absent while the task runs and whenever a list is present.
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
+    /// Absent while the task runs and after a complete check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2779,7 +2810,7 @@ impl BgTaskRegistry {
         let survivors_at_exit = should_sample
             && self
                 .sample_task_process_group(task)
-                .is_some_and(|(members, omitted)| !members.is_empty() || omitted > 0);
+                .is_some_and(|listing| !listing.is_clean());
         if !survivors_at_exit {
             let result = self.finish_terminal_transition(task, emit_frame);
             self.inner.terminal_transition.notify_waiters();
@@ -2804,10 +2835,7 @@ impl BgTaskRegistry {
                     );
                 }
                 registry.inner.terminal_transition.notify_waiters();
-                if settled
-                    .as_ref()
-                    .is_some_and(|(members, omitted)| !members.is_empty() || *omitted > 0)
-                {
+                if settled.as_ref().is_some_and(|listing| !listing.is_clean()) {
                     std::thread::sleep(Duration::from_millis(1_700));
                     let _ = registry.sample_task_process_group(&task);
                 }
@@ -2821,10 +2849,7 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    fn sample_task_process_group(
-        &self,
-        task: &Arc<BgTask>,
-    ) -> Option<(Vec<LiveDescendant>, usize)> {
+    fn sample_task_process_group(&self, task: &Arc<BgTask>) -> Option<GroupListing> {
         let pgid = task.lock_state().ok().map(|state| state.metadata.pgid)?;
         let sample = match pgid {
             Some(pgid) => live_process_group_members(pgid),
@@ -10922,7 +10947,11 @@ impl BgTaskRegistry {
                     .unwrap_or(0)
                     + state.metadata.live_descendants_omitted;
                 match state.metadata.pgid {
-                    Some(pgid) if cfg!(unix) && live_count > 0 => {
+                    Some(pgid)
+                        if cfg!(unix)
+                            && (live_count > 0
+                                || finished_group_may_be_alive(&state.metadata, pgid)) =>
+                    {
                         KillSignalPlan::TerminalSurvivors { pgid, live_count }
                     }
                     _ => KillSignalPlan::Nothing,
@@ -12169,7 +12198,7 @@ impl BgTaskRegistry {
         needs_sample
             && self
                 .sample_task_process_group(&task)
-                .is_none_or(|(members, omitted)| !members.is_empty() || omitted > 0)
+                .is_none_or(|listing| !listing.is_clean())
     }
 
     /// True when the task has reached a terminal state or is no longer in the
@@ -13349,21 +13378,43 @@ fn kill_survivors_line(members: &[LiveDescendant], omitted: usize) -> String {
         .replace("{processes}", &processes)
 }
 
-/// Why a finished task has no list of surviving group members. A running task
-/// has not been checked yet and carries no reason; a finished one whose list
-/// is missing always does.
+/// Why a finished task's list of surviving group members is missing or only
+/// partial. A running task has not been checked yet and carries no reason; a
+/// finished one whose list is missing always does, and an incomplete listing
+/// keeps its reason next to the members it did find.
 fn live_descendants_unavailable(metadata: &PersistedTask) -> Option<LiveDescendantsUnavailable> {
-    if metadata.live_descendants.is_some() || !metadata.status.is_terminal() {
+    if !metadata.status.is_terminal() {
         return None;
     }
-    Some(
-        metadata
-            .live_descendants_unavailable
-            .unwrap_or(LiveDescendantsUnavailable::NotChecked),
-    )
+    match (
+        metadata.live_descendants_unavailable,
+        &metadata.live_descendants,
+    ) {
+        (Some(reason), _) => Some(reason),
+        (None, None) => Some(LiveDescendantsUnavailable::NotChecked),
+        (None, Some(_)) => None,
+    }
 }
 
+/// Added to a task's text and completion notice when the check of its group
+/// could not read every process, so survivors may be missing from the list.
+pub(crate) const INCOMPLETE_LISTING_NOTE: &str =
+    "AFT could not read every process in the task's group, so others may also be running.";
+
 fn live_descendants_summary(metadata: &PersistedTask) -> Option<String> {
+    let summary = members_summary(metadata);
+    if metadata.live_descendants_unavailable != Some(LiveDescendantsUnavailable::ListingIncomplete)
+        || !metadata.status.is_terminal()
+    {
+        return summary;
+    }
+    Some(match summary {
+        Some(summary) => format!("{summary} {INCOMPLETE_LISTING_NOTE}"),
+        None => INCOMPLETE_LISTING_NOTE.to_string(),
+    })
+}
+
+fn members_summary(metadata: &PersistedTask) -> Option<String> {
     let Some(members) = metadata.live_descendants.as_deref() else {
         #[cfg(windows)]
         return (metadata.mode == BgMode::Pipes).then(|| {
@@ -16245,7 +16296,7 @@ mod tests {
         assert!(
             !super::super::process::live_process_group_members(pgid)
                 .unwrap()
-                .0
+                .members
                 .is_empty(),
             "target did not survive daemon loss"
         );
@@ -16255,7 +16306,7 @@ mod tests {
         assert!(
             super::super::process::live_process_group_members(pgid)
                 .unwrap()
-                .0
+                .members
                 .is_empty(),
             "replay published Killed without terminating the surviving group"
         );

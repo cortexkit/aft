@@ -102,7 +102,10 @@ export interface BashCompletedFrame {
   output_incomplete?: boolean;
   live_descendants?: LiveDescendant[] | null;
   live_descendants_omitted?: number;
-  /** Why `live_descendants` is null for a finished task: the group could not be checked. */
+  /**
+   * For a finished task, why `live_descendants` is null, or, with
+   * `listing_incomplete`, why the list may be only part of the group.
+   */
   live_descendants_unavailable?: LiveDescendantsUnavailable;
   live_descendants_summary?: string;
   session_id?: string;
@@ -174,7 +177,10 @@ export interface BgCompletion {
   output_incomplete?: boolean;
   live_descendants?: LiveDescendant[] | null;
   live_descendants_omitted?: number;
-  /** Why `live_descendants` is null for a finished task: the group could not be checked. */
+  /**
+   * For a finished task, why `live_descendants` is null, or, with
+   * `listing_incomplete`, why the list may be only part of the group.
+   */
   live_descendants_unavailable?: LiveDescendantsUnavailable;
   live_descendants_summary?: string;
 }

@@ -1592,8 +1592,9 @@ pub struct PersistedTask {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub live_descendants_omitted: usize,
-    /// Why the last check of the process group failed or was not possible.
-    /// Cleared by a check that succeeds.
+    /// Why the last check of the process group failed, was not possible, or
+    /// (`listing_incomplete`) saw only part of the group; the members it did
+    /// find stay in `live_descendants`. Cleared by a complete check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     /// AFT sent the kill signal to the task's process group (a timeout,

@@ -67,9 +67,10 @@ pub enum LiveDescendantsUnavailable {
     /// Listing the group's members failed, for example because `/proc`
     /// could not be read.
     ListingFailed,
-    /// The group still has members, but the listing could not account for
-    /// all of them: some were hidden or unreadable, for example because
-    /// `/proc` is mounted with `hidepid`. Survivors may exist.
+    /// The listing could not account for every process that may belong to the
+    /// group: some were hidden or unreadable, for example because `/proc` is
+    /// mounted with `hidepid`. Any members it did identify are still listed;
+    /// others may also be running.
     ListingIncomplete,
     /// AFT did not check this task's group: a remote job, a pseudoterminal
     /// task that ended on its own, or a record written by an older AFT.
@@ -87,13 +88,39 @@ impl LiveDescendantsUnavailable {
     }
 }
 
+/// One check of a task's process group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupListing {
+    /// The live members found, at most [`LIVE_DESCENDANT_CAP`], lowest pid first.
+    pub members: Vec<LiveDescendant>,
+    /// Live members found beyond the cap.
+    pub omitted: usize,
+    /// The group may have members the listing could not see or read, so
+    /// `members` may be only part of it.
+    pub incomplete: bool,
+}
+
+impl GroupListing {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn clean() -> Self {
+        Self {
+            members: Vec::new(),
+            omitted: 0,
+            incomplete: false,
+        }
+    }
+
+    /// The group has no live member and the listing saw every process.
+    pub fn is_clean(&self) -> bool {
+        self.members.is_empty() && self.omitted == 0 && !self.incomplete
+    }
+}
+
 /// Enumerate surviving members of a task's process group, at most
-/// [`LIVE_DESCENDANT_CAP`] of them plus the count left out. An empty list means
-/// the group was checked and has no live member; an error says why it could
-/// not be checked.
-pub fn live_process_group_members(
-    pgid: i32,
-) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
+/// [`LIVE_DESCENDANT_CAP`] of them plus the count left out. A clean listing
+/// means the group was checked and has no live member; an incomplete one keeps
+/// the members it found; an error says why the group could not be checked.
+pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
     #[cfg(test)]
     if test_hooks::listing_fails(pgid) {
         return Err(LiveDescendantsUnavailable::ListingFailed);
@@ -126,6 +153,7 @@ pub(crate) mod test_hooks {
     static SIGKILL_DENIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static MEMBERS_INVISIBLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static MEMBERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static OUTSIDERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
 
     fn insert(set: &OnceLock<Mutex<HashSet<i32>>>, pgid: i32) {
         set.get_or_init(Default::default)
@@ -159,6 +187,19 @@ pub(crate) mod test_hooks {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) fn members_unreadable(pgid: i32) -> bool {
         contains(&MEMBERS_UNREADABLE, pgid)
+    }
+
+    /// While listing this group, make every process outside it unreadable, as
+    /// `/proc` mounted with `hidepid=1` does for other users' processes. The
+    /// group's own members stay readable.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn make_outsiders_unreadable(pgid: i32) {
+        insert(&OUTSIDERS_UNREADABLE, pgid);
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn outsiders_unreadable(pgid: i32) -> bool {
+        contains(&OUTSIDERS_UNREADABLE, pgid)
     }
 
     /// Make every listing of this group fail, as an unreadable `/proc` would.
@@ -365,13 +406,11 @@ fn bounded_members<C>(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_group_members(
-    pgid: i32,
-) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
+fn linux_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
     // An empty group needs no /proc walk. EPERM still means the group exists
     // and must be enumerated, including reparented descendants.
     if pgid > 0 && process_group_gone(pgid) {
-        return Ok((Vec::new(), 0));
+        return Ok(GroupListing::clean());
     }
     #[cfg(test)]
     PROC_SCAN_COUNT.with(|count| count.set(count.get() + 1));
@@ -394,26 +433,30 @@ fn linux_process_group_members(
     }
     // An unreadable entry may be a member of this group. With none of them,
     // a group the probe found alive must show at least one member or zombie.
-    if unreadable > 0 || (candidates.is_empty() && zombies == 0) {
-        return incomplete_unless_gone(pgid);
-    }
-    Ok(bounded_members(candidates, |pid, comm| {
+    let incomplete = unreadable > 0 || (candidates.is_empty() && zombies == 0);
+    Ok(group_listing(pgid, candidates, incomplete, |pid, comm| {
         Some(linux_describe_member(pid, comm))
     }))
 }
 
-/// The verdict for a listing that could not account for the whole group: a
-/// clean empty list if the group has since exited, otherwise
-/// [`LiveDescendantsUnavailable::ListingIncomplete`]. Never an empty list for a
-/// group that is still alive, which would read as a clean kill.
+/// Build a listing from the members found. An incomplete listing of a group
+/// that has exited since the walk is clean; otherwise it keeps the members it
+/// did find and stays marked incomplete, so it never reads as a clean kill.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn incomplete_unless_gone(
+fn group_listing<C>(
     pgid: i32,
-) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
-    if process_group_gone(pgid) {
-        Ok((Vec::new(), 0))
-    } else {
-        Err(LiveDescendantsUnavailable::ListingIncomplete)
+    candidates: Vec<(u32, C)>,
+    incomplete: bool,
+    describe: impl FnMut(u32, C) -> Option<LiveDescendant>,
+) -> GroupListing {
+    if incomplete && process_group_gone(pgid) {
+        return GroupListing::clean();
+    }
+    let (members, omitted) = bounded_members(candidates, describe);
+    GroupListing {
+        members,
+        omitted,
+        incomplete,
     }
 }
 
@@ -426,6 +469,14 @@ fn process_group_gone(pgid: i32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Whether a process group may still have processes: signal 0 to it succeeds,
+/// or is refused (EPERM) because a member belongs to another user.
+#[cfg(unix)]
+pub fn process_group_may_be_alive(pgid: i32) -> bool {
+    pgid > 0
+        && ((unsafe { libc::kill(-pgid, 0) } == 0)
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
 #[cfg(all(test, target_os = "linux"))]
 thread_local! { static PROC_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -459,6 +510,10 @@ fn linux_proc_entry(pid: u32, expected_pgid: i32) -> ProcEntry {
         return ProcEntry::Unreadable;
     };
     if pgrp != expected_pgid {
+        #[cfg(test)]
+        if test_hooks::outsiders_unreadable(expected_pgid) {
+            return ProcEntry::Unreadable;
+        }
         return ProcEntry::Elsewhere;
     }
     #[cfg(test)]
@@ -526,9 +581,7 @@ fn linux_describe_member(pid: u32, comm: String) -> LiveDescendant {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_group_members(
-    pgid: i32,
-) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
+fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
     use std::ffi::{c_char, c_int, c_void};
 
     #[link(name = "proc")]
@@ -538,7 +591,7 @@ fn macos_process_group_members(
     }
 
     if pgid <= 0 {
-        return Ok((Vec::new(), 0));
+        return Ok(GroupListing::clean());
     }
     let mut pids = vec![0_u32; 16_384];
     let count = unsafe {
@@ -578,10 +631,8 @@ fn macos_process_group_members(
         })
         .collect();
     // A group the probe finds alive must show at least one member or zombie.
-    if candidates.is_empty() && zombies == 0 {
-        return incomplete_unless_gone(pgid);
-    }
-    Ok(bounded_members(candidates, |pid, info| {
+    let incomplete = candidates.is_empty() && zombies == 0;
+    Ok(group_listing(pgid, candidates, incomplete, |pid, info| {
         let mut name = [0 as c_char; 1024];
         let name_len =
             unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
@@ -1364,7 +1415,7 @@ fn lifecycle_empty_group_avoids_proc_scan() {
     let pgid = child.id() as i32;
     child.wait().unwrap();
     PROC_SCAN_COUNT.with(|count| count.set(0));
-    assert!(linux_process_group_members(pgid).unwrap().0.is_empty());
+    assert!(linux_process_group_members(pgid).unwrap().is_clean());
     assert_eq!(
         PROC_SCAN_COUNT.with(std::cell::Cell::get),
         0,
@@ -1410,7 +1461,7 @@ fn macos_kinfo_reads_this_process() {
 fn macos_group_listing_includes_another_users_process() {
     let members = macos_process_group_members(1)
         .expect("group 1 can be listed")
-        .0;
+        .members;
     let launchd = members
         .iter()
         .find(|member| member.pid == 1)
@@ -1430,7 +1481,12 @@ fn linux_member_records_owner_and_executable_name_only() {
     let members = linux_process_group_members(pgid);
     let _ = child.kill();
     let _ = child.wait();
-    let (members, omitted) = members.unwrap();
+    let GroupListing {
+        members,
+        omitted,
+        incomplete,
+    } = members.unwrap();
+    assert!(!incomplete);
     assert_eq!(omitted, 0);
     assert_eq!(members.len(), 1, "{members:?}");
     assert_eq!(members[0].command.as_deref(), Some("sleep …"));

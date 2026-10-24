@@ -328,6 +328,139 @@ fn hidden_members_of_an_emptied_group_still_report_an_empty_list() {
     assert_eq!(snapshot.live_descendants_unavailable, None);
 }
 
+/// A process outside the task's group is unreadable (`/proc` mounted
+/// `hidepid=1` hides other users' processes) while the group's own survivor is
+/// readable. The listing is incomplete, but the survivor it did find is kept
+/// and named next to the incomplete reason, not discarded.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_incomplete_listing_keeps_the_survivors_it_found() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), TERM_IGNORING);
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    test_hooks::deny_sigkill(pgid);
+    test_hooks::make_outsiders_unreadable(pgid);
+
+    registry.kill_for_timeout(&task_id, SESSION).unwrap();
+    let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+
+    let members = snapshot
+        .live_descendants
+        .clone()
+        .expect("the survivors found must be kept");
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert_eq!(members[0].comm, "sleep");
+    assert_eq!(
+        snapshot.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    let expected = format!(
+        "1 process survived the kill and is still running: pid {}, user {}, `sleep …`. AFT cannot signal processes owned by another user. AFT could not read every process in the task's group, so others may also be running.",
+        members[0].pid,
+        current_user()
+    );
+    assert_eq!(
+        snapshot.live_descendants_summary.as_deref(),
+        Some(expected.as_str())
+    );
+    let completion = completion_for(&registry, &task_id);
+    assert_eq!(completion.live_descendants, Some(members));
+    assert_eq!(
+        completion.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    assert_eq!(
+        completion.live_descendants_summary.as_deref(),
+        Some(expected.as_str())
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["live_descendants"][0]["comm"], "sleep");
+    assert_eq!(json["live_descendants_unavailable"], "listing_incomplete");
+}
+
+/// Whether a process has exited (gone, or a zombie waiting to be reaped).
+fn process_exited(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    return std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rfind(") ")
+            .is_some_and(|close| stat[close + 2..].starts_with('Z'))
+    });
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// A command finished on its own, leaving a TERM-ignoring process in its
+/// group that the check at its end could not see, so the task records no
+/// member and an incomplete listing. An explicit `bash_kill` must still
+/// signal the group, and the survivor must be gone afterwards.
+#[test]
+fn bash_kill_signals_a_finished_group_whose_listing_was_incomplete() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(
+        &registry,
+        dir.path(),
+        "sh -c 'trap \"\" TERM; echo $$ > survivor.pid; exec sleep 30' & while [ ! -f go ]; do sleep 0.01; done",
+    );
+    wait_for_file(
+        &dir.path().join("survivor.pid"),
+        "the survivor did not start",
+    );
+    let survivor = std::fs::read_to_string(dir.path().join("survivor.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    test_hooks::hide_members(pgid);
+    std::fs::write(dir.path().join("go"), "").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let finished = loop {
+        let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+        if snapshot.info.status.is_terminal() && snapshot.live_descendants_unavailable.is_some() {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "the task did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(finished.info.status, BgTaskStatus::Completed);
+    assert_eq!(finished.live_descendants, None);
+    assert_eq!(
+        finished.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    assert_eq!(
+        finished.live_descendants_summary.as_deref(),
+        Some(INCOMPLETE_LISTING_NOTE)
+    );
+    assert!(!process_exited(survivor), "the survivor must be running");
+
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+
+    assert!(
+        killed.kill_signaled,
+        "bash_kill must signal a group whose listing was incomplete"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !process_exited(survivor) {
+        assert!(
+            Instant::now() < deadline,
+            "bash_kill left the survivor {survivor} running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A pseudoterminal task's group is checked after AFT kills it, which it was
 /// not before: a TERM-ignoring survivor is named, not left unreported.
 #[test]
@@ -515,7 +648,7 @@ fn timeout_kill_reports_a_root_owned_survivor_through_sudo() {
     assert!(
         survivors_after
             .as_ref()
-            .is_ok_and(|(members, _)| !members.is_empty()),
+            .is_ok_and(|listing| !listing.members.is_empty()),
         "the repro needs a member that survives the kill"
     );
     assert_eq!(snapshot.info.status, BgTaskStatus::TimedOut);

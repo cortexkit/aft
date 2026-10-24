@@ -96,7 +96,8 @@ pub struct BashCompletedFrame {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
-    /// Why `live_descendants` is null: the process group could not be checked.
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(skip_serializing_if = "Option::is_none")]
