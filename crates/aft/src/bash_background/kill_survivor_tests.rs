@@ -261,6 +261,73 @@ fn timeout_kill_whose_group_cannot_be_listed_reports_null_with_a_reason() {
     assert_eq!(json["live_descendants_unavailable"], "listing_failed");
 }
 
+fn assert_incomplete_listing_is_not_a_clean_kill(hide: fn(i32)) {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), TERM_IGNORING);
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    test_hooks::deny_sigkill(pgid);
+    hide(pgid);
+
+    registry.kill_for_timeout(&task_id, SESSION).unwrap();
+    let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+
+    assert_eq!(snapshot.info.status, BgTaskStatus::TimedOut);
+    assert_eq!(
+        snapshot.live_descendants, None,
+        "a group that is still alive but lists nobody is not a clean kill"
+    );
+    assert_eq!(
+        snapshot.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    let completion = completion_for(&registry, &task_id);
+    assert_eq!(completion.live_descendants, None);
+    assert_eq!(
+        completion.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["live_descendants_unavailable"], "listing_incomplete");
+}
+
+/// A survivor the listing cannot see (`/proc` mounted with `hidepid=2`, where
+/// another user's processes are left out) while the group probe says the group
+/// is still alive.
+#[test]
+fn timeout_kill_with_invisible_survivors_reports_an_incomplete_listing() {
+    assert_incomplete_listing_is_not_a_clean_kill(test_hooks::hide_members);
+}
+
+/// A survivor whose `/proc/<pid>/stat` cannot be read (`hidepid=1`).
+#[cfg(target_os = "linux")]
+#[test]
+fn timeout_kill_with_unreadable_survivors_reports_an_incomplete_listing() {
+    assert_incomplete_listing_is_not_a_clean_kill(test_hooks::make_members_unreadable);
+}
+
+/// Hiding members does not turn a kill that emptied the group into an
+/// unknown: the group probe already says the group is gone.
+#[test]
+fn hidden_members_of_an_emptied_group_still_report_an_empty_list() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), TERM_IGNORING);
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    test_hooks::hide_members(pgid);
+    test_hooks::make_members_unreadable(pgid);
+
+    registry.kill_for_timeout(&task_id, SESSION).unwrap();
+    let snapshot = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+
+    assert_eq!(snapshot.live_descendants, Some(Vec::new()));
+    assert_eq!(snapshot.live_descendants_unavailable, None);
+}
+
 /// A pseudoterminal task's group is checked after AFT kills it, which it was
 /// not before: a TERM-ignoring survivor is named, not left unreported.
 #[test]

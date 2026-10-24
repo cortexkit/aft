@@ -66,6 +66,10 @@ pub enum LiveDescendantsUnavailable {
     /// Listing the group's members failed, for example because `/proc`
     /// could not be read.
     ListingFailed,
+    /// The group still has members, but the listing could not account for
+    /// all of them: some were hidden or unreadable, for example because
+    /// `/proc` is mounted with `hidepid`. Survivors may exist.
+    ListingIncomplete,
     /// AFT did not check this task's group: a remote job, a pseudoterminal
     /// task that ended on its own, or a record written by an older AFT.
     NotChecked,
@@ -119,6 +123,42 @@ pub(crate) mod test_hooks {
 
     static LISTING_FAILS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static SIGKILL_DENIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static MEMBERS_INVISIBLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static MEMBERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+    fn insert(set: &OnceLock<Mutex<HashSet<i32>>>, pgid: i32) {
+        set.get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(pgid);
+    }
+
+    fn contains(set: &OnceLock<Mutex<HashSet<i32>>>, pgid: i32) -> bool {
+        set.get()
+            .is_some_and(|groups| groups.lock().unwrap().contains(&pgid))
+    }
+
+    /// Leave this group's members out of the process listing while they stay
+    /// alive, as `/proc` mounted with `hidepid=2` does for another user's
+    /// processes.
+    pub(crate) fn hide_members(pgid: i32) {
+        insert(&MEMBERS_INVISIBLE, pgid);
+    }
+
+    pub(super) fn members_invisible(pgid: i32) -> bool {
+        contains(&MEMBERS_INVISIBLE, pgid)
+    }
+
+    /// Make this group's members' `/proc/<pid>/stat` unreadable, as `/proc`
+    /// mounted with `hidepid=1` does for another user's processes.
+    pub(crate) fn make_members_unreadable(pgid: i32) {
+        insert(&MEMBERS_UNREADABLE, pgid);
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn members_unreadable(pgid: i32) -> bool {
+        contains(&MEMBERS_UNREADABLE, pgid)
+    }
 
     /// Make every listing of this group fail, as an unreadable `/proc` would.
     pub(crate) fn fail_listing(pgid: i32) {
@@ -328,7 +368,7 @@ fn linux_process_group_members(
 ) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
     // An empty group needs no /proc walk. EPERM still means the group exists
     // and must be enumerated, including reparented descendants.
-    if pgid > 0 && unsafe { libc::kill(-pgid, 0) } == -1 && io_group_missing() {
+    if pgid > 0 && process_group_gone(pgid) {
         return Ok((Vec::new(), 0));
     }
     #[cfg(test)]
@@ -336,29 +376,107 @@ fn linux_process_group_members(
     // A group that exists but cannot be listed is not an empty group.
     let entries =
         std::fs::read_dir("/proc").map_err(|_| LiveDescendantsUnavailable::ListingFailed)?;
-    let candidates = entries
+    let mut candidates = Vec::new();
+    let mut zombies = 0_usize;
+    let mut unreadable = 0_usize;
+    for pid in entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| Some((pid, linux_group_member_comm(pid, pgid)?)))
-        .collect();
+    {
+        match linux_proc_entry(pid, pgid) {
+            ProcEntry::Member(comm) => candidates.push((pid, comm)),
+            ProcEntry::Zombie => zombies += 1,
+            ProcEntry::Unreadable => unreadable += 1,
+            ProcEntry::Elsewhere => {}
+        }
+    }
+    // An unreadable entry may be a member of this group. With none of them,
+    // a group the probe found alive must show at least one member or zombie.
+    if unreadable > 0 || (candidates.is_empty() && zombies == 0) {
+        return incomplete_unless_gone(pgid);
+    }
     Ok(bounded_members(candidates, |pid, comm| {
         Some(linux_describe_member(pid, comm))
     }))
 }
 
-#[cfg(target_os = "linux")]
-fn io_group_missing() -> bool {
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+/// The verdict for a listing that could not account for the whole group: a
+/// clean empty list if the group has since exited, otherwise
+/// [`LiveDescendantsUnavailable::ListingIncomplete`]. Never an empty list for a
+/// group that is still alive, which would read as a clean kill.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn incomplete_unless_gone(
+    pgid: i32,
+) -> Result<(Vec<LiveDescendant>, usize), LiveDescendantsUnavailable> {
+    if process_group_gone(pgid) {
+        Ok((Vec::new(), 0))
+    } else {
+        Err(LiveDescendantsUnavailable::ListingIncomplete)
+    }
+}
+
+/// Whether the group has no process left, zombies included. Signal 0 that
+/// succeeds, or fails with EPERM (a member AFT may not signal), means it
+/// still exists.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_group_gone(pgid: i32) -> bool {
+    (unsafe { libc::kill(-pgid, 0) } == -1)
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(all(test, target_os = "linux"))]
 thread_local! { static PROC_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-/// The command name of a live (not zombie) process in `expected_pgid`, or
-/// `None` for any other process.
+/// What one `/proc/<pid>` entry says about a process group.
 #[cfg(target_os = "linux")]
-fn linux_group_member_comm(pid: u32, expected_pgid: i32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+enum ProcEntry {
+    /// A live member, with its command name.
+    Member(String),
+    /// A member that has exited but is not yet reaped.
+    Zombie,
+    /// In another group, or gone since the directory was listed.
+    Elsewhere,
+    /// Its `stat` could not be read, so it may or may not be a member.
+    Unreadable,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_entry(pid: u32, expected_pgid: i32) -> ProcEntry {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        // The process exited after its directory was listed.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return ProcEntry::Elsewhere;
+        }
+        Err(_) => return ProcEntry::Unreadable,
+    };
+    let Some((comm, state, pgrp)) = parse_proc_stat(&stat) else {
+        return ProcEntry::Unreadable;
+    };
+    if pgrp != expected_pgid {
+        return ProcEntry::Elsewhere;
+    }
+    #[cfg(test)]
+    if test_hooks::members_invisible(pgrp) {
+        return ProcEntry::Elsewhere;
+    }
+    #[cfg(test)]
+    if test_hooks::members_unreadable(pgrp) {
+        return ProcEntry::Unreadable;
+    }
+    if state == "Z" {
+        ProcEntry::Zombie
+    } else {
+        ProcEntry::Member(comm)
+    }
+}
+
+/// The command name, state and process group from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &str) -> Option<(String, &str, i32)> {
     let open = stat.find('(')?;
     let close = stat.rfind(") ")?;
     let comm = stat.get(open + 1..close)?.to_string();
@@ -366,7 +484,7 @@ fn linux_group_member_comm(pid: u32, expected_pgid: i32) -> Option<String> {
     let state = fields.next()?;
     let _ppid = fields.next()?;
     let pgrp = fields.next()?.parse::<i32>().ok()?;
-    (pgrp == expected_pgid && state != "Z").then_some(comm)
+    Some((comm, state, pgrp))
 }
 
 #[cfg(target_os = "linux")]
@@ -432,22 +550,35 @@ fn macos_process_group_members(
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     pids.truncate(count as usize);
+    #[cfg(test)]
+    if test_hooks::members_invisible(pgid) {
+        pids.clear();
+    }
     // kern.proc.pid answers for every user's processes. proc_name does not:
     // it fails with EPERM for another user's process, and dropping the member
     // on that failure hid exactly the processes a kill cannot reach. Only a
     // process that is gone, a zombie, or in another group is left out.
-    let candidates = pids
+    let mut zombies = 0_usize;
+    let candidates: Vec<_> = pids
         .into_iter()
         .filter(|pid| *pid != 0)
         .filter_map(|pid| {
             let info = macos_kinfo(pid);
             match &info {
-                Some(info) if info.zombie || info.pgid != pgid => None,
+                Some(info) if info.pgid != pgid => None,
+                Some(info) if info.zombie => {
+                    zombies += 1;
+                    None
+                }
                 None if !macos_pid_exists(pid) => None,
                 _ => Some((pid, info)),
             }
         })
         .collect();
+    // A group the probe finds alive must show at least one member or zombie.
+    if candidates.is_empty() && zombies == 0 {
+        return incomplete_unless_gone(pgid);
+    }
     Ok(bounded_members(candidates, |pid, info| {
         let mut name = [0 as c_char; 1024];
         let name_len =
