@@ -186,7 +186,7 @@ export interface BgCompletion {
 export interface LiveDescendant {
   pid: number;
   comm: string;
-  /** First word of the process's first argument. */
+  /** First word of the process's first argument, or its process name when that cannot be read. */
   argv0: string;
   /** Owner of the process (real user ID), or the numeric ID. Absent when unreadable. */
   user?: string;

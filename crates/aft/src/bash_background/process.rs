@@ -37,7 +37,8 @@ pub struct LiveDescendant {
     pub pid: u32,
     pub comm: String,
     /// The first word of the process's first argument (normally the program
-    /// path it was started as). Never any later argument.
+    /// path it was started as), or its command name when that argument cannot
+    /// be read. Never any later argument.
     pub argv0: String,
     /// Name of the user that owns the process (its real user ID), or the
     /// numeric ID when the account has no name. Absent when it could not be
@@ -236,7 +237,8 @@ fn arguments_may_be_present(args: &[String]) -> bool {
     args.len() != 1
 }
 
-/// The first word of a process's first argument. A process can rewrite its
+/// The first word of a process's first argument, or its command name when that
+/// argument cannot be read. A process can rewrite its
 /// arguments into one title string (`setproctitle`), so everything after the
 /// first whitespace may be argument text and is dropped.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
