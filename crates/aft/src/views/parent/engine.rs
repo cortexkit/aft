@@ -299,7 +299,8 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
             "results": [],
             "more_available": false,
             "engine_capped": false,
-            "fully_degraded": true,
+            // No search ran yet, so no answer was read from files directly.
+            "fully_degraded": false,
         });
         attach_gaps(&mut body, gaps.into_values());
         return Response::success(&req.id, body);
@@ -517,7 +518,9 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         "results": page,
         "more_available": more_available,
         "engine_capped": engine_capped,
-        "fully_degraded": fully_degraded,
+        // Every child that answered read its files directly; with no child
+        // answer at all, nothing was read.
+        "fully_degraded": fully_degraded && searched,
         "lexical_only_fallback": lexical_only_fallback,
         "semantic_status": semantic_status,
     });

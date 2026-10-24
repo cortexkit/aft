@@ -3159,9 +3159,8 @@ fn external_prose_query_finds_a_file_added_after_the_saved_index() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #826: aft_search replies an agent misreads. Each test below states the
-// honest reply and fails on the current engine, so each is ignored until its
-// fix lands. Run them with `-- issue_826 --include-ignored`.
+// Issue #826: aft_search replies an agent misread. Each test below states the
+// honest reply that replaced a misleading one.
 // ---------------------------------------------------------------------------
 
 /// Files that talk about `bash_watch`, waiting and detaching, but never
@@ -3190,10 +3189,9 @@ fn render_search(response: Response) -> (String, Value) {
 
 /// The bare identifier already answers "not found"; the same name followed by
 /// `(` must not come back as files labelled `[lexical match]` that do not
-/// contain it. Today the lexical lane's trigram overlap returns
-/// `src/detach.rs:1 [lexical match]` for a doc comment about detaching.
+/// contain it. The reply says no file contains the literal and labels the
+/// files that only share its words as similar.
 #[test]
-#[ignore = "issue #826: a missing punctuated literal is answered with [lexical match] hits"]
 fn issue_826_missing_punctuated_literal_is_not_labelled_a_lexical_match() {
     let files = issue_826_bash_files();
     let (project, entries) = project_with_files(&files);
@@ -3223,13 +3221,37 @@ fn issue_826_missing_punctuated_literal_is_not_labelled_a_lexical_match() {
         !rendered.contains("[lexical match]"),
         "no file contains `bash_wait_detach(`, so no hit may be labelled a match:\n{rendered}"
     );
+    assert!(
+        rendered.starts_with(
+            "No file contains `bash_wait_detach(`. The files below only share words with it; none of them is a match.\n\n"
+        ),
+        "{rendered}"
+    );
+    // The header uses the platform's path separator.
+    let detach = format!(
+        "{}:1 [similar]",
+        Path::new("src").join("detach.rs").display()
+    );
+    assert!(rendered.contains(&detach), "{rendered}");
+    assert!(
+        rendered.contains("\nFound 1 similar result(s)."),
+        "{rendered}"
+    );
+
+    // A literal that does occur keeps its ordinary labels.
+    let (present, _) = render_search(handle_semantic_search(
+        &request_with_top_k("bash_watch(", None, 10),
+        &ctx,
+    ));
+    assert!(!present.contains("No file contains"), "{present}");
+    assert!(!present.contains("[similar]"), "{present}");
 }
 
 /// A regex-only request ranks every matching file before it cuts the page,
-/// so the list trailer knows the exact number of file results. Today it says
-/// `shown 3 of ≥4 results` beside `Found 36 match across 12 file`.
+/// so the list trailer knows the exact number of file results, and the count
+/// line counts files first. The reply used to say `shown 3 of ≥4 results`
+/// beside `Found 36 match across 12 file`.
 #[test]
-#[ignore = "issue #826: the regex route's trailer reports a floor although every file was ranked"]
 fn issue_826_regex_only_trailer_reports_the_ranked_file_total() {
     let owned: Vec<(String, String)> = (0..12)
         .map(|i| {
@@ -3265,14 +3287,20 @@ fn issue_826_regex_only_trailer_reports_the_ranked_file_total() {
         rendered.contains("shown 3 of 12 results"),
         "all 12 matching files were ranked before the page cut:\n{rendered}"
     );
+    assert!(
+        rendered.contains(
+            "\n12 files match (36 matching lines); one result per file, definitions first.\n"
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Found 36 match"), "{rendered}");
 }
 
 /// When the query embedding fails, the answer comes from a filesystem scan
-/// and the reply says so, yet the lane footer, read again after the answer,
-/// still prints `semantic: ready`. Both lines must come from the same record
-/// of what served this request.
+/// and the reply says so; the lane footer must not then print
+/// `semantic: ready`. Both lines come from the record of what served this
+/// request.
 #[test]
-#[ignore = "issue #826: lane footer says ready beside a degraded answer"]
 fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
     let (project, _source_file, _source) = project_with_needle();
     let (base_url, handle) = start_mock_embedding_error_server();
@@ -3287,21 +3315,24 @@ fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
     assert_eq!(response["fully_degraded"], true, "{response}");
     assert_eq!(response["semantic_unavailable"], true, "{response}");
     assert!(
-        rendered.contains("Search status: fully degraded"),
+        rendered.contains("Search status: answered by a filesystem scan"),
         "{rendered}"
     );
     assert!(
         !rendered.lines().any(|line| line == "semantic: ready"),
         "the semantic lane did not serve this answer, so the footer may not call it ready:\n{rendered}"
     );
+    assert!(
+        rendered.lines().any(|line| line
+            == "semantic: unavailable for this query (query embedding failed: HTTP 400)"),
+        "{rendered}"
+    );
 }
 
 /// The trigram lane is not resident but its saved cache is valid. Planning
 /// treats that lane as still loading and answers from a filesystem scan; the
-/// footer, observed afterwards with a different rule, calls it ready. This is
-/// the reported `Search status: fully degraded` beside `trigram: ready`.
+/// footer used to call it ready beside `Search status: fully degraded`.
 #[test]
-#[ignore = "issue #826: trigram footer says ready while the answer was a filesystem scan"]
 fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (project, _source_file, _source) = git_project_with_needle();
@@ -3321,11 +3352,17 @@ fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
     assert_eq!(response["success"], true, "{response}");
     assert_eq!(response["fully_degraded"], true, "{response}");
     assert!(
-        rendered.contains("Search status: fully degraded"),
+        rendered.contains("Search status: answered by a filesystem scan"),
         "{rendered}"
     );
     assert!(
         !rendered.lines().any(|line| line == "trigram: ready"),
         "the trigram index did not serve this answer, so the footer may not call it ready:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line == "trigram: loading (this answer read files directly, no index)"),
+        "{rendered}"
     );
 }

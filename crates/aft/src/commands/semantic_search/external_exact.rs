@@ -1319,7 +1319,7 @@ mod tests {
             let text = rendered_search_text(&ctx, session.path(), &root, query, subc);
             assert!(text.starts_with(&expected), "{text}");
             for forbidden in [
-                "fully degraded",
+                crate::subc_format::FILESYSTEM_SCAN_STATUS,
                 "Search status",
                 "[index: fallback]",
                 "[interpreted_as",

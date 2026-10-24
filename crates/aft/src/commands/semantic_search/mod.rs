@@ -2011,16 +2011,27 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
-        // These labels are observed after the reply was built. A reply that
-        // opens by saying its results came from a bounded walk because the
-        // trigram index was still loading must not end with `trigram: ready`
-        // because the load finished while the walk ran.
-        let walked_while_trigram_loading = data
+        // The lanes are observed after the answer was built, so on their own
+        // they say whether an index is usable now, not what served this
+        // answer. The answer records that itself: results read from files
+        // directly (`fully_degraded`) and a semantic lane that failed for this
+        // query. A lane label never calls a lane ready that did not serve.
+        let read_files_directly = data
+            .get("fully_degraded")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        // A reply that opens with the bounded-walk disclosure says it read
+        // files directly because the trigram index was still loading.
+        let walk_disclosed = data
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| text.starts_with(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
+        // An answer read from files directly did not use the trigram index,
+        // even when its load finished while the files were read: report the
+        // lane as still building, in the labels and in `lanes` alike.
+        let trigram_unused = (read_files_directly || walk_disclosed) && self.trigram.is_ready();
         let relabelled;
-        let lanes = if walked_while_trigram_loading && self.trigram.is_ready() {
+        let lanes = if trigram_unused {
             relabelled = Self {
                 trigram: IndexObservation::building(),
                 semantic: self.semantic.clone(),
@@ -2029,14 +2040,25 @@ impl SearchLaneStatus {
         } else {
             self
         };
+        // The disclosure already says why the index was not used; any other
+        // such reply says it in the trigram label.
+        let trigram_label =
+            (trigram_unused && !walk_disclosed).then_some(TRIGRAM_READ_FILES_DIRECTLY);
+        let semantic_query_failure = data
+            .get(SEMANTIC_QUERY_FAILURE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| self.semantic.is_ready())
+            .map(|reason| SEMANTIC_UNAVAILABLE_FOR_QUERY.replace("{reason}", reason));
         // Runtime readiness means the resident index can be queried, not that
         // this query covered the checkout. Do not contradict its named gaps
         // with a later, generic `semantic: ready` footer.
-        let semantic_label = data.get("semantic_gap").map(|gap| {
-            gap.get("unavailable")
-                .and_then(serde_json::Value::as_str)
-                .map(|reason| format!("semantic: unavailable: {reason}"))
-                .unwrap_or_else(|| "semantic: partial (checkout coverage gaps)".to_string())
+        let semantic_label = semantic_query_failure.or_else(|| {
+            data.get("semantic_gap").map(|gap| {
+                gap.get("unavailable")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|reason| format!("semantic: unavailable: {reason}"))
+                    .unwrap_or_else(|| "semantic: partial (checkout coverage gaps)".to_string())
+            })
         });
         let labels = lanes.text(ctx);
         let labels = labels
@@ -2044,6 +2066,8 @@ impl SearchLaneStatus {
             .map(|line| {
                 if line.starts_with("semantic:") {
                     semantic_label.as_deref().unwrap_or(line)
+                } else if line.starts_with("trigram:") {
+                    trigram_label.unwrap_or(line)
                 } else {
                     line
                 }
@@ -3314,12 +3338,13 @@ fn handle_external_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, &external_root, Some(ctx));
     let display_root = absolute_display_root(&external_root);
-    let mut text = format_semantic_text_with_display_root(
+    let mut text = format_ranked_text(
         &ranked.results,
         &display_root,
         more_available,
         snippets_incomplete,
         Some(ctx),
+        ranked.literal_absent.as_deref(),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(&display_root);
@@ -3718,6 +3743,7 @@ fn handle_grep_search(
         );
     }
 
+    let ranked_total = ranked_files.as_ref().map(Vec::len);
     let interval_end = offset.saturating_add(top_k);
     let interval_has_more = if ranked_files.is_some() {
         // Every ranked file is already in hand, one result each; a deeper page
@@ -3793,9 +3819,17 @@ fn handle_grep_search(
         }
         extras.insert("lexical_only_fallback".to_string(), serde_json::json!(true));
         extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
-    } else if let Some(envelope) =
-        search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped)
-    {
+    } else if let Some(envelope) = match &ranked_total {
+        // Every matching file was ranked before the page was cut, so the
+        // total number of results (one per file) is known exactly.
+        Some(total) if interval_has_more && !result.engine_capped => {
+            crate::list_surfaces::search::build_exact_total_search_envelope(
+                result_values.len(),
+                *total,
+            )
+        }
+        _ => search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped),
+    } {
         crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
     }
     search_response(
@@ -4076,6 +4110,10 @@ struct EngineRanking {
     /// the index. Its nearest names are then the results, and its rendering
     /// replaces the rendered result list.
     not_found: Option<nearest_names::NotFoundAnswer>,
+    /// Set when a code-literal query occurs in no indexed file: the literal
+    /// as the reply names it. The results are then only similar, and are
+    /// rendered as such.
+    literal_absent: Option<String>,
 }
 
 /// `source` of a result that is a nearest name in a not-found answer.
@@ -4728,6 +4766,23 @@ fn run_engine_ranking(
             ),
         }
     });
+    // A code literal that no indexed file contains (tests included) gets the
+    // same kind of answer: the reply says so first, and the files that only
+    // share its words are labelled similar rather than presented as matches.
+    // Phrases shorter than a trigram cannot be checked, so they get no claim.
+    let literal_absent = (not_found.is_none()
+        && plan.shape == SearchShape::CodeLiteral
+        && exact_candidates.is_empty()
+        && exact_disclosures.is_empty()
+        && index.is_ready())
+    .then(|| exact_lane::exact_phrase(exact_input))
+    .filter(|phrase| phrase.len() >= 3)
+    .filter(|_| {
+        snapshot
+            .whole_corpus_exact_pass(exact_input, project_root, None)
+            .is_empty()
+    })
+    .map(str::to_string);
 
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query
@@ -5482,6 +5537,7 @@ fn run_engine_ranking(
             prose_found,
             split_placements,
             not_found: not_found.clone(),
+            literal_absent: None,
         });
     }
     Ok(EngineRanking {
@@ -5505,6 +5561,7 @@ fn run_engine_ranking(
         prose_found,
         split_placements,
         not_found: None,
+        literal_absent,
     })
 }
 
@@ -5556,12 +5613,13 @@ fn handle_engine_only_search(
     }
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-    let mut text = format_semantic_text(
+    let mut text = format_ranked_text(
         &ranked.results,
         project_root,
         ranked.more_available,
         snippets_incomplete,
         Some(ctx),
+        ranked.literal_absent.as_deref(),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(project_root);
@@ -5798,7 +5856,8 @@ fn handle_semantic_or_hybrid_search(
                 return cancelled_search_response(req);
             }
             let gap = semantic_embed_gap(&error);
-            return semantic_unavailable_or_fallback_response(
+            let reason = query_embedding_failure_reason(&error, gap.footer_reason);
+            let response = semantic_unavailable_or_fallback_response(
                 req,
                 ctx,
                 &params,
@@ -5816,6 +5875,7 @@ fn handle_semantic_or_hybrid_search(
                 extensions,
                 engine_plan,
             );
+            return with_semantic_query_failure(response, reason);
         }
     };
     if search_cancellation_requested() {
@@ -5854,7 +5914,8 @@ fn handle_semantic_or_hybrid_search(
                 .unwrap_or_default(),
             None => {
                 let gap = semantic_artifacts_busy_gap();
-                return semantic_unavailable_or_fallback_response(
+                let reason = gap.footer_reason.to_string();
+                let response = semantic_unavailable_or_fallback_response(
                     req,
                     ctx,
                     &params,
@@ -5872,6 +5933,7 @@ fn handle_semantic_or_hybrid_search(
                     extensions,
                     engine_plan,
                 );
+                return with_semantic_query_failure(response, reason);
             }
         }
     };
@@ -5961,12 +6023,13 @@ fn handle_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut results, project_root, Some(ctx));
 
-    let mut text = format_semantic_text(
+    let mut text = format_ranked_text(
         &results,
         project_root,
         more_available,
         snippets_incomplete,
         Some(ctx),
+        engine_ranking.literal_absent.as_deref(),
     );
     if let Some(answer) = &engine_ranking.not_found {
         text = answer.render(project_root);
@@ -6111,12 +6174,13 @@ fn zero_result_escalation_response(
     }
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-    let mut text = format_semantic_text_with_display_root(
+    let mut text = format_ranked_text(
         &ranked.results,
         display_root,
         ranked.more_available,
         snippets_incomplete,
         Some(ctx),
+        ranked.literal_absent.as_deref(),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(display_root);
@@ -6301,8 +6365,13 @@ fn semantic_unavailable_or_fallback_response(
         };
         let snippets_incomplete =
             enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-        let mut text =
-            format_lexical_unavailable_text(&detail, &ranked.results, project_root, footer_reason);
+        let mut text = format_lexical_unavailable_text(
+            &detail,
+            &ranked.results,
+            project_root,
+            footer_reason,
+            ranked.literal_absent.as_deref(),
+        );
         if let Some(answer) = &ranked.not_found {
             text = answer.render(project_root);
         }
@@ -7365,6 +7434,7 @@ fn format_lexical_unavailable_text(
     results: &[HybridResult],
     project_root: &Path,
     footer_reason: &str,
+    literal_absent: Option<&str>,
 ) -> String {
     if results.is_empty() {
         let retry = retry_nudge_for_unavailable_detail(detail);
@@ -7373,9 +7443,19 @@ fn format_lexical_unavailable_text(
         );
     }
 
+    // A literal no file contains opens the list with that fact, and the
+    // list's files are labelled similar rather than matches.
+    let sections = match literal_absent {
+        Some(literal) => format!(
+            "{}\n\n{}",
+            absent_literal_line(literal),
+            format_result_sections_labelled(results, project_root, None, TextualHits::Similar)
+        ),
+        None => format_result_sections(results, project_root),
+    };
     format!(
         "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: {footer_reason}]",
-        format_result_sections(results, project_root),
+        sections,
         results.len()
     )
 }
@@ -7519,6 +7599,54 @@ fn semantic_not_loaded_gap(ctx: &AppContext) -> SemanticLaneGap {
         .to_string(),
         footer_reason: "not_ready",
     }
+}
+
+/// Response key naming why this request's semantic lane failed although the
+/// lane itself stayed loaded, for example a failed query embedding. The lane
+/// footer reads it so it never calls that lane ready for this answer.
+const SEMANTIC_QUERY_FAILURE_KEY: &str = "semantic_query_failure";
+
+/// Lane footer for a semantic lane that is loaded but failed this query.
+const SEMANTIC_UNAVAILABLE_FOR_QUERY: &str = "semantic: unavailable for this query ({reason})";
+
+/// Lane footer for a trigram index that was not used because this answer's
+/// results were read from files directly.
+const TRIGRAM_READ_FILES_DIRECTLY: &str =
+    "trigram: loading (this answer read files directly, no index)";
+
+/// Reason a query embedding failed, for the semantic lane footer.
+const QUERY_EMBEDDING_FAILED: &str = "query embedding failed";
+
+/// The footer reason for a failed query embedding: the classified reason
+/// when the failure has a specific one (a timeout, a busy or warming-up
+/// embedder), otherwise that the embedding failed, with the HTTP status when
+/// the embedding client reported one (it words those `request failed (HTTP
+/// <code> ...`).
+fn query_embedding_failure_reason(error: &str, footer_reason: &str) -> String {
+    if footer_reason != "unavailable" {
+        return footer_reason.to_string();
+    }
+    let status = error
+        .split_once("request failed (HTTP ")
+        .and_then(|(_, rest)| rest.get(..3))
+        .filter(|code| code.bytes().all(|byte| byte.is_ascii_digit()));
+    match status {
+        Some(code) => format!("{QUERY_EMBEDDING_FAILED}: HTTP {code}"),
+        None => QUERY_EMBEDDING_FAILED.to_string(),
+    }
+}
+
+/// Record on a successful fallback reply why its semantic lane failed.
+fn with_semantic_query_failure(mut response: Response, reason: String) -> Response {
+    if response.success {
+        if let Some(data) = response.data.as_object_mut() {
+            data.insert(
+                SEMANTIC_QUERY_FAILURE_KEY.to_string(),
+                serde_json::json!(reason),
+            );
+        }
+    }
+    response
 }
 
 /// The gap for a query embedding that failed or timed out.
@@ -7733,6 +7861,7 @@ fn results_are_low_confidence(results: &[HybridResult]) -> bool {
         .is_some_and(|cosine| cosine < WEAK_MATCH_COSINE_FLOOR)
 }
 
+#[cfg(test)]
 fn format_semantic_text(
     results: &[HybridResult],
     project_root: &Path,
@@ -7756,15 +7885,49 @@ fn format_semantic_text_with_display_root(
     snippets_incomplete: bool,
     ctx: Option<&AppContext>,
 ) -> String {
+    format_ranked_text(
+        results,
+        display_root,
+        more_available,
+        snippets_incomplete,
+        ctx,
+        None,
+    )
+}
+
+/// The reply text for ranked results. `literal_absent` names a code literal
+/// that occurs in no indexed file: the reply then opens by saying so and
+/// calls its results similar, never matches.
+fn format_ranked_text(
+    results: &[HybridResult],
+    display_root: &Path,
+    more_available: bool,
+    snippets_incomplete: bool,
+    ctx: Option<&AppContext>,
+    literal_absent: Option<&str>,
+) -> String {
     if results.is_empty() {
         return "Found 0 results.".to_string();
     }
 
-    let mut text = format_result_sections_with_context(results, display_root, ctx);
+    let mut text = match literal_absent {
+        Some(literal) => format!(
+            "{}\n\n{}",
+            absent_literal_line(literal),
+            format_result_sections_labelled(results, display_root, ctx, TextualHits::Similar)
+        ),
+        None => format_result_sections_with_context(results, display_root, ctx),
+    };
     // Drop the unconditional "[index: ready]" tag — it was pure per-call tax on
     // the common path. Degraded/building/unavailable paths carry their own
     // distinct "[semantic: ...]" labels, so absence of a label means ready.
-    text.push_str(&format!("\n\nFound {} result(s).", results.len()));
+    match literal_absent {
+        Some(_) => text.push_str(&format!(
+            "\n\n{}",
+            SIMILAR_RESULTS_FOOTER.replace("{count}", &results.len().to_string())
+        )),
+        None => text.push_str(&format!("\n\nFound {} result(s).", results.len())),
+    }
     if more_available {
         text.push_str(" More results available; raise topK to see more.");
     }
@@ -8246,16 +8409,48 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
     format_result_sections_with_context(results, project_root, None)
 }
 
+/// Whether textual (lexical) hits may be called matches. They may not when
+/// the query's literal occurs in no file: they only share words with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextualHits {
+    Matches,
+    Similar,
+}
+
+/// Label of a file holding a lexical hit for a literal that occurs nowhere.
+const SIMILAR_LABEL: &str = " [similar]";
+
+/// First line of a reply whose code literal occurs in no indexed file.
+const ABSENT_LITERAL_LINE: &str =
+    "No file contains `{literal}`. The files below only share words with it; none of them is a match.";
+
+/// Count line of a reply whose results only share words with the literal.
+const SIMILAR_RESULTS_FOOTER: &str = "Found {count} similar result(s).";
+
+fn absent_literal_line(literal: &str) -> String {
+    ABSENT_LITERAL_LINE.replace("{literal}", literal)
+}
+
 fn format_result_sections_with_context(
     results: &[HybridResult],
     project_root: &Path,
     ctx: Option<&AppContext>,
 ) -> String {
-    format_result_sections_within_budget(
+    format_result_sections_labelled(results, project_root, ctx, TextualHits::Matches)
+}
+
+fn format_result_sections_labelled(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+    textual_hits: TextualHits,
+) -> String {
+    format_result_sections_within_budget_labelled(
         results,
         project_root,
         ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
+        textual_hits,
     )
 }
 
@@ -8263,11 +8458,30 @@ fn format_result_sections_with_context(
 /// The budget is checked before each path, symbol header and snippet line is
 /// appended, so nothing past the cut is rendered. A cut reply ends with a note
 /// saying how many results were shown and how to narrow the search.
+#[cfg(test)]
 fn format_result_sections_within_budget(
     results: &[HybridResult],
     project_root: &Path,
     ctx: Option<&AppContext>,
     max_bytes: usize,
+) -> String {
+    format_result_sections_within_budget_labelled(
+        results,
+        project_root,
+        ctx,
+        max_bytes,
+        TextualHits::Matches,
+    )
+}
+
+/// [`format_result_sections_within_budget`], labelling each file that holds
+/// a lexical hit as a match or, for an absent literal, as similar.
+fn format_result_sections_within_budget_labelled(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+    max_bytes: usize,
+    textual_hits: TextualHits,
 ) -> String {
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
@@ -8324,7 +8538,10 @@ fn format_result_sections_within_budget(
             .iter()
             .any(|(_, result)| result.source == "lexical")
         {
-            header.push_str(" [lexical match]");
+            header.push_str(match textual_hits {
+                TextualHits::Matches => " [lexical match]",
+                TextualHits::Similar => SIMILAR_LABEL,
+            });
         }
         if !out.push(&header) {
             break;
@@ -10163,6 +10380,7 @@ mod tests {
             &[],
             Path::new("/fixture"),
             "loading",
+            None,
         );
 
         assert!(text.contains("0 lexical matches"));
@@ -11041,7 +11259,7 @@ mod tests {
         // the hook, 2 in each component, 2 in each document.
         let text = response["text"].as_str().expect("text");
         assert!(
-            text.contains("Found 75 match across 37 file") && !text.contains("(capped)"),
+            text.contains("37 files match (75 matching lines);") && !text.contains("(capped)"),
             "footer must count every match exactly: {text}"
         );
     }

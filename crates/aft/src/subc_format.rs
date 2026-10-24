@@ -2313,10 +2313,14 @@ fn format_search(data: &Value) -> String {
     }
 }
 
+/// Search-status note for an answer whose results were read from files
+/// directly because no index served it (the response's `fully_degraded`).
+pub(crate) const FILESYSTEM_SCAN_STATUS: &str = "answered by a filesystem scan";
+
 fn search_status_only_note(data: &Value) -> Option<String> {
     let mut notes = Vec::new();
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
-        notes.push("fully degraded");
+        notes.push(FILESYSTEM_SCAN_STATUS);
     }
     if data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
@@ -2337,7 +2341,7 @@ fn semantic_honesty_note(data: &Value) -> Option<String> {
         notes.push("enumeration capped");
     }
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
-        notes.push("fully degraded");
+        notes.push(FILESYSTEM_SCAN_STATUS);
     }
     if data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
@@ -2352,7 +2356,7 @@ fn semantic_honesty_note(data: &Value) -> Option<String> {
 fn extra_honesty_note(data: &Value) -> Option<String> {
     let mut notes = Vec::new();
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
-        notes.push("fully degraded");
+        notes.push(FILESYSTEM_SCAN_STATUS);
     }
     if data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");

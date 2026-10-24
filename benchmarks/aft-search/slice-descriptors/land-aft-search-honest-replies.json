@@ -1,0 +1,16 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/external_exact.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/regex_route.rs",
+    "packages/opencode-plugin/src/tools/semantic.ts",
+    "packages/pi-plugin/src/tools/semantic.ts"
+  ],
+  "note": "engine_unwired: aft_search reply wording only (absent-literal line and [similar] labels, lane footer from what served the answer, files-first count line and exact regex-route trailer, refusal for a rule-denied external path) Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

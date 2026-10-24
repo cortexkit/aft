@@ -363,7 +363,7 @@ fn subc_format_search_both_flags_preserves_status_text_and_json_markers() {
     assert!(!formatted.contains("enumeration capped"));
     // Status text preserved as unchanged
     assert!(
-        formatted.contains("Search status: fully degraded; partial/incomplete."),
+        formatted.contains("Search status: answered by a filesystem scan; partial/incomplete."),
         "status note must remain: {formatted}"
     );
 }
@@ -433,7 +433,7 @@ fn transport_parity_search_fixtures() {
         let base_with_status = if fully_degraded || !complete {
             let mut notes = Vec::new();
             if fully_degraded {
-                notes.push("fully degraded");
+                notes.push("answered by a filesystem scan");
             }
             if !complete {
                 notes.push("partial/incomplete");

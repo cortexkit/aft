@@ -80,7 +80,7 @@ describe("semantic renderer", () => {
     );
 
     expect(output).toContain(
-      "Search status: more results available; enumeration capped; fully degraded; partial/incomplete.",
+      "Search status: more results available; enumeration capped; answered by a filesystem scan; partial/incomplete.",
     );
   });
 

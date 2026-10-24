@@ -55,6 +55,22 @@ pub fn build_fallback_search_envelope(
     ))
 }
 
+/// Build the result envelope for a page cut from a list whose full length is
+/// known: every result was ranked before the page was cut, so the total is
+/// exact rather than a floor.
+pub fn build_exact_total_search_envelope(shown: usize, total: usize) -> Option<ListEnvelope> {
+    if shown >= total {
+        return None;
+    }
+    Some(ListEnvelope::new(
+        shown,
+        Total::Exact(total),
+        Unit::Results,
+        vec![Reason::Cap],
+        SEARCH_NARROW,
+    ))
+}
+
 /// Attach a producer-projected search envelope to a JSON response object map.
 pub fn attach_projected_search_envelope(
     map: &mut serde_json::Map<String, serde_json::Value>,
