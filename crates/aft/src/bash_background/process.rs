@@ -469,13 +469,47 @@ fn process_group_gone(pgid: i32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Whether a process group may still have processes: signal 0 to it succeeds,
-/// or is refused (EPERM) because a member belongs to another user.
-#[cfg(unix)]
-pub fn process_group_may_be_alive(pgid: i32) -> bool {
-    pgid > 0
-        && ((unsafe { libc::kill(-pgid, 0) } == 0)
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+/// A process as AFT recorded it: its pid and the time it started. A pid alone
+/// can be reused by an unrelated process; the pair cannot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub started_at_ms: u64,
+}
+
+impl ProcessIdentity {
+    /// The identity of a running process, or `None` when it has exited or
+    /// its start time cannot be read.
+    pub fn of(pid: u32) -> Option<Self> {
+        Some(Self {
+            pid,
+            started_at_ms: crate::root_cache::process_start_time_ms(pid)?,
+        })
+    }
+
+    /// Whether this exact process is still running and still in `pgid`. It is
+    /// the evidence that a process group answering under a task's saved
+    /// number is still that task's group, not a later one the system gave the
+    /// same number after the original group had exited.
+    pub fn is_running_in_group(self, pgid: i32) -> bool {
+        Self::of(self.pid) == Some(self) && process_group_of(self.pid) == Some(pgid)
+    }
+}
+
+/// The process group a process belongs to, read the same way for every user's
+/// processes. `None` when it has exited or the platform has no such reading.
+fn process_group_of(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_proc_stat(&stat).map(|(_, _, pgrp)| pgrp));
+    #[cfg(target_os = "macos")]
+    return macos_kinfo(pid).map(|info| info.pgid);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 #[cfg(all(test, target_os = "linux"))]
 thread_local! { static PROC_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

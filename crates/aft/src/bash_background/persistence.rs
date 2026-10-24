@@ -23,7 +23,7 @@ use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
-use super::process::{LiveDescendant, LiveDescendantsUnavailable};
+use super::process::{LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity};
 use super::BgTaskStatus;
 
 #[cfg(test)]
@@ -1602,6 +1602,13 @@ pub struct PersistedTask {
     /// `live_descendants` survived that kill.
     #[serde(default, skip_serializing_if = "is_false")]
     pub group_kill_sent: bool,
+    /// The identities of the group members the latest check found. A later
+    /// kill of the finished task signals its group only if the leader or one
+    /// of these processes is still running in it; otherwise the group number
+    /// may by then belong to an unrelated group. Kept through a failed or
+    /// incomplete check that found nobody, cleared by a clean one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_member_identities: Vec<ProcessIdentity>,
     pub completion_delivered: bool,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
@@ -1737,6 +1744,7 @@ impl PersistedTask {
             live_descendants_omitted: 0,
             live_descendants_unavailable: None,
             group_kill_sent: false,
+            group_member_identities: Vec::new(),
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
@@ -1895,6 +1903,7 @@ impl From<BashTaskRow> for PersistedTask {
             live_descendants_omitted: 0,
             live_descendants_unavailable: None,
             group_kill_sent: false,
+            group_member_identities: Vec::new(),
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,

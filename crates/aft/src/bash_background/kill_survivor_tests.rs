@@ -397,32 +397,29 @@ fn process_exited(pid: i32) -> bool {
     false
 }
 
-/// A command finished on its own, leaving a TERM-ignoring process in its
-/// group that the check at its end could not see, so the task records no
-/// member and an incomplete listing. An explicit `bash_kill` must still
-/// signal the group, and the survivor must be gone afterwards.
-#[test]
-fn bash_kill_signals_a_finished_group_whose_listing_was_incomplete() {
-    let registry = registry();
-    let dir = tempfile::tempdir().unwrap();
+/// Start a command that leaves a TERM-ignoring survivor in its group, install
+/// `hide` for the group, then let the command finish on its own. Returns the
+/// task, the survivor's pid and the group once the task's end-of-run check has
+/// recorded an incomplete listing.
+fn finish_leaving_a_survivor(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    hide: fn(i32),
+) -> (String, i32, i32, BgTaskSnapshot) {
     let task_id = spawn_for_kill(
-        &registry,
-        dir.path(),
+        registry,
+        dir,
         "sh -c 'trap \"\" TERM; echo $$ > survivor.pid; exec sleep 30' & while [ ! -f go ]; do sleep 0.01; done",
     );
-    wait_for_file(
-        &dir.path().join("survivor.pid"),
-        "the survivor did not start",
-    );
-    let survivor = std::fs::read_to_string(dir.path().join("survivor.pid"))
+    wait_for_file(&dir.join("survivor.pid"), "the survivor did not start");
+    let survivor = std::fs::read_to_string(dir.join("survivor.pid"))
         .unwrap()
         .trim()
         .parse::<i32>()
         .unwrap();
-    let pgid = task_pgid(&registry, &task_id);
-    let _reap = ReapGroup(pgid);
-    test_hooks::hide_members(pgid);
-    std::fs::write(dir.path().join("go"), "").unwrap();
+    let pgid = task_pgid(registry, &task_id);
+    hide(pgid);
+    std::fs::write(dir.join("go"), "").unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let finished = loop {
@@ -434,33 +431,227 @@ fn bash_kill_signals_a_finished_group_whose_listing_was_incomplete() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(finished.info.status, BgTaskStatus::Completed);
-    assert_eq!(finished.live_descendants, None);
     assert_eq!(
         finished.live_descendants_unavailable,
         Some(LiveDescendantsUnavailable::ListingIncomplete)
     );
-    assert_eq!(
-        finished.live_descendants_summary.as_deref(),
-        Some(INCOMPLETE_LISTING_NOTE)
-    );
     assert!(!process_exited(survivor), "the survivor must be running");
+    (task_id, survivor, pgid, finished)
+}
+
+fn wait_for_exit(pid: i32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !process_exited(pid) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A command finished on its own, leaving a TERM-ignoring survivor. Another
+/// user's process was unreadable, so the listing at its end was incomplete,
+/// but it did find the survivor and recorded who it is. An explicit
+/// `bash_kill` signals the group on that evidence, and the survivor is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn bash_kill_signals_a_finished_group_whose_incomplete_listing_found_a_survivor() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let (task_id, survivor, pgid, finished) =
+        finish_leaving_a_survivor(&registry, dir.path(), test_hooks::make_outsiders_unreadable);
+    let _reap = ReapGroup(pgid);
+    let members = finished.live_descendants.expect("the survivor was found");
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.pid as i32)
+            .collect::<Vec<_>>(),
+        vec![survivor]
+    );
 
     let killed = registry.kill(&task_id, SESSION).unwrap();
 
     assert!(
         killed.kill_signaled,
-        "bash_kill must signal a group whose listing was incomplete"
+        "bash_kill must signal a group whose recorded survivor still runs in it"
     );
+    wait_for_exit(survivor, "bash_kill left the survivor running");
+}
+
+/// The same, but the listing could see no member at all and the group's
+/// leader has exited, so nothing shows that the group still answering under
+/// the task's number is the task's own. `bash_kill` leaves it alone and the
+/// record keeps saying the listing was incomplete.
+#[test]
+fn bash_kill_leaves_a_group_alone_without_evidence_it_is_the_tasks() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let (task_id, survivor, pgid, finished) =
+        finish_leaving_a_survivor(&registry, dir.path(), test_hooks::hide_members);
+    let _reap = ReapGroup(pgid);
+    assert_eq!(finished.live_descendants, None);
+
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+
+    assert!(!killed.kill_signaled, "no evidence, so no signal");
+    assert_eq!(killed.live_descendants, None);
+    assert_eq!(
+        killed.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingIncomplete)
+    );
+    assert!(!process_exited(survivor));
+}
+
+/// A finished task whose saved group number now belongs to a live group,
+/// written as AFT records it. `leader_start` is the start time recorded for the
+/// task's leader and `members` the identities its last check recorded.
+fn finished_task_on_group(
+    registry: &BgTaskRegistry,
+    storage: &Path,
+    pgid: i32,
+    leader_start: Option<u64>,
+    members: Vec<ProcessIdentity>,
+) -> String {
+    let paths =
+        crate::bash_background::persistence::task_paths(storage, SESSION, &random_slug()).unwrap();
+    let mut metadata = PersistedTask::starting(
+        paths.task_id.clone(),
+        SESSION.into(),
+        "sleep 30".into(),
+        storage.into(),
+        Some(storage.into()),
+        None,
+        true,
+        false,
+    );
+    metadata.mark_running(pgid as u32, pgid);
+    metadata.child_start_time_ms = leader_start;
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    metadata.live_descendants = (!members.is_empty()).then(|| {
+        members
+            .iter()
+            .map(|identity| LiveDescendant {
+                pid: identity.pid,
+                comm: "sleep".into(),
+                argv0: "sleep".into(),
+                user: None,
+                command: None,
+            })
+            .collect()
+    });
+    metadata.live_descendants_unavailable = Some(LiveDescendantsUnavailable::ListingIncomplete);
+    metadata.group_member_identities = members;
+    crate::bash_background::persistence::write_task(&paths.json, &metadata).unwrap();
+    let task_id = metadata.task_id.clone();
+    registry
+        .insert_rehydrated_task(metadata, paths, true)
+        .unwrap();
+    task_id
+}
+
+/// A process in a new group of its own (its pid is the group number).
+fn spawn_group_leader(command: &str) -> std::process::Child {
+    let mut child = std::process::Command::new("sh");
+    child.arg("-c").arg(command);
+    crate::bash_background::process::start_new_session(&mut child);
+    child.spawn().unwrap()
+}
+
+/// The system gave a finished task's group number to an unrelated group: a
+/// process with that pid is running, but it started at a different time than
+/// the task's recorded leader, and no recorded member is in it. `bash_kill`
+/// must not signal it.
+#[test]
+fn bash_kill_does_not_signal_a_group_that_reused_the_tasks_number() {
+    let registry = registry();
+    let storage = tempfile::tempdir().unwrap();
+
+    // The unrelated group's own leader is alive under the saved number.
+    let mut leader = spawn_group_leader("exec sleep 30");
+    let pgid = leader.id() as i32;
+    let _reap_leader = ReapGroup(pgid);
+    let started = ProcessIdentity::of(leader.id()).unwrap().started_at_ms;
+    let task_id = finished_task_on_group(
+        &registry,
+        storage.path(),
+        pgid,
+        Some(started - 60_000),
+        vec![],
+    );
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+    assert!(
+        !killed.kill_signaled,
+        "a reused group number must not be signalled"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        leader.try_wait().unwrap().is_none(),
+        "the unrelated leader was signalled"
+    );
+    let _ = leader.kill();
+    let _ = leader.wait();
+
+    // The unrelated group's leader has exited and only its member remains;
+    // the task recorded a member under that pid, but with another start time.
+    let dir = tempfile::tempdir().unwrap();
+    let member_file = dir.path().join("member.pid");
+    let mut gone_leader =
+        spawn_group_leader(&format!("sleep 30 & echo $! > {}", member_file.display()));
+    let pgid = gone_leader.id() as i32;
+    let _reap_member = ReapGroup(pgid);
+    let _ = gone_leader.wait();
+    wait_for_file(&member_file, "the unrelated member did not start");
+    let member = std::fs::read_to_string(&member_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let real = ProcessIdentity::of(member).unwrap();
+    let task_id = finished_task_on_group(
+        &registry,
+        storage.path(),
+        pgid,
+        None,
+        vec![ProcessIdentity {
+            pid: member,
+            started_at_ms: real.started_at_ms - 60_000,
+        }],
+    );
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+    assert!(
+        !killed.kill_signaled,
+        "a recorded survivor's pid alone is no evidence"
+    );
+    assert!(
+        !process_exited(member as i32),
+        "the unrelated member was signalled"
+    );
+}
+
+/// The positive control for the case above: the process under the saved
+/// number is the task's recorded leader (same start time), so `bash_kill`
+/// signals the group even with no member listed.
+#[test]
+fn bash_kill_signals_a_finished_group_whose_recorded_leader_still_runs() {
+    let registry = registry();
+    let storage = tempfile::tempdir().unwrap();
+    let mut leader = spawn_group_leader("exec sleep 30");
+    let pgid = leader.id() as i32;
+    let _reap = ReapGroup(pgid);
+    let started = ProcessIdentity::of(leader.id()).unwrap().started_at_ms;
+    let task_id = finished_task_on_group(&registry, storage.path(), pgid, Some(started), vec![]);
+
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+
+    assert!(killed.kill_signaled);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !process_exited(survivor) {
+    while leader.try_wait().unwrap().is_none() {
         assert!(
             Instant::now() < deadline,
-            "bash_kill left the survivor {survivor} running"
+            "bash_kill left the task's own leader running"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
 /// A pseudoterminal task's group is checked after AFT kills it, which it was
 /// not before: a TERM-ignoring survivor is named, not left unreported.
 #[test]

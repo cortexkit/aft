@@ -59,7 +59,7 @@ use super::process::terminate_pgid;
 use super::process::terminate_pid;
 use super::process::{
     is_process_alive, is_recorded_process_alive, live_process_group_members, GroupListing,
-    LiveDescendant, LiveDescendantsUnavailable,
+    LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity,
 };
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
@@ -261,9 +261,8 @@ enum KillSignalPlan {
     Nothing,
     /// Another kill is signaling this task; wait for its outcome.
     AwaitOtherKill,
-    /// The task is already terminal and members of its process group were
-    /// still alive when it ended, or may be: its last check was incomplete or
-    /// missing and the group still answers.
+    /// The task is already terminal and its process group is evidently still
+    /// its own: the leader or a member a check found is still running in it.
     TerminalSurvivors { pgid: i32, live_count: usize },
     /// Signal a piped task's process group and reap its direct child.
     Piped {
@@ -390,29 +389,22 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
 #[cfg(not(unix))]
 fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
 
-/// Whether a finished task's process group may still hold processes that a
-/// kill should signal, when its last check named none. A clean check (`[]`
-/// with no reason) means the group was seen empty, and an empty group never
-/// regains members: a group answering under that id later is a different one,
-/// so it is left alone. An incomplete or missing check proves nothing, so the
-/// group is signalled whenever it still answers signal 0.
-fn finished_group_may_be_alive(metadata: &PersistedTask, pgid: i32) -> bool {
-    let seen_empty = metadata
-        .live_descendants
-        .as_ref()
-        .is_some_and(|members| members.is_empty())
-        && metadata.live_descendants_omitted == 0
-        && metadata.live_descendants_unavailable.is_none();
-    if seen_empty {
-        return false;
-    }
-    #[cfg(unix)]
-    return super::process::process_group_may_be_alive(pgid);
-    #[cfg(not(unix))]
-    {
-        let _ = pgid;
-        false
-    }
+/// Whether a finished task's process group, answering under its saved
+/// number, is still that task's group and may be signalled. The number is the
+/// group leader's pid, and once the original group has exited the system can
+/// hand it to an unrelated process. So the group is the task's only while its
+/// leader, or a member a check of this task found, is still running in it
+/// with the start time AFT recorded. Without such evidence it is left alone,
+/// even when a check could not see every member.
+fn finished_group_is_still_the_tasks(metadata: &PersistedTask, pgid: i32) -> bool {
+    let leader = u32::try_from(pgid)
+        .ok()
+        .zip(metadata.child_start_time_ms)
+        .map(|(pid, started_at_ms)| ProcessIdentity { pid, started_at_ms });
+    leader
+        .into_iter()
+        .chain(metadata.group_member_identities.iter().copied())
+        .any(|identity| identity.is_running_in_group(pgid))
 }
 
 /// Store the outcome of one check of a task's process group: the surviving
@@ -432,6 +424,15 @@ fn record_group_check(
             metadata.live_descendants_unavailable = listing
                 .incomplete
                 .then_some(LiveDescendantsUnavailable::ListingIncomplete);
+            if found_any {
+                metadata.group_member_identities = listing
+                    .members
+                    .iter()
+                    .filter_map(|member| ProcessIdentity::of(member.pid))
+                    .collect();
+            } else if !listing.incomplete {
+                metadata.group_member_identities.clear();
+            }
         }
         Err(reason) => {
             metadata.live_descendants = None;
@@ -10949,8 +10950,7 @@ impl BgTaskRegistry {
                 match state.metadata.pgid {
                     Some(pgid)
                         if cfg!(unix)
-                            && (live_count > 0
-                                || finished_group_may_be_alive(&state.metadata, pgid)) =>
+                            && finished_group_is_still_the_tasks(&state.metadata, pgid) =>
                     {
                         KillSignalPlan::TerminalSurvivors { pgid, live_count }
                     }
