@@ -35,6 +35,11 @@ mod read_policy_cache {
     }
 
     impl Entry {
+        fn clear(&self) {
+            self.policy.borrow_mut().take();
+            self.unrestored.borrow_mut().take();
+        }
+
         pub(super) fn get(&self) -> Option<Arc<AccessPolicy>> {
             self.policy.borrow().clone()
         }
@@ -63,10 +68,12 @@ mod read_policy_cache {
             slot.borrow()
                 .as_ref()
                 .filter(|entry| {
-                    entry.context == context
-                        && entry.request == request
-                        && crate::access_policy::scope_matches(&entry.scope)
-                        && entry.route_generation == crate::access_policy::ask_route_generation()
+                    let authority_matches = crate::access_policy::scope_matches(&entry.scope)
+                        && entry.route_generation == crate::access_policy::ask_route_generation();
+                    if !authority_matches {
+                        entry.clear();
+                    }
+                    entry.context == context && entry.request == request && authority_matches
                 })
                 .cloned()
         })
@@ -89,8 +96,46 @@ mod read_policy_cache {
             policy: RefCell::new(None),
             unrestored: RefCell::new(None),
         });
-        let _restore = Restore(CURRENT.with(|slot| slot.replace(Some(entry))));
+        let previous = CURRENT.with(|slot| slot.replace(Some(entry)));
+        let _restore = Restore(previous);
+        if let Some(previous) = &_restore.0 {
+            // A nested call under another authority must not revive the outer
+            // call's old grants when its cache slot is restored on return.
+            if !crate::access_policy::scope_matches(&previous.scope)
+                || previous.route_generation != crate::access_policy::ask_route_generation()
+            {
+                previous.clear();
+            }
+        }
         run()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn read_policy_cache_restores_outer_entry_and_clears_on_unwind() {
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+            with(7, "same-request", || {
+                let outer = current(7, "same-request").unwrap();
+                with(7, "same-request", || {
+                    let inner = current(7, "same-request").unwrap();
+                    assert!(!Rc::ptr_eq(&outer, &inner));
+                });
+                assert!(Rc::ptr_eq(&outer, &current(7, "same-request").unwrap()));
+            });
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+            let panicked = std::panic::catch_unwind(|| {
+                with(7, "same-request", || panic!("cache lifetime probe"));
+            });
+            assert!(panicked.is_err());
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+            with(7, "same-request", || {
+                assert!(current(7, "same-request").is_some())
+            });
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+        }
     }
 }
 

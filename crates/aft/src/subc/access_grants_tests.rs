@@ -1163,6 +1163,207 @@ fn scoped_read_lists_load_policy_and_grants_once_per_call() {
     });
 }
 
+fn read_policy_boundary_fixture() -> (
+    tempfile::TempDir,
+    AppContext,
+    RouteIdentity,
+    RouteIdentity,
+    PathBuf,
+    PathBuf,
+) {
+    let (dir, ctx, head, scope_a) = fixture();
+    let root_b = dir.path().join("worker-b");
+    std::fs::create_dir(&root_b).unwrap();
+    let scope_b = identity(&policy_path(&root_b), "worker-b", "worker", Some("head"));
+    register(&scope_b, &ctx).unwrap();
+    let path_a = head.project_root.join("grant-a.txt");
+    let path_b = head.project_root.join("grant-b.txt");
+    std::fs::write(&path_a, "scope A").unwrap();
+    std::fs::write(&path_b, "scope B").unwrap();
+    for (route, path) in [(&scope_a, &path_a), (&scope_b, &path_b)] {
+        remote_policy::catalog(
+            catalog_request(json!([{"path":path,"mode":"read"}])),
+            route,
+            &ctx,
+        )
+        .unwrap();
+    }
+    ctx.update_config(|config| {
+        config.project_root = Some(scope_a.project_root.clone());
+        config.restrict_to_project_root = true;
+    });
+    (dir, ctx, scope_a, scope_b, path_a, path_b)
+}
+
+fn assert_boundary_grants(
+    policy: &crate::access_policy::AccessPolicy,
+    allowed: &Path,
+    denied: &Path,
+    label: &str,
+) {
+    assert_eq!(
+        policy.decide(AccessOperation::Read, &policy_path(allowed), false),
+        AccessDecision::Allow,
+        "{label}: wrong grants for allowed path {allowed:?}: {:?}",
+        policy.grants
+    );
+    assert_ne!(
+        policy.decide(AccessOperation::Read, &policy_path(denied), false),
+        AccessDecision::Allow,
+        "{label}: inherited another scope's grant for {denied:?}: {:?}",
+        policy.grants
+    );
+}
+
+#[test]
+fn read_policy_snapshot_scope_boundary_uses_current_scope_grants() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, scope_a, scope_b, path_a, path_b) = read_policy_boundary_fixture();
+    let id = "same-request-scope-boundary";
+    let probe = crate::context::policy_load_probe::Probe::new(id);
+    crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
+        ctx.with_read_policy_snapshot(id, || {
+            let policy_a = ctx.access_policy(id).unwrap();
+            assert_boundary_grants(&policy_a, &path_a, &path_b, "scope A");
+            let initial = probe.counts();
+            crate::access_policy::with_scope(Some(scope_key(&scope_b)), || {
+                let policy_b = ctx.access_policy(id).unwrap();
+                assert_boundary_grants(
+                    &policy_b,
+                    &path_b,
+                    &path_a,
+                    "scope B in A's live request cache",
+                );
+                assert!(probe.counts().policies > initial.policies);
+                ctx.with_read_policy_snapshot(id, || {
+                    let nested_b = ctx.access_policy(id).unwrap();
+                    assert_boundary_grants(&nested_b, &path_b, &path_a, "nested scope B");
+                });
+                // Dropping the inner cache restores A's entry, not B's authority.
+                let after_nested = ctx.access_policy(id).unwrap();
+                assert_boundary_grants(
+                    &after_nested,
+                    &path_b,
+                    &path_a,
+                    "scope B after nested cache drop",
+                );
+            });
+        });
+    });
+    // Reusing both identifiers on this thread after the call must start fresh.
+    crate::access_policy::with_scope(Some(scope_key(&scope_b)), || {
+        let after_call = ctx.access_policy(id).unwrap();
+        assert_boundary_grants(&after_call, &path_b, &path_a, "scope B after call return");
+    });
+}
+
+#[test]
+fn read_policy_snapshot_route_generation_rebuilds_changed_grants() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, scope_a, _scope_b, path_a, path_b) = read_policy_boundary_fixture();
+    let id = "same-request-route-boundary";
+    crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
+        ctx.with_read_policy_snapshot(id, || {
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_a,
+                &path_b,
+                "initial route",
+            );
+            let generation = crate::access_policy::ask_route_generation();
+            {
+                let db = ctx.db().unwrap();
+                let conn = db.lock().unwrap();
+                assert_eq!(
+                    crate::db::access_grants::revoke(
+                        &conn,
+                        &scope_key(&scope_a),
+                        &policy_path(&path_a)
+                    )
+                    .unwrap(),
+                    1
+                );
+                crate::db::access_grants::insert(
+                    &conn,
+                    &scope_key(&scope_a),
+                    &crate::access_policy::AccessGrant {
+                        path: policy_path(&path_b),
+                        kind: crate::access_policy::GrantKind::File,
+                        operation: AccessOperation::Read,
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(crate::access_policy::ask_route_generation(), generation);
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_a,
+                &path_b,
+                "same-route snapshot",
+            );
+            let _route = crate::access_policy::ask_route_guard(Some(
+                crate::access_policy::AskRoute::Lowered,
+            ));
+            assert_ne!(crate::access_policy::ask_route_generation(), generation);
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_b,
+                &path_a,
+                "changed route generation",
+            );
+        });
+    });
+}
+
+#[test]
+fn read_policy_snapshot_nested_scope_does_not_resurrect_revoked_grants() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, scope_a, scope_b, path_a, path_b) = read_policy_boundary_fixture();
+    let id = "same-request-nested-scope-boundary";
+    crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
+        ctx.with_read_policy_snapshot(id, || {
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_a,
+                &path_b,
+                "outer scope A",
+            );
+            crate::access_policy::with_scope(Some(scope_key(&scope_b)), || {
+                ctx.with_read_policy_snapshot(id, || {
+                    assert_boundary_grants(
+                        &ctx.access_policy(id).unwrap(),
+                        &path_b,
+                        &path_a,
+                        "inner scope B",
+                    );
+                    let db = ctx.db().unwrap();
+                    let conn = db.lock().unwrap();
+                    assert_eq!(
+                        crate::db::access_grants::revoke(
+                            &conn,
+                            &scope_key(&scope_a),
+                            &policy_path(&path_a)
+                        )
+                        .unwrap(),
+                        1
+                    );
+                });
+            });
+            let after_nested = ctx.access_policy(id).unwrap();
+            assert_ne!(
+                after_nested.decide(AccessOperation::Read, &policy_path(&path_a), false),
+                AccessDecision::Allow,
+                "scope A resurrected revoked grants after scope B: {:?}",
+                after_nested.grants
+            );
+            assert_ne!(
+                after_nested.decide(AccessOperation::Read, &policy_path(&path_b), false),
+                AccessDecision::Allow
+            );
+        });
+    });
+}
+
 #[test]
 fn grants_ordinary_detach_and_reclamation_keep_standing_capabilities() {
     let (dir, ctx, _head, worker) = fixture();
