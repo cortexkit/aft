@@ -675,11 +675,72 @@ fn concurrent_equal_manifest_builders_write_privately_and_agree() {
         .filter(|(_, outcome)| matches!(outcome, PublishV2::EquivalentWinner { .. }))
         .count();
     assert_eq!((published, equivalent), (1, 1), "{outcomes:?}");
-    for (name, _) in &outcomes {
-        assert!(view
-            .view_dir()
-            .join(format!("manifest-{name}.json"))
-            .is_file());
+    let published_name = &outcomes
+        .iter()
+        .find(|(_, outcome)| *outcome == PublishV2::Published)
+        .unwrap()
+        .0;
+    let store = view.view_store().unwrap();
+    store.sweep_generations().unwrap();
+    assert_eq!(
+        store.current_generation().unwrap().as_ref(),
+        Some(published_name)
+    );
+    assert!(store.load_manifest_v2(published_name).is_ok());
+    for (_, outcome) in &outcomes {
+        if let PublishV2::EquivalentWinner { current } = outcome {
+            assert_eq!(current, published_name);
+            assert!(store.load_manifest_v2(current).is_ok());
+        }
+    }
+}
+
+/// Inspecting a builder's private file after commit requires an explicit pin;
+/// an uninstalled losing name is not the generation an EquivalentWinner names.
+#[test]
+fn equal_manifest_builders_can_pin_private_files_after_return() {
+    let storage = tempdir().unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let view = registry
+        .register_view_with_storage(
+            registry.storage(),
+            "pinned-builders",
+            &storage.path().join("root"),
+        )
+        .unwrap();
+    let manifest = ManifestV2::new(ManifestHeader {
+        producers: producers(),
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let outcomes = (0..2)
+        .map(|_| {
+            let view = view.clone();
+            let manifest = manifest.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let store = view.view_store().unwrap();
+                let name = GenerationName::for_manifest(&manifest).unwrap();
+                let pin = AssemblyPin::create_v2(&view, name.to_string(), &[]).unwrap();
+                let prepared = store.prepare_v2(&name, None, &manifest, None).unwrap();
+                barrier.wait();
+                (
+                    name.to_string(),
+                    store.commit_v2(prepared, None).unwrap(),
+                    pin,
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    let store = view.view_store().unwrap();
+    store.sweep_generations().unwrap();
+    for (name, _, _pin) in &outcomes {
+        assert!(store.load_manifest_v2(name).is_ok());
     }
 }
 

@@ -616,7 +616,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "views/generation.rs",
-        enclosing_item: "generation_directory_entries, blob_references_by_generation, generation_sweep_registry, sweep_generations_bounded, remove_generation_files",
+        enclosing_item: "generation_directory_entries, blob_references_by_generation, generation_sweep_registry, has_superseded_artifacts, sweep_generations_bounded, remove_generation_files",
         location_or_primitive: "take(limit.saturating_add(1)), take(GENERATION_DIRECTORY_LIMIT)",
         reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, while an incomplete temporary-file deletion pass only leaves garbage for a later pass",
     },

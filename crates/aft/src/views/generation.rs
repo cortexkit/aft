@@ -46,7 +46,6 @@ fn unlink_generation_file(path: &Path) -> Option<u64> {
 // A view has at most one cleanup worker. Publications arriving during a sweep
 // request another lap rather than starting competing pointer transactions.
 static GENERATION_SWEEPS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
-#[cfg(test)]
 static GENERATION_SWEEP_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
 
 pub(super) fn schedule_generation_sweep(view: ViewStore) {
@@ -95,7 +94,6 @@ pub(super) fn schedule_generation_sweep(view: ViewStore) {
                 continue;
             }
             jobs.remove(&path);
-            #[cfg(test)]
             GENERATION_SWEEP_SETTLED.notify_all();
             break;
         })
@@ -103,7 +101,6 @@ pub(super) fn schedule_generation_sweep(view: ViewStore) {
         jobs.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&failed_path);
-        #[cfg(test)]
         GENERATION_SWEEP_SETTLED.notify_all();
         log::warn!(
             "views: generation sweep worker unavailable view={} error={error}",
@@ -112,7 +109,6 @@ pub(super) fn schedule_generation_sweep(view: ViewStore) {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn wait_for_generation_sweep_for_test(path: &Path) {
     let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
     let (jobs, timeout) = GENERATION_SWEEP_SETTLED
@@ -360,6 +356,11 @@ impl ViewStore {
     }
 
     pub(crate) fn sweep_generations_with_bytes(&self) -> Result<GenerationSweep> {
+        // Most publications have no obsolete files. A read-only preflight
+        // avoids opening writable coordination handles just to discover that.
+        if !self.has_superseded_artifacts()? {
+            return Ok(GenerationSweep::default());
+        }
         if let Some(registry) = self.generation_sweep_registry()? {
             // V2 pin admission takes the registry before the view pointer.
             // Keep that order and hold the barrier through protection checks
@@ -372,8 +373,11 @@ impl ViewStore {
                         .unwrap_or_default()
                         .to_string_lossy();
                     let registered: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM members WHERE scope = ?1)",
-                        [scope.as_ref()],
+                        "SELECT EXISTS(SELECT 1 FROM members WHERE scope = ?1 AND view_dir = ?2)",
+                        rusqlite::params![
+                            scope.as_ref(),
+                            self.view_dir().to_string_lossy().as_ref()
+                        ],
                         |row| row.get(0),
                     )?;
                     if !registered {
@@ -393,7 +397,11 @@ impl ViewStore {
 
     fn generation_sweep_registry(&self) -> Result<Option<super::registry::FamilyRegistry>> {
         if let Some(registry) = &self.sweep_registry {
-            return Ok(Some(registry.clone()));
+            return registry
+                .open_for_sweep()
+                .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?
+                .map(Some)
+                .ok_or_else(|| ViewError::InvalidManifest("V2 sweep registry disappeared".into()));
         }
         let Some(v2) = self
             .view_dir()
@@ -428,24 +436,73 @@ impl ViewStore {
                 .to_string_lossy();
             let found = (|| -> super::registry::RegistryResult<_> {
                 let Some(registry) =
-                    super::registry::FamilyRegistry::open_existing(storage, &family)?
+                    super::registry::FamilyRegistry::open_existing_read_only(storage, &family)?
                 else {
                     return Ok(None);
                 };
                 let member = registry.member(&scope)?;
                 Ok(member
                     .filter(|member| member.view_dir == self.view_dir())
-                    .map(|_| registry))
+                    .map(|_| registry.location()))
             })()
             .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?;
             if found.is_some() {
-                return Ok(found);
+                return found
+                    .unwrap()
+                    .open_for_sweep()
+                    .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?
+                    .map(Some)
+                    .ok_or_else(|| {
+                        ViewError::InvalidManifest("V2 sweep registry disappeared".into())
+                    });
             }
         }
         Err(ViewError::InvalidManifest(format!(
             "V2 view has no registry: {}",
             self.view_dir().display()
         )))
+    }
+
+    fn has_superseded_artifacts(&self) -> Result<bool> {
+        let connection = crate::db::file_identity::IdentityConnection::open_census(
+            &self.pointer_path(),
+            "views::generation::census_pointer",
+        )?;
+        let current: String = connection.query_row(
+            "SELECT generation FROM pointer WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current = (!current.is_empty()).then_some(current);
+        drop(connection);
+        for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let generation = name
+                .strip_prefix("derived-")
+                .and_then(|name| {
+                    name.strip_suffix(".sqlite")
+                        .or_else(|| name.strip_suffix(".ref"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("manifest-")
+                        .and_then(|name| name.strip_suffix(".json"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("trigram-")
+                        .and_then(|name| name.strip_suffix(".bin"))
+                })
+                .or_else(|| {
+                    name.strip_prefix(".manifest-").and_then(|name| {
+                        name.split_once(".json.tmp.")
+                            .map(|(generation, _)| generation)
+                    })
+                });
+            if generation.is_some_and(|generation| current.as_deref() != Some(generation)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn sweep_generations_bounded(
@@ -455,7 +512,16 @@ impl ViewStore {
     ) -> Result<GenerationSweep> {
         // A publisher cannot add a reference after the ownership snapshot and
         // release its base pin before the sweep checks that pin.
-        let mut pointer = self.open_pointer_connection()?;
+        let mut pointer = crate::db::file_identity::IdentityConnection::open_with_flags(
+            self.pointer_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "views::generation::sweep_pointer",
+        )?;
+        pointer.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        pointer.busy_timeout(super::POINTER_BUSY_TIMEOUT)?;
         let ownership =
             pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current: String = ownership.query_row(
@@ -655,7 +721,6 @@ struct DeferredCheckpointJob {
 static DEFERRED_CHECKPOINTS: OnceLock<Mutex<HashMap<PathBuf, DeferredCheckpointJob>>> =
     OnceLock::new();
 static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-#[cfg(test)]
 static CHECKPOINT_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
 
 #[cfg(test)]
@@ -674,15 +739,17 @@ pub(crate) fn checkpoint_test_hooks() -> &'static Mutex<HashMap<PathBuf, Checkpo
     CHECKPOINT_TEST_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(test)]
 pub(crate) fn wait_for_derived_checkpoint_for_test(view_dir: &Path) {
-    let before_wait = checkpoint_test_hooks()
-        .lock()
-        .unwrap()
-        .get_mut(view_dir)
-        .and_then(|hooks| hooks.before_wait.take());
-    if let Some(before_wait) = before_wait {
-        before_wait();
+    #[cfg(test)]
+    {
+        let before_wait = checkpoint_test_hooks()
+            .lock()
+            .unwrap()
+            .get_mut(view_dir)
+            .and_then(|hooks| hooks.before_wait.take());
+        if let Some(before_wait) = before_wait {
+            before_wait();
+        }
     }
     let jobs = DEFERRED_CHECKPOINTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -874,7 +941,6 @@ pub(super) fn schedule_derived_checkpoint(
             {
                 jobs.remove(&key);
             }
-            #[cfg(test)]
             CHECKPOINT_SETTLED.notify_all();
         });
     if let Err(error) = spawn {

@@ -564,6 +564,9 @@ fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
         "the import never writes the legacy set"
     );
 
+    // Complete the new V2 publication pass before auditing only the legacy
+    // sweeps below; those old entry points must still never reach V2 storage.
+    crate::views::wait_for_generation_maintenance_for_test(&storage.join("views/v2/scope"));
     let v2_before = [
         snapshot_tree(&storage.join("blobs").join("v2")),
         snapshot_tree(&storage.join("views").join("v2")),

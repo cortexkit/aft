@@ -467,6 +467,8 @@ fn a_repeated_import_is_a_no_op() {
     write_legacy_set(&storage, &root, KEY, POLICY.max_file_size);
     let first = run_import(&full_request(&storage, &root), None).unwrap();
     assert_eq!(first.outcome, ImportOutcome::Completed);
+    // The no-op audit starts after the first import's background maintenance.
+    aft::views::wait_for_generation_maintenance_for_test(&storage.join("views/v2").join(SCOPE));
     let before = tree(&storage);
     let again = run_import(&full_request(&storage, &root), None).unwrap();
     assert_eq!(again.outcome, ImportOutcome::AlreadyComplete);
@@ -804,6 +806,8 @@ fn prune_fixture(base: &Path) -> PathBuf {
     write_legacy_set(&storage, &root, "familyb", POLICY.max_file_size);
     let report = run_import(&lane_request(&storage, &root, KEY), None).unwrap();
     assert_eq!(report.outcome, ImportOutcome::Completed);
+    // Pruning is audited independently of the publication that built the fixture.
+    aft::views::wait_for_generation_maintenance_for_test(&storage.join("views/v2").join(SCOPE));
     for (path, bytes) in [
         ("semantic/models/model.onnx", &b"model"[..]),
         ("backups/session/one.bak", &b"backup"[..]),

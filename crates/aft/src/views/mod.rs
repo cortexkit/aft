@@ -112,6 +112,15 @@ pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<
     .derived_path(generation)
 }
 
+/// Synchronize a fixture that has stopped publishing before it audits closed
+/// SQLite files. Do not call while holding a view-pointer transaction or a
+/// family-registry write transaction; generation maintenance acquires those locks.
+#[doc(hidden)]
+pub fn wait_for_generation_maintenance_for_test(view_dir: &Path) {
+    generation::wait_for_derived_checkpoint_for_test(view_dir);
+    generation::wait_for_generation_sweep_for_test(view_dir);
+}
+
 /// Errors raised while constructing, verifying, or publishing a view.
 #[derive(Debug)]
 pub enum ViewError {
@@ -768,7 +777,7 @@ pub struct PointerPragmas {
 pub struct ViewStore {
     view_dir: PathBuf,
     // Registered V2 views serialize cleanup with their family's pin admission.
-    sweep_registry: Option<registry::FamilyRegistry>,
+    sweep_registry: Option<registry::RegistryLocation>,
 }
 
 impl ViewStore {
@@ -817,7 +826,7 @@ impl ViewStore {
     }
 
     pub(crate) fn with_sweep_registry(mut self, registry: registry::FamilyRegistry) -> Self {
-        self.sweep_registry = Some(registry);
+        self.sweep_registry = Some(registry.location());
         self
     }
 
@@ -1077,6 +1086,25 @@ impl ViewStore {
         generation: &str,
         base_generation: &str,
     ) -> Result<PublishOutcome> {
+        self.compare_and_swap_pointer_with_pin(generation, base_generation, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn pin_prepared_generation(&self, generation: &str) -> Result<crate::pins::QueryPin> {
+        let mut connection = self.open_pointer_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pin = crate::pins::QueryPin::acquire(self.view_dir(), generation)
+            .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?;
+        transaction.commit()?;
+        Ok(pin)
+    }
+
+    fn compare_and_swap_pointer_with_pin(
+        &self,
+        generation: &str,
+        base_generation: &str,
+        protect_result: bool,
+    ) -> Result<(PublishOutcome, Option<crate::pins::QueryPin>)> {
         let mut connection = self.open_pointer_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
@@ -1084,18 +1112,38 @@ impl ViewStore {
             params![generation, base_generation],
         )?;
         if updated == 1 {
+            let pin = if protect_result {
+                Some(
+                    crate::pins::QueryPin::acquire(self.view_dir(), generation)
+                        .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?,
+                )
+            } else {
+                None
+            };
             transaction.commit()?;
-            Ok(PublishOutcome::Published)
+            Ok((PublishOutcome::Published, pin))
         } else {
             let current_generation: String = transaction.query_row(
                 "SELECT generation FROM pointer WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )?;
+            let pin = if protect_result && !current_generation.is_empty() {
+                Some(
+                    crate::pins::QueryPin::acquire(self.view_dir(), &current_generation)
+                        .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?,
+                )
+            } else {
+                None
+            };
             transaction.commit()?;
-            Ok(PublishOutcome::Conflict {
-                current_generation: (!current_generation.is_empty()).then_some(current_generation),
-            })
+            Ok((
+                PublishOutcome::Conflict {
+                    current_generation: (!current_generation.is_empty())
+                        .then_some(current_generation),
+                },
+                pin,
+            ))
         }
     }
 }

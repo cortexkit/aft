@@ -2050,9 +2050,11 @@ fn generation_registries(
                 Err(error) => return Err(error),
             }
             let family = entry.file_name().to_string_lossy().into_owned();
-            let Some(registry) =
-                crate::views::registry::FamilyRegistry::open_existing(&storage.artifacts, &family)
-                    .map_err(io::Error::other)?
+            let Some(registry) = crate::views::registry::FamilyRegistry::open_existing_read_only(
+                &storage.artifacts,
+                &family,
+            )
+            .map_err(io::Error::other)?
             else {
                 return Ok(None);
             };
@@ -7187,6 +7189,67 @@ mod storage_retention_tests {
             warnings.load(Ordering::SeqCst),
             1,
             "a persistent bad family must not log on every pass"
+        );
+    }
+
+    #[test]
+    fn generation_registry_census_preserves_closed_wal_bytes() {
+        let storage = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(storage.path());
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0000000000000001")
+                .unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "scope",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        drop(registration.view_store().unwrap());
+        drop(registration);
+        registry
+            .with_barrier(|tx| {
+                tx.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )?;
+                tx.execute("UPDATE registry_meta SET gc_epoch = gc_epoch + 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let database = registry.path().to_path_buf();
+        drop(registry);
+        assert_eq!(crate::db::file_identity::open_connections(&database), 0);
+        let wal = PathBuf::from(format!("{}-wal", database.display()));
+        let before_database = fs::read(&database).unwrap();
+        let before_wal = fs::read(&wal).unwrap();
+        assert!(
+            !before_wal.is_empty(),
+            "fixture must retain committed WAL frames"
+        );
+        let batch = super::traversal_batch(
+            &paths,
+            &[(storage.path().join("views/v2"), false)],
+            "census-audit",
+            64,
+        )
+        .unwrap();
+        let mut report = SweepReport::default();
+        let owners = generation_registries(&paths, &batch.entries, &mut report).unwrap();
+        assert_eq!(owners.len(), 1);
+        drop(owners);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(crate::db::file_identity::open_connections(&database), 0);
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            before_database,
+            "ownership census checkpointed the registry"
+        );
+        assert_eq!(
+            fs::read(&wal).unwrap(),
+            before_wal,
+            "ownership census removed or changed the WAL"
         );
     }
 
