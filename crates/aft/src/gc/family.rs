@@ -42,7 +42,7 @@
 //! mark could miss a protected key; a deletion walk that reaches one simply
 //! stops, which only leaves garbage for the next sweep.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -436,6 +436,7 @@ fn sweep_pass(
             stores.push(FamilyStore::open(&access, plane)?);
         }
     }
+    let mut reader_protection = crate::root_cache::ReadMarkerProtectionCache::default();
     if !may_collect(
         registry,
         &members,
@@ -444,6 +445,7 @@ fn sweep_pass(
         &bounds,
         small,
         set_up_totals,
+        &mut reader_protection,
     )? {
         // Dead-owner metadata and already-free pages can be reclaimed without
         // changing any blob's deletion epoch.
@@ -453,20 +455,21 @@ fn sweep_pass(
             ..Default::default()
         };
         report.reclaimed_readers = registry.reclaim_dead_readers()?;
-        for member in &members {
-            if bounds.past_deadline() {
-                return Err(FamilySweepError::Bounded(
-                    "deadline reached during metadata cleanup".into(),
-                ));
-            }
-            let reclaimed =
-                reclaim_member_metadata(member, registry.family(), &bounds).map_err(|failure| {
-                    match failure {
+        if metadata_cleanup_due(registry) {
+            for member in &members {
+                if bounds.past_deadline() {
+                    return Err(FamilySweepError::Bounded(
+                        "deadline reached during metadata cleanup".into(),
+                    ));
+                }
+                let reclaimed = reclaim_member_metadata(member, registry.family(), &bounds)
+                    .map_err(|failure| match failure {
                         MarkFailure::Uncertain(reason) => FamilySweepError::Uncertain(reason),
                         MarkFailure::Bounded(reason) => FamilySweepError::Bounded(reason),
-                    }
-                })?;
-            report.reclaimed_pins += reclaimed;
+                    })?;
+                report.reclaimed_pins += reclaimed;
+            }
+            metadata_cleanup_completed(registry);
         }
         for member in &members {
             deregister_if_missing(registry, member, observer, &bounds, &mut report)?;
@@ -503,22 +506,37 @@ fn sweep_pass(
                 member.scope
             )));
         }
-        let marks =
-            mark_member(member, registry.family(), &bounds, true).map_err(
-                |failure| match failure {
-                    MarkFailure::Uncertain(reason) => {
-                        FamilySweepError::Uncertain(format!("{}: {reason}", member.scope))
-                    }
-                    MarkFailure::Bounded(reason) => {
-                        FamilySweepError::Bounded(format!("{}: {reason}", member.scope))
-                    }
-                },
-            )?;
+        let marks = mark_member(
+            member,
+            registry.family(),
+            &bounds,
+            true,
+            &mut reader_protection,
+        )
+        .map_err(|failure| match failure {
+            MarkFailure::Uncertain(reason) => {
+                FamilySweepError::Uncertain(format!("{}: {reason}", member.scope))
+            }
+            MarkFailure::Bounded(reason) => {
+                FamilySweepError::Bounded(format!("{}: {reason}", member.scope))
+            }
+        })?;
         report.reclaimed_pins += marks.reclaimed_pins;
         marked.extend(marks.keys);
     }
     report.marked_keys = marked.len();
     observe(observer, SweepStep::Marked);
+
+    if metadata_cleanup_due(registry) {
+        for member in &members {
+            report.reclaimed_pins += reclaim_member_metadata(member, registry.family(), &bounds)
+                .map_err(|failure| match failure {
+                    MarkFailure::Uncertain(reason) => FamilySweepError::Uncertain(reason),
+                    MarkFailure::Bounded(reason) => FamilySweepError::Bounded(reason),
+                })?;
+        }
+        metadata_cleanup_completed(registry);
+    }
 
     let within_budget = match small {
         SmallFamilyCheck::Never => false,
@@ -575,7 +593,7 @@ pub(crate) fn member_references(
     family: &str,
     bounds: &SweepBounds,
 ) -> Result<BTreeSet<[u8; 32]>, String> {
-    mark_member(member, family, bounds, false)
+    mark_member(member, family, bounds, false, &mut Default::default())
         .map(|marks| marks.keys)
         .map_err(|failure| match failure {
             MarkFailure::Uncertain(reason) | MarkFailure::Bounded(reason) => reason,
@@ -783,41 +801,95 @@ impl From<String> for MarkFailure {
 }
 
 /// Marks everything one member relies on. Any uncertainty is an error.
-/// With `reclaim`, pins and read markers of dead owners are removed on the
-/// way, as a sweep does; without it nothing on disk changes.
+/// With `reclaim`, dead-owner pins are removed on the way. Reader-marker
+/// removal runs on the separate metadata-maintenance clock.
 fn mark_member(
     member: &MemberRecord,
     family: &str,
     bounds: &SweepBounds,
     reclaim: bool,
+    reader_protection: &mut crate::root_cache::ReadMarkerProtectionCache,
 ) -> Result<MemberMarks, MarkFailure> {
     let mut marks = MemberMarks::default();
     let view_dir = &member.view_dir;
-    match fs::symlink_metadata(view_dir) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(marks),
-        Err(error) => return Err(format!("view directory unreadable: {error}").into()),
-    }
-    let store = ViewStore::existing_dir(view_dir.clone());
-    if let Some(store) = &store {
-        let current = store
-            .current_generation()
-            .map_err(|error| format!("pointer unreadable: {error}"))?;
-        if let Some(generation) = current {
-            mark_generation(store, &generation, &mut marks)?;
-        }
-    }
-    mark_pins(
+    let store = mark_current(view_dir, &mut marks)?;
+    mark_member_protections(
         view_dir,
         family,
         store.as_ref(),
         bounds,
         reclaim,
-        true,
+        reader_protection,
         &mut marks,
     )?;
-    mark_readers(view_dir, store.as_ref(), bounds, reclaim, &mut marks)?;
     Ok(marks)
+}
+
+fn mark_current(
+    view_dir: &Path,
+    marks: &mut MemberMarks,
+) -> Result<Option<ViewStore>, MarkFailure> {
+    match fs::symlink_metadata(view_dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("view directory unreadable: {error}").into()),
+    }
+    let store = ViewStore::existing_dir(view_dir.to_path_buf());
+    if let Some(store) = &store {
+        let current = store
+            .current_generation()
+            .map_err(|error| format!("pointer unreadable: {error}"))?;
+        if let Some(generation) = current {
+            mark_generation(store, &generation, marks)?;
+        }
+    }
+    Ok(store)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_member_protections(
+    view_dir: &Path,
+    family: &str,
+    store: Option<&ViewStore>,
+    bounds: &SweepBounds,
+    reclaim: bool,
+    reader_protection: &mut crate::root_cache::ReadMarkerProtectionCache,
+    marks: &mut MemberMarks,
+) -> Result<(), MarkFailure> {
+    mark_pins(view_dir, family, store, bounds, reclaim, true, marks)?;
+    mark_readers(view_dir, store, bounds, false, reader_protection, marks)
+}
+
+// Dead-owner files do not need the disk-limit pass's ten-minute cadence. Keep
+// their cleanup independent of marking, including when no blob is collectable.
+const METADATA_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+fn metadata_cleanups() -> &'static Mutex<BTreeMap<PathBuf, Instant>> {
+    static CLEANUPS: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> = OnceLock::new();
+    CLEANUPS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn metadata_cleanup_due(registry: &FamilyRegistry) -> bool {
+    metadata_cleanups()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(registry.path())
+        .is_none_or(|last| last.elapsed() >= METADATA_CLEANUP_INTERVAL)
+}
+
+fn metadata_cleanup_completed(registry: &FamilyRegistry) {
+    let mut cleanups = metadata_cleanups()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    forget_expired_cleanups(&mut cleanups, Instant::now());
+    cleanups.insert(registry.path().to_path_buf(), Instant::now());
+}
+
+/// An entry older than the interval answers "due" exactly like a missing one,
+/// so dropping it changes nothing. This keeps the map to families cleaned in
+/// the last hour instead of every family the process has ever swept.
+fn forget_expired_cleanups(cleanups: &mut BTreeMap<PathBuf, Instant>, now: Instant) {
+    cleanups.retain(|_, last| now.saturating_duration_since(*last) < METADATA_CLEANUP_INTERVAL);
 }
 
 /// Reclaims dead-owner pin and reader files without loading references. A
@@ -838,7 +910,14 @@ fn reclaim_member_metadata(
         false,
         &mut cleanup,
     )?;
-    mark_readers(&member.view_dir, None, bounds, true, &mut cleanup)?;
+    mark_readers(
+        &member.view_dir,
+        None,
+        bounds,
+        true,
+        &mut Default::default(),
+        &mut cleanup,
+    )?;
     Ok(cleanup.reclaimed_pins)
 }
 
@@ -945,6 +1024,7 @@ fn mark_readers(
     store: Option<&ViewStore>,
     bounds: &SweepBounds,
     reclaim: bool,
+    reader_protection: &mut crate::root_cache::ReadMarkerProtectionCache,
     marks: &mut MemberMarks,
 ) -> Result<(), MarkFailure> {
     let readers = view_dir.join("readers");
@@ -966,7 +1046,7 @@ fn mark_readers(
         let protected = if reclaim {
             crate::root_cache::sweep_read_markers(view_dir, &generation).protected
         } else {
-            crate::root_cache::protected_read_marker_exists(view_dir, &generation)
+            reader_protection.protected(view_dir, &generation)
         };
         if protected {
             if let Some(store) = store {
@@ -1038,7 +1118,7 @@ fn member_has_protection(view_dir: &Path) -> Result<bool, String> {
             .to_str()
             .map(str::to_owned)
             .ok_or_else(|| "non-UTF-8 reader directory".to_string())?;
-        if crate::root_cache::sweep_read_markers(view_dir, &generation).protected {
+        if crate::root_cache::protected_read_marker_exists(view_dir, &generation) {
             return Ok(true);
         }
     }
@@ -1255,6 +1335,7 @@ fn may_collect(
     bounds: &SweepBounds,
     small: SmallFamilyCheck,
     set_up_totals: bool,
+    reader_protection: &mut crate::root_cache::ReadMarkerProtectionCache,
 ) -> Result<bool, FamilySweepError> {
     for member in members {
         if member.missing_sweeps > 0
@@ -1314,27 +1395,64 @@ fn may_collect(
     if candidates.is_empty() {
         return Ok(false);
     }
+    let has_unmarked = |marked: &BTreeSet<[u8; 32]>| -> Result<bool, FamilySweepError> {
+        for (store, segments) in &candidates {
+            if bounds.past_deadline() {
+                return Ok(true);
+            }
+            if segments.iter().any(|row| !marked.contains(&row.segment_id))
+                || store.may_have_unmarked(marked, bounds.deadline)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     let mut marked = BTreeSet::new();
-    for member in members {
+    let mut current = Vec::new();
+    // Current manifests alone often cover the entire store. In that case no
+    // protection census can change the no-delete decision. Check at geometric
+    // intervals so shared keys can end preflight early without a query per view.
+    for (index, member) in members.iter().enumerate() {
         if bounds.past_deadline() {
             return Ok(true);
         }
-        match member_references(member, registry.family(), bounds) {
-            Ok(keys) => marked.extend(keys),
+        let mut marks = MemberMarks::default();
+        match mark_current(&member.view_dir, &mut marks) {
+            Ok(store) => {
+                marked.extend(marks.keys.iter().copied());
+                current.push((member, store));
+            }
             Err(_) => return Ok(true),
         }
+        let checkpoint = (index + 1).is_power_of_two() || index + 1 == members.len();
+        if checkpoint && !has_unmarked(&marked)? {
+            return Ok(false);
+        }
     }
-    for (store, segments) in candidates {
+    // Older generations and assembly pins may be the only owners of some
+    // keys. Complete the read-only preflight without reloading current manifests.
+    for (member, store) in current {
         if bounds.past_deadline() {
             return Ok(true);
         }
-        if segments.iter().any(|row| !marked.contains(&row.segment_id))
-            || store.may_have_unmarked(&marked, bounds.deadline)?
+        let mut marks = MemberMarks::default();
+        if mark_member_protections(
+            &member.view_dir,
+            registry.family(),
+            store.as_ref(),
+            bounds,
+            false,
+            reader_protection,
+            &mut marks,
+        )
+        .is_err()
         {
             return Ok(true);
         }
+        marked.extend(marks.keys);
     }
-    Ok(false)
+    has_unmarked(&marked)
 }
 
 /// Work counters for a retained family directory. They are observational only;
@@ -1812,5 +1930,392 @@ mod sweep_stats_tests {
         assert_eq!(entry["aborted"], 1);
         assert_eq!(entry["stale_rows_touched"], 2);
         assert_eq!(entry["last_outcome"], "aborted");
+    }
+}
+
+#[cfg(test)]
+mod reader_marker_tests {
+    use super::*;
+    use crate::gc::family_read_tests::{build, publish_marks};
+    use crate::root_cache::{ReadMarker, ReaderCensusProbe};
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn reader_registered_between_census_and_removal_keeps_its_generation() {
+        let storage = tempfile::tempdir().unwrap();
+        let fixture = build(storage.path(), 1, |_| true);
+        let root = fixture.view.root().to_path_buf();
+        let scope = fixture.view.scope();
+        let root_scope = crate::path_identity::project_scope_key(&root);
+        let anchor = fs::canonicalize(storage.path()).unwrap();
+        let uuid = format!("fixture-volume:{root_scope}");
+        let _volume = fixture
+            .registry
+            .test_volume_uuid_guard(&anchor, &uuid)
+            .unwrap();
+        let binding_path = storage
+            .path()
+            .join(format!("retention/roots/{root_scope}.json"));
+        let mut binding: serde_json::Value =
+            serde_json::from_slice(&fs::read(&binding_path).unwrap()).unwrap();
+        binding["last_bound_ms"] = serde_json::json!(0);
+        binding["volume"] = serde_json::json!([anchor, 0]);
+        binding["stable_volume"]["uuid"] = serde_json::json!(uuid);
+        fs::write(&binding_path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        fixture
+            .registry
+            .with_barrier(|tx| {
+                tx.execute(
+                    "UPDATE members SET last_bind_ms = 0, missing_sweeps = ?1 WHERE scope = ?2",
+                    params![MISSING_ROOT_SWEEPS - 1, scope],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(crate::storage_retention::missing_root_due(
+            storage.path(),
+            &root,
+            0
+        ));
+        let member = fixture.registry.member(scope).unwrap().unwrap();
+        let counted = fixture
+            .registry
+            .with_barrier(|tx| count_missing_sweep(tx, &member, true))
+            .unwrap();
+        let Deregistration::Due { recorded } = counted else {
+            panic!("expected unprotected removal candidate")
+        };
+
+        // Registration writes its marker before confirming membership under the
+        // barrier. The earlier unprotected census must not decide deletion.
+        let reader = fixture.registry.register_reader("late-reader").unwrap();
+        let protected = reader.protect_current(scope).unwrap().unwrap();
+        let outcome = fixture
+            .registry
+            .with_barrier(|tx| remove_if_still_due(tx, scope, recorded, Some(storage.path())))
+            .unwrap();
+        assert!(matches!(outcome, Deregistration::Retained));
+        assert!(fixture.registry.member(scope).unwrap().is_some());
+        assert!(protected.marker_path().exists());
+        assert!(fixture
+            .view
+            .view_store()
+            .unwrap()
+            .manifest_path(protected.generation())
+            .unwrap()
+            .exists());
+    }
+
+    fn reader_only_generation(fixture: &crate::gc::family_read_tests::Fixture) -> String {
+        publish_marks(&fixture.view, 0..5);
+        let generation = fixture
+            .view
+            .view_store()
+            .unwrap()
+            .current_generation()
+            .unwrap()
+            .unwrap();
+        publish_marks(&fixture.view, 0..4);
+        metadata_cleanup_completed(&fixture.registry);
+        generation
+    }
+
+    #[test]
+    fn reader_registered_after_preflight_is_seen_by_the_deleting_mark() {
+        struct Register<'a> {
+            view_dir: &'a Path,
+            generation: &'a str,
+            marker: std::cell::RefCell<Option<ReadMarker>>,
+        }
+        impl SweepObserver for Register<'_> {
+            fn reached(&self, step: SweepStep) {
+                if step == SweepStep::EpochRaised {
+                    // Publish protection before opening any generation data.
+                    self.marker.replace(Some(
+                        ReadMarker::create(self.view_dir, self.generation).unwrap(),
+                    ));
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = build(dir.path(), 6, |_| true);
+        let generation = reader_only_generation(&fixture);
+        let markers = crate::root_cache::read_marker_dir(fixture.view.view_dir(), &generation);
+        fs::create_dir_all(&markers).unwrap();
+        fs::write(markers.join("stale"), b"malformed marker").unwrap();
+        let observer = Register {
+            view_dir: fixture.view.view_dir(),
+            generation: &generation,
+            marker: Default::default(),
+        };
+        let probe = ReaderCensusProbe::start();
+        let report = sweep_family(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy { byte_budget: 0 },
+            Some(&observer),
+        )
+        .unwrap();
+        let reads = probe.finish();
+        assert!(
+            fixture
+                .store
+                .contains(&crate::gc::family_read_tests::chunk_key(4))
+                .unwrap(),
+            "the generation protected between census and delete lost its only payload"
+        );
+        assert_eq!(
+            reads.get(&(fixture.view.view_dir().to_path_buf(), generation.clone())),
+            Some(&2),
+            "a negative preflight census must be read again after the epoch bump"
+        );
+        assert!(!fixture
+            .store
+            .contains(&crate::gc::family_read_tests::chunk_key(5))
+            .unwrap());
+        assert_eq!(report.deleted_blobs, 1);
+        assert!(observer.marker.borrow().as_ref().unwrap().path().exists());
+    }
+
+    #[test]
+    fn protected_generation_is_censused_once_in_a_collecting_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = build(dir.path(), 6, |_| true);
+        let generation = reader_only_generation(&fixture);
+        let marker = ReadMarker::create(fixture.view.view_dir(), &generation).unwrap();
+        let probe = ReaderCensusProbe::start();
+        let report = sweep_family(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy { byte_budget: 0 },
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.deleted_blobs, 1);
+        assert_eq!(
+            probe
+                .finish()
+                .get(&(fixture.view.view_dir().to_path_buf(), generation)),
+            Some(&1)
+        );
+        assert!(fixture
+            .store
+            .contains(&crate::gc::family_read_tests::chunk_key(4))
+            .unwrap());
+        assert!(marker.path().exists());
+    }
+
+    #[test]
+    fn protection_checks_leave_stale_markers_for_scheduled_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = build(dir.path(), 6, |_| true);
+        let markers = crate::root_cache::read_marker_dir(fixture.view.view_dir(), "old");
+        fs::create_dir_all(&markers).unwrap();
+        let stale = markers.join("stale");
+        fs::write(&stale, b"malformed marker").unwrap();
+        assert!(!view_has_protection(fixture.view.view_dir()).unwrap());
+        assert!(
+            stale.exists(),
+            "a protection read must not unlink marker files"
+        );
+        metadata_cleanups()
+            .lock()
+            .unwrap()
+            .remove(fixture.registry.path());
+        sweep_family(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy { byte_budget: 0 },
+            None,
+        )
+        .unwrap();
+        assert!(
+            !stale.exists(),
+            "the independent maintenance pass must still reap stale files"
+        );
+        fs::write(&stale, b"malformed marker").unwrap();
+        sweep_family(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy { byte_budget: 0 },
+            None,
+        )
+        .unwrap();
+        assert!(stale.exists(), "maintenance must not rerun on every sweep");
+        metadata_cleanups().lock().unwrap().insert(
+            fixture.registry.path().to_path_buf(),
+            Instant::now() - METADATA_CLEANUP_INTERVAL,
+        );
+        sweep_family(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy { byte_budget: 0 },
+            None,
+        )
+        .unwrap();
+        assert!(
+            !stale.exists(),
+            "maintenance must resume when its slower clock expires"
+        );
+    }
+
+    #[test]
+    fn noncollecting_family_does_not_rescan_reader_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = build(dir.path(), 6, |_| true);
+        let generation = fixture
+            .view
+            .view_store()
+            .unwrap()
+            .current_generation()
+            .unwrap()
+            .unwrap();
+        let reader = ReadMarker::create(fixture.view.view_dir(), &generation).unwrap();
+        let run = || {
+            sweep_family(
+                &fixture.registry,
+                None,
+                FamilySweepPolicy { byte_budget: 0 },
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(run().skipped, Some("nothing to collect"));
+        let probe = ReaderCensusProbe::start();
+        assert_eq!(run().skipped, Some("nothing to collect"));
+        assert_eq!(
+            probe.finish().values().sum::<usize>(),
+            0,
+            "current references cover the store; neither marking nor slow maintenance is due"
+        );
+        assert!(reader.path().exists());
+    }
+
+    #[test]
+    #[ignore = "bounded native directory-open and wall-time receipt"]
+    fn disk_limit_reader_markers_receipt() {
+        use crate::views::registry::ViewRegistration;
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixtures = Vec::new();
+        let mut views: Vec<ViewRegistration> = Vec::new();
+        let mut readers = Vec::new();
+        for family in 0..10 {
+            let storage = dir.path().join(format!("family-{family}"));
+            fs::create_dir_all(&storage).unwrap();
+            let fixture = build(&storage, 6, |_| true);
+            for member in 0..43 {
+                let view = if member == 0 {
+                    fixture.view.clone()
+                } else {
+                    fixture
+                        .registry
+                        .register_view_with_storage(
+                            &storage,
+                            &format!("v-{member}"),
+                            &storage.join("root"),
+                        )
+                        .unwrap()
+                };
+                for end in [4, 5, 6] {
+                    publish_marks(&view, 0..end);
+                    let generation = view
+                        .view_store()
+                        .unwrap()
+                        .current_generation()
+                        .unwrap()
+                        .unwrap();
+                    for _ in 0..4 {
+                        readers.push(ReadMarker::create(view.view_dir(), &generation).unwrap());
+                    }
+                }
+                views.push(view);
+            }
+            crate::views::eviction::wait_for_background_enforcement(&fixture.registry);
+            fixtures.push(fixture);
+        }
+        // Warm the page cache and run any maintenance due at process startup.
+        for fixture in &fixtures {
+            sweep_family(
+                &fixture.registry,
+                None,
+                FamilySweepPolicy { byte_budget: 0 },
+                None,
+            )
+            .unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        let (reset, count): (
+            Option<unsafe extern "C" fn()>,
+            Option<unsafe extern "C" fn() -> u64>,
+        ) = unsafe {
+            let reset = libc::dlsym(libc::RTLD_DEFAULT, c"aft_probe_reset".as_ptr());
+            let count = libc::dlsym(libc::RTLD_DEFAULT, c"aft_probe_count".as_ptr());
+            (
+                if reset.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute::<
+                        *mut libc::c_void,
+                        unsafe extern "C" fn(),
+                    >(reset))
+                },
+                if count.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute::<
+                        *mut libc::c_void,
+                        unsafe extern "C" fn() -> u64,
+                    >(count))
+                },
+            )
+        };
+        for pass in 0..3 {
+            let probe = ReaderCensusProbe::start();
+            #[cfg(target_os = "macos")]
+            if let Some(reset) = reset {
+                unsafe { reset() };
+            }
+            let started = Instant::now();
+            for fixture in &fixtures {
+                let report = sweep_family(
+                    &fixture.registry,
+                    None,
+                    FamilySweepPolicy { byte_budget: 0 },
+                    None,
+                )
+                .unwrap();
+                assert_eq!(report.skipped, Some("nothing to collect"));
+                assert_eq!(report.deleted_blobs, 0);
+            }
+            let elapsed = started.elapsed();
+            #[cfg(target_os = "macos")]
+            let opens = count.map(|count| unsafe { count() });
+            #[cfg(not(target_os = "macos"))]
+            let opens: Option<u64> = None;
+            let census = probe.finish();
+            eprintln!("reader-markers pass={pass} families=10 members=430 folders=430 generations=1290 markers={} censuses={} max_repeats={} directory_opens={opens:?} elapsed_ms={:.3}",
+                readers.len(), census.values().sum::<usize>(), census.values().max().copied().unwrap_or(0), elapsed.as_secs_f64() * 1000.0);
+        }
+        drop((readers, views));
+    }
+}
+
+#[cfg(test)]
+mod metadata_cleanup_clock_tests {
+    use super::*;
+
+    #[test]
+    fn expired_cleanup_entries_are_forgotten_and_recent_ones_kept() {
+        let swept = Instant::now();
+        let later = swept + METADATA_CLEANUP_INTERVAL + Duration::from_secs(1);
+        let mut cleanups = BTreeMap::new();
+        cleanups.insert(PathBuf::from("/families/gone"), swept);
+        cleanups.insert(PathBuf::from("/families/recent"), later);
+        forget_expired_cleanups(&mut cleanups, later);
+        assert_eq!(
+            cleanups.keys().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/families/recent")]
+        );
     }
 }

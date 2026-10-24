@@ -1013,11 +1013,42 @@ pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarke
     read_marker_protection(cache_dir, generation_label, true)
 }
 
+/// A sweep may retain a positive census across its epoch bump: an extra mark
+/// only postpones garbage collection. Never cache a negative result, because a
+/// reader can register before the deleting mark. Removal checks must bypass
+/// this cache entirely and inspect protection again under the registry barrier.
+#[derive(Default)]
+pub(crate) struct ReadMarkerProtectionCache {
+    protected: std::collections::BTreeMap<(PathBuf, String), bool>,
+}
+
+impl ReadMarkerProtectionCache {
+    pub(crate) fn protected(&mut self, cache_dir: &Path, generation: &str) -> bool {
+        let key = (cache_dir.to_path_buf(), generation.to_owned());
+        if let Some(protected) = self.protected.get(&key) {
+            return *protected;
+        }
+        let protected = protected_read_marker_exists(cache_dir, generation);
+        if protected {
+            self.protected.insert(key, protected);
+        }
+        protected
+    }
+}
+
 fn read_marker_protection(
     cache_dir: &Path,
     generation_label: &str,
     remove_stale: bool,
 ) -> ReadMarkerSweep {
+    #[cfg(test)]
+    READER_CENSUS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().as_mut() {
+            *reads
+                .entry((cache_dir.to_path_buf(), generation_label.to_owned()))
+                .or_default() += 1;
+        }
+    });
     let result = (|| {
         let cache = crate::bash_background::persistence::PinnedDir::open(cache_dir)?;
         let readers = match cache.repair_child_same_mount(std::ffi::OsStr::new("readers")) {
@@ -1047,6 +1078,26 @@ fn read_marker_protection(
             protected: true,
             removed_stale: 0,
         },
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static READER_CENSUS: std::cell::RefCell<Option<std::collections::BTreeMap<(PathBuf, String), usize>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ReaderCensusProbe;
+
+#[cfg(test)]
+impl ReaderCensusProbe {
+    pub(crate) fn start() -> Self {
+        READER_CENSUS.with(|reads| *reads.borrow_mut() = Some(Default::default()));
+        Self
+    }
+
+    pub(crate) fn finish(self) -> std::collections::BTreeMap<(PathBuf, String), usize> {
+        READER_CENSUS.with(|reads| reads.borrow_mut().take().unwrap())
     }
 }
 

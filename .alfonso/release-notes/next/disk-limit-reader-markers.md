@@ -1,0 +1,1 @@
+Avoid repeated reader-marker scans in disk-limit sweeps when current generations already cover the family store. Reuse only positive reader censuses within a sweep, recheck late readers before deletion, and reap stale marker files on a slower maintenance clock instead of during protection reads.
