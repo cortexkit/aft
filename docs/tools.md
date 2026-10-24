@@ -321,7 +321,12 @@ Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and 
 process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
 SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
 that leave the group (`setsid`, `setpgid`, Python `start_new_session=True`) survive; macOS has no
-tree kill. A bare foreground
+tree kill. AFT cannot signal a process owned by another user, such as one started with `sudo`; on
+Linux and macOS the task's `live_descendants` and text name any such survivor by pid, owner and executable
+name (never its arguments, which can hold credentials; a null list comes with
+`live_descendants_unavailable`, the reason AFT could not check), so bound `sudo` commands yourself:
+`sudo -n timeout -k 1 <secs> <cmd>` shorter than AFT's limit, or
+`sudo -n bash -c "trap 'kill -KILL 0' TERM; <cmd> & wait"`. A bare foreground
 `bash({ command })` is polled for a short internal wait window (~5s); if the command hasn't
 finished it auto-promotes to a background task and returns a `taskId` while the command keeps
 running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2000 })` polls

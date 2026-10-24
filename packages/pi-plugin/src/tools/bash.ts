@@ -507,8 +507,9 @@ interface BashStatusDetails {
   pty_cols?: number;
   pty_screen?: string;
   pty_raw?: string;
-  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants?: import("@cortexkit/aft-bridge").LiveDescendant[] | null;
   live_descendants_omitted?: number;
+  live_descendants_unavailable?: import("@cortexkit/aft-bridge").LiveDescendantsUnavailable;
   live_descendants_summary?: string;
   /** Text note saying which phase a still-running remote task has reached on the build server. */
   remote_phase_note?: string;

@@ -23,7 +23,7 @@ use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
-use super::process::LiveDescendant;
+use super::process::{LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity};
 use super::BgTaskStatus;
 
 #[cfg(test)]
@@ -1585,12 +1585,35 @@ pub struct PersistedTask {
     /// Used to detect when the OS reuses that PID for a different process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_start_time_ms: Option<u64>,
-    /// `Some` records a completed Unix sample, including an empty group. `None`
-    /// means sampling is unavailable (Windows and unsupported Unix targets).
+    /// `Some` records a completed check of the task's process group, including
+    /// an empty group. `None` means it could not be checked; the reason is in
+    /// `live_descendants_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub live_descendants_omitted: usize,
+    /// Why the last check of the process group failed, was not possible, or
+    /// (`listing_incomplete`) saw only part of the group; the members it did
+    /// find stay in `live_descendants`. Cleared by a complete check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
+    /// AFT sent the kill signal to the task's process group (a timeout,
+    /// `bash_kill`, or a cancelled call), so any member still listed in
+    /// `live_descendants` survived that kill.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_kill_sent: bool,
+    /// The identities of the group members the latest check found: every one
+    /// of them, not only the members shown, up to `GROUP_IDENTITY_CAP`. A
+    /// later kill of the finished task signals its group only if the leader or
+    /// one of these processes is still running in it; otherwise the group
+    /// number may by then belong to an unrelated group. Kept through a failed
+    /// or incomplete check that found nobody, cleared by a clean one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_member_identities: Vec<ProcessIdentity>,
+    /// The latest check found more members than `GROUP_IDENTITY_CAP`, so
+    /// `group_member_identities` holds only the first of them by pid.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_member_identities_truncated: bool,
     pub completion_delivered: bool,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
@@ -1724,6 +1747,10 @@ impl PersistedTask {
             child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
+            group_kill_sent: false,
+            group_member_identities: Vec::new(),
+            group_member_identities_truncated: false,
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
@@ -1880,6 +1907,10 @@ impl From<BashTaskRow> for PersistedTask {
             child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
+            group_kill_sent: false,
+            group_member_identities: Vec::new(),
+            group_member_identities_truncated: false,
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,

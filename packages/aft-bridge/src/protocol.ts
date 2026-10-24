@@ -100,8 +100,13 @@ export interface BashCompletedFrame {
   status_reason?: string;
   /** Capture was incomplete; status and exit_code still describe the command. */
   output_incomplete?: boolean;
-  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants?: LiveDescendant[] | null;
   live_descendants_omitted?: number;
+  /**
+   * For a finished task, why `live_descendants` is null, or, with
+   * `listing_incomplete`, why the list may be only part of the group.
+   */
+  live_descendants_unavailable?: LiveDescendantsUnavailable;
   live_descendants_summary?: string;
   session_id?: string;
 }
@@ -170,10 +175,47 @@ export interface BgCompletion {
   status_reason?: string;
   /** Capture was incomplete; status and exit_code still describe the command. */
   output_incomplete?: boolean;
-  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants?: LiveDescendant[] | null;
   live_descendants_omitted?: number;
+  /**
+   * For a finished task, why `live_descendants` is null, or, with
+   * `listing_incomplete`, why the list may be only part of the group.
+   */
+  live_descendants_unavailable?: LiveDescendantsUnavailable;
   live_descendants_summary?: string;
 }
+
+/**
+ * A process still running in a finished task's process group, as AFT lists
+ * it after the task ends or is killed.
+ */
+export interface LiveDescendant {
+  pid: number;
+  comm: string;
+  /** First word of the process's first argument, or its process name when that cannot be read. */
+  argv0: string;
+  /** Owner of the process (real user ID), or the numeric ID. Absent when unreadable. */
+  user?: string;
+  /**
+   * Executable name, followed by "…" when the process had arguments. The
+   * arguments themselves are never sent: they can hold credentials.
+   */
+  command?: string;
+}
+
+/**
+ * Why AFT could not list a finished task's process group, in the order the
+ * engine declares them. A list, even an empty one, always means it checked.
+ */
+export const LIVE_DESCENDANTS_UNAVAILABLE_REASONS = Object.freeze([
+  "unsupported_platform",
+  "no_process_group",
+  "listing_failed",
+  "listing_incomplete",
+  "not_checked",
+] as const);
+
+export type LiveDescendantsUnavailable = (typeof LIVE_DESCENDANTS_UNAVAILABLE_REASONS)[number];
 
 export const TERMINAL_BG_TASK_STATUSES = Object.freeze([
   "completed",

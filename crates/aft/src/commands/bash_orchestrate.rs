@@ -1586,6 +1586,7 @@ mod tests {
             phase: None,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
             live_descendants_summary: None,
             kill_signaled: false,
             kill_reached: 0,

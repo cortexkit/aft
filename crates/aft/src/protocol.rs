@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::bash_background::process::LiveDescendant;
+use crate::bash_background::process::{LiveDescendant, LiveDescendantsUnavailable};
 use crate::bash_background::BgTaskStatus;
 use crate::list_envelope::ListEnvelope;
 
@@ -96,6 +96,10 @@ pub struct BashCompletedFrame {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
 }
@@ -370,6 +374,7 @@ impl BashCompletedFrame {
             output_incomplete: false,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
             live_descendants_summary: None,
         }
     }
