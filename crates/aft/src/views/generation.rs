@@ -22,6 +22,86 @@ use super::{Result, ViewError, ViewStore};
 // Protection scans must finish within one common allowance before any unlink.
 const GENERATION_DIRECTORY_LIMIT: usize = 65_536;
 
+// A view has at most one cleanup worker. Publications arriving during a sweep
+// request another lap rather than starting competing pointer transactions.
+static GENERATION_SWEEPS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+#[cfg(test)]
+static GENERATION_SWEEP_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
+
+pub(super) fn schedule_generation_sweep(view: ViewStore) {
+    let path = view.view_dir().to_path_buf();
+    let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut jobs = jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = jobs.get_mut(&path) {
+            *pending = true;
+            return;
+        }
+        jobs.insert(path.clone(), false);
+    }
+    let failed_path = path.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("aft-view-generation-sweep".into())
+        .spawn(move || loop {
+            // An obsolete .ref protects its owner for the whole first census.
+            // A second complete census can reclaim that now-unreferenced owner.
+            match view
+                .sweep_generations()
+                .and_then(|removed| view.sweep_generations().map(|more| removed + more))
+            {
+                Ok(removed) => log::info!(
+                    "views: post-publication removed_generations={removed} view={}",
+                    path.display()
+                ),
+                Err(error) => log::warn!(
+                    "views: post-publication generation sweep deferred view={} error={error}",
+                    path.display()
+                ),
+            }
+            let mut jobs = jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if jobs
+                .get_mut(&path)
+                .is_some_and(|pending| std::mem::take(pending))
+            {
+                continue;
+            }
+            jobs.remove(&path);
+            #[cfg(test)]
+            GENERATION_SWEEP_SETTLED.notify_all();
+            break;
+        })
+    {
+        jobs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&failed_path);
+        #[cfg(test)]
+        GENERATION_SWEEP_SETTLED.notify_all();
+        log::warn!(
+            "views: generation sweep worker unavailable view={} error={error}",
+            failed_path.display()
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_generation_sweep_for_test(path: &Path) {
+    let jobs = GENERATION_SWEEPS.get_or_init(|| Mutex::new(HashMap::new()));
+    let (jobs, timeout) = GENERATION_SWEEP_SETTLED
+        .wait_timeout_while(jobs.lock().unwrap(), Duration::from_secs(20), |jobs| {
+            jobs.contains_key(path)
+        })
+        .unwrap();
+    assert!(
+        !timeout.timed_out() && !jobs.contains_key(path),
+        "generation sweep did not settle: {}",
+        path.display()
+    );
+}
+
 fn generation_directory_entries(directory: &Path, limit: usize) -> Result<Vec<fs::DirEntry>> {
     let entries = fs::read_dir(directory)?
         .take(limit.saturating_add(1))
@@ -251,10 +331,6 @@ impl ViewStore {
     /// liveness. A dead assembler can leave a derived file before any manifest.
     pub fn sweep_generations(&self) -> Result<usize> {
         self.sweep_generations_impl(false)
-    }
-
-    pub(crate) fn sweep_generations_locked(&self) -> Result<usize> {
-        self.sweep_generations_impl(true)
     }
 
     fn sweep_generations_impl(&self, admission_locked: bool) -> Result<usize> {
@@ -573,6 +649,7 @@ pub(super) fn schedule_derived_checkpoint(
     path: PathBuf,
     connection: crate::db::file_identity::IdentityConnection,
     root: PathBuf,
+    cleanup: Option<(ViewStore, Arc<AtomicBool>)>,
 ) {
     let key = path.parent().unwrap_or(&path).to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -624,6 +701,17 @@ pub(super) fn schedule_derived_checkpoint(
             }
             // Include the keeper close: it may checkpoint even a superseded job.
             drop(connection);
+            // A publication sweep may have found this superseded keeper still
+            // open. Retry after closing it; no SQLite descriptor is opened to
+            // inspect the old derived database.
+            if let Some((view, ready)) = cleanup {
+                // Settlement arms cleanup only after releasing the publisher's
+                // locks and pins. If the keeper closed before it was armed,
+                // settlement's own sweep sees that close instead.
+                if ready.load(Ordering::Acquire) {
+                    schedule_generation_sweep(view);
+                }
+            }
             #[cfg(test)]
             {
                 let before_settled = checkpoint_test_hooks()
@@ -1184,6 +1272,7 @@ mod tests {
             source.clone(),
             crate::db::file_identity::IdentityConnection::new(connection, "checkpoint test"),
             source.parent().unwrap().to_path_buf(),
+            None,
         );
 
         assert!(
@@ -1664,6 +1753,40 @@ mod ownership_tests {
 mod storage_retention_tests {
     use super::*;
     #[test]
+    fn post_publication_sweep_preserves_cloned_pages_after_donor_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
+        let donor = view.derived_path("donor").unwrap();
+        let cloned = view.derived_path("cloned").unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&donor, "clone donor").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE state (value TEXT); INSERT INTO state VALUES ('retained');",
+            )
+            .unwrap();
+        clone_derived(&donor, &cloned).unwrap();
+        assert!(!view.view_dir().join("derived-cloned.ref").exists());
+        drop(connection);
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'cloned'", [])
+            .unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(!donor.exists());
+        assert_eq!(crate::db::file_identity::open_connections(&cloned), 0);
+        let reader =
+            crate::db::file_identity::IdentityConnection::open(&cloned, "clone survivor").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "retained"
+        );
+    }
+
+    #[test]
     fn storage_retention_shared_derived_owner_keeps_manifest_until_unreferenced() {
         let temp = tempfile::tempdir().unwrap();
         let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
@@ -1724,6 +1847,9 @@ mod storage_retention_tests {
         let path = view.derived_path("old").unwrap();
         let connection =
             crate::db::file_identity::IdentityConnection::open(&path, "retention test").unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
         assert_eq!(view.sweep_generations().unwrap(), 0);
         assert!(path.exists());
         drop(connection);

@@ -1903,6 +1903,85 @@ fn next_batch(storage: &StoragePaths, domains: &[(PathBuf, bool)]) -> io::Result
     traversal_batch(storage, domains, "roots", PASS_ENTRIES)
 }
 
+/// Generation cleanup has its own durable cursor and a count budget, not the
+/// root-retirement deadline. Recursive byte accounting and due-root work can
+/// consume that deadline before the first view is visited. For a stable set of
+/// V views, 64 per pass reaches all of them in ceil(V / 64) + 1 uninterrupted
+/// passes, including a partial lap and wraparound. No payload tree is walked.
+fn sweep_view_generations(
+    storage: &StoragePaths,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    let batch = traversal_batch_filtered(
+        storage,
+        &[(storage.artifacts.join("views"), false)],
+        "generations",
+        64,
+        &|entry| {
+            key_valid(&entry.file_name().to_string_lossy())
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.path().join("pointer.sqlite").is_file()
+        },
+    )?;
+    if batch.entries.is_empty() && !batch.cursor_path.exists() {
+        return Ok(());
+    }
+    let mut cursor = None;
+    let mut completed = true;
+    for item in batch.entries {
+        if cancelled() || bind_pending(&storage.durable) {
+            report.cancelled |= cancelled();
+            report.stopped_early = true;
+            completed = false;
+            break;
+        }
+        let path = item.entry.path();
+        if let Some(store) = crate::views::ViewStore::existing_dir(path.clone()) {
+            #[cfg(test)]
+            test_hook(&path, "walk");
+            if cancelled() || bind_pending(&storage.durable) {
+                report.cancelled |= cancelled();
+                report.stopped_early = true;
+                completed = false;
+                break;
+            }
+            match store.sweep_generations() {
+                Ok(removed) => {
+                    report.removed_generations += removed;
+                    if removed > 0 {
+                        log::info!(
+                            "views: retention removed_generations={removed} view={}",
+                            path.display()
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.skipped_protected += 1;
+                    if report.errors.len() < 16 {
+                        report.errors.push(format!("{}: {error}", path.display()));
+                    }
+                }
+            }
+        }
+        report
+            .domains
+            .entry("views/generations".into())
+            .or_default()
+            .examined += 1;
+        report.examined += 1;
+        // A blocked or malformed view cannot starve the rest of the lap.
+        cursor = Some(item.after);
+    }
+    if completed {
+        cursor = Some(batch.end);
+    }
+    if let Some(cursor) = cursor {
+        persist_cursor(storage, &batch.cursor_path, &cursor)?;
+    }
+    Ok(())
+}
+
 fn visit_one_family(
     storage: &StoragePaths,
     domain: &str,
@@ -3087,20 +3166,6 @@ fn candidate_inner(
     let flat_pin = flat
         .then(|| crate::bash_background::persistence::PinnedDir::repair_open_path(&cache))
         .transpose()?;
-    let before = tree_files(&cache, deadline)?;
-    if directory.file_name().is_some_and(|name| name == "views") {
-        if let Some(store) = crate::views::ViewStore::existing_dir(cache.clone()) {
-            report.removed_generations += store
-                .sweep_generations()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-        }
-    }
-    let after_views = tree_files(&cache, deadline)?;
-    report.removed_bytes += before
-        .iter()
-        .map(|(_, bytes)| bytes)
-        .sum::<u64>()
-        .saturating_sub(after_views.iter().map(|(_, bytes)| bytes).sum());
     let mut leases = Vec::new();
     let local_writer = crate::root_cache::local_callgraph_writer(&cache);
     for name in [
@@ -3205,7 +3270,7 @@ fn candidate_inner(
         return Ok(());
     }
     if !history.contains_key(key)
-        && after_views.iter().any(|(path, _)| {
+        && before.iter().any(|(path, _)| {
             path.file_name().is_none_or(|name| {
                 !matches!(
                     name.to_str(),
@@ -3302,7 +3367,7 @@ fn candidate_inner(
         }
     } else {
         retire_directory(&storage.durable, &cache)?;
-        report.removed_bytes += after_views
+        report.removed_bytes += before
             .iter()
             .map(|(_, bytes)| bytes)
             .sum::<u64>()
@@ -3583,6 +3648,14 @@ fn run_pass_with_budget(
         // Residency probes distinguish an absent readers directory from an
         // unavailable cache root. Establish the durable metadata root first.
         crate::private_storage::create_dir_all(storage.durable.join("retention"))?;
+        let phase = Instant::now();
+        sweep_view_generations(storage, cancelled, &mut report)?;
+        report
+            .timings_ms
+            .insert("generations".into(), phase.elapsed().as_millis() as u64);
+        if report.cancelled || bind_pending(&storage.durable) {
+            return Ok(());
+        }
         prune_bindings(storage, cancelled, &mut report)?;
         let history = bindings(storage)?;
         let domains = domain_paths(storage)?;
@@ -3806,27 +3879,8 @@ fn collect_one_v2_family(
             .bind_durable_storage(&storage.durable)
             .map_err(io::Error::other)?;
         let deadline = Instant::now() + PASS_BUDGET;
-        for member in registry
-            .members_bounded(HISTORY_ENTRIES)
-            .map_err(|error| io::Error::other(error.to_string()))?
-        {
-            if cancelled() || Instant::now() >= deadline {
-                report.stopped_early = true;
-                return Ok(());
-            }
-            // V2 pin admission uses this same registry barrier. It cannot race the
-            // generation protection snapshot and removal under the pointer lock.
-            if let Some(store) = crate::views::ViewStore::existing_dir(member.view_dir) {
-                let removed = registry
-                    .with_barrier(|_| {
-                        store
-                            .sweep_generations_locked()
-                            .map_err(crate::views::registry::RegistryError::View)
-                    })
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                report.removed_generations += removed;
-            }
-        }
+        // Generation cleanup uses the independent view cursor above; starting
+        // at the first registry member on every family visit starves its tail.
         if cancelled() {
             return Ok(());
         }
@@ -6856,6 +6910,75 @@ mod storage_retention_tests {
         assert_eq!(report.removed_generations, 1, "{report:?}");
         assert!(!old.exists());
         assert!(view.view_dir().exists());
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_visits_every_view_despite_expired_root_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_generation_lane_bound(&StoragePaths::same(temp.path()));
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_uses_cache_views_and_durable_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let durable = temp.path().join("storage");
+        let cache = temp.path().join("cache-volume");
+        fs::create_dir(&cache).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(durable.clone()),
+            cache_dir: Some(cache),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let paths = StoragePaths::for_config(&config);
+        assert_ne!(paths.artifacts, durable);
+        assert_generation_lane_bound(&paths);
+        assert!(super::cursor_root(&paths)
+            .unwrap()
+            .join("generations.json")
+            .is_file());
+        assert!(!paths.artifacts.join("retention/cursors").exists());
+        assert!(!durable.join("views").exists());
+    }
+
+    fn assert_generation_lane_bound(paths: &StoragePaths) {
+        let views: Vec<_> = (0..145)
+            .map(|index| {
+                let view =
+                    crate::views::ViewStore::open(&paths.artifacts, &format!("{index:016x}"))
+                        .unwrap();
+                fs::write(view.derived_path("old").unwrap(), b"obsolete").unwrap();
+                view
+            })
+            .collect();
+        // Start halfway through a lap, as a daemon resuming its durable cursor
+        // would. Three batches plus one wraparound must reach every view.
+        atomic_json(
+            &super::cursor_root(paths).unwrap().join("generations.json"),
+            &TraversalCursor {
+                domain: "views".into(),
+                last_processed: Some("0000000000000048".into()),
+            },
+        )
+        .unwrap();
+        let mut removed = 0;
+        for _ in 0..4 {
+            let report = super::run_pass_with_budget(
+                paths,
+                &|| false,
+                &|| Instant::now() + Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(report.errors.is_empty(), "{report:?}");
+            removed += report.removed_generations;
+        }
+        let unvisited: Vec<_> = views
+            .iter()
+            .filter(|view| view.derived_path("old").unwrap().exists())
+            .map(|view| view.view_dir())
+            .collect();
+        assert!(unvisited.is_empty(), "unvisited views: {unvisited:?}");
+        assert_eq!(removed, views.len());
     }
 
     #[test]
