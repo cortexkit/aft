@@ -988,7 +988,8 @@ impl ViewRegistration {
 
     /// The view's own pointer and manifests in `views/v2/<scope>`.
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
-        Ok(super::ViewStore::open_dir(self.view_dir.clone())?)
+        Ok(super::ViewStore::open_dir(self.view_dir.clone())?
+            .with_sweep_registry(self.registry.clone()))
     }
 
     /// Runs `create` inside the registry's handoff barrier, after confirming
@@ -1314,6 +1315,49 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_generation_sweep_holds_registry_barrier_during_unlink() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let registry = FamilyRegistry::open(storage.path(), "0123456789abcdef").unwrap();
+        let registration = registry
+            .register_view_with_storage(storage.path(), "barrier", &root)
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"obsolete").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-delete"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }),
+        );
+        super::super::generation::schedule_generation_sweep(view.clone());
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let held = matches!(
+            registry.inner.connection.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(held, "V2 unlink must exclude registry pin admission");
+        assert!(!old.exists());
+    }
 
     #[test]
     fn registration_is_idempotent_and_readers_leave_on_drop() {

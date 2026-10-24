@@ -2531,10 +2531,13 @@ mod tests {
             .register_view_with_storage(registry.storage(), "pinned", &root)
             .unwrap();
         let old = publish(&view, &[("file.txt", text(1, 2_000))], 32);
+        let view_dir = view.view_dir().to_path_buf();
+        // Pin while the generation is current, before publication can reclaim it.
+        let pin = view
+            .under_pin_barrier(|dir| QueryPin::acquire(dir, &old))
+            .unwrap();
         let current = publish(&view, &[("file.txt", text(2, 2_000))], 32);
         assert_ne!(old, current);
-        let view_dir = view.view_dir().to_path_buf();
-        let pin = QueryPin::acquire(&view_dir, &old).unwrap();
         drop(view);
         registry.set_disk_budget(budget(0, u64::MAX));
 

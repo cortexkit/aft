@@ -560,6 +560,7 @@ impl ViewStore {
                 super::checkpoint_pointer_after_cas(&self.pointer_path())?;
                 sync_directory(self.view_dir())?;
                 observe(observer, DurabilityStep::PointerSynced);
+                super::generation::schedule_generation_sweep(self.clone());
                 Ok(PublishV2::Published)
             }
             super::PublishOutcome::Conflict { current_generation } => {
@@ -729,6 +730,73 @@ mod tests {
             )
             .unwrap();
         manifest
+    }
+
+    #[test]
+    fn v2_publication_burst_reclaims_superseded_generations() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0123456789abcdef")
+                .unwrap();
+        let registration = registry
+            .register_view_with_storage(storage.path(), "burst", &root)
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let mut previous = None;
+        let mut generations = Vec::new();
+        for index in 0..8 {
+            let mut manifest = manifest();
+            manifest.header_mut().head_tree = Some(format!("tree-{index}"));
+            let name = GenerationName::for_manifest(&manifest).unwrap();
+            let pin =
+                crate::pins::AssemblyPin::create_v2(&registration, name.to_string(), &[]).unwrap();
+            let prepared = view
+                .prepare_v2(&name, previous.as_deref(), &manifest, None)
+                .unwrap();
+            let database = view.derived_path(&name.to_string()).unwrap();
+            let connection = crate::db::file_identity::IdentityConnection::open(
+                &database,
+                "V2 publication test",
+            )
+            .unwrap();
+            connection
+                .execute_batch("CREATE TABLE state (value TEXT);")
+                .unwrap();
+            drop(connection);
+            // A caller may still own the family barrier at commit. The worker
+            // must acquire it before the pointer, not re-enter it on this thread.
+            let outcome = registry
+                .with_barrier(|_| {
+                    view.commit_v2(prepared, None)
+                        .map_err(crate::views::registry::RegistryError::View)
+                })
+                .unwrap();
+            assert_eq!(outcome, PublishV2::Published);
+            previous = Some(name.to_string());
+            generations.push(name.to_string());
+            drop(pin);
+        }
+        crate::views::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        for generation in &generations[..generations.len() - 1] {
+            assert!(
+                !view.manifest_path(generation).unwrap().exists(),
+                "superseded V2 manifest survived: {generation}"
+            );
+            assert!(
+                !view.derived_path(generation).unwrap().exists(),
+                "superseded V2 database survived: {generation}"
+            );
+        }
+        assert!(view
+            .manifest_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
+        assert!(view
+            .derived_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
     }
 
     #[test]

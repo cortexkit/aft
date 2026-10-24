@@ -107,6 +107,7 @@ pub fn callgraph_paths_match_v2(
 pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
     ViewStore {
         view_dir: view_dir.to_path_buf(),
+        sweep_registry: None,
     }
     .derived_path(generation)
 }
@@ -766,6 +767,8 @@ pub struct PointerPragmas {
 #[derive(Clone, Debug)]
 pub struct ViewStore {
     view_dir: PathBuf,
+    // Registered V2 views serialize cleanup with their family's pin admission.
+    sweep_registry: Option<registry::FamilyRegistry>,
 }
 
 impl ViewStore {
@@ -778,7 +781,10 @@ impl ViewStore {
         let view_dir = storage.as_ref().join("views").join(project_scope_key);
         crate::private_storage::open_dir(storage.as_ref(), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
-        let store = Self { view_dir };
+        let store = Self {
+            view_dir,
+            sweep_registry: None,
+        };
         store.initialize_pointer()?;
         Ok(store)
     }
@@ -791,7 +797,10 @@ impl ViewStore {
             .map_err(|error| ViewError::io_at("opening writable view", &view_dir, error))?;
         crate::private_storage::open_dir(view_storage_root(&view_dir), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
-        let store = Self { view_dir };
+        let store = Self {
+            view_dir,
+            sweep_registry: None,
+        };
         store.initialize_pointer()?;
         Ok(store)
     }
@@ -801,10 +810,15 @@ impl ViewStore {
     pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
         crate::root_cache::check_cache_access(&view_dir).ok()?;
         crate::private_storage::tighten_open_dir(view_storage_root(&view_dir), &view_dir);
-        view_dir
-            .join(POINTER_DATABASE)
-            .is_file()
-            .then_some(Self { view_dir })
+        view_dir.join(POINTER_DATABASE).is_file().then_some(Self {
+            view_dir,
+            sweep_registry: None,
+        })
+    }
+
+    pub(crate) fn with_sweep_registry(mut self, registry: registry::FamilyRegistry) -> Self {
+        self.sweep_registry = Some(registry);
+        self
     }
 
     pub fn view_dir(&self) -> &Path {

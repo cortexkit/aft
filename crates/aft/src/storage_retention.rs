@@ -1915,11 +1915,14 @@ fn sweep_view_generations(
 ) -> io::Result<()> {
     let batch = traversal_batch_filtered(
         storage,
-        &[(storage.artifacts.join("views"), false)],
+        &[
+            (storage.artifacts.join("views"), false),
+            (storage.artifacts.join("views/v2"), false),
+        ],
         "generations",
         64,
         &|entry| {
-            key_valid(&entry.file_name().to_string_lossy())
+            (key_valid(&entry.file_name().to_string_lossy()) || directory_is_v2_view(&entry.path()))
                 && entry.file_type().is_ok_and(|kind| kind.is_dir())
                 && entry.path().join("pointer.sqlite").is_file()
         },
@@ -1927,6 +1930,7 @@ fn sweep_view_generations(
     if batch.entries.is_empty() && !batch.cursor_path.exists() {
         return Ok(());
     }
+    let registries = generation_registries(storage, &batch.entries)?;
     let mut cursor = None;
     let mut completed = true;
     for item in batch.entries {
@@ -1937,7 +1941,15 @@ fn sweep_view_generations(
             break;
         }
         let path = item.entry.path();
-        if let Some(store) = crate::views::ViewStore::existing_dir(path.clone()) {
+        if let Some(mut store) = crate::views::ViewStore::existing_dir(path.clone()) {
+            if directory_is_v2_view(&path) {
+                let Some(registry) = registries.get(&path) else {
+                    report.skipped_protected += 1;
+                    cursor = Some(item.after);
+                    continue;
+                };
+                store = store.with_sweep_registry(registry.clone());
+            }
             #[cfg(test)]
             test_hook(&path, "walk");
             if cancelled() || bind_pending(&storage.durable) {
@@ -1946,12 +1958,20 @@ fn sweep_view_generations(
                 completed = false;
                 break;
             }
-            match store.sweep_generations() {
+            match store.sweep_generations_with_bytes() {
                 Ok(removed) => {
-                    report.removed_generations += removed;
-                    if removed > 0 {
+                    report.removed_generations += removed.removed_generations;
+                    report.removed_bytes += removed.removed_bytes;
+                    report
+                        .domains
+                        .entry("views/generations".into())
+                        .or_default()
+                        .removed_bytes += removed.removed_bytes;
+                    if removed.removed_generations > 0 || removed.removed_bytes > 0 {
                         log::info!(
-                            "views: retention removed_generations={removed} view={}",
+                            "views: retention removed_generations={} removed_bytes={} view={}",
+                            removed.removed_generations,
+                            removed.removed_bytes,
                             path.display()
                         );
                     }
@@ -1980,6 +2000,57 @@ fn sweep_view_generations(
         persist_cursor(storage, &batch.cursor_path, &cursor)?;
     }
     Ok(())
+}
+
+fn directory_is_v2_view(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "v2"))
+}
+
+/// Resolve owners once for the batch, not once per view. Existing registries
+/// share their tracked SQLite connection with publishers and readers.
+fn generation_registries(
+    storage: &StoragePaths,
+    entries: &[TraversalEntry],
+) -> io::Result<HashMap<PathBuf, crate::views::registry::FamilyRegistry>> {
+    let wanted: HashSet<_> = entries
+        .iter()
+        .map(|entry| entry.entry.path())
+        .filter(|path| directory_is_v2_view(path))
+        .collect();
+    let mut owners = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(owners);
+    }
+    for entry in bounded_dirs(&storage.artifacts.join("blobs/v2"), HISTORY_ENTRIES)? {
+        let family = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir()
+            || !entry
+                .path()
+                .join(crate::views::registry::REGISTRY_FILE)
+                .is_file()
+        {
+            continue;
+        }
+        let Some(registry) =
+            crate::views::registry::FamilyRegistry::open_existing(&storage.artifacts, &family)
+                .map_err(io::Error::other)?
+        else {
+            continue;
+        };
+        registry
+            .bind_durable_storage(&storage.durable)
+            .map_err(io::Error::other)?;
+        for member in registry
+            .members_bounded(HISTORY_ENTRIES)
+            .map_err(io::Error::other)?
+        {
+            if wanted.contains(&member.view_dir) {
+                owners.insert(member.view_dir, registry.clone());
+            }
+        }
+    }
+    Ok(owners)
 }
 
 fn visit_one_family(
@@ -6916,6 +6987,92 @@ mod storage_retention_tests {
     fn storage_retention_generation_lane_visits_every_view_despite_expired_root_budget() {
         let temp = tempfile::tempdir().unwrap();
         assert_generation_lane_bound(&StoragePaths::same(temp.path()));
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_reaches_nested_v2_views() {
+        let storage = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(storage.path());
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0123456789abcdef")
+                .unwrap();
+        let mut registrations = Vec::new();
+        let mut views = Vec::new();
+        for index in 0..145 {
+            let scope = if index == 144 {
+                "named-scope".to_owned()
+            } else {
+                format!("{index:016x}")
+            };
+            let registration = registry
+                .register_view_with_storage(storage.path(), &scope, &root)
+                .unwrap();
+            let view = registration.view_store().unwrap();
+            fs::write(view.derived_path("old").unwrap(), b"obsolete").unwrap();
+            registrations.push(registration);
+            views.push(view);
+        }
+        let direct = crate::views::ViewStore::open(storage.path(), "ffffffffffffffff").unwrap();
+        fs::write(direct.derived_path("old").unwrap(), b"obsolete").unwrap();
+        views.push(direct);
+        atomic_json(
+            &super::cursor_root(&paths).unwrap().join("generations.json"),
+            &TraversalCursor {
+                domain: "views/v2".into(),
+                last_processed: Some("0000000000000048".into()),
+            },
+        )
+        .unwrap();
+        let mut removed = 0;
+        let mut bytes = 0;
+        for _ in 0..4 {
+            let report = super::run_pass_with_budget(
+                &paths,
+                &|| false,
+                &|| Instant::now() + Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(report.errors.is_empty(), "{report:?}");
+            removed += report.removed_generations;
+            bytes += report.removed_bytes;
+        }
+        assert_eq!(removed, views.len(), "nested V2 views were not all swept");
+        assert_eq!(bytes, 8 * views.len() as u64);
+        assert!(views
+            .iter()
+            .all(|view| !view.derived_path("old").unwrap().exists()));
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_reports_unlinked_bytes() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = crate::views::ViewStore::open(storage.path(), "0123456789abcdef").unwrap();
+        for (name, bytes) in [
+            ("derived-old.sqlite", 17),
+            ("derived-old.sqlite-wal", 5),
+            ("derived-old.sqlite-shm", 3),
+            ("manifest-old.json", 11),
+            ("trigram-old.bin", 13),
+        ] {
+            fs::write(view.view_dir().join(name), vec![b'x'; bytes]).unwrap();
+        }
+        fs::write(view.view_dir().join("unrelated"), vec![b'x'; 101]).unwrap();
+        let report = run_pass_with_budget(
+            storage.path(),
+            &|| false,
+            &|| Instant::now() + Duration::from_secs(60),
+            Duration::ZERO,
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_generations, 1);
+        assert_eq!(
+            report.removed_bytes, 49,
+            "must count only successful generation-owned unlinks"
+        );
+        assert_eq!(report.domains["views/generations"].removed_bytes, 49);
+        assert!(view.view_dir().join("unrelated").exists());
     }
 
     #[test]

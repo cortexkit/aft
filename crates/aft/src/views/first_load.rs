@@ -535,6 +535,8 @@ mod tests {
             .unwrap();
         publish(&owner, &manifest(&[("file.rs", b"hello")]));
         let store = owner.view_store().unwrap();
+        // Publication maintenance is not part of the read-only operation audited below.
+        crate::views::generation::wait_for_generation_sweep_for_test(store.view_dir());
         // Close each SQLite handle before reading its file: no live WAL file
         // is opened by a second descriptor in this audit.
         {
