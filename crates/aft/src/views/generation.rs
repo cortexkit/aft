@@ -45,6 +45,8 @@ pub(super) fn schedule_generation_sweep(view: ViewStore) {
     if let Err(error) = std::thread::Builder::new()
         .name("aft-view-generation-sweep".into())
         .spawn(move || loop {
+            #[cfg(test)]
+            crate::storage_retention::test_hook(&path, "post-publication-sweep");
             // An obsolete .ref protects its owner for the whole first census.
             // A second complete census can reclaim that now-unreferenced owner.
             match view
@@ -1752,6 +1754,40 @@ mod ownership_tests {
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+    #[test]
+    fn post_publication_sweep_drops_superseded_refs_but_keeps_current_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
+        let owner = view.derived_path("owner").unwrap();
+        fs::write(&owner, b"shared database").unwrap();
+        fs::write(view.manifest_path("owner").unwrap(), b"owner manifest").unwrap();
+        view.reuse_derived("superseded", "owner").unwrap();
+        view.reuse_derived("current", "owner").unwrap();
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'current'", [])
+            .unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(!view.view_dir().join("derived-superseded.ref").exists());
+        assert!(view.view_dir().join("derived-current.ref").exists());
+        assert!(owner.exists());
+        assert_eq!(view.derived_path("current").unwrap(), owner);
+        fs::write(
+            view.derived_path("independent").unwrap(),
+            b"independent database",
+        )
+        .unwrap();
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'independent'", [])
+            .unwrap();
+        schedule_generation_sweep(view.clone());
+        wait_for_generation_sweep_for_test(view.view_dir());
+        assert!(!owner.exists());
+        assert!(view.derived_path("independent").unwrap().exists());
+    }
+
     #[test]
     fn post_publication_sweep_preserves_cloned_pages_after_donor_removal() {
         let temp = tempfile::tempdir().unwrap();

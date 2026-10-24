@@ -3226,6 +3226,71 @@ mod status_settlement_tests {
     }
 
     #[test]
+    fn views_post_publication_sweep_catches_up_with_backlogged_publications() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            std::sync::Arc::new(move |step| {
+                if step == "post-publication-sweep"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                }
+            }),
+        );
+        let mut generations = Vec::new();
+        for index in 0..8 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut prepared =
+                prepare_checkout(&request(&root, storage.path(), "head"), &mut |_| Ok(())).unwrap();
+            // Only publication requests drive this fixture's cleanup; no
+            // checkpoint-close retry can conceal a lost pending request.
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            prepared.settle_status();
+            if index == 0 {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        assert!(generations
+            .iter()
+            .all(|generation| view.manifest_path(generation).unwrap().exists()));
+        release_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        for generation in &generations[..generations.len() - 1] {
+            assert!(
+                !view.manifest_path(generation).unwrap().exists(),
+                "backlogged generation survived: {generation}"
+            );
+            assert!(!view.derived_path(generation).unwrap().exists());
+        }
+        assert!(view
+            .derived_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
     fn views_post_publication_sweep_runs_after_settlement_without_checkpoint() {
         let project = super::cold_fallback_tests::repository(1);
         let root = project.path().canonicalize().unwrap();
@@ -3242,6 +3307,9 @@ mod status_settlement_tests {
             let obsolete = view.trigram_path(&format!("unheld-{index}")).unwrap();
             fs::write(&obsolete, b"obsolete trigram").unwrap();
             let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+            // Exercise settlement's dispatch without a deferred keeper-close
+            // worker from this or a previous iteration also requesting cleanup.
+            prepared.derived_checkpoint.take();
             let report = prepared.commit().unwrap();
             assert!(report.published);
             super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
