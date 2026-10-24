@@ -1,0 +1,20 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/anchored_lane.rs",
+    "crates/aft/src/commands/semantic_search/blocks.rs",
+    "crates/aft/src/commands/semantic_search/comparator.rs",
+    "crates/aft/src/commands/semantic_search/confidence.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs"
+  ],
+  "note": "PROBE ONLY (not for landing): measures whether audit slice u20's semantic-search and configure fixes move any real-query benchmark row. If rows move, the uploaded score diff names them."
+}
