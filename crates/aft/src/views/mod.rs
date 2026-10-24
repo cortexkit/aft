@@ -1199,6 +1199,8 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
+    #[cfg(test)]
+    materialization::probe_connection(connection);
     Ok(())
 }
 
@@ -1247,11 +1249,16 @@ fn sqlite_full_sync_checkpoint(path: &Path, seam: &'static str) -> Result<(i64, 
     // and flushes the main database before the checkpoint returns. Keeping the
     // operation inside the VFS preserves its process-wide advisory locks.
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection
+    let result = connection
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
-        .map_err(ViewError::from)
+        .map_err(ViewError::from)?;
+    #[cfg(test)]
+    unsafe {
+        materialization::probe_checkpoint(connection.handle(), result.0, result.1, result.2)
+    };
+    Ok(result)
 }
 
 fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {

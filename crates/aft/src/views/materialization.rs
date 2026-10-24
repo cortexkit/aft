@@ -131,6 +131,7 @@ mod module_digest;
 pub(crate) mod parity;
 pub(crate) mod profile;
 mod resolution_facts;
+mod stable_rows;
 
 // Rebuild older generations rather than retaining rows produced by the
 // per-reference skip optimization when reference ordinals collide, or Go
@@ -299,6 +300,8 @@ fn materialize_reading(
     )?;
     configure_materialization_connection(&connection)?;
     initialize_schema(&connection)?;
+    #[cfg(test)]
+    let dirty_probe = tests::dirty_pages::observe(&connection, database_path);
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut base_fingerprint = None;
@@ -330,6 +333,11 @@ fn materialize_reading(
             base = None;
         } else if base_manifest == manifest {
             profile.finish("load_bindings_select");
+            #[cfg(test)]
+            {
+                drop(transaction);
+                tests::dirty_pages::finish(dirty_probe, &connection);
+            }
             return Ok((MaterializeStats::default(), profile.into_timings()));
         } else if manifest_callgraph_equivalent(base_manifest, manifest) {
             profile.finish("load_bindings_select");
@@ -341,6 +349,8 @@ fn materialize_reading(
             module_digest::advance_unchanged(&transaction, &base_fp, &next_fp)?;
             transaction.commit()?;
             profile.finish("commit");
+            #[cfg(test)]
+            tests::dirty_pages::finish(dirty_probe, &connection);
             return Ok((MaterializeStats::default(), profile.into_timings()));
         }
         base_fingerprint = Some(base_fp);
@@ -500,6 +510,11 @@ fn materialize_reading(
         transaction.execute_batch(
             "CREATE TEMP TABLE changed_view_paths (
                  path TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE emitted_view_rows (
+                 table_name TEXT NOT NULL,
+                 row_key TEXT NOT NULL,
+                 PRIMARY KEY(table_name, row_key)
              ) WITHOUT ROWID",
         )?;
         {
@@ -515,28 +530,31 @@ fn materialize_reading(
         }
         existing_binding_paths = existing_changed_paths(&transaction, "view_bindings")?;
         existing_surface_paths = existing_changed_paths(&transaction, "view_file_surfaces")?;
-        // Edges are owned through their ref_id, not their target. Delete them
-        // before refs so cross-file incoming edges remain available. Starting
-        // every lookup from the bounded path table keeps deletion on the diff.
-        stats.deleted += transaction.execute(
-            "DELETE FROM edges WHERE ref_id IN (
+        // Keep the logical replacement counts, but retain surviving keys until
+        // emission can update their changed fields without churning rowids.
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM edges WHERE ref_id IN (
                  SELECT refs.ref_id FROM changed_view_paths
                  CROSS JOIN refs INDEXED BY idx_refs_caller_file
                      ON refs.caller_file = changed_view_paths.path
              )",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
-        stats.deleted += transaction.execute(
-            "DELETE FROM refs WHERE caller_file IN (SELECT path FROM changed_view_paths)",
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM refs WHERE caller_file IN (SELECT path FROM changed_view_paths)",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
-        stats.deleted += transaction.execute(
-            "DELETE FROM nodes WHERE file_path IN (SELECT path FROM changed_view_paths)",
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE file_path IN (SELECT path FROM changed_view_paths)",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
-        stats.deleted += transaction.execute(
-            "DELETE FROM files WHERE path IN (SELECT path FROM changed_view_paths)",
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM files WHERE path IN (SELECT path FROM changed_view_paths)",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
         stats.dependency_deleted += transaction.query_row(
             "SELECT COUNT(*) FROM file_dependencies
@@ -644,30 +662,94 @@ fn materialize_reading(
         }
     }
 
-    stats.inserted += profile.measure(WritePhase::Files, &transaction, || {
-        let mut insert = transaction.prepare(
-            "INSERT OR REPLACE INTO files
-             (path, content_hash, mtime_ns, size, lang, is_dead_code_root, is_public_api,
-              surface_fingerprint, indexed_at)
-             VALUES (?1, ?2, 0, 0, ?3, 0, 0, '', 0)",
+    if changed.is_some() {
+        profile.measure(
+            WritePhase::DeleteRows,
+            &transaction,
+            || -> rusqlite::Result<()> {
+                transaction.execute_batch(
+                    "CREATE TEMP TABLE next_view_node_positions (
+                     id TEXT PRIMARY KEY, start_line INTEGER, start_col INTEGER,
+                     end_line INTEGER, end_col INTEGER, range_ordinal INTEGER
+                 ) WITHOUT ROWID",
+                )?;
+                let mut insert = transaction.prepare(
+                "INSERT OR REPLACE INTO next_view_node_positions VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+                for row in &owned_nodes {
+                    insert.execute(params![
+                        row.id,
+                        row.start_line,
+                        row.start_col,
+                        row.end_line,
+                        row.end_col,
+                        row.ordinal
+                    ])?;
+                }
+                // Moving a node can occupy another old node's unique source range.
+                // Vacate only moving/removed ranges, without deleting their rowids.
+                // Negative ordinals exist only inside this transaction: emission or
+                // pruning replaces every one before the generation can be published.
+                transaction.execute_batch(
+                    "UPDATE nodes SET range_ordinal = -rowid - 1
+                 WHERE file_path IN (SELECT path FROM changed_view_paths)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM next_view_node_positions AS next
+                       WHERE next.id=nodes.id AND next.start_line=nodes.start_line
+                         AND next.start_col=nodes.start_col AND next.end_line=nodes.end_line
+                         AND next.end_col=nodes.end_col AND next.range_ordinal=nodes.range_ordinal
+                   )",
+                )?;
+                Ok(())
+            },
         )?;
+    }
+    stats.inserted += profile.measure(WritePhase::Files, &transaction, || {
         owned_files.iter().try_fold(0, |count, row| {
-            insert
-                .execute(params![row.path, row.content_hash, row.language])
-                .map(|written| count + written)
+            stable_rows::write(
+                &transaction,
+                "files",
+                &[
+                    "path",
+                    "content_hash",
+                    "mtime_ns",
+                    "size",
+                    "lang",
+                    "is_dead_code_root",
+                    "is_public_api",
+                    "surface_fingerprint",
+                    "indexed_at",
+                ],
+                params![row.path, row.content_hash, 0, 0, row.language, 0, 0, "", 0],
+                changed.is_some(),
+            )
+            .map(|written| count + written)
         })
     })?;
     stats.inserted += profile.measure(WritePhase::Nodes, &transaction, || {
-        let mut insert = transaction.prepare(
-            "INSERT OR REPLACE INTO nodes
-             (id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
-              end_col, range_ordinal, signature, exported, is_default_export,
-              is_type_like, is_callgraph_entry_point, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?15, ?14)",
-        )?;
         owned_nodes.iter().try_fold(0, |count, row| {
-            insert
-                .execute(params![
+            stable_rows::write(
+                &transaction,
+                "nodes",
+                &[
+                    "id",
+                    "file_path",
+                    "name",
+                    "scoped_name",
+                    "kind",
+                    "start_line",
+                    "start_col",
+                    "end_line",
+                    "end_col",
+                    "range_ordinal",
+                    "signature",
+                    "exported",
+                    "is_default_export",
+                    "is_type_like",
+                    "is_callgraph_entry_point",
+                    "provenance",
+                ],
+                params![
                     row.id,
                     row.file_path,
                     row.name,
@@ -681,10 +763,13 @@ fn materialize_reading(
                     row.signature,
                     i64::from(row.exported),
                     i64::from(row.default_export),
-                    PROVENANCE_TREESITTER,
+                    0,
                     i64::from(row.entry_point),
-                ])
-                .map(|written| count + written)
+                    PROVENANCE_TREESITTER,
+                ],
+                changed.is_some(),
+            )
+            .map(|written| count + written)
         })
     })?;
     if changed.is_none() {
@@ -1128,40 +1213,62 @@ fn materialize_reading(
             let deleted = ref_deletes.iter().try_fold(0, |count, ref_id| {
                 delete.execute([ref_id]).map(|written| count + written)
             })?;
-            let mut insert = transaction.prepare(
-                "INSERT OR REPLACE INTO refs
-                 (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
-                  import_kind, local_name, requested_name, namespace_alias, wildcard, line,
-                  byte_start, byte_end, status, target_node, target_file, target_symbol, provenance, callee_last_segment)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-            )?;
             let mut relinked = 0;
             let mut owned = 0;
             for row in &pending_refs {
-                let written = insert.execute(params![
-                    row.ref_id,
-                    row.caller_node,
-                    row.caller_file,
-                    row.kind,
-                    row.short_name,
-                    row.full_ref,
-                    row.module_path,
-                    row.import_kind,
-                    row.local_name,
-                    row.requested_name,
-                    row.namespace_alias,
-                    i64::from(row.wildcard),
-                    i64::from(row.line),
-                    row.byte_start as i64,
-                    row.byte_end as i64,
-                    row.status,
-                    row.target_node,
-                    row.target_file,
-                    row.target_symbol,
-                    PROVENANCE_TREESITTER,
-                    row.short_name.as_deref().map(crate::callgraph_store::callee_last_segment),
-                ])?;
+                let written = stable_rows::write(
+                    &transaction,
+                    "refs",
+                    &[
+                        "ref_id",
+                        "caller_node",
+                        "caller_file",
+                        "kind",
+                        "short_name",
+                        "full_ref",
+                        "module_path",
+                        "import_kind",
+                        "local_name",
+                        "requested_name",
+                        "namespace_alias",
+                        "wildcard",
+                        "line",
+                        "byte_start",
+                        "byte_end",
+                        "status",
+                        "target_node",
+                        "target_file",
+                        "target_symbol",
+                        "provenance",
+                        "callee_last_segment",
+                    ],
+                    params![
+                        row.ref_id,
+                        row.caller_node,
+                        row.caller_file,
+                        row.kind,
+                        row.short_name,
+                        row.full_ref,
+                        row.module_path,
+                        row.import_kind,
+                        row.local_name,
+                        row.requested_name,
+                        row.namespace_alias,
+                        i64::from(row.wildcard),
+                        i64::from(row.line),
+                        row.byte_start as i64,
+                        row.byte_end as i64,
+                        row.status,
+                        row.target_node,
+                        row.target_file,
+                        row.target_symbol,
+                        PROVENANCE_TREESITTER,
+                        row.short_name
+                            .as_deref()
+                            .map(crate::callgraph_store::callee_last_segment),
+                    ],
+                    changed.is_some(),
+                )?;
                 if row.relink {
                     relinked += written;
                 } else {
@@ -1174,25 +1281,36 @@ fn materialize_reading(
         WritePhase::Edges,
         &transaction,
         || -> rusqlite::Result<_> {
-            let mut insert = transaction.prepare(
-                "INSERT OR REPLACE INTO edges
-                 (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
-                  kind, line, provenance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
-            )?;
             let mut relinked = 0;
             let mut owned = 0;
             for row in &pending_edges {
-                let written = insert.execute(params![
-                    format!("edge:{}", row.ref_id),
-                    row.ref_id,
-                    row.source_node,
-                    row.target_node,
-                    row.target_file,
-                    row.target_symbol,
-                    i64::from(row.line),
-                    PROVENANCE_TREESITTER,
-                ])?;
+                let written = stable_rows::write(
+                    &transaction,
+                    "edges",
+                    &[
+                        "edge_id",
+                        "ref_id",
+                        "source_node",
+                        "target_node",
+                        "target_file",
+                        "target_symbol",
+                        "kind",
+                        "line",
+                        "provenance",
+                    ],
+                    params![
+                        format!("edge:{}", row.ref_id),
+                        row.ref_id,
+                        row.source_node,
+                        row.target_node,
+                        row.target_file,
+                        row.target_symbol,
+                        "call",
+                        i64::from(row.line),
+                        PROVENANCE_TREESITTER,
+                    ],
+                    changed.is_some(),
+                )?;
                 if row.relink {
                     relinked += written;
                 } else {
@@ -1209,6 +1327,11 @@ fn materialize_reading(
         eprintln!("view_profile emission identical_refs_skipped={identical_refs} stats={stats:?}");
     }
     profile.finish("emit_refs_edges");
+    if changed.is_some() {
+        profile.measure(WritePhase::DeleteRows, &transaction, || {
+            stable_rows::prune(&transaction)
+        })?;
+    }
     for phase in [
         WritePhase::Files,
         WritePhase::Nodes,
@@ -1300,6 +1423,8 @@ fn materialize_reading(
         commit_stage.finish("sqlite_commit", format_args!(""));
     }
     profile.finish("commit");
+    #[cfg(test)]
+    tests::dirty_pages::finish(dirty_probe, &connection);
     if let Some(probe) = write_probe {
         probe.finish(&connection, database_path);
     }
@@ -1479,6 +1604,9 @@ pub(crate) fn configure_materialization_connection(connection: &Connection) -> R
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::dirty_pages::publication::{probe_checkpoint, probe_connection, probe_wal};
 
 // The measurement harness reads process CPU time through getrusage.
 #[cfg(all(test, unix))]

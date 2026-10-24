@@ -443,6 +443,10 @@ unsafe extern "C" fn tracked_wal_hook(
 ) -> c_int {
     let state = unsafe { &*(context.cast::<WalHookState>()) };
     state.observe_commit(frame_count);
+    #[cfg(test)]
+    unsafe {
+        crate::views::materialization::probe_wal(db, frame_count)
+    };
     let threshold = state.threshold_pages.load(Ordering::Relaxed);
     if threshold <= 0 || frame_count < threshold {
         return rusqlite::ffi::SQLITE_OK;
@@ -462,6 +466,15 @@ unsafe extern "C" fn tracked_wal_hook(
         )
     };
     if result == rusqlite::ffi::SQLITE_OK {
+        #[cfg(test)]
+        unsafe {
+            crate::views::materialization::probe_checkpoint(
+                db,
+                0,
+                log_frames.into(),
+                checkpointed_frames.into(),
+            )
+        };
         let frames = state.record_checkpoint(log_frames, checkpointed_frames);
         state
             .checkpoint_counter
@@ -774,7 +787,8 @@ impl TrackedConnection {
         &self,
         mode: WalCheckpointMode,
     ) -> rusqlite::Result<WalCheckpointResult> {
-        self.connection
+        let result = self
+            .connection
             .as_ref()
             .expect("tracked SQLite connection accessed after drop")
             .query_row(mode.pragma_sql(), [], |row| {
@@ -783,7 +797,17 @@ impl TrackedConnection {
                     log_frames: row.get(1)?,
                     checkpointed_frames: row.get(2)?,
                 })
-            })
+            })?;
+        #[cfg(test)]
+        unsafe {
+            crate::views::materialization::probe_checkpoint(
+                self.connection.as_ref().unwrap().handle(),
+                result.busy,
+                result.log_frames,
+                result.checkpointed_frames,
+            )
+        };
+        Ok(result)
     }
 
     fn credit_checkpoint_result_as(&self, result: WalCheckpointResult, domain: WriteDomain) -> u64 {

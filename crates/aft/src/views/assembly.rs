@@ -173,6 +173,17 @@ pub struct PreparedAssembly {
     _verification: manifest_incremental::PreparationVerification,
 }
 
+#[cfg(test)]
+pub(crate) fn seed_labels_for_test(
+    prepared: &PreparedAssembly,
+) -> (&'static str, &'static str, &'static str) {
+    (
+        prepared.profile.seed_source,
+        prepared.profile.clone_mechanism,
+        prepared.profile.cold_build_reason,
+    )
+}
+
 /// The path-status changes a complete assembly computed: pending rows to
 /// clear and call-graph skips to record or drop. They describe the generation
 /// being prepared, so they are applied only once that generation is the one
