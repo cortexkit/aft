@@ -30,8 +30,9 @@ export interface BgCompletion {
   tokens_skipped?: boolean;
   status_reason?: string;
   output_incomplete?: boolean;
-  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants?: import("@cortexkit/aft-bridge").LiveDescendant[] | null;
   live_descendants_omitted?: number;
+  live_descendants_unavailable?: import("@cortexkit/aft-bridge").LiveDescendantsUnavailable;
   live_descendants_summary?: string;
   mode?: "pipes" | "pty" | string;
   output_path?: string;
