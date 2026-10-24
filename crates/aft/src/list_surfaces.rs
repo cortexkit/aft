@@ -592,8 +592,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, write_retirement_witness, verify_retirement_witness",
-        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, 64-view generation batch, take",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, write_retirement_witness, verify_retirement_witness",
+        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, 64-view generation batch, 16 diagnostic errors, take",
         reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed, remaining vanished views and stopped-early counts",
     },
     ExclusionEntry {

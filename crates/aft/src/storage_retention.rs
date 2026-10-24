@@ -1930,7 +1930,21 @@ fn sweep_view_generations(
     if batch.entries.is_empty() && !batch.cursor_path.exists() {
         return Ok(());
     }
-    let registries = generation_registries(storage, &batch.entries)?;
+    let registries = match generation_registries(storage, &batch.entries, report) {
+        Ok(registries) => {
+            generation_registry_errors()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&storage.artifacts.join("blobs/v2"));
+            registries
+        }
+        Err(error) => {
+            // An unavailable family census protects unknown V2 owners, but it
+            // must not prevent direct-view cleanup or cursor/root progress.
+            report_generation_registry_error(&storage.artifacts.join("blobs/v2"), &error, report);
+            HashMap::new()
+        }
+    };
     let mut cursor = None;
     let mut completed = true;
     for item in batch.entries {
@@ -2012,6 +2026,7 @@ fn directory_is_v2_view(path: &Path) -> bool {
 fn generation_registries(
     storage: &StoragePaths,
     entries: &[TraversalEntry],
+    report: &mut SweepReport,
 ) -> io::Result<HashMap<PathBuf, crate::views::registry::FamilyRegistry>> {
     let wanted: HashSet<_> = entries
         .iter()
@@ -2023,34 +2038,82 @@ fn generation_registries(
         return Ok(owners);
     }
     for entry in bounded_dirs(&storage.artifacts.join("blobs/v2"), HISTORY_ENTRIES)? {
-        let family = entry.file_name().to_string_lossy().into_owned();
-        if !entry.file_type()?.is_dir()
-            || !entry
-                .path()
-                .join(crate::views::registry::REGISTRY_FILE)
-                .is_file()
-        {
-            continue;
-        }
-        let Some(registry) =
-            crate::views::registry::FamilyRegistry::open_existing(&storage.artifacts, &family)
-                .map_err(io::Error::other)?
-        else {
-            continue;
+        let registry_path = entry.path().join(crate::views::registry::REGISTRY_FILE);
+        let family = (|| -> io::Result<Option<_>> {
+            if !entry.file_type()?.is_dir() {
+                return Ok(None);
+            }
+            match fs::metadata(&registry_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err(io::Error::other("family registry is not a regular file")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let family = entry.file_name().to_string_lossy().into_owned();
+            let Some(registry) =
+                crate::views::registry::FamilyRegistry::open_existing(&storage.artifacts, &family)
+                    .map_err(io::Error::other)?
+            else {
+                return Ok(None);
+            };
+            registry
+                .bind_durable_storage(&storage.durable)
+                .map_err(io::Error::other)?;
+            let members = registry
+                .members_bounded(HISTORY_ENTRIES)
+                .map_err(io::Error::other)?;
+            Ok(Some((registry, members)))
+        })();
+        let (registry, members) = match family {
+            Ok(family) => {
+                generation_registry_errors()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&registry_path);
+                let Some(family) = family else { continue };
+                family
+            }
+            Err(error) => {
+                report_generation_registry_error(&registry_path, &error, report);
+                continue;
+            }
         };
-        registry
-            .bind_durable_storage(&storage.durable)
-            .map_err(io::Error::other)?;
-        for member in registry
-            .members_bounded(HISTORY_ENTRIES)
-            .map_err(io::Error::other)?
-        {
+        // Publish no owners from a family until its complete membership census
+        // succeeded. A bad family's views remain protected, not partly swept.
+        for member in members {
             if wanted.contains(&member.view_dir) {
                 owners.insert(member.view_dir, registry.clone());
             }
         }
     }
     Ok(owners)
+}
+
+fn generation_registry_errors() -> &'static Mutex<HashSet<PathBuf>> {
+    static ERRORS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ERRORS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn report_generation_registry_error(path: &Path, error: &io::Error, report: &mut SweepReport) {
+    if report.errors.len() < 16 {
+        report
+            .errors
+            .push(format!("{}: generation registry: {error}", path.display()));
+    }
+    // Emit once per failing family until a successful census resets it. Keep
+    // the per-pass health error even when the warning is rate-limited.
+    let first = generation_registry_errors()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    if first {
+        log::warn!(
+            "views: generation registry skipped registry={} error={error}",
+            path.display()
+        );
+        #[cfg(test)]
+        test_hook(path, "generation-registry-error");
+    }
 }
 
 fn visit_one_family(
@@ -7043,6 +7106,88 @@ mod storage_retention_tests {
         assert!(views
             .iter()
             .all(|view| !view.derived_path("old").unwrap().exists()));
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_isolates_corrupt_family_and_advances() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let storage = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(storage.path());
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let bad_registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0000000000000001")
+                .unwrap();
+        let good_registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0000000000000002")
+                .unwrap();
+        let bad_registration = bad_registry
+            .register_view_with_storage(storage.path(), "0000000000000001", &root)
+            .unwrap();
+        let good_registration = good_registry
+            .register_view_with_storage(storage.path(), "0000000000000002", &root)
+            .unwrap();
+        let bad_view = bad_registration.view_store().unwrap();
+        let good_view = good_registration.view_store().unwrap();
+        let bad_old = bad_view.derived_path("old").unwrap();
+        fs::write(&bad_old, b"must be retained").unwrap();
+        // Corrupt the schema through its tracked connection, never by opening
+        // the live SQLite file through a second, raw descriptor.
+        bad_registry
+            .with_barrier(|tx| {
+                tx.execute_batch("DROP TABLE members")?;
+                Ok(())
+            })
+            .unwrap();
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let observed = warnings.clone();
+        let _hook = observe_test_hook(
+            bad_registry.path(),
+            Arc::new(move |step| {
+                if step == "generation-registry-error" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let cursor_path = super::cursor_root(&paths).unwrap().join("generations.json");
+        atomic_json(
+            &cursor_path,
+            &TraversalCursor {
+                domain: "views/v2".into(),
+                last_processed: Some("0000000000000000".into()),
+            },
+        )
+        .unwrap();
+        for pass in 0..2 {
+            let good_old = good_view.derived_path(&format!("old-{pass}")).unwrap();
+            fs::write(&good_old, b"reclaim this").unwrap();
+            let report = super::run_pass_with_budget(
+                &paths,
+                &|| false,
+                &|| Instant::now() + Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(
+                !good_old.exists(),
+                "healthy family was starved by a corrupt neighbor: {report:?}"
+            );
+            assert!(bad_old.exists(), "unchecked family must remain protected");
+            let cursor: TraversalCursor = read_json(&cursor_path).unwrap();
+            assert!(
+                cursor.last_processed.is_none(),
+                "the completed generation lap was not committed: {cursor:?}"
+            );
+            assert!(
+                report.timings_ms.contains_key("roots"),
+                "generation lookup failure skipped root-retirement work: {report:?}"
+            );
+        }
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            1,
+            "a persistent bad family must not log on every pass"
+        );
     }
 
     #[test]
