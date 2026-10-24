@@ -100,6 +100,79 @@ fn read_refuses_storage_floor() {
 }
 
 #[test]
+fn storage_floor_separate_cache_root_refuses_tools_and_independent_snapshot() {
+    let mut f = Fixture::new();
+    let cache_volume = f._root.path().join("cache-volume");
+    f.ctx
+        .update_config(|config| config.cache_dir = Some(cache_volume));
+    let cache_root = f.ctx.cache_dir();
+    std::fs::create_dir_all(&cache_root).unwrap();
+    f.store = cache_root.join("aft.db");
+    std::fs::write(&f.store, "original\n").unwrap();
+    f.assert_refused(|| {
+        super::read::handle_read(&request("read", json!({"file":f.store})), &f.ctx)
+    });
+    f.assert_refused(|| {
+        super::write::handle_write(
+            &request("write", json!({"file":f.store,"content":"changed"})),
+            &f.ctx,
+        )
+    });
+    f.assert_refused(|| {
+        super::edit_match::handle_edit_match(
+            &request(
+                "edit_match",
+                json!({"file":f.store,"match":"original","replacement":"changed"}),
+            ),
+            &f.ctx,
+        )
+    });
+    f.assert_refused(|| {
+        super::apply_patch::handle_apply_patch(
+            &request("apply_patch", json!({"patch_text":patch(&f.store)})),
+            &f.ctx,
+        )
+    });
+    f.assert_refused(|| {
+        super::delete_file::handle_delete_file(
+            &request("delete_file", json!({"files":[f.store]})),
+            &f.ctx,
+        )
+    });
+    f.assert_refused(|| {
+        super::move_file::handle_move_file(
+            &request(
+                "move_file",
+                json!({"file":f.store,"destination":f.neighbor.with_extension("moved")}),
+            ),
+            &f.ctx,
+        )
+    });
+    f.assert_refused(|| {
+        super::move_file::handle_move_file(
+            &request(
+                "move_file",
+                json!({"file":f.neighbor,"destination":f.store}),
+            ),
+            &f.ctx,
+        )
+    });
+    let before = crate::file_identity::metadata(&f.store).unwrap();
+    let error = crate::backup::BackupStore::new()
+        .snapshot("cache-floor", &f.store, "refused")
+        .unwrap_err();
+    assert_eq!(error.code(), "denied_floor");
+    let after = crate::file_identity::metadata(&f.store).unwrap();
+    assert_eq!(before.1, after.1);
+    assert_eq!(before.0.modified().unwrap(), after.0.modified().unwrap());
+    let allowed = super::write::handle_write(
+        &request("write", json!({"file":f.neighbor,"content":"normal"})),
+        &f.ctx,
+    );
+    assert!(allowed.success, "{allowed:?}");
+}
+
+#[test]
 fn write_refuses_storage_floor() {
     let f = Fixture::new();
     f.assert_refused(|| {

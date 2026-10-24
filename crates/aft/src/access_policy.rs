@@ -685,6 +685,14 @@ impl AccessPolicy {
             path
         })
         .collect();
+        if config.cache_dir.is_some() {
+            let path = policy_path(&crate::root_cache::cache_root(config));
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule: FloorRule::AftStorage,
+            });
+            deny.push(path);
+        }
         if let Some(path) = &config.semantic.subc_connection_file {
             let path = expand_home(path, home);
             let path = policy_path(&if path.is_absolute() {

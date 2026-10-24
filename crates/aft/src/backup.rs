@@ -6815,6 +6815,43 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backup_storage_floor_lazy_history_refuses_live_database_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.txt");
+        std::fs::write(&source, "original").unwrap();
+        let mut store = super::BackupStore::new();
+        store.set_storage_dir(root.path().join("storage"), 72);
+        store.snapshot("lazy-floor", &source, "snapshot").unwrap();
+        let entry = store.history("lazy-floor", &source).pop().unwrap();
+        let blob = match &entry.content {
+            super::BackupContent::OnDisk { path, .. } => path.clone(),
+            _ => panic!("durable history must remain lazy"),
+        };
+        let database = root.path().join("live.db");
+        let connection = crate::db::file_identity::IdentityConnection::open(
+            &database,
+            "lazy history floor fixture",
+        )
+        .unwrap();
+        connection
+            .execute_batch("CREATE TABLE source(value TEXT);")
+            .unwrap();
+        std::fs::remove_file(&blob).unwrap();
+        std::fs::hard_link(&database, &blob).unwrap();
+        let error = entry.content_bytes().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("is denied by the access policy floor"));
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM source", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn backup_storage_floor_windows_short_names_and_missing_descendants() {
@@ -8422,7 +8459,7 @@ mod tests {
 
     #[test]
     fn backup_memory_session_release_keeps_history_and_pending_annotations() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         store.snapshot("closed", &path, "first").unwrap();
         store.snapshot("other", &path, "other session").unwrap();
         fs::write(&path, b"changed").unwrap();
@@ -8452,7 +8489,7 @@ mod tests {
 
     #[test]
     fn backup_discard_single_entry_reloads_after_session_release() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         fs::write(&path, b"original").unwrap();
         store
             .snapshot_with_op("discard", &path, "successful", Some("good"))
@@ -8472,7 +8509,7 @@ mod tests {
     fn backup_cancelled_rollback_ignores_expired_request() {
         for single in [false, true] {
             for released in [false, true] {
-                let (mut store, _storage, path) = durability_store();
+                let (mut store, _storage, _project, path) = durability_store();
                 fs::write(&path, b"original").unwrap();
                 store
                     .snapshot_with_op("cancelled", &path, "success", Some("good"))
@@ -8516,7 +8553,7 @@ mod tests {
     #[test]
     fn backup_rollback_cleanup_bounds_namespace_session_and_stack_waits() {
         for (held_stage, released) in [(0, false), (1, false), (2, false), (2, true)] {
-            let (mut store, storage, original_path) = durability_store();
+            let (mut store, storage, _project, original_path) = durability_store();
             // Keep a noncanonical spelling even on hosts whose temp directory
             // is already canonical, so the held lease must use the snapshot key.
             let path = if held_stage == 2 {
@@ -8655,8 +8692,8 @@ mod tests {
 
     #[test]
     fn backup_discard_operation_reloads_all_released_paths() {
-        let (mut store, storage, first) = durability_store();
-        let second = storage.path().join("second.txt");
+        let (mut store, _storage, project, first) = durability_store();
+        let second = project.path().join("second.txt");
         let paths = [first, second];
         for path in &paths {
             fs::write(path, b"original").unwrap();
@@ -8689,8 +8726,8 @@ mod tests {
     fn backup_preview_rediscovers_released_operation_without_sqlite_rows() {
         for empty_sqlite in [false, true] {
             for release in [0, 1, 2] {
-                let (mut store, storage, first) = durability_store();
-                let paths = [first, storage.path().join("second.bin")];
+                let (mut store, storage, project, first) = durability_store();
+                let paths = [first, project.path().join("second.bin")];
                 for path in &paths {
                     fs::write(path, [0, 255, 128]).unwrap();
                     store
@@ -8746,8 +8783,8 @@ mod tests {
 
     #[test]
     fn backup_preview_discovery_cap_refuses_partial_history() {
-        let (mut store, storage, first) = durability_store();
-        for path in [first, storage.path().join("second.txt")] {
+        let (mut store, _storage, project, first) = durability_store();
+        for path in [first, project.path().join("second.txt")] {
             fs::write(&path, b"original").unwrap();
             store
                 .snapshot_with_op("preview", &path, "before", Some("operation"))
@@ -8767,7 +8804,7 @@ mod tests {
 
     #[test]
     fn backup_preview_discovery_deadline_is_checked_before_advancing() {
-        let (mut store, _storage, path) = durability_store();
+        let (mut store, _storage, _project, path) = durability_store();
         store
             .snapshot_with_op("preview", &path, "before", Some("operation"))
             .unwrap();

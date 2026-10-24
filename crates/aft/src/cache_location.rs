@@ -340,6 +340,7 @@ pub fn cache_root(config: &crate::config::Config) -> PathBuf {
         .map(|root| root.join("aft"))
         .unwrap_or_else(|| crate::bash_background::storage_dir(config.storage_dir.as_deref()));
     if config.cache_dir.is_some() {
+        crate::project_content::register_storage_root(&root);
         // A root that is, contains or sits inside durable storage never gets a
         // location entry: an entry denies every path under it, durable
         // writes included.
