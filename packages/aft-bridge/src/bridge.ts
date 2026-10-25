@@ -1096,7 +1096,7 @@ export class BinaryBridge implements AftProjectTransport {
       this.logHashlineRegistrationCarrier("tool_call", sessionId, editSlotSurvives);
     }
     const { preview, workerSession, hostToolNames, searchContext, ...sendOptions } = options ?? {};
-    if ((name === "search" || name === "aft_search") && searchContext !== undefined) {
+    if ((name === "search" || name === "aft_search") && typeof searchContext === "string") {
       params.search_context = capSearchContext(searchContext);
     }
     if (preview === true) params.preview = true;

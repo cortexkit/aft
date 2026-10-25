@@ -10398,7 +10398,12 @@ async fn handle_tool_call(
     }
     let lane = command_lane(&bare_name);
     let tool_call_context = ToolCallContext {
-        search_context: call.search_context,
+        // Only a first-party host can supply context to the decision model.
+        search_context: if matches!(bind_trust, BindTrust::Untrusted) {
+            None
+        } else {
+            call.search_context
+        },
         project_root: identity.project_root.clone(),
         session_id: Some(identity.session.clone()),
         request_id: request_id.clone(),

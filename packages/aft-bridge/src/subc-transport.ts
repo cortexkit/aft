@@ -1397,7 +1397,10 @@ class SubcTransport implements AftProjectTransport {
     this.assertCurrent();
     const { preview, timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
-    if ((name === "search" || name === "aft_search") && options?.searchContext !== undefined) {
+    if (
+      (name === "search" || name === "aft_search") &&
+      typeof options?.searchContext === "string"
+    ) {
       body.search_context = capSearchContext(options.searchContext);
     }
     const editSlotSurvives = this.pool.getEditSlotSurvives();
@@ -1450,9 +1453,8 @@ class SubcTransport implements AftProjectTransport {
       ...args
     } = params;
     const body: Record<string, unknown> = { name: command, arguments: args };
-    if (command === "semantic_search" && searchContext !== undefined) {
-      body.search_context =
-        typeof searchContext === "string" ? capSearchContext(searchContext) : searchContext;
+    if (command === "semantic_search" && typeof searchContext === "string") {
+      body.search_context = capSearchContext(searchContext);
     }
     if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
     if (hostToolNames !== undefined) body[HOST_TOOL_NAMES_FIELD] = hostToolNames;

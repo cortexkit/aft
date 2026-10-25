@@ -6,6 +6,7 @@ import type { RouteHandle } from "@cortexkit/subc-client";
 import { BinaryBridge } from "../bridge.js";
 import * as bridgeExports from "../index.js";
 import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
+import type { ToolCallOptions } from "../transport.js";
 import { TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 import { cachedExecutable } from "./test-utils/cached-executable.js";
 
@@ -46,6 +47,12 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       const plain = await bridge.toolCall("s", name, args, options);
       expect(plain.captured).not.toHaveProperty("search_context");
     }
+    for (const value of [null, undefined, 42, { marker: "junk" }]) {
+      const options = { searchContext: value } as unknown as ToolCallOptions;
+      const plain = await bridge.toolCall("s", "search", args, options);
+      expect(plain.captured).not.toHaveProperty("search_context");
+      expect((plain.captured as Record<string, unknown>).arguments).toEqual(args);
+    }
   } finally {
     await bridge.shutdown();
     rmSync(root, { recursive: true, force: true });
@@ -80,7 +87,6 @@ test("gather subc carries tool and native search context outside arguments", asy
     await bridge.toolCall("s", "read", args, { searchContext: "trace-marker" });
     await bridge.toolCall("s", "search", args);
     await bridge.send("status", { search_context: "trace-marker" });
-    await bridge.send("semantic_search", { ...args, search_context: 42 });
     expect(bodies[0]).toMatchObject({ search_context: "trace-marker", arguments: args });
     expect(bodies[0]?.arguments).toEqual(args);
     expect(bodies[1]?.search_context).toBe(`${"界".repeat(5999)}🙂`);
@@ -90,8 +96,16 @@ test("gather subc carries tool and native search context outside arguments", asy
       expect(body).not.toHaveProperty("search_context");
       expect(body.arguments).not.toHaveProperty("search_context");
     }
-    expect(bodies[6]?.search_context).toBe(42);
-    expect(bodies[6]?.arguments).toEqual(args);
+    for (const value of [null, undefined, 42, { marker: "junk" }]) {
+      const options = { searchContext: value } as unknown as ToolCallOptions;
+      await bridge.send("semantic_search", { ...args, search_context: value });
+      expect(bodies[bodies.length - 1]).not.toHaveProperty("search_context");
+      await bridge.toolCall("s", "search", args, options);
+      for (const body of bodies.slice(-2)) {
+        expect(body).not.toHaveProperty("search_context");
+        expect(body.arguments).toEqual(args);
+      }
+    }
   } finally {
     await pool.shutdown();
   }
