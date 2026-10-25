@@ -19,6 +19,8 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const WALK_PARTIAL_GAP: &str =
+    "Directory walk reached its time budget; only examined entries are reported.";
 /// Request budget for a mutation's path checks when no caller budget exists.
 /// It matches the budget agent tool calls already run under, so a native
 /// request and a tool call wait equally long for a helper to be scheduled.
@@ -93,6 +95,14 @@ struct Access {
 struct Probe {
     state: Mutex<ProbeState>,
     ready: Condvar,
+    activity: Mutex<ProbeActivity>,
+}
+#[derive(Default)]
+struct ProbeActivity {
+    path: Option<PathBuf>,
+    progress: Option<Instant>,
+    walking: bool,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 struct ProbeState {
     result: Option<Result<Access, ProbeError>>,
@@ -108,6 +118,7 @@ impl Probe {
                 started: None,
             }),
             ready: Condvar::new(),
+            activity: Mutex::new(ProbeActivity::default()),
         }
     }
     fn set_deadline(&self, deadline: Instant, started: Option<Instant>) {
@@ -123,6 +134,8 @@ pub(crate) struct Budget {
     pub(crate) deadline: Instant,
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
+    walk_partial: Arc<AtomicBool>,
+    walk_gap: Arc<Mutex<Option<String>>>,
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
     traversable: Arc<Mutex<HashSet<PathBuf>>>,
     permissions: Arc<Mutex<Vec<PermissionObservation>>>,
@@ -147,6 +160,8 @@ impl Budget {
             deadline: Instant::now() + duration,
             failure: Arc::new(Mutex::new(None)),
             failed: Arc::new(AtomicBool::new(false)),
+            walk_partial: Arc::new(AtomicBool::new(false)),
+            walk_gap: Arc::new(Mutex::new(None)),
             directories: Arc::new(Mutex::new(HashMap::new())),
             traversable: Arc::new(Mutex::new(HashSet::new())),
             permissions: Arc::new(Mutex::new(Vec::new())),
@@ -297,7 +312,7 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
     )
 }
 
-pub(crate) fn finish_response(response: Response) -> Response {
+pub(crate) fn finish_response(mut response: Response) -> Response {
     if matches!(
         response.data["code"].as_str(),
         Some("denied_floor" | "path_outside_root" | "access_read_only")
@@ -320,6 +335,29 @@ pub(crate) fn finish_response(response: Response) -> Response {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     });
+    if response.success && current().is_some_and(|b| b.walk_partial.load(Ordering::Acquire)) {
+        let gap = error
+            .map(|error| error.message)
+            .or_else(|| {
+                current().and_then(|budget| {
+                    budget
+                        .walk_gap
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+            })
+            .unwrap_or_else(|| WALK_PARTIAL_GAP.to_string());
+        response.data["complete"] = serde_json::json!(false);
+        if let Some(gaps) = response.data["gaps"].as_array_mut() {
+            gaps.push(serde_json::json!(gap));
+        } else {
+            response.data["gaps"] = serde_json::json!([gap]);
+        }
+        let text = response.data["text"].as_str().unwrap_or_default();
+        response.data["text"] = serde_json::json!(format!("{text}\n\n{gap}"));
+        return response;
+    }
     match error {
         Some(error) => Response::error(&response.id, error.code, error.message),
         None => response,
@@ -327,6 +365,7 @@ pub(crate) fn finish_response(response: Response) -> Response {
 }
 thread_local! {
     static CURRENT: RefCell<Option<Budget>> = const { RefCell::new(None) };
+    static ACTIVE_PROBE: RefCell<Option<Arc<Probe>>> = const { RefCell::new(None) };
     // Rayon shares the request's single-flight probes, but does not contend on
     // that map per file. Its workers remember successful lookups locally.
     static DIRECTORIES: RefCell<(u64, HashMap<PathBuf, Access>)> = RefCell::new((0, HashMap::new()));
@@ -544,6 +583,187 @@ pub(crate) fn command(
 }
 
 type IoJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// A published walk snapshot never holds its lock while accessing the filesystem.
+/// The caller can take the last examined prefix even if the helper is stuck in `next`.
+pub(crate) struct WalkProgress<T> {
+    snapshot: Arc<Mutex<T>>,
+    stopped: Arc<AtomicBool>,
+    deadline: Instant,
+    published: Arc<AtomicBool>,
+}
+pub(crate) struct WalkCompletion {
+    pub(crate) incomplete: bool,
+    pub(crate) time_limit: bool,
+}
+impl<T> WalkProgress<T> {
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+            || Instant::now() >= self.deadline
+            || prior_failure().is_some()
+    }
+    pub(crate) fn update(&self, update: impl FnOnce(&mut T)) {
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        update(&mut snapshot);
+        drop(snapshot);
+        self.published.store(true, Ordering::Release);
+        ACTIVE_PROBE.with(|probe| {
+            if let Some(probe) = probe.borrow().as_ref() {
+                probe
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .progress = Some(Instant::now());
+            }
+        });
+    }
+}
+
+pub(crate) fn run_walk<T: Clone + Send + 'static>(
+    path: &Path,
+    at: Option<Instant>,
+    initial: T,
+    work: impl FnOnce(PathBuf, WalkProgress<T>) -> io::Result<T> + Send + 'static,
+) -> (T, WalkCompletion) {
+    if prior_failure().is_some() {
+        return (
+            initial,
+            WalkCompletion {
+                incomplete: true,
+                time_limit: false,
+            },
+        );
+    }
+    let deadline = request_deadline(at).unwrap_or_else(|| Instant::now() + IO_BUDGET);
+    let snapshot = Arc::new(Mutex::new(initial));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let published = Arc::new(AtomicBool::new(false));
+    let progress = WalkProgress {
+        snapshot: snapshot.clone(),
+        stopped: stopped.clone(),
+        deadline,
+        published: published.clone(),
+    };
+    let probe = Arc::new(Probe::queued(deadline));
+    {
+        let mut activity = probe.activity.lock().unwrap_or_else(|e| e.into_inner());
+        activity.walking = true;
+        activity.cancelled = Some(stopped.clone());
+    }
+    // A stalled descendant is a gap in this walk, not a reason to discard
+    // already-discovered paths when the caller reads or admits them afterward.
+    let parent = current();
+    let local = parent.clone().map(|mut budget| {
+        budget.failure = Arc::new(Mutex::new(None));
+        budget.failed = Arc::new(AtomicBool::new(false));
+        budget
+    });
+    let (result, failure) = with_budget(local, || {
+        let result = run_with_timeout(
+            path,
+            Some(deadline),
+            Arc::clone(HELPERS.get_or_init(|| Limiter::new(IO_POOL_SIZE))),
+            access_budget(path),
+            Some(probe),
+            move |path| work(path, progress),
+        );
+        let failure = current()
+            .and_then(|budget| {
+                budget
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+            .or_else(|| {
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.get_ref()?.downcast_ref::<Failure>().cloned())
+            });
+        (result, failure)
+    });
+    stopped.store(true, Ordering::Release);
+    let failed = failure.is_some();
+    let partial = result.is_err() || failed || Instant::now() >= deadline;
+    if partial && (published.load(Ordering::Acquire) || !failed) {
+        if let Some(budget) = &parent {
+            budget.walk_partial.store(true, Ordering::Release);
+            if let Some(failure) = failure {
+                budget
+                    .walk_gap
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(failure.message);
+            }
+        }
+    } else if let (Some(budget), Some(failure)) = (parent, failure) {
+        budget
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(failure);
+        budget.failed.store(true, Ordering::Release);
+    }
+    (
+        result.unwrap_or_else(|_| snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        WalkCompletion {
+            incomplete: partial,
+            time_limit: partial && !failed,
+        },
+    )
+}
+
+/// Attribute nested access to the entry being checked, not the walk's root.
+pub(crate) fn reading_path(path: &Path) -> impl Drop {
+    struct ReadingPath(Option<(Arc<Probe>, Option<PathBuf>)>);
+    impl Drop for ReadingPath {
+        fn drop(&mut self) {
+            if let Some((probe, previous)) = self.0.take() {
+                probe
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .path = previous;
+            }
+        }
+    }
+    ReadingPath(ACTIVE_PROBE.with(|probe| {
+        probe.borrow().as_ref().map(|probe| {
+            let previous = probe
+                .activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .path
+                .replace(path.to_path_buf());
+            (probe.clone(), previous)
+        })
+    }))
+}
+
+pub(crate) fn walk_path(path: &Path) -> bool {
+    let keep_going = ACTIVE_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            let mut activity = probe.activity.lock().unwrap_or_else(|e| e.into_inner());
+            if activity
+                .cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            {
+                return false;
+            }
+            activity.path = Some(path.to_path_buf());
+            activity.progress = Some(Instant::now());
+        }
+        true
+    });
+    #[cfg(all(test, unix))]
+    stall_running_helper_if_requested(path);
+    keep_going
+}
 
 struct Worker {
     sender: std::sync::mpsc::Sender<IoJob>,
@@ -872,21 +1092,6 @@ impl IsolatedPool {
     }
 }
 
-/// Reserves time for a bounded walk to return partial results before the bounded I/O helper's
-/// deadline; a helper still stuck in one OS call remains a `read_blocked`.
-pub(crate) fn deadline_before_io_timeout(
-    path: &Path,
-    budget: Duration,
-    return_margin: Duration,
-) -> Instant {
-    let now = Instant::now();
-    let access_deadline = now + access_budget(path);
-    let hard_deadline =
-        request_deadline(None).map_or(access_deadline, |request| request.min(access_deadline));
-    let walk_deadline = now + budget;
-    let return_deadline = hard_deadline.checked_sub(return_margin).unwrap_or(now);
-    walk_deadline.min(return_deadline)
-}
 fn run_with_limiter<T: Send + 'static>(
     path: &Path,
     at: Option<Instant>,
@@ -918,6 +1123,7 @@ fn run_with_timeout<T: Send + 'static>(
     probe: Option<Arc<Probe>>,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
+    let _reading = reading_path(path);
     if let Some(error) = prior_failure() {
         return Err(error);
     }
@@ -944,9 +1150,20 @@ fn run_with_timeout<T: Send + 'static>(
     // A bounded walk already owns an isolated helper. Do not consume another
     // slot per nested directory probe (or let healthy walks deadlock each
     // other on admission). Its caller's deadline must be no later than ours.
-    if let Some(outer) =
-        HELPER_DEADLINE.with(|outer| outer.get().filter(|outer| *outer <= queue_deadline))
-    {
+    let walking = ACTIVE_PROBE.with(|probe| {
+        probe.borrow().as_ref().is_some_and(|probe| {
+            probe
+                .activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .walking
+        })
+    });
+    if let Some(outer) = HELPER_DEADLINE.with(|outer| {
+        outer.get().filter(|outer| {
+            *outer <= queue_deadline || (walking && request_deadline.is_some_and(|at| at >= *outer))
+        })
+    }) {
         if let Some(probe) = &probe {
             probe.set_deadline(outer, Some(Instant::now()));
         }
@@ -995,7 +1212,18 @@ fn run_with_timeout<T: Send + 'static>(
                         HELPER_DEADLINE.with(|deadline| deadline.set(self.0));
                     }
                 }
-                let _deadline = DeadlineScope(HELPER_DEADLINE.with(|deadline| deadline.replace(Some(at))));
+                let helper_at = if helper_probe.activity.lock().unwrap_or_else(|e| e.into_inner()).walking {
+                    request_deadline.unwrap_or(at)
+                } else { at };
+                let _deadline = DeadlineScope(HELPER_DEADLINE.with(|deadline| deadline.replace(Some(helper_at))));
+                struct ActiveProbeScope(Option<Arc<Probe>>);
+                impl Drop for ActiveProbeScope {
+                    fn drop(&mut self) {
+                        ACTIVE_PROBE.with(|probe| *probe.borrow_mut() = self.0.take());
+                    }
+                }
+                let _active = ActiveProbeScope(ACTIVE_PROBE.with(|probe| probe.replace(Some(helper_probe.clone()))));
+                helper_probe.activity.lock().unwrap_or_else(|e| e.into_inner()).progress = Some(started);
                 #[cfg(test)]
                 regression_tests::after_helper_start(&owned);
                 work(owned)
@@ -1031,11 +1259,31 @@ fn run_with_timeout<T: Send + 'static>(
                     "filesystem helper did not start before the deadline; this call did not start",
                 ));
                 };
-                let at = state.deadline;
+                let mut at = state.deadline;
                 drop(state);
+                let activity = probe.activity.lock().unwrap_or_else(|e| e.into_inner());
+                let access_started = if activity.walking {
+                    activity.progress.unwrap_or(started)
+                } else {
+                    started
+                };
+                let stalled_at = access_started + access_budget;
+                if activity.walking {
+                    at = request_deadline.map_or(stalled_at, |deadline| deadline.min(stalled_at));
+                }
+                let blocked_path = activity.path.clone().unwrap_or_else(|| path.to_path_buf());
+                let walk_deadline = activity.walking
+                    && request_deadline.is_some_and(|deadline| deadline <= stalled_at);
+                drop(activity);
                 if Instant::now() < at {
                     wait_until = at;
                     continue;
+                }
+                if walk_deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "walk deadline elapsed",
+                    ));
                 }
                 let hint = if cfg!(target_os = "macos") {
                     "; on macOS, check ck-aft access in Privacy & Security, then retry"
@@ -1043,11 +1291,11 @@ fn run_with_timeout<T: Send + 'static>(
                     ""
                 };
                 return Err(failure(
-                    path,
+                    &blocked_path,
                     "read_blocked",
                     &format!(
                         "OS access did not finish within {:.3} s{hint}",
-                        at.saturating_duration_since(started).as_secs_f64()
+                        at.saturating_duration_since(access_started).as_secs_f64()
                     ),
                 ));
             }
@@ -1058,6 +1306,7 @@ fn run_with_timeout<T: Send + 'static>(
     }
 }
 fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
+    let _reading = reading_path(path);
     if let Some(error) = prior_failure() {
         return Err(error);
     }

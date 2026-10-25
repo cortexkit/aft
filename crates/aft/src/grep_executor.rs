@@ -1252,6 +1252,9 @@ fn target_walk_builder(
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(!crate::context::confinement::active())
         .filter_entry(move |entry| {
+            if !crate::bounded_io::walk_path(entry.path()) {
+                return false;
+            }
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
             {
@@ -1659,31 +1662,43 @@ fn bounded_fallback_walk_files_with_limits_target(
     let filters = filters.clone();
     let entry_delay = fallback_walk_entry_delay();
     let sort_metadata_delay = fallback_walk_sort_metadata_delay();
-    let deadline = crate::bounded_io::deadline_before_io_timeout(
+    let deadline = Instant::now() + budget;
+    let deadline = crate::bounded_io::current().map_or(deadline, |b| {
+        b.deadline
+            .checked_sub(FALLBACK_WALK_RETURN_MARGIN)
+            .unwrap_or(b.deadline)
+            .min(deadline)
+    });
+    let (mut outcome, partial) = crate::bounded_io::run_walk(
         search_root,
-        budget,
-        FALLBACK_WALK_RETURN_MARGIN,
+        Some(deadline),
+        FallbackWalkOutcome {
+            files: Vec::new(),
+            walk_truncated: false,
+            walk_time_limit_reached: false,
+            skipped_foreign_mounts: 0,
+            entries_visited: 0,
+        },
+        move |search_root, progress| {
+            Ok(walk_files_unbounded(
+                &filter_root,
+                &search_root,
+                &filters,
+                max_files,
+                deadline,
+                ignored_target,
+                ignore_ancestors,
+                entry_delay,
+                sort_metadata_delay,
+                &progress,
+            ))
+        },
     );
-    crate::bounded_io::run(search_root, None, move |search_root| {
-        Ok(walk_files_unbounded(
-            &filter_root,
-            &search_root,
-            &filters,
-            max_files,
-            deadline,
-            ignored_target,
-            ignore_ancestors,
-            entry_delay,
-            sort_metadata_delay,
-        ))
-    })
-    .unwrap_or_else(|_| FallbackWalkOutcome {
-        files: Vec::new(),
-        walk_truncated: true,
-        walk_time_limit_reached: false,
-        skipped_foreign_mounts: 0,
-        entries_visited: 0,
-    })
+    if partial.incomplete {
+        outcome.walk_truncated = true;
+        outcome.walk_time_limit_reached = partial.time_limit;
+    }
+    outcome
 }
 
 fn walk_files_unbounded(
@@ -1696,6 +1711,7 @@ fn walk_files_unbounded(
     ignore_ancestors: bool,
     entry_delay: Duration,
     sort_metadata_delay: Duration,
+    progress: &crate::bounded_io::WalkProgress<FallbackWalkOutcome>,
 ) -> FallbackWalkOutcome {
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     // Built before the file test below, which would stat the starting path.
@@ -1726,9 +1742,9 @@ fn walk_files_unbounded(
     let mut walker = builder.build();
 
     loop {
-        // Stop between entries so a progressing walk can return before the
-        // bounded I/O helper deadline. A blocked `next` still times out there.
-        if Instant::now() >= deadline {
+        // Stop between entries; if `next` blocks, the caller can still take
+        // the published prefix without waiting for the iterator to return.
+        if Instant::now() >= deadline || progress.stopped() {
             walk_truncated = true;
             walk_time_limit_reached = true;
             break;
@@ -1737,6 +1753,10 @@ fn walk_files_unbounded(
             break;
         };
         entries_visited += 1;
+        progress.update(|snapshot| {
+            snapshot.entries_visited = entries_visited;
+            snapshot.skipped_foreign_mounts = skipped_foreign_mounts.load(Ordering::Relaxed);
+        });
         if entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
             break;
@@ -1757,6 +1777,7 @@ fn walk_files_unbounded(
                 break;
             }
             files.push(path);
+            progress.update(|snapshot| snapshot.files.push(files.last().unwrap().clone()));
             if !entry_delay.is_zero() {
                 std::thread::sleep(entry_delay);
             }
@@ -1798,10 +1819,12 @@ where
     let project_root = project_root.to_path_buf();
     let filters = filters.clone();
     let cancellation = crate::executor::current_job_cancellation();
-    let walked = crate::bounded_io::run(
+    let entry_delay = fallback_walk_entry_delay();
+    let (walked, partial) = crate::bounded_io::run_walk(
         search_root,
         Some(Instant::now() + budget),
-        move |search_root| {
+        (Vec::<PathBuf>::new(), FallbackWalkProgress::default()),
+        move |search_root, snapshot| {
             let mut files = Vec::new();
             let progress = walk_each_file_unbounded(
                 &filter_root,
@@ -1811,25 +1834,28 @@ where
                 path_exclusion,
                 max_files,
                 budget,
-                &mut |path| files.push(path.clone()),
+                &mut |path| {
+                    files.push(path.clone());
+                    snapshot.update(|state| state.0.push(path.clone()));
+                    if !entry_delay.is_zero() {
+                        std::thread::sleep(entry_delay);
+                    }
+                },
                 ignored_target,
                 cancellation.as_ref(),
+                &snapshot,
             );
             Ok((files, progress))
         },
     );
-    match walked {
-        Ok((files, progress)) => {
-            for file in files {
-                on_file(&file);
-            }
-            progress
-        }
-        Err(_) => FallbackWalkProgress {
-            bound: Some(WalkBound::TimeBudget),
-            ..FallbackWalkProgress::default()
-        },
+    let (files, mut progress) = walked;
+    for file in files {
+        on_file(&file);
     }
+    if partial.incomplete {
+        progress.bound = Some(WalkBound::TimeBudget);
+    }
+    progress
 }
 
 fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
@@ -1843,6 +1869,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     on_file: &mut F,
     ignored_target: bool,
     cancellation: Option<&crate::executor::JobCancellation>,
+    snapshot: &crate::bounded_io::WalkProgress<(Vec<PathBuf>, FallbackWalkProgress)>,
 ) -> FallbackWalkProgress {
     let started = Instant::now();
     let mut files_seen = 0usize;
@@ -1857,10 +1884,27 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     ) else {
         return FallbackWalkProgress::default();
     };
-    let walker = builder.build();
+    let mut walker = builder.build();
 
-    for entry in walker.filter_map(|entry| entry.ok()) {
+    loop {
+        if snapshot.stopped() {
+            return FallbackWalkProgress {
+                bound: Some(WalkBound::TimeBudget),
+                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                counts,
+            };
+        }
+        let Some(entry) = walker.next() else {
+            break;
+        };
         counts.entries_visited += 1;
+        snapshot.update(|state| {
+            state.1.counts = counts;
+            state.1.skipped_foreign_mounts = skipped_foreign_mounts.load(Ordering::Relaxed);
+        });
+        let Ok(entry) = entry else {
+            continue;
+        };
         if cancellation.is_some_and(|token| token.cancel_requested_before_commit()) {
             return FallbackWalkProgress {
                 bound: Some(WalkBound::Cancelled),
@@ -1882,6 +1926,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
             continue;
         }
         counts.examined += 1;
+        snapshot.update(|state| state.1.counts = counts);
         let path = entry.into_path();
         if path_exclusion.is_some_and(|exclude| exclude(&path, project_root)) {
             counts.filtered += 1;
@@ -1889,6 +1934,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         }
         if filters.matches(filter_root, &path) {
             counts.eligible += 1;
+            snapshot.update(|state| state.1.counts = counts);
             files_seen += 1;
             if files_seen > max_files {
                 return FallbackWalkProgress {
@@ -2618,6 +2664,73 @@ fn line_details_with_next(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn walk_deadline_keeps_every_path_already_found() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(dir.path().join(name), "needle\n").unwrap();
+        }
+        let budget = crate::bounded_io::Budget::after(Duration::from_millis(400));
+        let walked = crate::bounded_io::with_budget(Some(budget), || {
+            with_fallback_walk_sort_metadata_delay_for_test(Duration::from_secs(1), || {
+                bounded_fallback_walk_files_with_limits(
+                    dir.path(),
+                    dir.path(),
+                    &PathFilters::default(),
+                    10,
+                    Duration::from_secs(5),
+                )
+            })
+        });
+        let mut names = walked
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a.rs", "b.rs"],
+            "a late sort must not discard the walk: {walked:?}"
+        );
+        assert!(walked.walk_truncated);
+        assert!(walked.walk_time_limit_reached);
+        assert_eq!(walked.entries_visited, 3);
+    }
+
+    #[test]
+    fn progressing_walk_is_not_a_stalled_access() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..30 {
+            std::fs::write(dir.path().join(format!("{index}.rs")), "needle\n").unwrap();
+        }
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(5))
+            .with_access_budget(Duration::from_millis(300));
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let walked = with_fallback_walk_entry_delay_for_test(Duration::from_millis(60), || {
+                bounded_fallback_walk_files_with_limits(
+                    dir.path(),
+                    dir.path(),
+                    &PathFilters::default(),
+                    100,
+                    Duration::from_millis(900),
+                )
+            });
+            assert!(
+                walked.files.len() > 5,
+                "walk stopped at one access cap: {walked:?}"
+            );
+            assert!(walked.walk_time_limit_reached);
+            crate::bounded_io::finish_response(Response::success(
+                "progressing-walk",
+                serde_json::json!({"complete": false}),
+            ))
+        });
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(!response.data.to_string().contains("read_blocked"));
+    }
+
     use super::*;
 
     fn audit10_fallback_matches(bytes: &[u8], pattern: CompiledPattern) -> Vec<GrepMatch> {

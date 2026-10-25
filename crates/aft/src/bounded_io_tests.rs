@@ -87,6 +87,7 @@ fn wait_at_gate(path: &Path, gates: &Mutex<HashMap<PathBuf, HelperGate>>) {
 }
 
 pub(super) fn before_directory_probe(path: &Path) -> io::Result<()> {
+    wait_at_gate(path, &RUNNING_GATES);
     if let Some(fired) = BLOCKED_DIRECTORIES.lock().unwrap().get(path) {
         fired.fetch_add(1, Ordering::Relaxed);
         return Err(failure(
@@ -96,6 +97,31 @@ pub(super) fn before_directory_probe(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_filter_stall_names_directory_being_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let stall = stall_running_helper(&child);
+    let budget =
+        Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_millis(200));
+    let child_in_walk = child.clone();
+    let error = with_budget(Some(budget), || {
+        run(dir.path(), None, move |_| {
+            probe_directory(&child_in_walk, None)
+        })
+    })
+    .unwrap_err();
+    stall.reached.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("read_blocked: {}:", child.display())),
+        "{error}"
+    );
 }
 
 struct BlockDirectory(PathBuf, Arc<AtomicUsize>);
@@ -196,6 +222,28 @@ fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
     assert!(second.9, "canonicalization collector leaked");
     assert!(second.10, "grep I/O probe leaked");
     assert_eq!(second.11, None, "grep cancellation clock leaked");
+}
+
+#[test]
+fn walk_directory_probes_reuse_the_owned_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let budget =
+        Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_millis(200));
+    with_budget(Some(budget.clone()), || {
+        let (_, completion) = run_walk(dir.path(), None, 0usize, move |_, progress| {
+            probe_directory(&child, None)?;
+            progress.update(|count| *count += 1);
+            Ok(1)
+        });
+        assert!(!completion.incomplete);
+    });
+    assert_eq!(
+        budget.measurements().0,
+        1,
+        "a walk must not queue a nested helper"
+    );
 }
 
 #[test]
