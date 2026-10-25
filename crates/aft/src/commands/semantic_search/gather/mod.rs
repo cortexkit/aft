@@ -1,8 +1,29 @@
-//! Gather uses one pinned graph snapshot and at most 40 direct neighbors.
-//! Test-only nodes are omitted unless requested. Source trees live for one walk.
-//! A query gap names its seed and does not discard other seeds.
+//! `gather` reads one pinned `CallGraphStore` snapshot and at most 40 neighbor nodes.
+//! `gather` adds test-only nodes only when requested. Source trees live for one walk.
+//! A `GatherGap` names its seed and does not discard other seeds.
 
+mod decision;
 mod graph;
+mod walk;
+
+pub(super) use decision::{
+    deterministic_decision, validate_decision, Decision, DecisionError, DecisionInput,
+    DecisionModel,
+};
+pub(super) type GatherSettings = walk::GatherSettings;
+pub(super) type GatherWalk = walk::GatherWalk;
+pub(super) type GatherWalkRequest<'a> = walk::GatherWalkRequest<'a>;
+
+pub(super) fn gather_walk(request: &GatherWalkRequest<'_>) -> Result<GatherWalk, &'static str> {
+    walk::gather_walk(request)
+}
+
+pub(super) fn parse_decision(
+    json: &str,
+    frontier_ids: &[String],
+) -> Result<Decision, DecisionError> {
+    decision::parse_decision(json, frontier_ids)
+}
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -100,6 +121,7 @@ pub(super) struct GatherNode {
 #[derive(Default)]
 pub(crate) struct GatherRuntime {
     neighbors: Mutex<NeighborCache>,
+    decisions: Mutex<decision::DecisionCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

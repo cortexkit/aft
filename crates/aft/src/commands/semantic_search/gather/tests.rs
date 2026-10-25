@@ -4,6 +4,8 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::parser::TreeSitterProvider;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 const SOURCE: &str = "/// Load application settings.\npub fn load_config() {\n    parse_config();\n}\nfn parse_config() {\n    read_config();\n    external_library();\n}\nfn read_config() { parse_config(); }\n#[cfg(test)]\nfn test_caller() { parse_config(); }\n";
 
@@ -438,6 +440,214 @@ fn gather_graph_ready_callback_retains_owner_and_snapshot() {
     );
 }
 
+struct FakeWalkClock {
+    base: Instant,
+    millis: AtomicU64,
+}
+
+impl FakeWalkClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            millis: AtomicU64::new(0),
+        }
+    }
+
+    fn advance(&self, millis: u64) {
+        self.millis.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+impl walk::WalkClock for FakeWalkClock {
+    fn now(&self) -> Instant {
+        self.base + Duration::from_millis(self.millis.load(Ordering::SeqCst))
+    }
+}
+
+struct ScriptedDecisionModel<'a> {
+    name: &'static str,
+    calls: AtomicUsize,
+    handler: Box<
+        dyn Fn(&DecisionInput<'_>, Instant) -> Result<Decision, DecisionError> + Send + Sync + 'a,
+    >,
+}
+
+impl<'a> ScriptedDecisionModel<'a> {
+    fn new(
+        handler: impl Fn(&DecisionInput<'_>, Instant) -> Result<Decision, DecisionError>
+            + Send
+            + Sync
+            + 'a,
+    ) -> Self {
+        Self {
+            name: "scripted",
+            calls: AtomicUsize::new(0),
+            handler: Box::new(handler),
+        }
+    }
+}
+
+impl DecisionModel for ScriptedDecisionModel<'_> {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn decide(
+        &self,
+        input: &DecisionInput<'_>,
+        deadline: Instant,
+    ) -> Result<Decision, DecisionError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(!input.trace.is_empty() && !input.query.is_empty());
+        (self.handler)(input, deadline)
+    }
+}
+
+fn configured_gather_search() -> crate::config::SearchConfig {
+    serde_json::from_value(serde_json::json!({
+        "gather": { "decision": { "backend": "endpoint", "endpoint": "http://127.0.0.1:9/v1/chat/completions", "model": "fixture" } }
+    })).unwrap()
+}
+
+fn walk_request<'a>(
+    f: &'a Fixture,
+    snapshot: &'a CallGraphStore,
+    seeds: &'a [GatherNode],
+    search: &'a crate::config::SearchConfig,
+    model: Option<&'a dyn DecisionModel>,
+) -> GatherWalkRequest<'a> {
+    GatherWalkRequest {
+        ctx: &f.ctx,
+        snapshot,
+        seeds,
+        search,
+        session_id: Some("session-one"),
+        trace: "private reasoning",
+        query: "load application settings",
+        include_tests: false,
+        model,
+        reranker: None,
+        cancelled: None,
+    }
+}
+
+fn keep_frontier(input: &DecisionInput<'_>) -> Decision {
+    Decision {
+        keep: input.frontier.iter().map(|node| node.id.clone()).collect(),
+        expand: Vec::new(),
+        stop: true,
+    }
+}
+
+#[test]
+fn gather_decision_rejects_unknown_node_ids() {
+    assert!(matches!(
+        parse_decision(
+            r#"{"keep":["foreign"],"expand":[],"stop":true}"#,
+            &["known".to_owned()]
+        ),
+        Err(DecisionError::Invalid)
+    ));
+}
+
+#[test]
+fn gather_decision_parser_is_strict() {
+    let ids = vec!["known".to_owned()];
+    for text in [
+        r#"{"keep":[],"expand":[]}"#,
+        r#"{"keep":"known","expand":[],"stop":true}"#,
+        r#"{"keep":[],"expand":[],"stop":true,"extra":0}"#,
+        r#"{"keep":[],"expand":["foreign"],"stop":true}"#,
+        r#"{"keep":["known","known"],"expand":[],"stop":true}"#,
+        r#"{"keep":[],"expand":["known","known"],"stop":true}"#,
+        r#"{"keep":[],"expand":[],"stop":true} trailing"#,
+        "```json\n{\"keep\":[],\"expand\":[],\"stop\":true}\n```",
+    ] {
+        assert!(matches!(
+            parse_decision(text, &ids),
+            Err(DecisionError::Invalid)
+        ));
+    }
+    let parsed = parse_decision(
+        r#"{"keep":["known"],"expand":["known"],"stop":false}"#,
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(parsed.keep, ids);
+    assert_eq!(parsed.expand, ids);
+    assert!(!parsed.stop);
+}
+
+#[test]
+fn gather_decision_order_is_seed_hop_score_then_id() {
+    let f = Fixture::new(SOURCE);
+    let base = f.seeds(6).remove(0);
+    let mut nodes = vec![base.clone(); 5];
+    for (node, (id, seed, hop, score)) in nodes.iter_mut().zip([
+        ("z", 1, 0, Some(100.0)),
+        ("b", 0, 1, Some(9.0)),
+        ("a", 0, 0, None),
+        ("d", 0, 1, Some(10.0)),
+        ("c", 0, 1, Some(10.0)),
+    ]) {
+        node.id = id.into();
+        node.seed_ordinal = seed;
+        node.hop_distance = hop;
+        node.rerank_score = score;
+    }
+    let selected = deterministic_decision(&nodes, 4);
+    assert_eq!(selected.keep, ["a", "c", "d", "b"]);
+    assert_eq!(selected.expand, selected.keep);
+    assert!(!selected.stop);
+    let direct = decision::DeterministicDecisionModel
+        .decide(
+            &DecisionInput {
+                trace: "",
+                query: "",
+                frontier: &nodes,
+            },
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(direct.keep, ["a", "c", "d", "b", "z"]);
+}
+
+#[test]
+fn gather_decision_settings_default_zero_and_saturation() {
+    let settings = GatherSettings::resolve(&crate::config::SearchConfig::default()).unwrap();
+    assert_eq!(
+        (
+            settings.max_rounds,
+            settings.max_nodes,
+            settings.max_frontier,
+            settings.max_output_bytes
+        ),
+        (3, 12, 40, 12288)
+    );
+    assert_eq!(settings.decision_timeout, Duration::from_millis(3000));
+    assert_eq!(settings.deadline, Duration::from_millis(8000));
+    for field in [
+        "max_rounds",
+        "max_nodes",
+        "max_frontier",
+        "decision_timeout_ms",
+        "deadline_ms",
+        "max_output_bytes",
+    ] {
+        let search: crate::config::SearchConfig =
+            serde_json::from_value(serde_json::json!({ "gather": { field: 0 } })).unwrap();
+        assert!(GatherSettings::resolve(&search).is_err());
+    }
+    let search = serde_json::from_value(serde_json::json!({ "gather": { "max_frontier": u64::MAX, "max_nodes": u64::MAX, "max_output_bytes": u64::MAX } })).unwrap();
+    let settings = GatherSettings::resolve(&search).unwrap();
+    assert_eq!(settings.max_frontier, 40);
+    assert_eq!(settings.max_output_bytes, 12288);
+    assert_eq!(
+        settings.max_nodes,
+        usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+    );
+}
+
 #[test]
 fn gather_graph_source_tree_is_loaded_once_across_rounds() {
     let f = Fixture::new(SOURCE);
@@ -484,6 +694,550 @@ fn gather_graph_missing_seed_has_named_gap_without_losing_good_seeds() {
         result.gaps,
         [GatherGap {
             seed_id: seeds[2].id.clone(),
+            state: "seed_unresolved"
+        }]
+    );
+}
+#[test]
+fn gather_walk_scripted_real_chain_stops_after_two_rounds() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let model = ScriptedDecisionModel::new(|input, _| {
+        let name = if input.frontier.iter().any(|n| n.name == "parse_config") {
+            "parse_config"
+        } else {
+            "read_config"
+        };
+        let id = input
+            .frontier
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+            .clone();
+        Ok(Decision {
+            keep: vec![id.clone()],
+            expand: if name == "parse_config" {
+                vec![id]
+            } else {
+                Vec::new()
+            },
+            stop: name == "read_config",
+        })
+    });
+    let result = gather_walk(&walk_request(&f, &snapshot, &seeds, &search, Some(&model))).unwrap();
+    assert_eq!(
+        result
+            .kept
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["parse_config", "read_config"]
+    );
+    assert_eq!(result.rounds, 2);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(result.fallback_rounds.is_empty());
+}
+
+#[test]
+fn gather_walk_expand_does_not_imply_keep() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let model = ScriptedDecisionModel::new(|input, _| {
+        if input.frontier[0].name == "parse_config" {
+            Ok(Decision {
+                keep: Vec::new(),
+                expand: vec![input.frontier[0].id.clone()],
+                stop: false,
+            })
+        } else {
+            Ok(keep_frontier(input))
+        }
+    });
+    let result = gather_walk(&walk_request(&f, &snapshot, &seeds, &search, Some(&model))).unwrap();
+    assert!(result.kept.iter().all(|node| node.name != "parse_config"));
+    assert_eq!(result.rounds, 2);
+}
+
+#[test]
+fn gather_walk_deterministic_default_and_missing_endpoint() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = crate::config::SearchConfig::default();
+    let forbidden = ScriptedDecisionModel::new(|_, _| panic!("no backend is configured"));
+    let default = gather_walk(&walk_request(
+        &f,
+        &snapshot,
+        &seeds,
+        &search,
+        Some(&forbidden),
+    ))
+    .unwrap();
+    assert_eq!(default.model, "deterministic");
+    assert!(!default.kept.is_empty());
+    assert!(default.fallback_rounds.is_empty());
+    assert_eq!(forbidden.calls.load(Ordering::SeqCst), 0);
+    let mut search = configured_gather_search();
+    search
+        .gather
+        .as_mut()
+        .unwrap()
+        .decision
+        .as_mut()
+        .unwrap()
+        .endpoint = None;
+    let result = gather_walk(&walk_request(
+        &f,
+        &snapshot,
+        &seeds,
+        &search,
+        Some(&forbidden),
+    ))
+    .unwrap();
+    assert!(!result.kept.is_empty());
+    assert_eq!(result.fallback_reasons[0], (1, "configuration_failure"));
+    assert_eq!(forbidden.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn gather_walk_model_errors_and_invalid_ids_use_fallback() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let mut search = configured_gather_search();
+    search.gather.as_mut().unwrap().max_rounds = Some(1);
+    for error in [
+        DecisionError::Timeout,
+        DecisionError::Unavailable,
+        DecisionError::Invalid,
+        DecisionError::Refused,
+    ] {
+        let model = ScriptedDecisionModel::new(move |_, _| Err(error));
+        let result =
+            gather_walk(&walk_request(&f, &snapshot, &seeds, &search, Some(&model))).unwrap();
+        assert_eq!(result.kept[0].name, "parse_config");
+        assert_eq!(result.fallback_rounds, [1]);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    }
+    let invalid = ScriptedDecisionModel::new(|_, _| {
+        Ok(Decision {
+            keep: vec!["foreign".into()],
+            expand: Vec::new(),
+            stop: true,
+        })
+    });
+    let result = gather_walk(&walk_request(
+        &f,
+        &snapshot,
+        &seeds,
+        &search,
+        Some(&invalid),
+    ))
+    .unwrap();
+    assert_eq!(result.kept[0].name, "parse_config");
+    assert_eq!(result.fallback_reasons, [(1, "invalid")]);
+}
+
+#[test]
+fn gather_walk_full_deadline_preserves_evidence_and_bounds_requests() {
+    use walk::WalkClock;
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let clock = FakeWalkClock::new();
+    let mut search = configured_gather_search();
+    search.gather.as_mut().unwrap().deadline_ms = Some(100);
+    search.gather.as_mut().unwrap().decision_timeout_ms = Some(80);
+    let calls = AtomicUsize::new(0);
+    let model = ScriptedDecisionModel::new(|input, deadline| {
+        let call = calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            deadline,
+            clock.base + Duration::from_millis(if call == 0 { 80 } else { 100 })
+        );
+        clock.advance(if call == 0 { 70 } else { 30 });
+        Ok(Decision {
+            keep: vec![input.frontier[0].id.clone()],
+            expand: vec![input.frontier[0].id.clone()],
+            stop: false,
+        })
+    });
+    let result = walk::walk_with_clock(
+        &walk_request(&f, &snapshot, &seeds, &search, Some(&model)),
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(result.kept.len(), 1);
+    assert_eq!(result.kept[0].name, "parse_config");
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.stop_reason, Some("deadline"));
+    assert_eq!(clock.now(), clock.base + Duration::from_millis(100));
+}
+
+#[test]
+fn gather_walk_late_decision_uses_fallback_before_full_deadline() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let clock = FakeWalkClock::new();
+    let mut search = configured_gather_search();
+    search.gather.as_mut().unwrap().max_rounds = Some(1);
+    let model = ScriptedDecisionModel::new(|_, _| {
+        clock.advance(3000);
+        Ok(Decision {
+            keep: Vec::new(),
+            expand: Vec::new(),
+            stop: true,
+        })
+    });
+    let result = walk::walk_with_clock(
+        &walk_request(&f, &snapshot, &seeds, &search, Some(&model)),
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(result.kept[0].name, "parse_config");
+    assert_eq!(result.fallback_reasons, [(1, "timeout")]);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gather_walk_limits_empty_frontier_and_cycles() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = crate::config::SearchConfig::default();
+    let result = gather_walk(&walk_request(&f, &snapshot, &[], &search, None)).unwrap();
+    assert!(result.kept.is_empty());
+    assert_eq!((result.rounds, result.considered), (0, 0));
+    let result = gather_walk(&walk_request(&f, &snapshot, &seeds, &search, None)).unwrap();
+    let unique: std::collections::HashSet<_> = result.kept.iter().map(|n| &n.id).collect();
+    assert_eq!(unique.len(), result.kept.len());
+    assert_eq!(result.rounds, 2);
+    let mut search = search;
+    search.gather = Some(crate::config::GatherConfig {
+        max_nodes: Some(1),
+        ..Default::default()
+    });
+    let result = gather_walk(&walk_request(&f, &snapshot, &seeds, &search, None)).unwrap();
+    assert_eq!((result.kept.len(), result.rounds), (1, 1));
+}
+
+#[test]
+fn gather_walk_caps_real_frontier_at_forty() {
+    let mut source = "fn root() {}\n".to_owned();
+    for index in 0..50 {
+        source.push_str(&format!("fn caller_{index}() {{ root(); }}\n"));
+    }
+    let f = Fixture::new(&source);
+    let seeds = f.seeds(1);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let mut search = configured_gather_search();
+    search.gather.as_mut().unwrap().max_frontier = Some(500);
+    search.gather.as_mut().unwrap().max_nodes = Some(100);
+    let callers = snapshot
+        .direct_callers_of(Path::new("main.rs"), "root")
+        .unwrap();
+    assert_eq!(callers.len(), 50);
+    let model = ScriptedDecisionModel::new(|input, _| {
+        assert!(input.frontier.len() <= 40);
+        let ids: Vec<_> = input.frontier.iter().map(|node| node.id.clone()).collect();
+        Ok(Decision {
+            keep: ids.clone(),
+            expand: ids,
+            stop: input.frontier.len() > 1,
+        })
+    });
+    let request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    let result = gather_walk(&request).unwrap();
+    assert_eq!(result.rounds, 2);
+    assert_eq!(result.considered, 41);
+    assert_eq!(result.kept.len(), 41);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn gather_walk_graph_failure_retains_evidence_and_reports_round() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let clock = FakeWalkClock::new();
+    let search = crate::config::SearchConfig::default();
+    let request = walk_request(&f, &snapshot, &seeds, &search, None);
+    let result =
+        walk::walk_with_neighbors(&request, &clock, |_| Err("graph_query_failed".into())).unwrap();
+    assert_eq!(result.kept[0].name, "parse_config");
+    assert_eq!(result.fallback_reasons, [(1, "graph_query_failed")]);
+    assert_eq!(result.rounds, 1);
+}
+
+#[test]
+fn gather_walk_cancellation_stops_before_and_after_model() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let cancelled = AtomicBool::new(true);
+    let model = ScriptedDecisionModel::new(|input, _| {
+        cancelled.store(true, Ordering::SeqCst);
+        Ok(keep_frontier(input))
+    });
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    request.cancelled = Some(&cancelled);
+    let before = gather_walk(&request).unwrap();
+    assert!(before.kept.is_empty());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    cancelled.store(false, Ordering::SeqCst);
+    let after = gather_walk(&request).unwrap();
+    assert!(after.kept.is_empty());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(after.stop_reason, Some("cancelled"));
+}
+
+#[test]
+fn gather_walk_cache_hashes_inputs_and_releases_lock() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let model = ScriptedDecisionModel::new(|input, _| {
+        assert!(f.ctx.gather_runtime().decisions.try_lock().is_ok());
+        Ok(keep_frontier(input))
+    });
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    gather_walk(&request).unwrap();
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    request.trace = "different private reasoning";
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    request.query = "different question";
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    request.session_id = Some("session-two");
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+    let different = f.seeds(9);
+    request.seeds = &different;
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 5);
+    let cache = f.ctx.gather_runtime().decisions.lock().unwrap();
+    assert_eq!(cache.entries.len(), 5);
+    assert!(cache.entries.keys().all(|key| key.len() == 32));
+    assert!(cache.entries.values().all(|entry| !entry
+        .decision
+        .keep
+        .iter()
+        .any(|id| id.contains("reasoning"))));
+}
+
+#[test]
+fn gather_walk_cache_expires_at_six_hundred_seconds() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let clock = FakeWalkClock::new();
+    let model = ScriptedDecisionModel::new(|input, _| Ok(keep_frontier(input)));
+    let request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    walk::walk_with_clock(&request, &clock).unwrap();
+    clock.advance(599_000);
+    walk::walk_with_clock(&request, &clock).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    clock.advance(1000);
+    walk::walk_with_clock(&request, &clock).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.ctx
+            .gather_runtime()
+            .decisions
+            .lock()
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn gather_walk_cache_separates_model_config_and_missing_session() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let one = ScriptedDecisionModel::new(|input, _| Ok(keep_frontier(input)));
+    let mut two = ScriptedDecisionModel::new(|input, _| Ok(keep_frontier(input)));
+    two.name = "different-model";
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, Some(&one));
+    gather_walk(&request).unwrap();
+    request.model = Some(&two);
+    gather_walk(&request).unwrap();
+    assert_eq!(two.calls.load(Ordering::SeqCst), 1);
+    let mut changed = search.clone();
+    changed.gather.as_mut().unwrap().max_rounds = Some(4);
+    request.search = &changed;
+    gather_walk(&request).unwrap();
+    assert_eq!(two.calls.load(Ordering::SeqCst), 2);
+    let mut changed_model = changed.clone();
+    changed_model
+        .gather
+        .as_mut()
+        .unwrap()
+        .decision
+        .as_mut()
+        .unwrap()
+        .model = Some("new-model".into());
+    request.search = &changed_model;
+    gather_walk(&request).unwrap();
+    assert_eq!(two.calls.load(Ordering::SeqCst), 3);
+    request.session_id = None;
+    gather_walk(&request).unwrap();
+    gather_walk(&request).unwrap();
+    assert_eq!(two.calls.load(Ordering::SeqCst), 5);
+}
+
+struct GatherTestReranker<'a> {
+    calls: AtomicUsize,
+    clock: &'a FakeWalkClock,
+    exhaust_deadline: bool,
+}
+
+impl crate::commands::semantic_search::rerank::RerankBackend for GatherTestReranker<'_> {
+    fn fingerprint(&self) -> crate::commands::semantic_search::rerank::RerankFingerprint {
+        crate::commands::semantic_search::rerank::RerankFingerprint {
+            backend: "gather-test",
+            model: "fixture".into(),
+            revision: "1".into(),
+        }
+    }
+    fn max_batch(&self) -> usize {
+        40
+    }
+    fn score(
+        &self,
+        _query: &str,
+        docs: &[crate::commands::semantic_search::rerank::RerankDoc<'_>],
+        deadline: Instant,
+    ) -> Result<Vec<f32>, crate::commands::semantic_search::rerank::RerankError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(deadline <= self.clock.base + Duration::from_millis(3000));
+        if self.exhaust_deadline {
+            self.clock.advance(8000);
+        }
+        Ok(docs
+            .iter()
+            .map(|doc| {
+                if doc.text.contains("fn read_config") {
+                    10.0
+                } else {
+                    0.0
+                }
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn gather_walk_reranks_only_deterministic_ties_with_same_deadline() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let clock = FakeWalkClock::new();
+    let reranker = GatherTestReranker {
+        calls: AtomicUsize::new(0),
+        clock: &clock,
+        exhaust_deadline: false,
+    };
+    let search: crate::config::SearchConfig = serde_json::from_value(
+        serde_json::json!({ "rerank": { "backend": "remote" }, "gather": { "max_nodes": 2 } }),
+    )
+    .unwrap();
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, None);
+    request.reranker = Some(&reranker);
+    let result = walk::walk_with_clock(&request, &clock).unwrap();
+    assert_eq!(
+        result
+            .kept
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["parse_config", "read_config"]
+    );
+    assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+    assert!(seeds[0].rerank_score.is_none());
+    let off = crate::config::SearchConfig::default();
+    request.search = &off;
+    walk::walk_with_clock(&request, &clock).unwrap();
+    assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gather_walk_reranker_cannot_extend_full_deadline() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let clock = FakeWalkClock::new();
+    let reranker = GatherTestReranker {
+        calls: AtomicUsize::new(0),
+        clock: &clock,
+        exhaust_deadline: true,
+    };
+    let search: crate::config::SearchConfig =
+        serde_json::from_value(serde_json::json!({ "rerank": { "backend": "remote" } })).unwrap();
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, None);
+    request.reranker = Some(&reranker);
+    let result = walk::walk_with_clock(&request, &clock).unwrap();
+    assert_eq!(result.kept.len(), 1);
+    assert_eq!(result.kept[0].name, "parse_config");
+    assert_eq!(result.stop_reason, Some("deadline"));
+    assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gather_walk_cache_separates_graph_revision_and_test_domain() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let model = ScriptedDecisionModel::new(|input, _| Ok(keep_frontier(input)));
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    gather_walk(&request).unwrap();
+    request.include_tests = true;
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    std::fs::write(&f.file, format!("{SOURCE}\nfn added() {{}}\n")).unwrap();
+    f.store
+        .refresh_files(std::slice::from_ref(&f.file))
+        .unwrap();
+    let next = f.store.read_snapshot().unwrap();
+    request.snapshot = &next;
+    gather_walk(&request).unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn gather_walk_preserves_per_seed_graph_gaps() {
+    let f = Fixture::new(SCOPED_SOURCE);
+    let unindexed = f.root.join("unindexed.rs");
+    std::fs::write(&unindexed, "fn unindexed() {}\n").unwrap();
+    let seeds = resolve_seeds(
+        &f.ctx,
+        &f.root,
+        &[(f.file.clone(), 7), (unindexed, 1)],
+        false,
+    );
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = crate::config::SearchConfig::default();
+    let result = gather_walk(&walk_request(&f, &snapshot, &seeds, &search, None)).unwrap();
+    assert!(result.kept.iter().any(|node| node.name == "good_leaf"));
+    assert_eq!(
+        result.graph_gaps,
+        [GatherGap {
+            seed_id: seeds[1].id.clone(),
             state: "seed_unresolved"
         }]
     );
