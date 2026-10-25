@@ -10,6 +10,85 @@ use std::time::{Duration, Instant};
 const SOURCE: &str = "/// Load application settings.\npub fn load_config() {\n    parse_config();\n}\nfn parse_config() {\n    read_config();\n    external_library();\n}\nfn read_config() { parse_config(); }\n#[cfg(test)]\nfn test_caller() { parse_config(); }\n";
 
 #[test]
+fn gather_walk_clamps_huge_limits_at_deadline_consumer() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(3);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let mut search = configured_gather_search();
+    let raw = search.gather.as_mut().unwrap();
+    raw.max_rounds = Some(u64::MAX);
+    raw.deadline_ms = Some(u64::MAX);
+    raw.decision_timeout_ms = Some(u64::MAX);
+    let clock = FakeWalkClock::new();
+    let model = ScriptedDecisionModel::new(|input, deadline| {
+        assert!(deadline <= clock.base.checked_add(Duration::from_secs(3)).unwrap());
+        Ok(keep_frontier(input))
+    });
+    let request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    assert_eq!(
+        walk::walk_with_clock(&request, &clock).unwrap().kept.len(),
+        1
+    );
+}
+
+#[test]
+fn gather_graph_test_hits_do_not_spend_seed_budget() {
+    let f = Fixture::new(SOURCE);
+    let test_file = f.root.join("example_test.rs");
+    std::fs::write(&test_file, "fn test_example() {}\n").unwrap();
+    let mut hits = vec![(test_file, 1); 5];
+    hits.push((f.file.clone(), 3));
+    let seeds = resolve_seeds(&f.ctx, &f.root, &hits, false);
+    assert_eq!(seeds.len(), 1);
+    assert_eq!(seeds[0].name, "load_config");
+    assert_eq!(seeds[0].seed_ordinal, 5);
+}
+
+#[test]
+fn gather_walk_request_job_cancellation_stops_between_rounds() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(3);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let token = crate::executor::JobCancellation::new();
+    let _guard = crate::executor::install_job_cancellation(token.clone());
+    let clock = FakeWalkClock::new();
+    let search = crate::config::SearchConfig::default();
+    let request = walk_request(&f, &snapshot, &seeds, &search, None);
+    let result = walk::walk_with_neighbors(&request, &clock, |_| {
+        token.request_cancel();
+        Ok(f.seeds(6))
+    })
+    .unwrap();
+    assert_eq!(result.rounds, 1);
+    assert_eq!(result.stop_reason, Some("cancelled"));
+}
+
+#[test]
+fn gather_attach_full_response_discloses_output_budget() {
+    let f = Fixture::new(SOURCE);
+    f.ctx.update_config(|config| {
+        config.search.gather = Some(crate::config::GatherConfig {
+            enabled: Some(true),
+            ..Default::default()
+        })
+    });
+    let req = serde_json::from_value(serde_json::json!({"id":"full", "command":"semantic_search", "query":"how is application config loaded"})).unwrap();
+    let prefix = "r".repeat(50 * 1024);
+    let mut response =
+        crate::protocol::Response::success("full", serde_json::json!({"text":prefix}));
+    attach(&req, &f.ctx, &mut response, &f.root, None);
+    assert_eq!(response.data["text"], prefix);
+    assert_eq!(
+        response.data["gather_notice"],
+        "gather: skipped output_budget"
+    );
+    let formatted =
+        crate::subc_format::format_response_with_context("search", &response, &Default::default());
+    assert!(formatted.starts_with(&prefix));
+    assert!(formatted.contains("gather: skipped output_budget"));
+}
+
+#[test]
 fn gather_graph_denied_source_is_not_loaded() {
     let f = Fixture::new(SOURCE);
     f.ctx
@@ -89,7 +168,7 @@ fn gather_attach_missing_and_denied_hits_keep_ranked_evidence() {
             }),
         );
         let ranked = response.data["results"].clone();
-        attach(&req, &f.ctx, &mut response, &f.root);
+        attach(&req, &f.ctx, &mut response, &f.root, None);
         assert!(response.success);
         assert_eq!(response.data["results"], ranked);
         assert_eq!(
@@ -257,8 +336,23 @@ fn gather_render_small_budget_keeps_bounded_disclosure() {
     );
     let text = response.data["text"].as_str().unwrap();
     assert!(text.starts_with("ranked"));
-    assert!(text.contains("gather:"));
     assert!(text.len() - "ranked".len() <= 80);
+    assert_eq!(
+        response.data["gather_notice"],
+        "gather: skipped output_budget"
+    );
+    let formatted =
+        crate::subc_format::format_response_with_context("search", &response, &Default::default());
+    assert!(formatted.contains("gather: skipped output_budget"));
+}
+
+#[test]
+fn gather_render_empty_body_discloses_output_budget() {
+    let mut response = crate::protocol::Response::success("empty", serde_json::json!({"text": ""}));
+    render::append_state(&mut response, "off", 1);
+    let formatted =
+        crate::subc_format::format_response_with_context("search", &response, &Default::default());
+    assert!(formatted.contains("gather: skipped output_budget"));
 }
 
 struct Fixture {
@@ -910,11 +1004,14 @@ fn gather_decision_settings_default_zero_and_saturation() {
             serde_json::from_value(serde_json::json!({ "gather": { field: 0 } })).unwrap();
         assert!(GatherSettings::resolve(&search).is_err());
     }
-    let search = serde_json::from_value(serde_json::json!({ "gather": { "max_frontier": u64::MAX, "max_nodes": u64::MAX, "max_output_bytes": u64::MAX } })).unwrap();
+    let search = serde_json::from_value(serde_json::json!({ "gather": { "max_frontier": u64::MAX, "max_nodes": u64::MAX, "max_output_bytes": u64::MAX, "max_rounds": u64::MAX, "decision_timeout_ms": u64::MAX, "deadline_ms": u64::MAX } })).unwrap();
     let settings = GatherSettings::resolve(&search).unwrap();
     assert_eq!(settings.max_frontier, 40);
     assert_eq!(settings.max_output_bytes, 12288);
     assert_eq!(settings.max_nodes, 12);
+    assert_eq!(settings.max_rounds, 3);
+    assert_eq!(settings.decision_timeout, Duration::from_secs(3));
+    assert_eq!(settings.deadline, Duration::from_secs(8));
 }
 
 #[test]
@@ -1361,7 +1458,7 @@ fn gather_walk_cache_separates_model_config_and_missing_session() {
     gather_walk(&request).unwrap();
     assert_eq!(two.calls.load(Ordering::SeqCst), 1);
     let mut changed = search.clone();
-    changed.gather.as_mut().unwrap().max_rounds = Some(4);
+    changed.gather.as_mut().unwrap().max_rounds = Some(2);
     request.search = &changed;
     gather_walk(&request).unwrap();
     assert_eq!(two.calls.load(Ordering::SeqCst), 2);

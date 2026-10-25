@@ -615,7 +615,20 @@ See [Synapse search backends](synapse-search-backends.md) for the wire details o
 }
 ```
 
-Each value is a prototype default, revisable when #890 answers. AFT limits `max_frontier` to 40. Gather uses at most 5 seed symbols, 3 rounds, 12 kept symbols and 12 KB of added output. The full response stays below the current 50 KB limit. One decision has a 3 s limit and the full walk has an 8 s limit. AFT caches decision results in the session for 10 minutes, until the call graph changes.
+These prototype limits are defaults and maximum limits. AFT decreases larger user values to these limits:
+
+| Setting | Maximum limit |
+|---|---|
+| `max_rounds` | 3 |
+| `max_nodes` | 12 |
+| `max_frontier` | 40 |
+| `decision_timeout_ms` | 3000 |
+| `deadline_ms` | 8000 |
+| `max_output_bytes` | 12288 |
+
+Gather uses at most 5 seed symbols. One decision has a 3 s limit and the full walk has an 8 s limit. Added output has a 12 KB limit. The ranked body and gather section share the current 50 KB limit. Status notices and the list trailer follow this body.
+
+If gather output cannot fit, the `gather_notice` field reports `gather: skipped output_budget`. The search formatter shows this notice after the body, independently from its byte limit. AFT caches decision results in the session for 10 minutes, until the call graph changes.
 
 Gather runs on natural-language searches, also for a query used with `pattern`. It does not change ranking or agent arguments. Pattern-only and empty-query searches do not walk. If identity or the current stored turn is unavailable, AFT uses the query only. A missing decision backend uses deterministic selection and makes no network request.
 
@@ -627,9 +640,11 @@ User harness search overrides now keep the base `search.rerank` block when the h
 
 OpenCode 1 and Pi send the agent's thinking and assistant text shown to the user before the call. They add the newest user text last. OpenCode 2.1 sends only the current assistant message's thinking and text. It does not send a user message.
 
-OMP has no tested trace collection. It uses the query only. AFT keeps the newest 6000 characters, so the last user text stays in the trace. No host reads conversation text while gather is off.
+OMP uses the Pi collector. It sends the same content as Pi when OMP stores the assistant turn before tools run. No test checks this timing. The collector falls back to the query only when the current turn is not stored. AFT keeps the newest 6000 characters, so the last user text stays in the trace. No host reads conversation text while gather is off.
 
-If the call graph is not built, or a walk or decision has an error or times out, search keeps its ranked results. It adds one state line. A call-graph snapshot failure reports `snapshot_unavailable`. The value `walk_failed` means all other walk failures.
+Search keeps its ranked results if the graph is unavailable or a walk or decision has an error. An unavailable graph or missing seeds adds a skip state. A call-graph snapshot failure reports `snapshot_unavailable`.
+
+A decision error or timeout uses deterministic selection for that round. A graph-query error keeps the available evidence and stops the walk. The gather footer reports `fallback=<round>:<reason>`, with `configuration_failure` for an invalid decision backend. These errors do not give a `configuration_failure` skip state.
 
 A search with `path` in a different project reports `callgraph=unavailable reason=other_project`. Gather does not use a graph from a different project. Gather does not read or show files that the session cannot read.
 

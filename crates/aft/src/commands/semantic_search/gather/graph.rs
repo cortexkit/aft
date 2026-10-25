@@ -293,13 +293,13 @@ pub(super) fn resolve_seeds_for_request(
         .filter_map(|(ordinal, (path, line))| {
             code_path(&root, path).map(|path| (ordinal, path, *line))
         })
-        .take(MAX_SEEDS)
         .filter(|(_, path, _)| {
             include_tests
                 || !crate::inspect::job::is_test_file(
                     &path.strip_prefix(&root).unwrap_or(path).to_string_lossy(),
                 )
         })
+        .take(MAX_SEEDS)
         .filter_map(|(ordinal, path, line)| {
             let mut node = render_cached(
                 ctx,

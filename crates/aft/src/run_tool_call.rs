@@ -1678,6 +1678,7 @@ mod tests {
                 raw_request_from_translated("semantic_search".into(), params.clone(), &ctx)
                     .unwrap();
             assert_eq!(request.params["search_context"], "trace-marker");
+            assert!(!format!("{request:?}").contains("trace-marker"));
             let other = raw_request_from_translated("status".into(), params.clone(), &ctx).unwrap();
             assert!(other.params.get("search_context").is_none());
             let absent =

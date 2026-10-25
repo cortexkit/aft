@@ -19,6 +19,10 @@ const DEFAULT_DECISION_TIMEOUT_MS: u64 = 3_000;
 /// Full-walk budget when the user does not set one.
 const DEFAULT_DEADLINE_MS: u64 = 8_000;
 
+const MAX_ROUNDS: usize = 3;
+const MAX_DECISION_TIMEOUT_MS: u64 = 3_000;
+const MAX_DEADLINE_MS: u64 = 8_000;
+
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::commands::semantic_search) struct GatherSettings {
     pub max_rounds: usize,
@@ -52,14 +56,19 @@ impl GatherSettings {
             })
         };
         Ok(Self {
-            max_rounds: count(raw.max_rounds, DEFAULT_MAX_ROUNDS),
+            max_rounds: count(raw.max_rounds, DEFAULT_MAX_ROUNDS).min(MAX_ROUNDS),
             max_nodes: count(raw.max_nodes, super::MAX_NODES).min(super::MAX_NODES),
             max_frontier: count(raw.max_frontier, super::MAX_FRONTIER).min(super::MAX_FRONTIER),
             decision_timeout: Duration::from_millis(
                 raw.decision_timeout_ms
-                    .unwrap_or(DEFAULT_DECISION_TIMEOUT_MS),
+                    .unwrap_or(DEFAULT_DECISION_TIMEOUT_MS)
+                    .min(MAX_DECISION_TIMEOUT_MS),
             ),
-            deadline: Duration::from_millis(raw.deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS)),
+            deadline: Duration::from_millis(
+                raw.deadline_ms
+                    .unwrap_or(DEFAULT_DEADLINE_MS)
+                    .min(MAX_DEADLINE_MS),
+            ),
             max_output_bytes: count(raw.max_output_bytes, super::MAX_OUTPUT_BYTES)
                 .min(super::MAX_OUTPUT_BYTES),
         })
@@ -402,11 +411,14 @@ pub(super) fn walk_with_neighbors(
     let mut visited = HashSet::new();
     let mut kept = HashSet::new();
     let mut expanded = HashSet::new();
-    while result.rounds < settings.max_rounds && result.kept.len() < settings.max_nodes {
-        if request
+    let cancelled = || {
+        request
             .cancelled
             .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
+            || super::super::search_cancellation_requested()
+    };
+    while result.rounds < settings.max_rounds && result.kept.len() < settings.max_nodes {
+        if cancelled() {
             result.stop_reason = Some("cancelled");
             break;
         }
@@ -440,10 +452,7 @@ pub(super) fn walk_with_neighbors(
             result.stop_reason = Some("deadline");
             break;
         }
-        if request
-            .cancelled
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
+        if cancelled() {
             result.stop_reason = Some("cancelled");
             break;
         }
@@ -485,10 +494,7 @@ pub(super) fn walk_with_neighbors(
             }
         }
         .and_then(|decision| validate_decision(decision, &frontier));
-        if request
-            .cancelled
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
+        if cancelled() {
             result.stop_reason = Some("cancelled");
             break;
         }
@@ -515,10 +521,7 @@ pub(super) fn walk_with_neighbors(
             result.stop_reason = Some("deadline");
             break;
         }
-        if request
-            .cancelled
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
+        if cancelled() {
             result.stop_reason = Some("cancelled");
             break;
         }
@@ -537,10 +540,7 @@ pub(super) fn walk_with_neighbors(
             result.stop_reason = Some("deadline");
             break;
         }
-        if request
-            .cancelled
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
+        if cancelled() {
             result.stop_reason = Some("cancelled");
             break;
         }
@@ -582,10 +582,7 @@ pub(super) fn walk_with_neighbors(
             result.stop_reason = Some("deadline");
             break;
         }
-        if request
-            .cancelled
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
+        if cancelled() {
             result.stop_reason = Some("cancelled");
             break;
         }

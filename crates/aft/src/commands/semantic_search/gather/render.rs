@@ -14,11 +14,17 @@ pub(super) fn available_bytes(response: &Response) -> usize {
         .min(MAX_OUTPUT_BYTES)
 }
 
+pub(super) fn output_budget_notice(response: &mut Response) {
+    response.data["gather_notice"] = serde_json::json!("gather: skipped output_budget");
+}
+
 fn append(response: &mut Response, addition: &str, budget: usize) {
     if addition.len() <= budget {
         if let Some(serde_json::Value::String(text)) = response.data.get_mut("text") {
             text.push_str(addition);
         }
+    } else {
+        output_budget_notice(response);
     }
 }
 
@@ -35,7 +41,6 @@ pub(super) fn append_state(response: &mut Response, state: &str, budget: usize) 
         "building" | "suspended" | "off" | "unavailable" | "error" => state,
         "root_unavailable" => "unavailable",
         "no_seeds" => "no_seeds",
-        "configuration_failure" => "configuration_failure",
         "snapshot_unavailable" => "snapshot_unavailable",
         _ => "walk_failed",
     };
@@ -88,11 +93,10 @@ pub(super) fn append_walk(
     };
     let reserve = header(MAX_NODES).len() + footer(MAX_NODES).len();
     if reserve > budget {
+        output_budget_notice(response);
         let disclosure = footer(0);
         if disclosure.len() <= budget {
             append(response, &disclosure, budget);
-        } else {
-            append(response, "\n\ngather: skipped output_budget", budget);
         }
         return;
     }

@@ -794,6 +794,17 @@ fn handle_semantic_search_with_disk_fallback(
 ) -> Response {
     use extensions::{RawQuery, Root, Token};
 
+    let mut sanitized_request = req.clone();
+    let context = crate::search_context::SearchContext::from_request_field(
+        sanitized_request
+            .params
+            .as_object_mut()
+            .and_then(|params| params.remove("search_context"))
+            .as_ref(),
+    )
+    .unwrap_or_default();
+    let req = &sanitized_request;
+
     let page_request = match paging::parse_public_page_request(&req.params) {
         Ok(request) => request,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
@@ -943,6 +954,7 @@ fn handle_semantic_search_with_disk_fallback(
             ctx,
             &mut response,
             external_root.as_deref().unwrap_or(&project_root),
+            context.as_ref(),
         );
         return response;
     }
@@ -1059,6 +1071,7 @@ fn handle_semantic_search_with_disk_fallback(
             ctx,
             &mut response,
             external_root.as_deref().unwrap_or(&project_root),
+            context.as_ref(),
         );
     }
     response

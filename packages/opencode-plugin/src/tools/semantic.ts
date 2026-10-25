@@ -234,7 +234,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         rawArgs.path = pathArg;
       }
 
-      const searchContext = await collectOpenCodeSearchContext(ctx, context);
+      const searchContext = hasQuery ? await collectOpenCodeSearchContext(ctx, context) : undefined;
       const response = await callToolCall(ctx, context, "search", rawArgs, {
         abortSignal: context.abort,
         ...(searchContext !== undefined ? { searchContext } : {}),

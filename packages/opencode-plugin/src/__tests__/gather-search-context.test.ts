@@ -188,6 +188,31 @@ function openCodeGatherFixture(options: FixtureOptions) {
 }
 
 for (const version of [1, 2] as const) {
+  for (const query of [undefined, "", " \t"]) {
+    test(`V${version} pattern-only query ${String(query)} reads no context`, async () => {
+      const f = openCodeGatherFixture({ enabled: true, version });
+      await f.search({ query, pattern: "load_config" });
+      expect(f.calls).toHaveLength(1);
+      expect(f.readerConstructions()).toBe(0);
+      expect(f.gatherMessageReads()).toBe(0);
+      expect(f.sentOptions()).not.toHaveProperty("searchContext");
+    });
+    test(`V${version} pattern-only fallback ${String(query)} reads no context`, async () => {
+      const f = openCodeGatherFixture({
+        enabled: true,
+        version,
+        ask: async (input) => {
+          if (input.permission !== "aft_search_external") return;
+          throw Object.assign(new Error("external rule denied"), { _tag: "DeniedError" });
+        },
+      });
+      await f.search({ query, pattern: "load_config", path: external });
+      expect(f.calls).toHaveLength(1);
+      expect(f.readerConstructions()).toBe(0);
+      expect(f.gatherMessageReads()).toBe(0);
+      expect(f.sentOptions()).not.toHaveProperty("searchContext");
+    });
+  }
   for (const enabled of [false, undefined]) {
     test(`V${version} gather ${String(enabled)} constructs no readers and reads no parts`, async () => {
       const f = openCodeGatherFixture({ enabled, version });

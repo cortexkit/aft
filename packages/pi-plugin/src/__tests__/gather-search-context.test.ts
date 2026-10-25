@@ -72,6 +72,16 @@ function expectQueryOnly(fixture: ReturnType<typeof piGatherFixture>) {
 }
 
 describe("Pi gather context through registration", () => {
+  for (const query of [undefined, "", " \t"]) {
+    test(`pattern-only query ${String(query)} reads no context`, async () => {
+      const f = piGatherFixture();
+      await f.search("call-now", { query, pattern: "load_config" });
+      expect(f.calls).toHaveLength(1);
+      expect(f.getBranch).not.toHaveBeenCalled();
+      expect(f.getLeafEntry).not.toHaveBeenCalled();
+      expect(f.calls[0].options?.searchContext).toBeUndefined();
+    });
+  }
   test("whitespace-only thinking, text and user parts do not become context", async () => {
     const fixture = piGatherFixture();
     fixture.setBranch([

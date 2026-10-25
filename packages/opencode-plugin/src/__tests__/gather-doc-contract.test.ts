@@ -64,6 +64,26 @@ test("gather documentation states endpoint egress", async () => {
   const grepSource = await Bun.file(new URL("crates/aft/src/commands/grep.rs", root)).text();
 
   expect(config).toContain('"enabled": false');
+  expect(config).toContain("OMP uses the Pi collector");
+  expect(config).toContain("No test checks this timing");
+  expect(config).toContain("when the current turn is not stored");
+  for (const doc of [config, tools]) {
+    expect(doc).toContain("fallback=<round>:<reason>");
+    expect(doc).not.toContain("It adds one state line.");
+  }
+  expect(tools).not.toContain("| `configuration_failure` |");
+  expect(tools).toContain("`gaps=` counts graph gaps");
+  expect(tools).toContain("`gather_notice`");
+  for (const [limit, maximum] of [
+    ["max_rounds", 3],
+    ["max_nodes", 12],
+    ["max_frontier", 40],
+    ["decision_timeout_ms", 3000],
+    ["deadline_ms", 8000],
+    ["max_output_bytes", 12288],
+  ]) {
+    expect(config).toContain(`| \`${limit}\` | ${maximum} |`);
+  }
   expect(config).toContain("off by default");
   expect(config).toContain("Host redaction does not apply to this request.");
   expect(config).toContain("local endpoint");

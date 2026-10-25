@@ -377,7 +377,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         if (includeTests !== undefined) req.includeTests = includeTests;
         if (params.path !== undefined) req.path = params.path;
         const options: ToolCallOptions = signal ? { abortSignal: signal } : {};
-        if (gatherEnabled(ctx.config)) {
+        if (hasQuery && gatherEnabled(ctx.config)) {
           const searchContext = collectPiSearchContext(ctx.config, extCtx, toolCallId);
           if (searchContext !== undefined) options.searchContext = searchContext;
         }

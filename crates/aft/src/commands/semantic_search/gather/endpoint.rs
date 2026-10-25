@@ -1,4 +1,5 @@
-use super::{parse_decision, Decision, DecisionError, DecisionInput, DecisionModel};
+use super::decision::parse_decision;
+use super::{Decision, DecisionError, DecisionInput, DecisionModel};
 use crate::config::GatherDecisionConfig;
 use crate::grep_executor::truncate_at_char_boundary;
 use serde_json::{json, Value};

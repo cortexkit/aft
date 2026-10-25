@@ -21,6 +21,7 @@ pub(super) fn attach(
     ctx: &crate::context::AppContext,
     response: &mut crate::protocol::Response,
     selected_root: &Path,
+    context: Option<&crate::search_context::SearchContext>,
 ) {
     let config = ctx.config();
     let query = req
@@ -46,6 +47,7 @@ pub(super) fn attach(
             .map_or(MAX_OUTPUT_BYTES, |settings| settings.max_output_bytes),
     );
     if budget == 0 {
+        render::output_budget_notice(response);
         return;
     }
     if selected_root.canonicalize().ok()
@@ -54,12 +56,7 @@ pub(super) fn attach(
         render::append_state(response, "root_mismatch", budget);
         return;
     }
-    let context =
-        crate::search_context::SearchContext::from_request_field(req.params.get("search_context"))
-            .unwrap_or_default();
-    let trace = context
-        .as_ref()
-        .map(crate::search_context::SearchContext::as_str);
+    let trace = context.map(crate::search_context::SearchContext::as_str);
     let has_trace = trace.is_some_and(|text| !text.trim().is_empty());
     let include_tests = req
         .params
@@ -118,6 +115,7 @@ pub(super) fn gather_walk(request: &GatherWalkRequest<'_>) -> Result<GatherWalk,
     walk::gather_walk(request)
 }
 
+#[cfg(test)]
 pub(super) fn parse_decision(
     json: &str,
     frontier_ids: &[String],
