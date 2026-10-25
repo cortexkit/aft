@@ -6,6 +6,7 @@ import { z } from "zod";
 import { ConfigRejectedError } from "../../src/config.js";
 import { makeServerEffect } from "../../src/entry/server-runtime.mjs";
 import * as logger from "../../src/logger.js";
+import type { PluginContext } from "../../src/types.js";
 
 /** A registered V2 tool call fails (an Effect failure, red in the host) with the fix text. */
 async function expectConfigErrorCall(tool: Record<string, unknown> | undefined, fix: string) {
@@ -176,14 +177,44 @@ describe("V2 server effect", () => {
     for (const directory of ["/work/a", "/work/b"]) {
       const events: string[] = [];
       const added: Array<Record<string, unknown>> = [];
-      const effect = makeServerEffect(testDependencies(events));
+      let toolContext: PluginContext | undefined;
+      const dependencies = testDependencies(events);
+      const effect = makeServerEffect({
+        ...dependencies,
+        buildToolMap: (context: PluginContext, config: unknown) => {
+          toolContext = context;
+          return dependencies.buildToolMap(context, config);
+        },
+      });
       const host = hostContext(directory, events, added);
+      const reads: Array<{ sessionID: string; messageID: string }> = [];
+      const message = { id: "message-reader", type: "assistant", content: [] };
+      Object.assign(host.context.session, {
+        message: {
+          get: (input: { sessionID: string; messageID: string }) =>
+            Effect.sync(() => {
+              reads.push(input);
+              return message;
+            }),
+        },
+      });
 
       const program = effect(host.context);
       expect(host.locationReads()).toBe(1);
       expect(events).toEqual([`location:${directory}`]);
 
       await Effect.runPromise(Effect.scoped(program));
+
+      const reader = toolContext?.readSearchMessageV2;
+      expect(reader).toBeFunction();
+      expect(reads).toEqual([]);
+      if (!reader) throw new Error("missing V2 search reader");
+      expect(
+        await Effect.runPromise(
+          reader({ sessionID: "session-reader", messageID: "message-reader" }),
+        ),
+      ).toEqual(message);
+      expect(reads).toEqual([{ sessionID: "session-reader", messageID: "message-reader" }]);
 
       expect(host.locationReads()).toBe(1);
       expect(added.map((tool) => tool.name)).toEqual(["aft_probe"]);

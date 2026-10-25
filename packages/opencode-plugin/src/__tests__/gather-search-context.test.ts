@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { AftTransportPool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { Effect } from "effect";
+import * as configModule from "../config.js";
 import { semanticTools } from "../tools/semantic.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
@@ -27,7 +28,8 @@ type FixtureOptions = {
   callID?: string;
   reject?: "message" | "list";
   ask?: ToolContext["ask"];
-  read?: (sessionID: string) => Promise<void>;
+  read?: (sessionID: string, signal?: AbortSignal) => Promise<void>;
+  abort?: AbortSignal;
 };
 
 function partsFor(version: Version, sessionID: string): Part[] {
@@ -61,10 +63,11 @@ function openCodeGatherFixture(options: FixtureOptions) {
   }> = [];
   const messageInputs: unknown[] = [];
   const listInputs: unknown[] = [];
+  const readSignals: Array<AbortSignal | undefined> = [];
   let readerConstructions = 0;
   let effectRuns = 0;
-  const message = async (sessionID: string) => {
-    if (options.read) await options.read(sessionID);
+  const message = async (sessionID: string, signal?: AbortSignal) => {
+    if (options.read) await options.read(sessionID, signal);
     if (options.reject === "message") throw new Error("host unavailable");
     const parts = options.parts ?? partsFor(options.version, sessionID);
     return options.version === 1
@@ -90,13 +93,19 @@ function openCodeGatherFixture(options: FixtureOptions) {
       get message() {
         readerConstructions++;
         if (options.version === 2) throw new Error("V1 reader used on V2");
-        return async (input: { path: { id: string; messageID: string } }) => {
-          messageInputs.push(input);
-          return { data: await message(input.path.id) };
+        return async (input: { path: { id: string; messageID: string }; signal?: AbortSignal }) => {
+          messageInputs.push({ path: input.path });
+          readSignals.push(input.signal);
+          return { data: await message(input.path.id, input.signal) };
         };
       },
-      messages: async (input: { path: { id: string }; query: { limit: number } }) => {
-        listInputs.push(input);
+      messages: async (input: {
+        path: { id: string };
+        query: { limit: number };
+        signal?: AbortSignal;
+      }) => {
+        listInputs.push({ path: input.path, query: input.query });
+        readSignals.push(input.signal);
         expect(input.query.limit).toBeGreaterThan(0);
         expect(input.query.limit).toBeLessThanOrEqual(50);
         if (options.reject === "list") throw new Error("history unavailable");
@@ -114,7 +123,7 @@ function openCodeGatherFixture(options: FixtureOptions) {
                 { type: "file", text: "user-attachment-secret" },
               ],
             },
-            await message(input.path.id),
+            await message(input.path.id, input.signal),
           ],
         };
       },
@@ -132,10 +141,10 @@ function openCodeGatherFixture(options: FixtureOptions) {
       ? {
           readSearchMessageV2: (input: { sessionID: string; messageID: string }) => {
             readerConstructions++;
-            return Effect.tryPromise(async () => {
+            return Effect.tryPromise(async (signal) => {
               effectRuns++;
               messageInputs.push(input);
-              return message(input.sessionID);
+              return message(input.sessionID, signal);
             });
           },
         }
@@ -151,9 +160,11 @@ function openCodeGatherFixture(options: FixtureOptions) {
       worktree: root,
       sessionID: options.missingSession ? undefined : sessionID,
       messageID: options.missingMessage ? undefined : "current-message",
-      ...(options.version === 2 ? { hostVersion: 2, id: options.callID ?? "call-current" } : {}),
+      ...(options.version === 2
+        ? { hostVersion: 2, id: options.callID ?? "call-current", effectAbort: options.abort }
+        : {}),
       ...(options.version === 1 && options.callID ? { callID: options.callID } : {}),
-      abort: new AbortController().signal,
+      abort: options.abort ?? new AbortController().signal,
       agent: "test",
       metadata: () => {},
       ask: options.ask ?? noopAsk,
@@ -167,6 +178,7 @@ function openCodeGatherFixture(options: FixtureOptions) {
     defaultSession,
     messageInputs,
     listInputs,
+    readSignals,
     effectRuns: () => effectRuns,
     gatherMessageReads: () => messageInputs.length + listInputs.length,
     readerConstructions: () => readerConstructions,
@@ -361,4 +373,93 @@ test("V1 bounded user-message read failure keeps search query-only", async () =>
   expect(f.messageInputs).toHaveLength(1);
   expect(f.listInputs).toHaveLength(1);
   expect(f.sentOptions()).not.toHaveProperty("searchContext");
+});
+
+for (const version of [1, 2] as const) {
+  test(`V${version} an aborted call constructs no gather readers`, async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const f = openCodeGatherFixture({ enabled: true, version, abort: controller.signal });
+    await f.search();
+    expect(f.gatherMessageReads()).toBe(0);
+    expect(f.readerConstructions()).toBe(0);
+    expect(f.sentOptions()).not.toHaveProperty("searchContext");
+  });
+
+  test(`V${version} abort during a read stops history and context`, async () => {
+    const controller = new AbortController();
+    let entered!: () => void;
+    let release!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = openCodeGatherFixture({
+      enabled: true,
+      version,
+      abort: controller.signal,
+      read: async () => {
+        entered();
+        await released;
+      },
+    });
+    const pending = f.search();
+    await reading;
+    controller.abort();
+    release();
+    await pending;
+    expect(f.messageInputs).toHaveLength(1);
+    expect(f.listInputs).toHaveLength(0);
+    expect(f.sentOptions()).not.toHaveProperty("searchContext");
+    if (version === 1) expect(f.readSignals[0]?.aborted).toBe(true);
+  });
+
+  test(`V${version} a late timeout loser rejection has a handler`, async () => {
+    let rejectLate!: (reason: Error) => void;
+    const late = new Promise<void>((_resolve, reject) => {
+      rejectLate = reject;
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const f = openCodeGatherFixture({ enabled: true, version, read: () => late });
+      expect(await f.search()).toBe("search-result");
+      expect(f.messageInputs).toHaveLength(1);
+      expect(f.listInputs).toHaveLength(0);
+      expect(f.sentOptions()).not.toHaveProperty("searchContext");
+      rejectLate(new Error("late-reader-rejection"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+}
+
+test("V1 both SDK reads receive the tool cancellation signal", async () => {
+  const controller = new AbortController();
+  const f = openCodeGatherFixture({ enabled: true, version: 1, abort: controller.signal });
+  await f.search();
+  expect(f.readSignals).toHaveLength(2);
+  controller.abort();
+  expect(f.readSignals.map((signal) => signal?.aborted)).toEqual([true, true]);
+});
+
+test("gatherEnabled requires explicit enablement in effective config", () => {
+  expect(configModule.gatherEnabled).toBeFunction();
+  for (const [config, enabled] of [
+    [{}, false],
+    [{ search: {} }, false],
+    [{ search: { gather: {} } }, false],
+    [{ search: { gather: { enabled: false } } }, false],
+    [{ search: { gather: { enabled: true } } }, true],
+  ] as const) {
+    expect(configModule.gatherEnabled(config)).toBe(enabled);
+  }
 });

@@ -1,5 +1,6 @@
 import { capSearchContext } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
+import { gatherEnabled } from "../config.js";
 import type { ToolRuntime } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
@@ -12,23 +13,27 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-async function bounded<T>(read: (signal: AbortSignal) => Promise<T>): Promise<T | undefined> {
+async function bounded<T>(
+  read: (signal: AbortSignal) => Promise<T>,
+  abort?: AbortSignal,
+): Promise<T | undefined> {
+  if (abort?.aborted) return undefined;
   const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const signal = abort ? AbortSignal.any([controller.signal, abort]) : controller.signal;
+  let stop!: () => void;
+  const stopped = new Promise<undefined>((resolve) => {
+    stop = () => resolve(undefined);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+  const timer = setTimeout(() => controller.abort(), READ_TIMEOUT_MS);
   try {
-    return await Promise.race([
-      Promise.resolve().then(() => read(controller.signal)),
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => {
-          controller.abort();
-          resolve(undefined);
-        }, READ_TIMEOUT_MS);
-      }),
-    ]);
-  } catch {
-    return undefined;
+    const reading = Promise.resolve()
+      .then(() => (signal.aborted ? undefined : read(signal)))
+      .catch(() => undefined);
+    return await Promise.race([reading, stopped]);
   } finally {
     clearTimeout(timer);
+    signal.removeEventListener("abort", stop);
   }
 }
 
@@ -64,7 +69,9 @@ export async function collectOpenCodeSearchContext(
   ctx: PluginContext,
   runtime: ToolRuntime,
 ): Promise<string | undefined> {
-  if (ctx.config.search?.gather?.enabled !== true) return undefined;
+  if (!gatherEnabled(ctx.config)) return undefined;
+  const abort = runtime.effectAbort ?? runtime.abort;
+  if (abort?.aborted) return undefined;
   if (!runtime.sessionID || !runtime.messageID) return undefined;
   const { sessionID, messageID } = runtime;
   const readV2 = ctx.readSearchMessageV2;
@@ -75,10 +82,9 @@ export async function collectOpenCodeSearchContext(
     let user: string[] = [];
     if (runtime.hostVersion === 2 && readV2) {
       const message = record(
-        await bounded((signal) =>
-          Effect.runPromise(readV2({ sessionID, messageID }), {
-            signal: runtime.effectAbort ? AbortSignal.any([signal, runtime.effectAbort]) : signal,
-          }),
+        await bounded(
+          (signal) => Effect.runPromise(readV2({ sessionID, messageID }), { signal }),
+          abort,
         ),
       );
       if (
@@ -91,8 +97,9 @@ export async function collectOpenCodeSearchContext(
       // OpenCode 2 has no bounded history reader or user message id on assistant messages.
       // Do not load all messages to add the user text.
     } else {
-      const response = await bounded(() =>
-        ctx.client.session.message({ path: { id: sessionID, messageID } }),
+      const response = await bounded(
+        (signal) => ctx.client.session.message({ path: { id: sessionID, messageID }, signal }),
+        abort,
       );
       const message = response?.data;
       if (
@@ -103,14 +110,20 @@ export async function collectOpenCodeSearchContext(
         return undefined;
       preceding = assistantText(message.parts, runtime);
       if (!preceding) return undefined;
-      const history = await bounded(() =>
-        ctx.client.session.messages({ path: { id: sessionID }, query: { limit: MESSAGE_LIMIT } }),
+      const history = await bounded(
+        (signal) =>
+          ctx.client.session.messages({
+            path: { id: sessionID },
+            query: { limit: MESSAGE_LIMIT },
+            signal,
+          }),
+        abort,
       );
       if (!Array.isArray(history?.data)) return undefined;
       const newestUser = [...history.data].reverse().find((entry) => entry.info.role === "user");
       if (newestUser) user = textParts(newestUser.parts);
     }
-    if (!preceding || ctx.config.search?.gather?.enabled !== true) return undefined;
+    if (!preceding || abort?.aborted || !gatherEnabled(ctx.config)) return undefined;
     const text = [...preceding, ...user].join("\n\n");
     return text ? capSearchContext(text) : undefined;
   } catch {
