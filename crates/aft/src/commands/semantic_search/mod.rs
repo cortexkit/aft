@@ -9,13 +9,6 @@ pub mod extensions;
 pub(crate) mod external_disk_check;
 mod external_exact;
 mod external_pattern;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "not called until the search handler attaches gather"
-    )
-)]
 pub(crate) mod gather;
 pub mod generation_token;
 pub mod lexical_lane;
@@ -935,7 +928,7 @@ fn handle_semantic_search_with_disk_fallback(
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
     if let Some((pattern_text, compiled)) = pattern {
-        return handle_pattern_request(
+        let mut response = handle_pattern_request(
             req,
             ctx,
             page_request,
@@ -945,6 +938,13 @@ fn handle_semantic_search_with_disk_fallback(
             &compiled,
             external_root.as_deref(),
         );
+        gather::attach(
+            req,
+            ctx,
+            &mut response,
+            external_root.as_deref().unwrap_or(&project_root),
+        );
+        return response;
     }
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
@@ -1054,6 +1054,12 @@ fn handle_semantic_search_with_disk_fallback(
         if external_root.is_none() {
             SearchLaneStatus::observe_current(ctx).attach_labels(&mut response, ctx);
         }
+        gather::attach(
+            req,
+            ctx,
+            &mut response,
+            external_root.as_deref().unwrap_or(&project_root),
+        );
     }
     response
 }

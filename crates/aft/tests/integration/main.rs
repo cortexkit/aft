@@ -53,6 +53,7 @@ mod created_file_syntax_test;
 mod cuda_test;
 mod db_migration_race_test;
 mod db_read_fallback_test;
+mod gather_search_test;
 #[cfg(target_os = "macos")]
 mod privacy_spawn_test;
 // Stands in shell scripts for Apple's developer-tools launcher.

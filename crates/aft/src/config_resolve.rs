@@ -1610,12 +1610,14 @@ fn apply_harness_override(
                 if search_floor
                     .as_ref()
                     .and_then(|search| search.gather.as_ref())
-                    .is_some_and(|gather| gather.enabled == Some(false))
+                    .is_some_and(|gather| {
+                        gather.enabled.is_some() && !crate::config::gather_enabled(gather.enabled)
+                    })
                     && override_config
                         .search
                         .as_ref()
                         .and_then(|search| search.gather.as_ref())
-                        .is_some_and(|gather| gather.enabled == Some(true))
+                        .is_some_and(|gather| crate::config::gather_enabled(gather.enabled))
                 {
                     push_drop(
                         dropped,
@@ -1904,7 +1906,9 @@ fn merge_project_search(base: Option<RawSearch>, project: Option<RawSearch>) -> 
     let disables_gather = project
         .as_ref()
         .and_then(|search| search.gather.as_ref())
-        .is_some_and(|gather| gather.enabled == Some(false));
+        .is_some_and(|gather| {
+            gather.enabled.is_some() && !crate::config::gather_enabled(gather.enabled)
+        });
     if !disables_rerank && !disables_gather {
         return base;
     }
@@ -2708,7 +2712,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         .and_then(|search| search.gather.as_ref())
     {
         for (key, present) in [
-            ("enabled", gather.enabled == Some(true)),
+            ("enabled", crate::config::gather_enabled(gather.enabled)),
             ("max_rounds", gather.max_rounds.is_some()),
             ("max_nodes", gather.max_nodes.is_some()),
             ("max_frontier", gather.max_frontier.is_some()),

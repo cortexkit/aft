@@ -88,7 +88,8 @@ pub(in crate::commands::semantic_search) struct GatherWalkRequest<'a> {
     pub seeds: &'a [GatherNode],
     pub search: &'a SearchConfig,
     pub session_id: Option<&'a str>,
-    pub trace: &'a str,
+    pub request: Option<&'a crate::protocol::RawRequest>,
+    pub trace: Option<&'a str>,
     pub query: &'a str,
     pub include_tests: bool,
     pub model: Option<&'a dyn DecisionModel>,
@@ -246,7 +247,8 @@ fn decision_key(
 ) -> Option<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     hash_field(&mut hasher, &namespace?);
-    hash_field(&mut hasher, request.trace.as_bytes());
+    hash_field(&mut hasher, &[u8::from(request.trace.is_some())]);
+    hash_field(&mut hasher, request.trace.unwrap_or_default().as_bytes());
     hash_field(&mut hasher, request.query.as_bytes());
     hash_field(&mut hasher, &(remaining as u64).to_le_bytes());
     for node in frontier {
@@ -362,7 +364,7 @@ pub(super) fn walk_with_clock(
     request: &GatherWalkRequest<'_>,
     clock: &dyn WalkClock,
 ) -> Result<GatherWalk, &'static str> {
-    let mut sources = GatherSourceCache::default();
+    let mut sources = GatherSourceCache::for_request(request.request);
     let mut gaps = Vec::new();
     let mut result = walk_with_neighbors(request, clock, |seeds| {
         let graph = collect_callgraph_neighbors_with_cache(

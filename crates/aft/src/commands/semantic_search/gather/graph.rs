@@ -24,11 +24,33 @@ struct GatherFile {
 #[derive(Default)]
 pub(in crate::commands::semantic_search) struct GatherSourceCache {
     files: HashMap<PathBuf, Option<GatherFile>>,
+    access: Option<(String, String)>,
     #[cfg(test)]
     pub(super) loads: usize,
 }
 
 impl GatherSourceCache {
+    pub(super) fn for_request(req: Option<&crate::protocol::RawRequest>) -> Self {
+        Self {
+            access: req.map(|req| (req.id.clone(), req.session().to_owned())),
+            ..Self::default()
+        }
+    }
+
+    fn allowed(&self, ctx: &AppContext, path: &Path) -> bool {
+        let (id, session) = self
+            .access
+            .as_ref()
+            .map_or(("", ""), |(id, session)| (id.as_str(), session.as_str()));
+        ctx.validate_search_path(
+            id,
+            session,
+            path,
+            crate::context::WorkerSearchTool::AftSearch,
+        )
+        .is_ok()
+    }
+
     fn load(&mut self, path: &Path) -> Option<&GatherFile> {
         if !self.files.contains_key(path) {
             #[cfg(test)]
@@ -112,12 +134,16 @@ fn containing_symbol(file: &GatherFile, line: u32) -> Option<&Symbol> {
         })
 }
 
+#[cfg(test)]
 pub(in crate::commands::semantic_search) fn resolve_containing_symbol(
     file: &Path,
     line: u32,
-    _ctx: &AppContext,
+    ctx: &AppContext,
 ) -> Option<(String, u32)> {
     let mut sources = GatherSourceCache::default();
+    if !sources.allowed(ctx, file) {
+        return None;
+    }
     let file = sources.load(file)?;
     let symbol = containing_symbol(file, line)?;
     let declaration = declaration_node(&file.tree, &file.source, symbol);
@@ -238,17 +264,28 @@ fn code_path(root: &Path, file: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
 pub(in crate::commands::semantic_search) fn resolve_seeds(
-    _ctx: &AppContext,
+    ctx: &AppContext,
     root: &Path,
     hits: &[(PathBuf, u32)],
     include_tests: bool,
+) -> Vec<GatherNode> {
+    resolve_seeds_for_request(ctx, root, hits, include_tests, None)
+}
+
+pub(super) fn resolve_seeds_for_request(
+    ctx: &AppContext,
+    root: &Path,
+    hits: &[(PathBuf, u32)],
+    include_tests: bool,
+    request: Option<&crate::protocol::RawRequest>,
 ) -> Vec<GatherNode> {
     let Ok(root) = root.canonicalize() else {
         return Vec::new();
     };
     let mut seen = HashSet::new();
-    let mut sources = GatherSourceCache::default();
+    let mut sources = GatherSourceCache::for_request(request);
     hits.iter()
         .enumerate()
         .filter_map(|(ordinal, (path, line))| {
@@ -263,6 +300,7 @@ pub(in crate::commands::semantic_search) fn resolve_seeds(
         })
         .filter_map(|(ordinal, path, line)| {
             let mut node = render_cached(
+                ctx,
                 &root,
                 &path,
                 line,
@@ -277,8 +315,9 @@ pub(in crate::commands::semantic_search) fn resolve_seeds(
         .collect()
 }
 
+#[cfg(test)]
 pub(in crate::commands::semantic_search) fn render_node(
-    _ctx: &AppContext,
+    ctx: &AppContext,
     root: &Path,
     path: &Path,
     line: u32,
@@ -286,6 +325,7 @@ pub(in crate::commands::semantic_search) fn render_node(
     include_tests: bool,
 ) -> Option<GatherNode> {
     render_cached(
+        ctx,
         root,
         path,
         line,
@@ -296,6 +336,7 @@ pub(in crate::commands::semantic_search) fn render_node(
 }
 
 fn render_cached(
+    ctx: &AppContext,
     root: &Path,
     path: &Path,
     line: u32,
@@ -304,6 +345,9 @@ fn render_cached(
     sources: &mut GatherSourceCache,
 ) -> Option<GatherNode> {
     let path = code_path(root, path)?;
+    if !sources.allowed(ctx, &path) {
+        return None;
+    }
     let file = sources.load(&path)?;
     let symbol = containing_symbol(file, line)?;
     let source = &file.source;
@@ -535,8 +579,12 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
         };
         let target = candidates
             .into_iter()
-            .filter(|node| node.line <= seed.line && seed.line <= node.end_line)
-            .min_by_key(|node| node.end_line.saturating_sub(node.line));
+            // Store ranges select a name, not the full source declaration.
+            .find(|candidate| {
+                render_cached(ctx, snapshot.project_root(), Path::new(&candidate.file), candidate.line,
+                    DEFAULT_BODY_LINE_BUDGET, include_tests, sources)
+                    .is_some_and(|node| node.id == seed.id)
+            });
         let Some(target) = target else {
             result.gaps.push(GatherGap {
                 seed_id: seed.id.clone(),
@@ -600,7 +648,16 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
         let mut progressed = false;
         for (seed, queue) in seeds.iter().zip(&mut queues) {
             while let Some((direction, location)) = queue.pop_front() {
+                let path = snapshot.project_root().join(&location.path);
+                if !sources.allowed(ctx, &path) {
+                    result.gaps.push(GatherGap {
+                        seed_id: seed.id.clone(),
+                        state: "path_denied",
+                    });
+                    continue;
+                }
                 let Some(mut node) = render_cached(
+                    ctx,
                     snapshot.project_root(),
                     &location.path,
                     location.line,

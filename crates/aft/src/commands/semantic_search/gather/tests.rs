@@ -9,6 +9,226 @@ use std::time::{Duration, Instant};
 
 const SOURCE: &str = "/// Load application settings.\npub fn load_config() {\n    parse_config();\n}\nfn parse_config() {\n    read_config();\n    external_library();\n}\nfn read_config() { parse_config(); }\n#[cfg(test)]\nfn test_caller() { parse_config(); }\n";
 
+#[test]
+fn gather_graph_denied_source_is_not_loaded() {
+    let f = Fixture::new(SOURCE);
+    f.ctx
+        .update_config(|config| config.sandbox.read_deny.push(f.file.clone()));
+    assert!(resolve_seeds(&f.ctx, &f.root, &[(f.file.clone(), 3)], false).is_empty());
+    let snapshot = f.store.read_snapshot().unwrap();
+    let seed = GatherNode {
+        id: "main.rs:5:parse_config".into(),
+        path: "main.rs".into(),
+        line: 5,
+        name: "parse_config".into(),
+        kind: "function".into(),
+        signature: String::new(),
+        docs: vec![],
+        body: String::new(),
+        edge: "seed".into(),
+        seed_ordinal: 0,
+        hop_distance: 0,
+        rerank_score: None,
+    };
+    let mut sources = GatherSourceCache::default();
+    let graph =
+        collect_callgraph_neighbors_with_cache(&f.ctx, &snapshot, &[seed], false, &mut sources)
+            .unwrap();
+    assert!(graph.nodes.is_empty());
+    assert_eq!(sources.loads, 0);
+    assert!(!graph.gaps.is_empty());
+}
+
+#[test]
+fn gather_graph_restricted_neighbor_does_not_load_source() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let allowed = f.root.join("allowed");
+    std::fs::create_dir(&allowed).unwrap();
+    f.ctx.update_config(|config| {
+        config.project_root = Some(allowed);
+        config.restrict_to_project_root = true;
+    });
+    let snapshot = f.store.read_snapshot().unwrap();
+    let mut sources = GatherSourceCache::default();
+    let graph =
+        collect_callgraph_neighbors_with_cache(&f.ctx, &snapshot, &seeds, false, &mut sources)
+            .unwrap();
+    assert!(graph.nodes.is_empty());
+    assert_eq!(sources.loads, 0);
+    assert!(!graph.gaps.is_empty());
+}
+
+#[test]
+fn gather_attach_missing_and_denied_hits_keep_ranked_evidence() {
+    for missing in [false, true] {
+        let f = Fixture::new(SOURCE);
+        f.ctx.update_config(|config| {
+            config.views.enabled = false;
+            config.search.gather = Some(crate::config::GatherConfig {
+                enabled: Some(true),
+                ..Default::default()
+            });
+            if !missing {
+                config.sandbox.read_deny.push(f.file.clone());
+            }
+        });
+        *f.ctx.callgraph_store().write().unwrap() = Some(std::sync::Arc::new(
+            CallGraphStore::open_readonly(f.dir.clone(), f.root.clone())
+                .unwrap()
+                .unwrap(),
+        ));
+        if missing {
+            std::fs::remove_file(&f.file).unwrap();
+        }
+        let req = serde_json::from_value(serde_json::json!({"id":"missing", "command":"semantic_search", "query":"how is application config loaded"})).unwrap();
+        let mut response = crate::protocol::Response::success(
+            "missing",
+            serde_json::json!({
+                "text":"ranked evidence", "results":[{"file":f.file,"start_line":3}], "ranked_files":["immutable"]
+            }),
+        );
+        let ranked = response.data["results"].clone();
+        attach(&req, &f.ctx, &mut response, &f.root);
+        assert!(response.success);
+        assert_eq!(response.data["results"], ranked);
+        assert_eq!(
+            response.data["ranked_files"],
+            serde_json::json!(["immutable"])
+        );
+        assert_eq!(
+            response.data["text"],
+            "ranked evidence\n\ngather: skipped callgraph=no_seeds"
+        );
+    }
+}
+
+#[test]
+fn gather_render_preserves_ranked_prefix_and_utf8_caps_with_formatter_overhead() {
+    let f = Fixture::new(&format!(
+        "fn entry() {{ let s = \"{}\"; }}\n",
+        "界".repeat(7000)
+    ));
+    let seeds = f.seeds(1);
+    for ranked_bytes in [0, 49 * 1024, 50 * 1024] {
+        let prefix = "r".repeat(ranked_bytes);
+        let mut response = crate::protocol::Response::success(
+            "render",
+            serde_json::json!({
+                "text": prefix, "complete": false,
+                "results_list_envelope": {"shown": 1,"total":{"kind":"exact","value":2},"unit":"results","causes":[],"narrow":["query"]}
+            }),
+        );
+        let before = response.data.clone();
+        let budget = render::available_bytes(&response);
+        render::append_walk(
+            &mut response,
+            GatherWalk {
+                kept: seeds.clone(),
+                rounds: 1,
+                considered: 1,
+                fallback_rounds: vec![],
+                elapsed: Duration::ZERO,
+                model: "deterministic".into(),
+                fallback_reasons: vec![],
+                stop_reason: Some("model_stop"),
+                graph_gaps: vec![],
+            },
+            budget,
+            false,
+        );
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.starts_with(&prefix));
+        assert!(text.len() - prefix.len() <= 12 * 1024);
+        assert_eq!(
+            response.data["results_list_envelope"],
+            before["results_list_envelope"]
+        );
+        let formatted = crate::subc_format::format_response_with_context(
+            "search",
+            &response,
+            &Default::default(),
+        );
+        if ranked_bytes < 50 * 1024 {
+            assert!(formatted.len() <= 50 * 1024, "{} bytes", formatted.len());
+            assert!(text.contains("context: query only"));
+            assert!(text.contains("kept=1"));
+        } else {
+            assert_eq!(
+                text, prefix,
+                "ranked evidence must not shrink to fit gather"
+            );
+        }
+    }
+}
+
+#[test]
+fn gather_render_sorts_by_seed_hop_and_identity_and_limits_nodes() {
+    let f = Fixture::new(SOURCE);
+    let mut nodes = Vec::new();
+    for ordinal in (0..14).rev() {
+        let mut node = f.seeds(3).remove(0);
+        node.id = format!("node-{ordinal:02}");
+        node.name = node.id.clone();
+        node.seed_ordinal = ordinal / 2;
+        node.hop_distance = ordinal % 2;
+        nodes.push(node);
+    }
+    let mut response =
+        crate::protocol::Response::success("sort", serde_json::json!({"text":"ranked"}));
+    render::append_walk(
+        &mut response,
+        GatherWalk {
+            kept: nodes,
+            rounds: 3,
+            considered: 14,
+            fallback_rounds: vec![],
+            elapsed: Duration::ZERO,
+            model: "deterministic".into(),
+            fallback_reasons: vec![],
+            stop_reason: None,
+            graph_gaps: vec![],
+        },
+        12 * 1024,
+        true,
+    );
+    let text = response.data["text"].as_str().unwrap();
+    let mut last = 0;
+    for ordinal in 0..12 {
+        let offset = text.find(&format!("node-{ordinal:02}:")).unwrap();
+        assert!(offset > last);
+        last = offset;
+    }
+    assert!(!text.contains("node-12:"));
+    assert!(text.contains("kept=12"));
+}
+
+#[test]
+fn gather_render_small_budget_keeps_bounded_disclosure() {
+    let mut response =
+        crate::protocol::Response::success("small", serde_json::json!({"text":"ranked"}));
+    render::append_walk(
+        &mut response,
+        GatherWalk {
+            kept: vec![],
+            rounds: 0,
+            considered: 0,
+            fallback_rounds: vec![],
+            elapsed: Duration::ZERO,
+            model: "deterministic".into(),
+            fallback_reasons: vec![],
+            stop_reason: None,
+            graph_gaps: vec![],
+        },
+        80,
+        false,
+    );
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.starts_with("ranked"));
+    assert!(text.contains("gather:"));
+    assert!(text.len() - "ranked".len() <= 80);
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -498,7 +718,7 @@ impl DecisionModel for ScriptedDecisionModel<'_> {
         deadline: Instant,
     ) -> Result<Decision, DecisionError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        assert!(!input.trace.is_empty() && !input.query.is_empty());
+        assert!(!input.query.is_empty());
         (self.handler)(input, deadline)
     }
 }
@@ -522,7 +742,8 @@ fn walk_request<'a>(
         seeds,
         search,
         session_id: Some("session-one"),
-        trace: "private reasoning",
+        request: None,
+        trace: Some("private reasoning"),
         query: "load application settings",
         include_tests: false,
         model,
@@ -537,6 +758,25 @@ fn keep_frontier(input: &DecisionInput<'_>) -> Decision {
         expand: Vec::new(),
         stop: true,
     }
+}
+
+#[test]
+fn gather_walk_query_only_keeps_absent_and_empty_context_distinct() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(3);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let search = configured_gather_search();
+    let model = ScriptedDecisionModel::new(|input, _| {
+        assert!(input.trace.is_none_or(str::is_empty));
+        Ok(keep_frontier(input))
+    });
+    let mut request = walk_request(&f, &snapshot, &seeds, &search, Some(&model));
+    request.trace = None;
+    assert_eq!(gather_walk(&request).unwrap().kept.len(), 1);
+    request.trace = Some("");
+    assert_eq!(gather_walk(&request).unwrap().kept.len(), 1);
+    assert_eq!(gather_walk(&request).unwrap().kept.len(), 1);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -602,7 +842,7 @@ fn gather_decision_order_is_seed_hop_score_then_id() {
     let direct = decision::DeterministicDecisionModel
         .decide(
             &DecisionInput {
-                trace: "",
+                trace: Some(""),
                 query: "",
                 frontier: &nodes,
             },
@@ -1015,7 +1255,7 @@ fn gather_walk_cache_hashes_inputs_and_releases_lock() {
     gather_walk(&request).unwrap();
     gather_walk(&request).unwrap();
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    request.trace = "different private reasoning";
+    request.trace = Some("different private reasoning");
     gather_walk(&request).unwrap();
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     request.query = "different question";
@@ -1433,7 +1673,7 @@ fn endpoint_decide(
     let model = super::endpoint::EndpointDecisionModel::new(config)?;
     model.decide(
         &DecisionInput {
-            trace: ENDPOINT_TRACE,
+            trace: Some(ENDPOINT_TRACE),
             query: "load settings",
             frontier: &endpoint_frontier(),
         },
@@ -1666,7 +1906,7 @@ fn gather_endpoint_credentials_are_read_at_request_time_and_restored() {
     std::env::set_var(ENDPOINT_KEY_ENV, ENDPOINT_KEY);
     let result = model.decide(
         &DecisionInput {
-            trace: ENDPOINT_TRACE,
+            trace: Some(ENDPOINT_TRACE),
             query: "q",
             frontier: &endpoint_frontier(),
         },
@@ -1679,7 +1919,7 @@ fn gather_endpoint_credentials_are_read_at_request_time_and_restored() {
     assert!(matches!(
         model.decide(
             &DecisionInput {
-                trace: ENDPOINT_TRACE,
+                trace: Some(ENDPOINT_TRACE),
                 query: "q",
                 frontier: &endpoint_frontier()
             },

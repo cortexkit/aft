@@ -30,7 +30,7 @@ impl DecisionError {
 }
 
 pub(in crate::commands::semantic_search) struct DecisionInput<'a> {
-    pub trace: &'a str,
+    pub trace: Option<&'a str>,
     pub query: &'a str,
     pub frontier: &'a [GatherNode],
 }
@@ -53,6 +53,7 @@ pub(in crate::commands::semantic_search) trait DecisionModel:
     ) -> Result<Decision, DecisionError>;
 }
 
+#[cfg(test)]
 pub(in crate::commands::semantic_search) struct DeterministicDecisionModel;
 
 impl<T: DecisionModel + ?Sized> DecisionModel for &T {
@@ -73,6 +74,7 @@ impl<T: DecisionModel + ?Sized> DecisionModel for &T {
     }
 }
 
+#[cfg(test)]
 impl DecisionModel for DeterministicDecisionModel {
     fn name(&self) -> &str {
         "deterministic"

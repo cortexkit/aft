@@ -669,6 +669,11 @@ pub struct SearchConfig {
     pub gather: Option<GatherConfig>,
 }
 
+/// Only an explicit true value enables gather.
+pub fn gather_enabled(enabled: Option<bool>) -> bool {
+    enabled == Some(true)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatherConfig {
