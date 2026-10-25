@@ -1872,17 +1872,7 @@ fn merge_trusted_search(base: Option<RawSearch>, next: Option<RawSearch>) -> Opt
         };
     }
     if let Some(next) = next.rerank {
-        let base = base.rerank.get_or_insert_with(RawRerank::default);
-        take_defined!(
-            base,
-            next,
-            backend,
-            model,
-            endpoint,
-            api_key_env,
-            top_n,
-            timeout_ms
-        );
+        base.rerank = Some(next);
     }
     if let Some(next) = next.gather {
         let base = base.gather.get_or_insert_with(RawGather::default);
@@ -2709,6 +2699,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         }
     }
 
+    // The decision endpoint receives conversation text and uses the user's
+    // credentials. A project may disable collection, but it must not select
+    // an endpoint or increase the request budget.
     if let Some(gather) = raw
         .search
         .as_ref()
@@ -3873,6 +3866,39 @@ mod tests {
             "https://example.test"
         );
         assert_ne!(search["gather"]["enabled"], true);
+    }
+
+    #[test]
+    fn gather_config_user_harness_keeps_rerank_siblings_and_replaces_explicit_blocks() {
+        for harness in [Harness::Opencode, Harness::Pi] {
+            let rerank = serde_json::json!({"backend":"remote","model":"base-model","endpoint":"https://example.test/rerank","api_key_env":"BASE_KEY","top_n":7,"timeout_ms":500});
+            for override_rerank in [
+                None,
+                Some(serde_json::json!({"backend":"off"})),
+                Some(serde_json::json!({})),
+            ] {
+                let mut search = serde_json::json!({"gather":{"max_nodes":9}});
+                if let Some(rerank) = &override_rerank {
+                    search["rerank"] = rerank.clone();
+                }
+                let name = harness.wire_label();
+                let doc = serde_json::json!({"search":{"rerank":rerank,"gather":{"enabled":true}},"harnesses":{name:{"search":search}}});
+                let result =
+                    resolve_config_for_harness(&[tier("user", &doc.to_string())], Some(&harness));
+                assert!(result.errors.is_empty(), "{:?}", result.errors);
+                let search = serde_json::to_value(result.config.search).unwrap();
+                let expected = override_rerank.as_ref().unwrap_or(&rerank);
+                if expected.as_object().unwrap().is_empty() {
+                    assert!(search.get("rerank").is_none(), "{search}");
+                } else {
+                    assert_eq!(&search["rerank"], expected);
+                }
+                assert_eq!(
+                    search["gather"],
+                    serde_json::json!({"enabled":true,"max_nodes":9})
+                );
+            }
+        }
     }
 
     #[test]

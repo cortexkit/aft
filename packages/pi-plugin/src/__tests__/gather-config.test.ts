@@ -136,6 +136,79 @@ describe.serial("gather config", () => {
       expect(resolveProjectOverridesForConfigure(config).search).toEqual({ gather: { decision } });
     });
   });
+  test("partial harness decision overrides inherit the other trusted fields", async () => {
+    await fixture((f) => {
+      f.user({
+        search: { gather: { enabled: true, decision } },
+        harnesses: { pi: { search: { gather: { decision: { api_key_env: "HARNESS_KEY" } } } } },
+      });
+      f.project({});
+      const config = loadAftConfig(f.root);
+      const inherited = { ...decision, api_key_env: "HARNESS_KEY" };
+      expect(config.search?.gather?.decision).toEqual(inherited);
+      expect(resolveProjectOverridesForConfigure(config).search).toEqual({
+        gather: { enabled: true, decision: inherited },
+      });
+    });
+  });
+  test("user harness search keeps rerank siblings but replaces an explicit rerank block", async () => {
+    await fixture((f) => {
+      const rerank = {
+        backend: "remote",
+        model: "base-model",
+        endpoint: "https://example.test/rerank",
+        api_key_env: "BASE_KEY",
+        top_n: 7,
+        timeout_ms: 500,
+      };
+      for (const override of [
+        { gather: { enabled: true } },
+        { gather: { enabled: true }, rerank: { backend: "off" } },
+        { gather: { enabled: true }, rerank: {} },
+      ]) {
+        f.user({ search: { rerank }, harnesses: { pi: { search: override } } });
+        f.project({});
+        const config = loadAftConfig(f.root);
+        const expected = "rerank" in override ? override.rerank : rerank;
+        expect(config.search?.rerank).toEqual(expected);
+        expect(resolveProjectOverridesForConfigure(config).search).toEqual({
+          gather: { enabled: true },
+          ...(expected && Object.keys(expected).length > 0 ? { rerank: expected } : {}),
+        });
+      }
+    });
+  });
+  test("empty decisions are omitted from user and harness config and configure projection", async () => {
+    expect(
+      resolveProjectOverridesForConfigure({
+        disabled_tools: [],
+        search: { gather: { enabled: true, decision: {} } },
+      }).search,
+    ).toEqual({ gather: { enabled: true } });
+    await fixture((f) => {
+      for (const user of [
+        { search: { gather: { enabled: true, decision: {} } } },
+        { harnesses: { pi: { search: { gather: { enabled: true, decision: {} } } } } },
+        {
+          search: { gather: { enabled: true, decision: {} } },
+          harnesses: { pi: { search: { gather: { decision: {} } } } },
+        },
+      ]) {
+        f.user(user);
+        f.project({});
+        const config = loadAftConfig(f.root);
+        expect(config.search?.gather?.decision).toBeUndefined();
+        expect(resolveProjectOverridesForConfigure(config).search).toEqual({
+          gather: { enabled: true },
+        });
+      }
+      f.user({
+        search: { gather: { enabled: true, decision } },
+        harnesses: { pi: { search: { gather: { decision: {} } } } },
+      });
+      expect(loadAftConfig(f.root).search?.gather?.decision).toEqual(decision);
+    });
+  });
   test("project base disables survive an active harness enable attempt", async () => {
     await fixture((f) => {
       f.user({ search: { gather: { enabled: true }, rerank: { backend: "onnx" } } });

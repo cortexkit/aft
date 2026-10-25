@@ -210,6 +210,7 @@ const GatherConfigSchema = z.object({
       model: z.string().trim().min(1).optional(),
       api_key_env: z.string().trim().min(1).optional(),
     })
+    .transform((decision) => definedEntries(decision))
     .optional(),
   max_rounds: z.number().int().positive().optional(),
   max_nodes: z.number().int().positive().optional(),
@@ -1079,7 +1080,10 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
-  const gather = definedEntries(config.search?.gather);
+  const gather = definedEntries({
+    ...config.search?.gather,
+    decision: definedEntries(config.search?.gather?.decision),
+  });
   if (rerank !== undefined || gather !== undefined) {
     overrides.search = {
       ...(rerank !== undefined ? { rerank } : {}),
@@ -2029,6 +2033,10 @@ function projectRerankStrippedKeys(rerank: RerankConfig | undefined): string[] {
   return stripped;
 }
 
+/**
+ * The decision endpoint receives conversation text and uses the user's credentials.
+ * A project may disable collection, but it must not select an endpoint or increase the request budget.
+ */
 function projectGatherStrippedKeys(gather: GatherConfig | undefined): string[] {
   if (gather === undefined) return [];
   const stripped: string[] = [];
@@ -2069,9 +2077,7 @@ function mergeTrustedSearchConfig(
   if (override === undefined) return base;
   return {
     ...base,
-    ...(override.rerank !== undefined
-      ? { rerank: { ...base?.rerank, ...definedEntries(override.rerank) } }
-      : {}),
+    ...(override.rerank !== undefined ? { rerank: override.rerank } : {}),
     ...(override.gather !== undefined
       ? {
           gather: {
