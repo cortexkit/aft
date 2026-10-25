@@ -1,6 +1,6 @@
 use super::{
     Direction, GatherGap, GatherNode, GraphIdentity, NeighborKey, NeighborLocation,
-    DEFAULT_BODY_BYTE_BUDGET, DEFAULT_BODY_LINE_BUDGET,
+    DEFAULT_BODY_BYTE_BUDGET, DEFAULT_BODY_LINE_BUDGET, MAX_FRONTIER,
 };
 use crate::callgraph_store::{CallGraphStore, StoreNode};
 use crate::commands::symbol_render::{render_symbol_within_budget, symbol_kind_string};
@@ -11,7 +11,6 @@ use crate::symbols::{Symbol, SymbolKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_FRONTIER_LIMIT: usize = 40;
 const CACHE_ENTRY_LIMIT: usize = 512;
 
 struct GatherFile {
@@ -321,7 +320,8 @@ fn render_cached(
     let start = declaration.map_or(symbol.range.start_line as usize, |node| {
         node.start_position().row
     });
-    let docs = lines[symbol.range.start_line as usize..start.min(lines.len())]
+    let docs = lines[symbol.range.start_line as usize
+        ..start.max(symbol.range.start_line as usize).min(lines.len())]
         .iter()
         .filter_map(|line| {
             let line = line.trim();
@@ -393,16 +393,79 @@ fn query_neighbors(
     include_tests: bool,
 ) -> Result<Vec<NeighborLocation>, String> {
     let mut locations: Vec<_> = match direction {
-        Direction::Caller => snapshot
-            .direct_callers_of(Path::new(&target.file), &target.symbol)
-            .map_err(|_| "graph_query_failed")?
-            .into_iter()
-            .filter(|site| include_tests || !crate::inspect::job::is_test_file(&site.caller.file))
-            .map(|site| NeighborLocation {
-                path: PathBuf::from(site.caller.file),
-                line: site.line,
-            })
-            .collect(),
+        Direction::Caller => {
+            let mut locations: Vec<_> = snapshot
+                .direct_callers_of(Path::new(&target.file), &target.symbol)
+                .map_err(|_| "graph_query_failed")?
+                .into_iter()
+                .filter(|site| {
+                    include_tests || !crate::inspect::job::is_test_file(&site.caller.file)
+                })
+                .map(|site| NeighborLocation {
+                    path: PathBuf::from(site.caller.file),
+                    line: site.line,
+                })
+                .collect();
+            let templates = if detect_language(Path::new(&target.file)) == Some(LangId::Rust) {
+                snapshot
+                    .ref_sites_named(
+                        crate::callgraph_store::MACRO_BODY_CALL_REF_KIND,
+                        &target.name,
+                        MAX_FRONTIER,
+                    )
+                    .map_err(|_| "graph_query_failed")?
+            } else {
+                Vec::new()
+            };
+            // Macro templates have no direct edges. Their calls are ambiguous when target names repeat.
+            if !templates.is_empty()
+                && !snapshot
+                    .nodes_matching(&target.name)
+                    .map_err(|_| "graph_query_failed")?
+                    .iter()
+                    .any(|node| {
+                        node.name == target.name
+                            && (&node.file, &node.symbol, node.line, node.end_line)
+                                != (&target.file, &target.symbol, target.line, target.end_line)
+                    })
+            {
+                let mut macros = Vec::new();
+                for site in templates {
+                    let Some(name) = site.local_name else {
+                        continue;
+                    };
+                    if locations.len() < MAX_FRONTIER
+                        && (include_tests || !crate::inspect::job::is_test_file(&site.file))
+                    {
+                        locations.push(NeighborLocation {
+                            path: PathBuf::from(site.file),
+                            line: site.line,
+                        });
+                    }
+                    macros.push(name);
+                }
+                macros.sort();
+                macros.dedup();
+                for name in macros {
+                    let remaining = MAX_FRONTIER.saturating_sub(locations.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    for site in snapshot
+                        .ref_sites_named("call", &name, remaining)
+                        .map_err(|_| "graph_query_failed")?
+                    {
+                        if include_tests || !crate::inspect::job::is_test_file(&site.file) {
+                            locations.push(NeighborLocation {
+                                path: PathBuf::from(site.file),
+                                line: site.line,
+                            });
+                        }
+                    }
+                }
+            }
+            locations
+        }
         Direction::Callee => {
             let mut locations = Vec::new();
             for site in snapshot
@@ -432,7 +495,7 @@ fn query_neighbors(
     };
     locations.sort_by(|left, right| left.path.cmp(&right.path).then(left.line.cmp(&right.line)));
     locations.dedup_by(|left, right| left.path == right.path && left.line == right.line);
-    locations.truncate(DEFAULT_FRONTIER_LIMIT);
+    locations.truncate(MAX_FRONTIER);
     Ok(locations)
 }
 
@@ -562,7 +625,7 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
                 );
                 result.nodes.push(node);
                 progressed = true;
-                if result.nodes.len() >= DEFAULT_FRONTIER_LIMIT {
+                if result.nodes.len() >= MAX_FRONTIER {
                     return Ok(result);
                 }
                 break;

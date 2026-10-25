@@ -12,6 +12,18 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Stop after this many decisions when the user does not set a round limit.
+const DEFAULT_MAX_ROUNDS: usize = 3;
+/// Keep this many symbols when the user does not set a node limit.
+const DEFAULT_MAX_NODES: usize = 12;
+/// Per-decision budget when the user does not set one.
+const DEFAULT_DECISION_TIMEOUT_MS: u64 = 3_000;
+/// Full-walk budget when the user does not set one.
+const DEFAULT_DEADLINE_MS: u64 = 8_000;
+/// Leave space for ranked results inside the search response's 50 KiB limit.
+/// This is both the default and the hard output limit.
+const MAX_OUTPUT_BYTES: usize = 12 * 1024;
+
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::commands::semantic_search) struct GatherSettings {
     pub max_rounds: usize,
@@ -45,12 +57,15 @@ impl GatherSettings {
             })
         };
         Ok(Self {
-            max_rounds: count(raw.max_rounds, 3),
-            max_nodes: count(raw.max_nodes, 12),
-            max_frontier: count(raw.max_frontier, 40).min(40),
-            decision_timeout: Duration::from_millis(raw.decision_timeout_ms.unwrap_or(3000)),
-            deadline: Duration::from_millis(raw.deadline_ms.unwrap_or(8000)),
-            max_output_bytes: count(raw.max_output_bytes, 12288).min(12288),
+            max_rounds: count(raw.max_rounds, DEFAULT_MAX_ROUNDS),
+            max_nodes: count(raw.max_nodes, DEFAULT_MAX_NODES),
+            max_frontier: count(raw.max_frontier, super::MAX_FRONTIER).min(super::MAX_FRONTIER),
+            decision_timeout: Duration::from_millis(
+                raw.decision_timeout_ms
+                    .unwrap_or(DEFAULT_DECISION_TIMEOUT_MS),
+            ),
+            deadline: Duration::from_millis(raw.deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS)),
+            max_output_bytes: count(raw.max_output_bytes, MAX_OUTPUT_BYTES).min(MAX_OUTPUT_BYTES),
         })
     }
 }
@@ -151,6 +166,7 @@ fn selected_mode<'a>(request: &GatherWalkRequest<'a>) -> Mode<'a> {
 }
 
 fn hash_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    // The length keeps adjacent fields distinct, such as ["ab", "c"] and ["a", "bc"].
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
 }
@@ -478,10 +494,6 @@ pub(super) fn walk_with_neighbors(
             result.stop_reason = Some("cancelled");
             break;
         }
-        if clock.now() >= walk_deadline {
-            result.stop_reason = Some("deadline");
-            break;
-        }
         let mut decision = match computed {
             Ok(decision) => decision,
             Err(error) => {
@@ -492,6 +504,16 @@ pub(super) fn walk_with_neighbors(
             }
         };
         if clock.now() >= walk_deadline {
+            if !result.fallback_rounds.contains(&round) {
+                record_failure(&mut result, round, "timeout");
+            }
+            apply_keep(
+                &deterministic_decision(&frontier, remaining),
+                &frontier,
+                settings.max_nodes,
+                &mut kept,
+                &mut result.kept,
+            );
             result.stop_reason = Some("deadline");
             break;
         }

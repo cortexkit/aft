@@ -872,8 +872,11 @@ fn gather_walk_full_deadline_preserves_evidence_and_bounds_requests() {
         &clock,
     )
     .unwrap();
-    assert_eq!(result.kept.len(), 1);
+    assert_eq!(result.kept.len(), 3);
     assert_eq!(result.kept[0].name, "parse_config");
+    assert!(result.kept.iter().any(|node| node.name == "load_config"));
+    assert!(result.kept.iter().any(|node| node.name == "read_config"));
+    assert_eq!(result.fallback_reasons, [(2, "timeout")]);
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     assert_eq!(result.stop_reason, Some("deadline"));
     assert_eq!(clock.now(), clock.base + Duration::from_millis(100));
@@ -1191,8 +1194,9 @@ fn gather_walk_reranker_cannot_extend_full_deadline() {
     let mut request = walk_request(&f, &snapshot, &seeds, &search, None);
     request.reranker = Some(&reranker);
     let result = walk::walk_with_clock(&request, &clock).unwrap();
-    assert_eq!(result.kept.len(), 1);
+    assert_eq!(result.kept.len(), 3);
     assert_eq!(result.kept[0].name, "parse_config");
+    assert_eq!(result.fallback_reasons, [(2, "timeout")]);
     assert_eq!(result.stop_reason, Some("deadline"));
     assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
 }
@@ -1241,6 +1245,76 @@ fn gather_walk_preserves_per_seed_graph_gaps() {
             state: "seed_unresolved"
         }]
     );
+}
+
+#[test]
+fn gather_walk_first_round_overrun_keeps_fallback_and_discloses_timeout() {
+    let f = Fixture::new(SOURCE);
+    let seeds = f.seeds(6);
+    let snapshot = f.store.read_snapshot().unwrap();
+    for failed in [false, true] {
+        let clock = FakeWalkClock::new();
+        let mut search = configured_gather_search();
+        search.gather.as_mut().unwrap().deadline_ms = Some(100);
+        search.gather.as_mut().unwrap().decision_timeout_ms = Some(80);
+        let model = ScriptedDecisionModel::new(|_, deadline| {
+            assert_eq!(deadline, clock.base + Duration::from_millis(80));
+            clock.advance(100);
+            if failed {
+                Err(DecisionError::Unavailable)
+            } else {
+                Ok(Decision {
+                    keep: Vec::new(),
+                    expand: Vec::new(),
+                    stop: true,
+                })
+            }
+        });
+        let result = walk::walk_with_neighbors(
+            &walk_request(&f, &snapshot, &seeds, &search, Some(&model)),
+            &clock,
+            |_| panic!("deadline must prevent further graph queries"),
+        )
+        .unwrap();
+        assert_eq!(
+            result.kept.iter().map(|node| &node.id).collect::<Vec<_>>(),
+            seeds.iter().map(|node| &node.id).collect::<Vec<_>>()
+        );
+        assert_eq!(result.fallback_rounds, [1]);
+        assert_eq!(result.fallback_reasons, [(1, "timeout")]);
+        assert_eq!(result.stop_reason, Some("deadline"));
+        assert_eq!(result.rounds, 1);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn gather_graph_macro_callers_keep_positions_and_test_domain() {
+    let source = "fn target() {}\nmacro_rules! dispatch { () => { target(); }; }\nfn caller() { dispatch!(); }\nfn unrelated() {}\n#[cfg(test)]\nfn test_caller() { dispatch!(); }\n";
+    let f = Fixture::new(source);
+    let seeds = f.seeds(1);
+    let snapshot = f.store.read_snapshot().unwrap();
+    let nodes = collect_callgraph_neighbors(&f.ctx, &snapshot, &seeds, false).unwrap();
+    let caller = nodes
+        .iter()
+        .find(|node| node.name == "caller")
+        .expect("macro invocation must reach its target");
+    assert_eq!(caller.path, PathBuf::from("main.rs"));
+    assert_eq!(caller.line, 3);
+    assert_eq!(caller.edge, format!("caller-of-{}", seeds[0].id));
+    assert!(!nodes
+        .iter()
+        .any(|node| matches!(node.name.as_str(), "unrelated" | "test_caller")));
+    let tests = collect_callgraph_neighbors(&f.ctx, &snapshot, &seeds, true).unwrap();
+    assert!(tests
+        .iter()
+        .any(|node| node.name == "test_caller" && node.line == 6));
+
+    let ambiguous = Fixture::new(&format!("{source}mod other {{ pub fn target() {{}} }}\n"));
+    let seeds = ambiguous.seeds(1);
+    let snapshot = ambiguous.store.read_snapshot().unwrap();
+    let nodes = collect_callgraph_neighbors(&ambiguous.ctx, &snapshot, &seeds, true).unwrap();
+    assert!(!nodes.iter().any(|node| node.name == "caller"));
 }
 
 const ENDPOINT_TRACE: &str = "gather_trace_marker_507d5f";

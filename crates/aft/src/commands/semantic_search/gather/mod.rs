@@ -32,6 +32,8 @@ use std::sync::Mutex;
 
 pub(super) const DEFAULT_BODY_LINE_BUDGET: usize = 80;
 pub(super) const DEFAULT_BODY_BYTE_BUDGET: usize = 4096;
+/// Limit graph work and the symbol evidence sent in one decision request.
+pub(super) const MAX_FRONTIER: usize = 40;
 pub(super) type GatherSourceCache = graph::GatherSourceCache;
 pub(super) type GatherGraph = graph::GatherGraph;
 
