@@ -220,6 +220,7 @@ const GatherConfigSchema = z.object({
   max_output_bytes: z.number().int().positive().optional(),
 });
 
+/** Only an explicit `enabled: true` lets the host read message parts. */
 export function gatherEnabled(config: AftConfig): boolean {
   return config.search?.gather?.enabled === true;
 }

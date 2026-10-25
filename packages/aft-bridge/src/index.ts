@@ -393,7 +393,7 @@ export {
   revisionRefArg,
 } from "./revision-reads.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
-export { capSearchContext } from "./search-context.js";
+export { capSearchContext, SEARCH_CONTEXT_MAX_CHARACTERS } from "./search-context.js";
 // --- semantic-index status vocabulary (shared by both plugin hosts) ---
 export type { SemanticBackendDetail, SemanticIndexStatusKind } from "./semantic-status.js";
 export { formatSemanticIndexStatus, semanticIndexStatusKind } from "./semantic-status.js";

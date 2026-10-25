@@ -72,6 +72,30 @@ function expectQueryOnly(fixture: ReturnType<typeof piGatherFixture>) {
 }
 
 describe("Pi gather context through registration", () => {
+  test("whitespace-only thinking, text and user parts do not become context", async () => {
+    const fixture = piGatherFixture();
+    fixture.setBranch([
+      message("user", "user", [{ type: "text", text: " \t\n" }]),
+      message("assistant", "assistant", [
+        { type: "thinking", thinking: " \n" },
+        { type: "text", text: "\t " },
+        { type: "toolCall", id: "call-now", name: "aft_search", arguments: {} },
+      ]),
+    ]);
+    await fixture.search();
+    expectQueryOnly(fixture);
+    fixture.setBranch([
+      message("user", "user", " \n"),
+      message("assistant", "assistant", [
+        { type: "thinking", thinking: "\t" },
+        { type: "text", text: "kept" },
+        { type: "toolCall", id: "call-now", name: "aft_search", arguments: {} },
+      ]),
+    ]);
+    await fixture.search();
+    expect(fixture.calls.at(-1)?.options?.searchContext).toBe("kept");
+  });
+
   test("gatherEnabled reads only an explicit true from live config", () => {
     expect(typeof configModule.gatherEnabled).toBe("function");
     const fixture = piGatherFixture();

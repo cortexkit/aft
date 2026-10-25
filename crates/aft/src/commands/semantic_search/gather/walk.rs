@@ -14,15 +14,10 @@ use std::time::{Duration, Instant};
 
 /// Stop after this many decisions when the user does not set a round limit.
 const DEFAULT_MAX_ROUNDS: usize = 3;
-/// Keep this many symbols when the user does not set a node limit.
-const DEFAULT_MAX_NODES: usize = 12;
 /// Per-decision budget when the user does not set one.
 const DEFAULT_DECISION_TIMEOUT_MS: u64 = 3_000;
 /// Full-walk budget when the user does not set one.
 const DEFAULT_DEADLINE_MS: u64 = 8_000;
-/// Leave space for ranked results inside the search response's 50 KiB limit.
-/// This is both the default and the hard output limit.
-const MAX_OUTPUT_BYTES: usize = 12 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::commands::semantic_search) struct GatherSettings {
@@ -58,14 +53,15 @@ impl GatherSettings {
         };
         Ok(Self {
             max_rounds: count(raw.max_rounds, DEFAULT_MAX_ROUNDS),
-            max_nodes: count(raw.max_nodes, DEFAULT_MAX_NODES),
+            max_nodes: count(raw.max_nodes, super::MAX_NODES).min(super::MAX_NODES),
             max_frontier: count(raw.max_frontier, super::MAX_FRONTIER).min(super::MAX_FRONTIER),
             decision_timeout: Duration::from_millis(
                 raw.decision_timeout_ms
                     .unwrap_or(DEFAULT_DECISION_TIMEOUT_MS),
             ),
             deadline: Duration::from_millis(raw.deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS)),
-            max_output_bytes: count(raw.max_output_bytes, MAX_OUTPUT_BYTES).min(MAX_OUTPUT_BYTES),
+            max_output_bytes: count(raw.max_output_bytes, super::MAX_OUTPUT_BYTES)
+                .min(super::MAX_OUTPUT_BYTES),
         })
     }
 }

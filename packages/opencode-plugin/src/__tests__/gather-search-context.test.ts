@@ -230,6 +230,15 @@ for (const version of [1, 2] as const) {
     expect(f.trace()).not.toContain("secret");
   });
 
+  test(`V${version} drops whitespace-only parts`, async () => {
+    const parts = partsFor(version, "spaces");
+    parts[0].text = " \t\n";
+    parts[1].text = "kept";
+    const f = openCodeGatherFixture({ enabled: true, version, parts });
+    await f.search();
+    expect(f.trace()).toBe(version === 1 ? `kept\n\nuser-${f.defaultSession}` : "kept");
+  });
+
   for (const missing of ["missingMessage", "missingSession"] as const) {
     test(`V${version} ${missing} reads no parts`, async () => {
       const f = openCodeGatherFixture({ enabled: true, version, [missing]: true });

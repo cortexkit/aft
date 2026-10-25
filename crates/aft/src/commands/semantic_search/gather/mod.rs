@@ -43,7 +43,7 @@ pub(super) fn attach(
     }
     let budget = render::available_bytes(response).min(
         GatherSettings::resolve(&config.search)
-            .map_or(12 * 1024, |settings| settings.max_output_bytes),
+            .map_or(MAX_OUTPUT_BYTES, |settings| settings.max_output_bytes),
     );
     if budget == 0 {
         return;
@@ -133,6 +133,9 @@ pub(super) const DEFAULT_BODY_LINE_BUDGET: usize = 80;
 pub(super) const DEFAULT_BODY_BYTE_BUDGET: usize = 4096;
 /// Limit graph work and the symbol evidence sent in one decision request.
 pub(super) const MAX_FRONTIER: usize = 40;
+pub(super) const MAX_NODES: usize = 12;
+/// Keep space for ranked results in the search response's 50 KiB limit.
+pub(super) const MAX_OUTPUT_BYTES: usize = 12 * 1024;
 pub(super) type GatherSourceCache = graph::GatherSourceCache;
 pub(super) type GatherGraph = graph::GatherGraph;
 

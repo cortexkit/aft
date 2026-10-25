@@ -52,7 +52,7 @@ export function collectPiSearchContext(
       }
       break;
     }
-    const trace = text.filter((part) => part.length > 0).join("\n\n");
+    const trace = text.filter((part) => part.trim().length > 0).join("\n\n");
     return trace.length > 0 ? capSearchContext(trace) : undefined;
   } catch (error) {
     warn(`gather context unavailable: ${error instanceof Error ? "Error" : typeof error}`);

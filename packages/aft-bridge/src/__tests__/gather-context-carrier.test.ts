@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RouteHandle } from "@cortexkit/subc-client";
+import { type RouteHandle, SocketClosedError } from "@cortexkit/subc-client";
 import { BinaryBridge } from "../bridge.js";
 import * as bridgeExports from "../index.js";
 import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
@@ -11,6 +11,7 @@ import { TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 import { cachedExecutable } from "./test-utils/cached-executable.js";
 
 test("gather cap keeps newest Unicode characters", () => {
+  expect(bridgeExports.SEARCH_CONTEXT_MAX_CHARACTERS).toBe(6000);
   const input = `discard${"界".repeat(5999)}🙂`;
   const output = bridgeExports.capSearchContext(input);
   expect(Array.from(output)).toHaveLength(6000);
@@ -107,6 +108,86 @@ test("gather subc carries tool and native search context outside arguments", asy
       }
     }
   } finally {
+    await pool.shutdown();
+  }
+});
+
+test("gather context remains per call through deferred admission and reconnect", async () => {
+  let admit!: () => void;
+  let entered!: () => void;
+  const admission = new Promise<void>((resolve) => {
+    admit = resolve;
+  });
+  const opening = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const bodies: Array<{ client: number; body: Record<string, unknown> }> = [];
+  let clients = 0;
+  let fail = false;
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake/connection.json",
+    harness: "opencode",
+    connect: async () => {
+      const client = ++clients;
+      return {
+        routeOpen: async () => {
+          entered();
+          await admission;
+          return { channel: client, epoch: 1 } as RouteHandle;
+        },
+        request: async (_route, body) => {
+          if (fail) {
+            fail = false;
+            throw new SocketClosedError("fixture socket closed");
+          }
+          bodies.push({ client, body: body as Record<string, unknown> });
+          return { structuredContent: { success: true, text: "ok" } };
+        },
+        subscribe: () => ({ closed: new Promise<void>(() => {}), unsubscribe() {} }),
+        closeRouteChannel: async () => {},
+        close() {},
+      } satisfies SubcClientLike;
+    },
+  });
+  try {
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const pending = bridge.toolCall(
+      "a",
+      "search",
+      { query: "how is config loaded" },
+      { searchContext: "trace-a" },
+    );
+    await opening;
+    expect(bodies).toHaveLength(0);
+    admit();
+    await pending;
+    expect(bodies[0]).toMatchObject({ client: 1, body: { search_context: "trace-a" } });
+    fail = true;
+    await expect(
+      bridge.toolCall(
+        "a",
+        "search",
+        { query: "how is config loaded" },
+        { searchContext: "failed-trace" },
+      ),
+    ).rejects.toThrow();
+    await bridge.toolCall(
+      "b",
+      "search",
+      { query: "how is config loaded" },
+      { searchContext: "trace-b" },
+    );
+    expect(clients).toBe(2);
+    expect(bodies[1]).toMatchObject({ client: 2, body: { search_context: "trace-b" } });
+    await bridge.toolCall("a", "search", { query: "how is config loaded" });
+    expect(bodies[2]?.body).not.toHaveProperty("search_context");
+    expect(
+      bodies.every(
+        ({ body }) => !("search_context" in (body.arguments as Record<string, unknown>)),
+      ),
+    ).toBe(true);
+  } finally {
+    admit();
     await pool.shutdown();
   }
 });

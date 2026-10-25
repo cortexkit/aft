@@ -38,6 +38,8 @@ impl GatherSourceCache {
     }
 
     fn allowed(&self, ctx: &AppContext, path: &Path) -> bool {
+        // An edge can point to a denied file. Check access before source loads,
+        // to prevent denied source in symbol output and decision requests.
         let (id, session) = self
             .access
             .as_ref()

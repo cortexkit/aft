@@ -1,9 +1,6 @@
-use super::GatherWalk;
+use super::{GatherWalk, MAX_NODES, MAX_OUTPUT_BYTES};
 use crate::grep_executor::truncate_at_char_boundary;
 use crate::protocol::Response;
-
-const MAX_ADDED_BYTES: usize = 12 * 1024;
-const MAX_NODES: usize = 12;
 
 pub(super) fn available_bytes(response: &Response) -> usize {
     let rendered = crate::subc_format::format_response_with_context(
@@ -14,7 +11,7 @@ pub(super) fn available_bytes(response: &Response) -> usize {
     // Finalization can add a status bar after the search formatter runs.
     super::super::snippet_bounds::SEARCH_MAX_OUTPUT_BYTES
         .saturating_sub(rendered.len().saturating_add(512))
-        .min(MAX_ADDED_BYTES)
+        .min(MAX_OUTPUT_BYTES)
 }
 
 fn append(response: &mut Response, addition: &str, budget: usize) {
@@ -39,6 +36,7 @@ pub(super) fn append_state(response: &mut Response, state: &str, budget: usize) 
         "root_unavailable" => "unavailable",
         "no_seeds" => "no_seeds",
         "configuration_failure" => "configuration_failure",
+        "snapshot_unavailable" => "snapshot_unavailable",
         _ => "walk_failed",
     };
     append(

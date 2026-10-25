@@ -32,7 +32,7 @@ impl EndpointDecisionModel {
         {
             return Err(DecisionError::Refused);
         }
-        let base = endpoint.trim_end_matches('/');
+        let base = url.as_str().trim_end_matches('/');
         let endpoint = if base.ends_with("/chat/completions") {
             base.to_owned()
         } else {

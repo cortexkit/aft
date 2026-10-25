@@ -153,6 +153,38 @@ fn gather_render_preserves_ranked_prefix_and_utf8_caps_with_formatter_overhead()
             assert!(formatted.len() <= 50 * 1024, "{} bytes", formatted.len());
             assert!(text.contains("context: query only"));
             assert!(text.contains("kept=1"));
+            f.ctx.set_harness(crate::harness::Harness::Opencode);
+            f.ctx
+                .update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+            let mut subc = formatted.clone();
+            crate::response_finalize::finalize_tool_response(
+                &mut response,
+                &mut subc,
+                &f.ctx,
+                &format!("subc-{ranked_bytes}"),
+                "search",
+                false,
+            );
+            assert!(subc.contains("[AFT E? W? | D1 U2 C3 | T4]"), "{subc}");
+            assert!(
+                subc.len() <= 50 * 1024,
+                "finalized subc response: {} bytes",
+                subc.len()
+            );
+            crate::response_finalize::finalize_response_with_bg_completions(
+                &mut response,
+                &f.ctx,
+                &format!("ndjson-{ranked_bytes}"),
+                "search",
+                false,
+            );
+            let ndjson = response.data["text"].as_str().unwrap();
+            assert!(ndjson.contains("[AFT E? W? | D1 U2 C3 | T4]"));
+            assert!(
+                ndjson.len() <= 50 * 1024,
+                "finalized NDJSON response: {} bytes",
+                ndjson.len()
+            );
         } else {
             assert_eq!(
                 text, prefix,
@@ -882,9 +914,17 @@ fn gather_decision_settings_default_zero_and_saturation() {
     let settings = GatherSettings::resolve(&search).unwrap();
     assert_eq!(settings.max_frontier, 40);
     assert_eq!(settings.max_output_bytes, 12288);
+    assert_eq!(settings.max_nodes, 12);
+}
+
+#[test]
+fn gather_render_discloses_snapshot_unavailable() {
+    let mut response =
+        crate::protocol::Response::success("state", serde_json::json!({"text":"ranked"}));
+    render::append_state(&mut response, "snapshot_unavailable", 1024);
     assert_eq!(
-        settings.max_nodes,
-        usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+        response.data["text"],
+        "ranked\n\ngather: skipped callgraph=snapshot_unavailable"
     );
 }
 
@@ -1199,7 +1239,7 @@ fn gather_walk_caps_real_frontier_at_forty() {
     let result = gather_walk(&request).unwrap();
     assert_eq!(result.rounds, 2);
     assert_eq!(result.considered, 41);
-    assert_eq!(result.kept.len(), 41);
+    assert_eq!(result.kept.len(), 12);
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -1761,6 +1801,23 @@ fn gather_endpoint_rejects_unsafe_urls_and_missing_configuration() {
             Err(DecisionError::Refused)
         ));
     }
+}
+
+#[test]
+fn gather_endpoint_uses_validated_url_for_request_path() {
+    let server = endpoint_server(
+        200,
+        endpoint_reply(r#"{"keep":["node-1"],"expand":[],"stop":true}"#),
+        None,
+        None,
+    );
+    let config = endpoint_config(&format!(" {}/ ", server.base));
+    endpoint_decide(&config, Duration::from_secs(2)).unwrap();
+    let (headers, _) = server.thread.join().unwrap();
+    assert!(
+        headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"),
+        "{headers}"
+    );
 }
 
 #[test]
