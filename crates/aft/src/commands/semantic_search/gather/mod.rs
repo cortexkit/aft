@@ -131,10 +131,13 @@ use std::sync::Mutex;
 
 pub(super) const DEFAULT_BODY_LINE_BUDGET: usize = 80;
 pub(super) const DEFAULT_BODY_BYTE_BUDGET: usize = 4096;
+pub(super) const MAX_SEEDS: usize = 5;
 /// Limit graph work and the symbol evidence sent in one decision request.
 pub(super) const MAX_FRONTIER: usize = 40;
+/// Limit kept symbols to keep space for ranked results.
 pub(super) const MAX_NODES: usize = 12;
 /// Keep space for ranked results in the search response's 50 KiB limit.
+/// This value is the default and the hard limit for added output.
 pub(super) const MAX_OUTPUT_BYTES: usize = 12 * 1024;
 pub(super) type GatherSourceCache = graph::GatherSourceCache;
 pub(super) type GatherGraph = graph::GatherGraph;

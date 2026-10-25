@@ -1010,15 +1010,19 @@ cannot yet be combined with `path`.
 
 When user config enables `search.gather.enabled`, each natural-language search adds related call-graph symbols after the ranked results. Ranking and agent arguments do not change. A query with `pattern` also collects related code without changing its ranking. Pattern-only and empty-query searches do not walk.
 
-The added section starts with `Related code (gathered for this search` and contains at most 12 symbols and 12 KB. The full response stays below the current 50 KB limit. Its last state line reports `model=`, `rounds=`, `considered=`, `kept=`, `fallback=`, time in seconds, `context: host trace` or `context: query only`, `gaps=` and `stop=`. A missing identity or current stored turn uses query only.
+The added section starts with `Related code (gathered for this search` and contains at most 12 symbols and 12 KB. The full response stays below the current 50 KB limit.
 
-Gather uses at most 5 seed symbols and 40 candidates in each round. It uses 3 rounds, 3 seconds for each decision and 8 seconds for the full walk. AFT limits the frontier to 40. AFT caches decision results in the session for 10 minutes, until the call graph changes.
+Ranked results come first and do not change. On agent-visible output, search status lines and the `shown N of M` trailer stay at the end, after the gather section. Their counts give the number of ranked results only.
+
+The last state line reports `model=`, `rounds=`, `considered=`, `kept=`, `fallback=`, time in seconds, `context: host trace` or `context: query only`, `gaps=` and `stop=`. A missing identity or current stored turn uses query only.
+
+Gather uses at most 5 seed symbols and 40 candidates in each round. It uses 3 rounds, 3 seconds for each decision and 8 seconds for the full walk. AFT caches decision results in the session for 10 minutes, until the call graph changes.
 
 If the graph is not built, or a walk or decision has an error or times out, search keeps the ranked results. It adds one state line.
 
 The state line can report these values:
 
-| State | Meaning |
+| Reported value | Meaning |
 |---|---|
 | `building` | The call graph is building. |
 | `suspended` | The store pauses the graph. |
@@ -1027,7 +1031,8 @@ The state line can report these values:
 | `error` | The call graph has an error. |
 | `no_seeds` | Search found no seed symbols. |
 | `configuration_failure` | The decision config has an error. |
-| `walk_failed` | The walk has an error. |
+| `snapshot_unavailable` | The call-graph snapshot is not available. |
+| `walk_failed` | All other walk failures. |
 | `output_budget` | The response has no space for gather output. |
 | `other_project` | The call graph belongs to a different project. |
 

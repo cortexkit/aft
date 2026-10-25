@@ -543,6 +543,18 @@ fn assert_ranked_unchanged(plain: &Response, gathered: &Response) {
     );
     let plain_text = plain.data["text"].as_str().unwrap();
     let gathered_text = gathered.data["text"].as_str().unwrap();
+    assert_eq!(
+        gathered_text.matches("gather:").count(),
+        1,
+        "gather disclosure must appear exactly once: {gathered_text}"
+    );
+    assert!(
+        gathered_text
+            .matches("Related code (gathered for this search")
+            .count()
+            <= 1,
+        "gather section must not repeat: {gathered_text}"
+    );
     let suffix_start = plain_text
         .find("\nSearch status:")
         .or_else(|| plain_text.find("\n\nshown "))

@@ -629,7 +629,9 @@ OpenCode 1 and Pi send the agent's thinking and assistant text shown to the user
 
 OMP has no tested trace collection. It uses the query only. AFT keeps the newest 6000 characters, so the last user text stays in the trace. No host reads conversation text while gather is off.
 
-If the call graph is not built, or a walk or decision has an error or times out, search keeps its ranked results. It adds one state line. A search with `path` in a different project reports `callgraph=unavailable reason=other_project`. Gather does not use a graph from a different project. Gather does not read or show files that the session cannot read.
+If the call graph is not built, or a walk or decision has an error or times out, search keeps its ranked results. It adds one state line. A call-graph snapshot failure reports `snapshot_unavailable`. The value `walk_failed` means all other walk failures.
+
+A search with `path` in a different project reports `callgraph=unavailable reason=other_project`. Gather does not use a graph from a different project. Gather does not read or show files that the session cannot read.
 
 ## Reading at a git revision
 

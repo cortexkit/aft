@@ -60,6 +60,53 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   }
 });
 
+test.each([
+  ["null", null, undefined],
+  ["missing", undefined, undefined],
+  ["number", 42, undefined],
+  ["object", { marker: "junk" }, undefined],
+  ["empty", "", ""],
+  ["short", "trace-marker", "trace-marker"],
+  ["over cap", `discard${"界".repeat(5999)}🙂`, `${"界".repeat(5999)}🙂`],
+])("gather BinaryBridge native send handles %s context", async (_label, value, expected) => {
+  const executable = cachedExecutable(`#!/usr/bin/env node
+const readline = require("node:readline");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const req = JSON.parse(line);
+  process.stdout.write(JSON.stringify({ id: req.id, success: true, text: "ok", captured: req }) + "\\n");
+});
+`);
+  const root = mkdtempSync(join(tmpdir(), "gather-native-carrier-"));
+  const bridge = new BinaryBridge(executable, root, { timeoutMs: 10000, maxRestarts: 0 });
+  try {
+    for (const args of [
+      { query: "config loading" },
+      { query: "config loading", method: "payload" },
+    ]) {
+      const params = { ...args, search_context: value };
+      const reply = await bridge.send("semantic_search", params);
+      const captured = reply.captured as Record<string, unknown>;
+      if (expected === undefined) {
+        expect(captured).not.toHaveProperty("search_context");
+      } else {
+        expect(captured.search_context).toBe(expected);
+      }
+      if ("method" in args) {
+        expect(captured.params).toEqual(args);
+      } else {
+        expect(captured).toMatchObject(args);
+        expect(captured).not.toHaveProperty("params");
+      }
+      expect(params).toEqual({ ...args, search_context: value });
+    }
+    const plain = await bridge.send("status", { search_context: value });
+    expect(plain.captured).not.toHaveProperty("search_context");
+  } finally {
+    await bridge.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("gather subc carries tool and native search context outside arguments", async () => {
   const bodies: Record<string, unknown>[] = [];
   const client: SubcClientLike = {

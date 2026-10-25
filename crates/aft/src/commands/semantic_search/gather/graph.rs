@@ -1,6 +1,6 @@
 use super::{
     Direction, GatherGap, GatherNode, GraphIdentity, NeighborKey, NeighborLocation,
-    DEFAULT_BODY_BYTE_BUDGET, DEFAULT_BODY_LINE_BUDGET, MAX_FRONTIER,
+    DEFAULT_BODY_BYTE_BUDGET, DEFAULT_BODY_LINE_BUDGET, MAX_FRONTIER, MAX_SEEDS,
 };
 use crate::callgraph_store::{CallGraphStore, StoreNode};
 use crate::commands::symbol_render::{render_symbol_within_budget, symbol_kind_string};
@@ -293,7 +293,7 @@ pub(super) fn resolve_seeds_for_request(
         .filter_map(|(ordinal, (path, line))| {
             code_path(&root, path).map(|path| (ordinal, path, *line))
         })
-        .take(5)
+        .take(MAX_SEEDS)
         .filter(|(_, path, _)| {
             include_tests
                 || !crate::inspect::job::is_test_file(
