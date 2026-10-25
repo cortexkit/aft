@@ -6,10 +6,15 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { canonicalizeProjectRoot, coerceBoolean } from "@cortexkit/aft-bridge";
+import {
+  canonicalizeProjectRoot,
+  coerceBoolean,
+  type ToolCallOptions,
+} from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
+import { collectPiSearchContext } from "../shared/search-context.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -331,7 +336,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       ].join("\n\n"),
       parameters: SearchParams,
       async execute(
-        _toolCallId: string,
+        toolCallId: string,
         params: Static<typeof SearchParams>,
         signal,
         _onUpdate,
@@ -370,13 +375,12 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         if (params.offset !== undefined) req.offset = params.offset;
         if (includeTests !== undefined) req.includeTests = includeTests;
         if (params.path !== undefined) req.path = params.path;
-        const response = await callToolCall(
-          bridge,
-          "search",
-          req,
-          extCtx,
-          signal ? { abortSignal: signal } : undefined,
-        );
+        const options: ToolCallOptions = signal ? { abortSignal: signal } : {};
+        if (ctx.config.search?.gather?.enabled === true) {
+          const searchContext = collectPiSearchContext(ctx.config, extCtx, toolCallId);
+          if (searchContext !== undefined) options.searchContext = searchContext;
+        }
+        const response = await callToolCall(bridge, "search", req, extCtx, options);
         if (response.success === false) {
           throw new Error(response.text || response.message || "search failed");
         }
