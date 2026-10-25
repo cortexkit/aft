@@ -1,5 +1,7 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as configModule from "../config.js";
+import * as logger from "../logger.js";
 import { registerSemanticTool } from "../tools/semantic.js";
 import {
   makeExtContext,
@@ -70,6 +72,22 @@ function expectQueryOnly(fixture: ReturnType<typeof piGatherFixture>) {
 }
 
 describe("Pi gather context through registration", () => {
+  test("gatherEnabled reads only an explicit true from live config", () => {
+    expect(typeof configModule.gatherEnabled).toBe("function");
+    const fixture = piGatherFixture();
+    expect(configModule.gatherEnabled(fixture.ctx.config)).toBe(true);
+    fixture.ctx.config.search = { gather: { enabled: false } };
+    expect(configModule.gatherEnabled(fixture.ctx.config)).toBe(false);
+    fixture.ctx.config.search = { gather: {} };
+    expect(configModule.gatherEnabled(fixture.ctx.config)).toBe(false);
+    fixture.ctx.config.search = {};
+    expect(configModule.gatherEnabled(fixture.ctx.config)).toBe(false);
+    fixture.ctx.config.search = undefined;
+    expect(configModule.gatherEnabled(fixture.ctx.config)).toBe(false);
+    Object.assign(fixture.ctx.config, { search: { gather: { enabled: "true" } } });
+    expect(configModule.gatherEnabled(fixture.ctx.config)).toBe(false);
+  });
+
   test("gather off never reads the Pi branch", async () => {
     const fixture = piGatherFixture({ enabled: false });
     await fixture.search();
@@ -92,7 +110,7 @@ describe("Pi gather context through registration", () => {
     await fixture.search();
     expect(fixture.getBranch).toHaveBeenCalledWith("assistant");
     expect(fixture.calls[0].options?.searchContext).toBe(
-      "current user\ncurrent thinking\ncurrent text",
+      "current thinking\n\ncurrent text\n\ncurrent user",
     );
     expect(fixture.calls[0].params.arguments).toEqual({ query: "how is config loaded" });
   });
@@ -103,7 +121,7 @@ describe("Pi gather context through registration", () => {
     const signal = new AbortController().signal;
     await fixture.search("call-now", args, signal);
     expect(fixture.calls[0].options?.searchContext).toBe(
-      "current user\ncurrent thinking\ncurrent text",
+      "current thinking\n\ncurrent text\n\ncurrent user",
     );
     expect(fixture.calls[0].options?.abortSignal).toBe(signal);
     expect(fixture.calls[0].params.arguments).toEqual(args);
@@ -163,9 +181,9 @@ describe("Pi gather context through registration", () => {
     expectQueryOnly(fixture);
   });
 
-  test("OMP minimal contexts without branch APIs return query-only", async () => {
+  test("a minimal Pi-shaped session manager without branch APIs returns query-only", async () => {
     const fixture = piGatherFixture();
-    fixture.extCtx.sessionManager = makeExtContext(process.cwd(), "omp-session").sessionManager;
+    fixture.extCtx.sessionManager = makeExtContext(process.cwd(), "minimal-session").sessionManager;
     await fixture.search();
     expectQueryOnly(fixture);
   });
@@ -202,6 +220,40 @@ describe("Pi gather context through registration", () => {
     expectQueryOnly(fixture);
   });
 
+  test("a read exception logs only its kind without error or context text", async () => {
+    const diagnostic = spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      const fixture = piGatherFixture();
+      const failure = new Error("private-error-body");
+      failure.name = "private-error-name";
+      fixture.getBranch.mockImplementation(() => {
+        throw failure;
+      });
+      await fixture.search();
+      expectQueryOnly(fixture);
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      expect(diagnostic).toHaveBeenCalledWith("gather context unavailable: Error");
+    } finally {
+      diagnostic.mockRestore();
+    }
+  });
+
+  test("a non-Error read exception logs only the value type", async () => {
+    const diagnostic = spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      const fixture = piGatherFixture();
+      fixture.getLeafEntry.mockImplementation(() => {
+        throw "private-error-body";
+      });
+      await fixture.search();
+      expectQueryOnly(fixture);
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      expect(diagnostic).toHaveBeenCalledWith("gather context unavailable: string");
+    } finally {
+      diagnostic.mockRestore();
+    }
+  });
+
   test("a branch that does not end at the captured leaf returns query-only", async () => {
     const fixture = piGatherFixture();
     fixture.getBranch.mockImplementation(() => storedBranch().slice(0, -1));
@@ -209,7 +261,7 @@ describe("Pi gather context through registration", () => {
     expectQueryOnly(fixture);
   });
 
-  test("caps the joined trace to the newest 6000 Unicode characters", async () => {
+  test("caps long reasoning to 6000 Unicode characters while retaining the newest user text", async () => {
     const fixture = piGatherFixture();
     fixture.setBranch([
       message("user", "user", "user prefix"),
@@ -219,7 +271,10 @@ describe("Pi gather context through registration", () => {
       ]),
     ]);
     await fixture.search();
-    expect(fixture.calls[0].options?.searchContext).toBe(`${"界".repeat(5999)}🙂`);
+    const context = fixture.calls[0].options?.searchContext;
+    expect(context === `${"界".repeat(5986)}🙂\n\nuser prefix`).toBe(true);
+    expect(Array.from(String(context))).toHaveLength(6000);
+    expect(String(context).endsWith("🙂\n\nuser prefix")).toBe(true);
   });
 
   test("string user content and an assistant without preceding text remain valid", async () => {
@@ -238,7 +293,7 @@ describe("Pi gather context through registration", () => {
     const fixture = piGatherFixture();
     await fixture.search();
     expect(fixture.calls[0].options?.searchContext).toBe(
-      "current user\ncurrent thinking\ncurrent text",
+      "current thinking\n\ncurrent text\n\ncurrent user",
     );
     fixture.ctx.config = { ...fixture.ctx.config, search: { gather: { enabled: false } } };
     fixture.getBranch.mockClear();
@@ -258,8 +313,8 @@ describe("Pi gather context through registration", () => {
     const second = fixture.search();
     await Promise.all([first, second]);
     expect(fixture.calls.map((call) => call.options?.searchContext)).toEqual([
-      "first user\nfirst thinking\nfirst text",
-      "second user\nsecond thinking\nsecond text",
+      "first thinking\n\nfirst text\n\nfirst user",
+      "second thinking\n\nsecond text\n\nsecond user",
     ]);
   });
 });

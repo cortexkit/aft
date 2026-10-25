@@ -810,6 +810,10 @@ const GatherConfigSchema = z.object({
   max_output_bytes: z.number().int().positive().optional(),
 });
 
+export function gatherEnabled(config: AftConfig): boolean {
+  return config.search?.gather?.enabled === true;
+}
+
 const SearchConfigSchema = z.object({
   rerank: RerankConfigSchema.optional(),
   gather: GatherConfigSchema.optional(),

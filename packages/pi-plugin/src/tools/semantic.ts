@@ -14,6 +14,7 @@ import {
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
+import { gatherEnabled } from "../config.js";
 import { collectPiSearchContext } from "../shared/search-context.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -376,7 +377,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         if (includeTests !== undefined) req.includeTests = includeTests;
         if (params.path !== undefined) req.path = params.path;
         const options: ToolCallOptions = signal ? { abortSignal: signal } : {};
-        if (ctx.config.search?.gather?.enabled === true) {
+        if (gatherEnabled(ctx.config)) {
           const searchContext = collectPiSearchContext(ctx.config, extCtx, toolCallId);
           if (searchContext !== undefined) options.searchContext = searchContext;
         }
