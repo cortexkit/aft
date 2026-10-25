@@ -1008,13 +1008,32 @@ cannot yet be combined with `path`.
 
 #### Related-code gathering
 
-When user config enables `search.gather.enabled`, each natural-language search adds related call-graph symbols after the ranked results. Ranking and agent arguments do not change. A query with `pattern` also gathers without changing its ranking. Pattern-only and empty-query searches do not walk.
+When user config enables `search.gather.enabled`, each natural-language search adds related call-graph symbols after the ranked results. Ranking and agent arguments do not change. A query with `pattern` also collects related code without changing its ranking. Pattern-only and empty-query searches do not walk.
 
-The added section starts with `Related code (gathered for this search` and contains at most 12 symbols and 12 KB. The whole response stays within the existing 50 KB cap. Its final state line reports rounds, kept and considered counts, the decision source, and the context source (`host trace` or `query only`). A missing identity or current stored turn uses query-only context.
+The added section starts with `Related code (gathered for this search` and contains at most 12 symbols and 12 KB. The full response stays below the current 50 KB limit. Its last state line reports `model=`, `rounds=`, `considered=`, `kept=`, `fallback=`, time in seconds, `context: host trace` or `context: query only`, `gaps=` and `stop=`. A missing identity or current stored turn uses query only.
 
-Gather uses at most 5 seed symbols, 40 candidates per round, 3 rounds, 3 seconds per decision and 8 seconds for the full walk. Values above 40 for the frontier are clamped. Decision results are cached per session for 10 minutes. A graph that is not ready, a walk error, a decision failure or a timeout keeps the normal search results and adds one disclosed state line. A path in another project reports `callgraph=unavailable reason=other_project`.
+Gather uses at most 5 seed symbols and 40 candidates in each round. It uses 3 rounds, 3 seconds for each decision and 8 seconds for the full walk. AFT limits the frontier to 40. AFT caches decision results in the session for 10 minutes, until the call graph changes.
 
-Without a configured decision backend, selection is deterministic and makes no network request. The `endpoint` backend sends trace text and candidate code to its endpoint outside host redaction. See [gather configuration and privacy](config.md#related-code-gathering) before enabling it. Files that the session may not read are not read or shown.
+If the graph is not built, or a walk or decision has an error or times out, search keeps the ranked results. It adds one state line.
+
+The state line can report these values:
+
+| State | Meaning |
+|---|---|
+| `building` | The call graph is building. |
+| `suspended` | The store pauses the graph. |
+| `unavailable` | The call graph is unavailable. |
+| `off` | The call graph is off. |
+| `error` | The call graph has an error. |
+| `no_seeds` | Search found no seed symbols. |
+| `configuration_failure` | The decision config has an error. |
+| `walk_failed` | The walk has an error. |
+| `output_budget` | The response has no space for gather output. |
+| `other_project` | The call graph belongs to a different project. |
+
+A search with `path` in a different project reports `callgraph=unavailable reason=other_project`.
+
+Without a configured decision backend, selection is deterministic and makes no network request. The `endpoint` backend sends trace text and candidate code to its endpoint. Host redaction does not apply to this request. See [gather configuration and privacy](config.md#related-code-gathering) before enabling it. Gather does not read or show files that the session cannot read.
 
 #### Cross-project search
 

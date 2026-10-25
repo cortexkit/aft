@@ -591,7 +591,7 @@ See [Synapse search backends](synapse-search-backends.md) for the wire details o
 
 ## Related-code gathering
 
-`search.gather` adds call-graph context after the ranked `aft_search` results. It is off by default. Only user config can enable it. Project config can turn it off, but cannot enable it or set its decision endpoint, model, key or limits.
+`search.gather` adds call-graph context after the ranked `aft_search` results. It is off by default. Set `"enabled": true` in user config to turn it on. Project config can turn it off, but cannot enable it or set its decision endpoint, model, key or limits.
 
 ```jsonc
 {
@@ -615,17 +615,21 @@ See [Synapse search backends](synapse-search-backends.md) for the wire details o
 }
 ```
 
-Each value is a prototype default, revisable when #890 answers. AFT clamps `max_frontier` to 40. Gather uses at most 5 seed symbols, 3 rounds, 12 kept symbols and 12 KB of added output. The full response stays within the existing 50 KB cap. One decision has a 3 s limit and the full walk has an 8 s limit. Decision results are cached per session for 10 minutes.
+Each value is a prototype default, revisable when #890 answers. AFT limits `max_frontier` to 40. Gather uses at most 5 seed symbols, 3 rounds, 12 kept symbols and 12 KB of added output. The full response stays below the current 50 KB limit. One decision has a 3 s limit and the full walk has an 8 s limit. AFT caches decision results in the session for 10 minutes, until the call graph changes.
 
-Gather runs on natural-language searches, including a query used with `pattern`. It does not change ranking or agent arguments. Pattern-only and empty-query searches do not walk. If identity or the current stored turn is unavailable, AFT uses the query only. A missing decision backend uses deterministic selection and makes no network request.
+Gather runs on natural-language searches, also for a query used with `pattern`. It does not change ranking or agent arguments. Pattern-only and empty-query searches do not walk. If identity or the current stored turn is unavailable, AFT uses the query only. A missing decision backend uses deterministic selection and makes no network request.
 
-The decision backend, endpoint, model and `api_key_env` are user-tier settings. AFT appends `/chat/completions` to the configured base URL. The key is read from the environment variable named by `api_key_env`, never from a value in project config. In daemon (`subc`) mode, the key comes from the daemon module's environment under normal daemon custody grants.
+The decision backend, endpoint, model and `api_key_env` are user-tier settings. AFT appends `/chat/completions` to the configured base URL unless the URL ends with `/chat/completions`. The key comes from the environment entry named by `api_key_env`, not from project config. In daemon (`subc`) mode, the key comes from the daemon module's environment. The usual daemon custody grants apply.
 
 User harness search overrides now keep the base `search.rerank` block when the harness sets only `search.gather`. An explicit harness `search.rerank` block replaces the whole base rerank block, as before.
 
-**Privacy:** Backend `endpoint` sends the trace and candidate symbol code to the configured endpoint outside host redaction. The trace can contain reasoning, visible assistant text and the newest user text. Use a local endpoint for private code. This version has no redaction hook, and host secret guards do not inspect this request. Gather logs only lengths, counts and timings. It does not read conversation text while gather is off.
+**Privacy:** Backend `endpoint` sends the trace and candidate symbol code to the configured endpoint. Host redaction does not apply to this request. Use a local endpoint for private code. This version has no redaction hook. AFT does not log the trace, prompts, model requests or responses. It does not read conversation text while gather is off.
 
-If the call graph is not ready, a walk fails, or a decision fails or times out, search keeps its normal results and adds one state line. A search with `path` in another project reports `callgraph=unavailable reason=other_project`; gather does not use a graph from another project. Files that the session cannot read are not read or shown.
+OpenCode 1 and Pi send the agent's thinking and assistant text shown to the user before the call. They add the newest user text last. OpenCode 2.1 sends only the current assistant message's thinking and text. It does not send a user message.
+
+OMP has no tested trace collection. It uses the query only. AFT keeps the newest 6000 characters, so the last user text stays in the trace. No host reads conversation text while gather is off.
+
+If the call graph is not built, or a walk or decision has an error or times out, search keeps its ranked results. It adds one state line. A search with `path` in a different project reports `callgraph=unavailable reason=other_project`. Gather does not use a graph from a different project. Gather does not read or show files that the session cannot read.
 
 ## Reading at a git revision
 
