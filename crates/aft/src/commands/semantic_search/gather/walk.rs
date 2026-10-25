@@ -95,7 +95,7 @@ impl WalkClock for SystemWalkClock {
 
 enum Mode<'a> {
     Deterministic,
-    Model(&'a dyn DecisionModel),
+    Model(Box<dyn DecisionModel + 'a>),
     Failed(&'static str),
 }
 
@@ -138,9 +138,13 @@ fn selected_mode<'a>(request: &GatherWalkRequest<'a>) -> Mode<'a> {
             if !configured {
                 Mode::Failed("configuration_failure")
             } else {
-                request
-                    .model
-                    .map_or(Mode::Failed("unavailable"), Mode::Model)
+                match request.model {
+                    Some(model) => Mode::Model(Box::new(model)),
+                    None => match super::endpoint::EndpointDecisionModel::new(decision.unwrap()) {
+                        Ok(model) => Mode::Model(Box::new(model)),
+                        Err(_) => Mode::Failed("configuration_failure"),
+                    },
+                }
             }
         }
     }
@@ -438,7 +442,7 @@ pub(super) fn walk_with_neighbors(
         let computed = if let Some(decision) = cached {
             Ok(decision)
         } else {
-            match mode {
+            match &mode {
                 Mode::Deterministic => {
                     rerank_ties(request, &mut frontier, &settings, clock, round_deadline);
                     Ok(deterministic_decision(&frontier, remaining))

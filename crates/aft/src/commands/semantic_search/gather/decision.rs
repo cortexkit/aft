@@ -55,6 +55,24 @@ pub(in crate::commands::semantic_search) trait DecisionModel:
 
 pub(in crate::commands::semantic_search) struct DeterministicDecisionModel;
 
+impl<T: DecisionModel + ?Sized> DecisionModel for &T {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn fingerprint(&self) -> String {
+        (**self).fingerprint()
+    }
+
+    fn decide(
+        &self,
+        input: &DecisionInput<'_>,
+        deadline: Instant,
+    ) -> Result<Decision, DecisionError> {
+        (**self).decide(input, deadline)
+    }
+}
+
 impl DecisionModel for DeterministicDecisionModel {
     fn name(&self) -> &str {
         "deterministic"
