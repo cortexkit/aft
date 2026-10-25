@@ -665,6 +665,48 @@ pub struct RerankConfig {
 pub struct SearchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gather: Option<GatherConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatherConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<GatherDecisionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_frontier: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatherDecisionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<GatherDecisionBackend>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatherDecisionBackend {
+    Endpoint,
 }
 
 impl Config {

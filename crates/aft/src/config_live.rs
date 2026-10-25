@@ -974,6 +974,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     // Search reranking is read per request, so a change applies to the next
     // search.
     live!("search.rerank", search.rerank);
+    live!("search.gather", search.gather);
     // Integrations.
     later!("github.shim", github.shim);
     later!("github.read", github.read);

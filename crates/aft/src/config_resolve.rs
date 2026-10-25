@@ -13,15 +13,16 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectCategories, InspectConfig, LspIdleMinutes, RemoteExecConfig, RerankBackendKind,
-    RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
-    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GatherConfig,
+    GatherDecisionBackend, GatherDecisionConfig, GhShimConfig, GitConfig, GithubConfig, IdleConfig,
+    IndexConfig, IndexKind, IndexRootConfig, IndexesConfig, InspectCategories, InspectConfig,
+    LspIdleMinutes, RemoteExecConfig, RerankBackendKind, RerankConfig, SandboxConfig, SearchConfig,
+    SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
+    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config;
 use crate::harness::Harness;
@@ -329,6 +330,38 @@ impl RawSemantic {
 #[serde(default)]
 pub struct RawSearch {
     pub rerank: Option<RawRerank>,
+    pub gather: Option<RawGather>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawGather {
+    pub enabled: Option<bool>,
+    pub decision: Option<RawGatherDecision>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub max_rounds: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub max_nodes: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub max_frontier: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub decision_timeout_ms: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub deadline_ms: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub max_output_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawGatherDecision {
+    pub backend: Option<GatherDecisionBackend>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub endpoint: Option<String>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub model: Option<String>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub api_key_env: Option<String>,
 }
 
 /// Raw `search.rerank`. Parsing only: defaults and clamps belong to the search
@@ -1572,7 +1605,48 @@ fn apply_harness_override(
             // A project harness block, like the project base, may only turn an
             // index off; a user harness block overrides the user base.
             let override_indexes = override_config.indexes.take();
+            let search_floor = if trusted { None } else { raw.search.clone() };
+            if !trusted {
+                if search_floor
+                    .as_ref()
+                    .and_then(|search| search.gather.as_ref())
+                    .is_some_and(|gather| gather.enabled == Some(false))
+                    && override_config
+                        .search
+                        .as_ref()
+                        .and_then(|search| search.gather.as_ref())
+                        .is_some_and(|gather| gather.enabled == Some(true))
+                {
+                    push_drop(
+                        dropped,
+                        "search.gather.enabled",
+                        &tier.tier,
+                        USER_ONLY_REASON,
+                    );
+                }
+                if search_floor
+                    .as_ref()
+                    .and_then(|search| search.rerank.as_ref())
+                    .is_some_and(|rerank| rerank.backend == Some(RerankBackendKind::Off))
+                    && override_config
+                        .search
+                        .as_ref()
+                        .and_then(|search| search.rerank.as_ref())
+                        .and_then(|rerank| rerank.backend)
+                        .is_some_and(|backend| backend != RerankBackendKind::Off)
+                {
+                    push_drop(
+                        dropped,
+                        "search.rerank.backend",
+                        &tier.tier,
+                        RERANK_PROJECT_REASON,
+                    );
+                }
+            }
             merge_trusted_config(raw, override_config);
+            if !trusted {
+                raw.search = merge_project_search(raw.search.take(), search_floor);
+            }
             raw.indexes = merge_indexes(raw.indexes, override_indexes, !trusted);
         }
         Err(_) => warnings.push(ConfigWarning {
@@ -1700,9 +1774,7 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.semantic.is_some() {
         base.semantic = override_config.semantic;
     }
-    if override_config.search.is_some() {
-        base.search = override_config.search;
-    }
+    base.search = merge_trusted_search(base.search.take(), override_config.search);
     if override_config.auto_update.is_some() {
         base.auto_update = override_config.auto_update;
     }
@@ -1791,23 +1863,72 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
 }
 
-/// A project may set `search.rerank.backend` to `"off"` and nothing else;
-/// `record_project_drops` reports every other value it supplied.
+fn merge_trusted_search(base: Option<RawSearch>, next: Option<RawSearch>) -> Option<RawSearch> {
+    let Some(next) = next else { return base };
+    let mut base = base.unwrap_or_default();
+    macro_rules! take_defined {
+        ($base:ident, $next:ident, $($field:ident),+ $(,)?) => {
+            $(if $next.$field.is_some() { $base.$field = $next.$field; })+
+        };
+    }
+    if let Some(next) = next.rerank {
+        let base = base.rerank.get_or_insert_with(RawRerank::default);
+        take_defined!(
+            base,
+            next,
+            backend,
+            model,
+            endpoint,
+            api_key_env,
+            top_n,
+            timeout_ms
+        );
+    }
+    if let Some(next) = next.gather {
+        let base = base.gather.get_or_insert_with(RawGather::default);
+        take_defined!(
+            base,
+            next,
+            enabled,
+            max_rounds,
+            max_nodes,
+            max_frontier,
+            decision_timeout_ms,
+            deadline_ms,
+            max_output_bytes
+        );
+        if let Some(next) = next.decision {
+            let base = base.decision.get_or_insert_with(RawGatherDecision::default);
+            take_defined!(base, next, backend, endpoint, model, api_key_env);
+        }
+    }
+    Some(base)
+}
+
+/// Project search settings can only disable collection or reranking.
 fn merge_project_search(base: Option<RawSearch>, project: Option<RawSearch>) -> Option<RawSearch> {
-    let disables = project
-        .and_then(|search| search.rerank)
+    let disables_rerank = project
+        .as_ref()
+        .and_then(|search| search.rerank.as_ref())
         .is_some_and(|rerank| rerank.backend == Some(RerankBackendKind::Off));
-    if !disables {
+    let disables_gather = project
+        .as_ref()
+        .and_then(|search| search.gather.as_ref())
+        .is_some_and(|gather| gather.enabled == Some(false));
+    if !disables_rerank && !disables_gather {
         return base;
     }
     let mut search = base.unwrap_or_default();
-    search.rerank.get_or_insert_with(RawRerank::default).backend = Some(RerankBackendKind::Off);
+    if disables_rerank {
+        search.rerank.get_or_insert_with(RawRerank::default).backend = Some(RerankBackendKind::Off);
+    }
+    if disables_gather {
+        search.gather.get_or_insert_with(RawGather::default).enabled = Some(false);
+    }
     Some(search)
 }
 
-/// Carry the parsed `search` block into the runtime config unchanged. An
-/// all-empty `rerank` object is kept as absent so it serializes the same as no
-/// block at all.
+/// Empty search blocks stay absent so omitted fields do not receive defaults.
 fn resolve_search_config(raw: Option<&RawSearch>) -> SearchConfig {
     let rerank = raw
         .and_then(|search| search.rerank.as_ref())
@@ -1821,6 +1942,28 @@ fn resolve_search_config(raw: Option<&RawSearch>) -> SearchConfig {
         });
     SearchConfig {
         rerank: rerank.filter(|rerank| *rerank != RerankConfig::default()),
+        gather: raw
+            .and_then(|search| search.gather.as_ref())
+            .map(|gather| GatherConfig {
+                enabled: gather.enabled,
+                decision: gather
+                    .decision
+                    .as_ref()
+                    .map(|decision| GatherDecisionConfig {
+                        backend: decision.backend,
+                        endpoint: decision.endpoint.clone(),
+                        model: decision.model.clone(),
+                        api_key_env: decision.api_key_env.clone(),
+                    })
+                    .filter(|decision| *decision != GatherDecisionConfig::default()),
+                max_rounds: gather.max_rounds,
+                max_nodes: gather.max_nodes,
+                max_frontier: gather.max_frontier,
+                decision_timeout_ms: gather.decision_timeout_ms,
+                deadline_ms: gather.deadline_ms,
+                max_output_bytes: gather.max_output_bytes,
+            })
+            .filter(|gather| *gather != GatherConfig::default()),
     }
 }
 
@@ -2562,6 +2705,48 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         ] {
             if present {
                 push_drop(dropped, key, tier, RERANK_PROJECT_REASON);
+            }
+        }
+    }
+
+    if let Some(gather) = raw
+        .search
+        .as_ref()
+        .and_then(|search| search.gather.as_ref())
+    {
+        for (key, present) in [
+            ("enabled", gather.enabled == Some(true)),
+            ("max_rounds", gather.max_rounds.is_some()),
+            ("max_nodes", gather.max_nodes.is_some()),
+            ("max_frontier", gather.max_frontier.is_some()),
+            ("decision_timeout_ms", gather.decision_timeout_ms.is_some()),
+            ("deadline_ms", gather.deadline_ms.is_some()),
+            ("max_output_bytes", gather.max_output_bytes.is_some()),
+        ] {
+            if present {
+                push_drop(
+                    dropped,
+                    &format!("search.gather.{key}"),
+                    tier,
+                    USER_ONLY_REASON,
+                );
+            }
+        }
+        if let Some(decision) = &gather.decision {
+            for (key, present) in [
+                ("backend", decision.backend.is_some()),
+                ("endpoint", decision.endpoint.is_some()),
+                ("model", decision.model.is_some()),
+                ("api_key_env", decision.api_key_env.is_some()),
+            ] {
+                if present {
+                    push_drop(
+                        dropped,
+                        &format!("search.gather.decision.{key}"),
+                        tier,
+                        USER_ONLY_REASON,
+                    );
+                }
             }
         }
     }
@@ -3542,6 +3727,196 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gather_config_enablement_and_trust_matrix() {
+        for harness in [Harness::Opencode, Harness::Pi] {
+            for nested in [false, true] {
+                for (user, project, enabled) in [
+                    (serde_json::json!({}), serde_json::json!({}), false),
+                    (
+                        serde_json::json!({"enabled":true}),
+                        serde_json::json!({}),
+                        true,
+                    ),
+                    (
+                        serde_json::json!({"enabled":true}),
+                        serde_json::json!({"enabled":false}),
+                        false,
+                    ),
+                    (
+                        serde_json::json!({}),
+                        serde_json::json!({"enabled":true}),
+                        false,
+                    ),
+                    (
+                        serde_json::json!({"enabled":false}),
+                        serde_json::json!({"enabled":true}),
+                        false,
+                    ),
+                ] {
+                    let doc = |gather| {
+                        let fields = serde_json::json!({"search":{"gather":gather}});
+                        if nested {
+                            let name = match harness {
+                                Harness::Opencode => "opencode",
+                                _ => "pi",
+                            };
+                            serde_json::json!({"harnesses":{name:fields}}).to_string()
+                        } else {
+                            fields.to_string()
+                        }
+                    };
+                    let result = resolve_config_for_harness(
+                        &[tier("user", &doc(user)), tier("project", &doc(project))],
+                        Some(&harness),
+                    );
+                    assert!(result.errors.is_empty(), "{:?}", result.errors);
+                    let config = serde_json::to_value(result.config.search).unwrap();
+                    assert_eq!(config["gather"]["enabled"] == true, enabled);
+                }
+                let project = serde_json::json!({
+                    "search":{"gather":{"enabled":false},"rerank":{"backend":"off"}},
+                    "harnesses":{harness.wire_label():{"search":{"gather":{"enabled":true},"rerank":{"backend":"remote"}}}}
+                });
+                let result = resolve_config_for_harness(
+                    &[
+                        tier(
+                            "user",
+                            r#"{"search":{"gather":{"enabled":true},"rerank":{"backend":"onnx"}}}"#,
+                        ),
+                        tier("project", &project.to_string()),
+                    ],
+                    Some(&harness),
+                );
+                let search = serde_json::to_value(result.config.search).unwrap();
+                assert_eq!(search["gather"]["enabled"], false);
+                assert_eq!(search["rerank"]["backend"], "off");
+            }
+        }
+    }
+
+    #[test]
+    fn gather_config_project_fields_are_dropped() {
+        let gather = serde_json::json!({"enabled":true,"decision":{"backend":"endpoint","endpoint":"https://example.test","model":"test","api_key_env":"TEST_KEY"},"max_rounds":3,"max_nodes":12,"max_frontier":40,"decision_timeout_ms":3000,"deadline_ms":8000,"max_output_bytes":12288});
+        for harness in [Harness::Opencode, Harness::Pi] {
+            for nested in [false, true] {
+                let fields = serde_json::json!({"search":{"gather":gather}});
+                let doc = if nested {
+                    let name = match harness {
+                        Harness::Opencode => "opencode",
+                        _ => "pi",
+                    };
+                    serde_json::json!({"harnesses":{name:fields}})
+                } else {
+                    fields
+                };
+                let result = resolve_config_for_harness(
+                    &[tier("project", &doc.to_string())],
+                    Some(&harness),
+                );
+                assert!(result.errors.is_empty(), "{:?}", result.errors);
+                for key in [
+                    "enabled",
+                    "decision.backend",
+                    "decision.endpoint",
+                    "decision.model",
+                    "decision.api_key_env",
+                    "max_rounds",
+                    "max_nodes",
+                    "max_frontier",
+                    "decision_timeout_ms",
+                    "deadline_ms",
+                    "max_output_bytes",
+                ] {
+                    assert!(
+                        drop_keys(&result).contains(&format!("search.gather.{key}")),
+                        "{key}: {:?}",
+                        result.dropped
+                    );
+                }
+                assert_eq!(result.config.search, SearchConfig::default());
+            }
+        }
+    }
+
+    #[test]
+    fn gather_config_trusted_harness_preserves_fields_and_rerank() {
+        let result = resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"search":{"rerank":{"backend":"onnx"},"gather":{"enabled":true,"decision":{"backend":"endpoint","endpoint":" https://example.test ","model":"test"}}},"harnesses":{"opencode":{"search":{"gather":{"max_nodes":9,"decision":{"api_key_env":" TEST_KEY "}}}}}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let search = serde_json::to_value(result.config.search).unwrap();
+        assert_eq!(search["rerank"]["backend"], "onnx");
+        assert_eq!(search["gather"]["enabled"], true);
+        assert_eq!(search["gather"]["max_nodes"], 9);
+        assert_eq!(
+            search["gather"]["decision"]["endpoint"],
+            "https://example.test"
+        );
+        assert_eq!(search["gather"]["decision"]["api_key_env"], "TEST_KEY");
+    }
+
+    #[test]
+    fn gather_config_endpoint_alone_does_not_enable() {
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{"search":{"gather":{"decision":{"endpoint":"https://example.test"}}}}"#,
+        )]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let search = serde_json::to_value(result.config.search).unwrap();
+        assert_eq!(
+            search["gather"]["decision"]["endpoint"],
+            "https://example.test"
+        );
+        assert_ne!(search["gather"]["enabled"], true);
+    }
+
+    #[test]
+    fn gather_config_rejects_invalid_raw_values() {
+        for key in [
+            "max_rounds",
+            "max_nodes",
+            "max_frontier",
+            "decision_timeout_ms",
+            "deadline_ms",
+            "max_output_bytes",
+        ] {
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("3"),
+            ] {
+                let doc = serde_json::json!({"search":{"gather":{key:value}}});
+                assert!(
+                    serde_json::from_value::<RawAftConfig>(doc).is_err(),
+                    "{key}"
+                );
+            }
+        }
+        for key in ["endpoint", "model", "api_key_env"] {
+            let doc = serde_json::json!({"search":{"gather":{"decision":{key:"  "}}}});
+            assert!(
+                serde_json::from_value::<RawAftConfig>(doc).is_err(),
+                "{key}"
+            );
+        }
+        for gather in [
+            serde_json::json!(false),
+            serde_json::json!({"enabled":"true"}),
+            serde_json::json!({"decision":{"backend":"local"}}),
+        ] {
+            assert!(serde_json::from_value::<RawAftConfig>(
+                serde_json::json!({"search":{"gather":gather}})
+            )
+            .is_err());
+        }
+    }
+
     #[test]
     fn storage_cache_dir_is_a_recognized_user_setting() {
         let raw = serde_json::from_str::<super::RawAftConfig>(
