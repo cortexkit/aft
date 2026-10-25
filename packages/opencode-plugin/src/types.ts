@@ -1,5 +1,6 @@
 import type { AftTransportPool, HostToolNames } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
+import type { Effect } from "effect";
 import type { AftConfig } from "./config.js";
 
 interface ShellEnvPluginHost {
@@ -17,6 +18,10 @@ interface ShellEnvPluginHost {
 export interface PluginContext {
   pool: AftTransportPool;
   client: PluginInput["client"];
+  readSearchMessageV2?: (input: {
+    sessionID: string;
+    messageID: string;
+  }) => Effect.Effect<unknown, unknown>;
   plugin?: ShellEnvPluginHost;
   config: AftConfig;
   /** Whether hashline edit/read mode is active for this plugin registration. */

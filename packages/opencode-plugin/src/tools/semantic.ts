@@ -1,6 +1,7 @@
 import { canonicalizeProjectRoot, coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { collectOpenCodeSearchContext } from "../shared/search-context.js";
 import type { PluginContext } from "../types.js";
 import {
   callToolCall,
@@ -233,8 +234,10 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         rawArgs.path = pathArg;
       }
 
+      const searchContext = await collectOpenCodeSearchContext(ctx, context);
       const response = await callToolCall(ctx, context, "search", rawArgs, {
         abortSignal: context.abort,
+        ...(searchContext !== undefined ? { searchContext } : {}),
       });
 
       if (response.success === false) {

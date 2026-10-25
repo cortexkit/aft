@@ -108,6 +108,9 @@ export interface ToolRuntime {
   directory: string;
   /** Opaque OpenCode session identifier. Missing in CLI tests / some hosts. */
   sessionID?: string;
+  messageID?: string;
+  callID?: string;
+  id?: string;
   /**
    * True when `directory` is the directory the host placed this session in, so
    * it, not `worktree`, is the root to use while no session directory is
