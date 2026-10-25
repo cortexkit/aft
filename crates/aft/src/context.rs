@@ -4515,6 +4515,13 @@ pub struct AppContext {
     /// The search reranker backend, rebuilt off the search path whenever the
     /// published config or the daemon mode changes.
     rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "not called until the search handler attaches gather"
+        )
+    )]
     gather_runtime: crate::commands::semantic_search::gather::GatherRuntime,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
@@ -9388,6 +9395,13 @@ impl AppContext {
         &self.rerank_slot
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "not called until the search handler attaches gather"
+        )
+    )]
     pub(crate) fn gather_runtime(
         &self,
     ) -> &crate::commands::semantic_search::gather::GatherRuntime {

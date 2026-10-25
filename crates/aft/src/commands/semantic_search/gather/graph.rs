@@ -1,18 +1,68 @@
-use super::{Direction, GatherNode, GraphIdentity, NeighborKey, NeighborLocation};
-use crate::callgraph_store::CallGraphStore;
-use crate::commands::callgraph_store_adapter::{call_tree_result, callers_result};
+use super::{
+    Direction, GatherGap, GatherNode, GraphIdentity, NeighborKey, NeighborLocation,
+    DEFAULT_BODY_BYTE_BUDGET, DEFAULT_BODY_LINE_BUDGET,
+};
+use crate::callgraph_store::{CallGraphStore, StoreNode};
 use crate::commands::symbol_render::{render_symbol_within_budget, symbol_kind_string};
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::grep_executor::truncate_at_char_boundary;
 use crate::parser::{detect_language, LangId};
 use crate::symbols::{Symbol, SymbolKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-pub(in crate::commands::semantic_search) const DEFAULT_BODY_LINE_BUDGET: usize = 80;
-pub(in crate::commands::semantic_search) const DEFAULT_BODY_BYTE_BUDGET: usize = 4096;
 const DEFAULT_FRONTIER_LIMIT: usize = 40;
 const CACHE_ENTRY_LIMIT: usize = 512;
+
+struct GatherFile {
+    source: String,
+    tree: tree_sitter::Tree,
+    symbols: Vec<Symbol>,
+    lines: Vec<String>,
+    lang: LangId,
+}
+
+#[derive(Default)]
+pub(in crate::commands::semantic_search) struct GatherSourceCache {
+    files: HashMap<PathBuf, Option<GatherFile>>,
+    #[cfg(test)]
+    pub(super) loads: usize,
+}
+
+impl GatherSourceCache {
+    fn load(&mut self, path: &Path) -> Option<&GatherFile> {
+        if !self.files.contains_key(path) {
+            #[cfg(test)]
+            {
+                self.loads += 1;
+            }
+            let parsed = (|| {
+                let lang = detect_language(path)?;
+                let source = crate::parser::read_source(path).ok()?;
+                let tree =
+                    crate::parser::parse_source_with_cached_parser(path, &source, lang).ok()?;
+                let symbols =
+                    crate::parser::extract_symbols_from_tree(&source, &tree, lang).ok()?;
+                let lines = source.lines().map(str::to_owned).collect();
+                Some(GatherFile {
+                    source,
+                    tree,
+                    symbols,
+                    lines,
+                    lang,
+                })
+            })();
+            self.files.insert(path.to_owned(), parsed);
+        }
+        self.files.get(path)?.as_ref()
+    }
+}
+
+#[derive(Default)]
+pub(in crate::commands::semantic_search) struct GatherGraph {
+    pub nodes: Vec<GatherNode>,
+    pub gaps: Vec<GatherGap>,
+}
 
 pub(in crate::commands::semantic_search) fn with_graph_snapshot<T>(
     ctx: &AppContext,
@@ -43,12 +93,10 @@ pub(in crate::commands::semantic_search) fn with_graph_snapshot<T>(
     result
 }
 
-fn containing_symbol(file: &Path, line: u32, ctx: &AppContext) -> Option<Symbol> {
+fn containing_symbol(file: &GatherFile, line: u32) -> Option<&Symbol> {
     let line = line.checked_sub(1)?;
-    ctx.provider()
-        .list_symbols(file)
-        .ok()?
-        .into_iter()
+    file.symbols
+        .iter()
         .filter(|symbol| {
             !matches!(symbol.kind, SymbolKind::Heading | SymbolKind::FileSummary)
                 && symbol.range.start_line <= line
@@ -68,14 +116,12 @@ fn containing_symbol(file: &Path, line: u32, ctx: &AppContext) -> Option<Symbol>
 pub(in crate::commands::semantic_search) fn resolve_containing_symbol(
     file: &Path,
     line: u32,
-    ctx: &AppContext,
+    _ctx: &AppContext,
 ) -> Option<(String, u32)> {
-    let symbol = containing_symbol(file, line, ctx)?;
-    let source = crate::parser::read_source(file).ok()?;
-    let tree =
-        crate::parser::parse_source_with_cached_parser(file, &source, detect_language(file)?)
-            .ok()?;
-    let declaration = declaration_node(&tree, &source, &symbol);
+    let mut sources = GatherSourceCache::default();
+    let file = sources.load(file)?;
+    let symbol = containing_symbol(file, line)?;
+    let declaration = declaration_node(&file.tree, &file.source, symbol);
     Some((
         symbol.name.clone(),
         declaration
@@ -194,7 +240,7 @@ fn code_path(root: &Path, file: &Path) -> Option<PathBuf> {
 }
 
 pub(in crate::commands::semantic_search) fn resolve_seeds(
-    ctx: &AppContext,
+    _ctx: &AppContext,
     root: &Path,
     hits: &[(PathBuf, u32)],
     include_tests: bool,
@@ -203,6 +249,7 @@ pub(in crate::commands::semantic_search) fn resolve_seeds(
         return Vec::new();
     };
     let mut seen = HashSet::new();
+    let mut sources = GatherSourceCache::default();
     hits.iter()
         .enumerate()
         .filter_map(|(ordinal, (path, line))| {
@@ -216,13 +263,13 @@ pub(in crate::commands::semantic_search) fn resolve_seeds(
                 )
         })
         .filter_map(|(ordinal, path, line)| {
-            let mut node = render_node(
-                ctx,
+            let mut node = render_cached(
                 &root,
                 &path,
                 line,
                 DEFAULT_BODY_LINE_BUDGET,
                 include_tests,
+                &mut sources,
             )?;
             node.seed_ordinal = ordinal;
             node.edge = "seed".into();
@@ -232,19 +279,37 @@ pub(in crate::commands::semantic_search) fn resolve_seeds(
 }
 
 pub(in crate::commands::semantic_search) fn render_node(
-    ctx: &AppContext,
+    _ctx: &AppContext,
     root: &Path,
     path: &Path,
     line: u32,
     line_budget: usize,
     include_tests: bool,
 ) -> Option<GatherNode> {
+    render_cached(
+        root,
+        path,
+        line,
+        line_budget,
+        include_tests,
+        &mut GatherSourceCache::default(),
+    )
+}
+
+fn render_cached(
+    root: &Path,
+    path: &Path,
+    line: u32,
+    line_budget: usize,
+    include_tests: bool,
+    sources: &mut GatherSourceCache,
+) -> Option<GatherNode> {
     let path = code_path(root, path)?;
-    let symbol = containing_symbol(&path, line, ctx)?;
-    let source = crate::parser::read_source(&path).ok()?;
-    let lang = detect_language(&path)?;
-    let tree = crate::parser::parse_source_with_cached_parser(&path, &source, lang).ok()?;
-    let declaration = declaration_node(&tree, &source, &symbol);
+    let file = sources.load(&path)?;
+    let symbol = containing_symbol(file, line)?;
+    let source = &file.source;
+    let lang = file.lang;
+    let declaration = declaration_node(&file.tree, source, symbol);
     if !include_tests
         && (crate::inspect::job::is_test_file(&path.strip_prefix(root).ok()?.to_string_lossy())
             || lang == LangId::Rust
@@ -252,24 +317,27 @@ pub(in crate::commands::semantic_search) fn render_node(
     {
         return None;
     }
-    let lines: Vec<String> = source.lines().map(str::to_owned).collect();
+    let lines = &file.lines;
     let start = declaration.map_or(symbol.range.start_line as usize, |node| {
         node.start_position().row
     });
-    let mut docs: Vec<String> = lines[..start.min(lines.len())]
+    let docs = lines[symbol.range.start_line as usize..start.min(lines.len())]
         .iter()
-        .rev()
-        .take_while(|line| {
+        .filter_map(|line| {
             let line = line.trim();
-            line.starts_with("///")
-                || line.starts_with("//!")
-                || line.starts_with("/**")
-                || line.starts_with('*')
+            if line == "*/" {
+                return None;
+            }
+            let text = line
+                .strip_prefix("///")
+                .or_else(|| line.strip_prefix("//!"))
+                .or_else(|| line.strip_prefix("/**"))
+                .or_else(|| line.strip_prefix('*'))?;
+            let text = text.strip_suffix("*/").unwrap_or(text).trim();
+            (!text.is_empty()).then(|| truncate_at_char_boundary(text, 512).to_owned())
         })
         .take(3)
-        .map(|line| truncate_at_char_boundary(line.trim(), 512).to_owned())
         .collect();
-    docs.reverse();
     let render = render_symbol_within_budget(
         &symbol,
         &lines,
@@ -320,50 +388,51 @@ fn graph_identity(snapshot: &CallGraphStore) -> Result<Option<GraphIdentity>, St
 
 fn query_neighbors(
     snapshot: &CallGraphStore,
-    seed: &GatherNode,
+    target: &StoreNode,
     direction: Direction,
     include_tests: bool,
 ) -> Result<Vec<NeighborLocation>, String> {
-    let candidates = snapshot
-        .nodes_for(&seed.path, &seed.name)
-        .map_err(|_| "graph_query_failed")?;
-    let Some(target) = candidates
-        .iter()
-        .filter(|node| node.line <= seed.line && seed.line <= node.end_line)
-        .min_by_key(|node| node.end_line.saturating_sub(node.line))
-    else {
-        return Ok(Vec::new());
-    };
-    let locations = match direction {
-        Direction::Caller => callers_result(snapshot, &seed.path, &target.symbol, 1, include_tests)
+    let mut locations: Vec<_> = match direction {
+        Direction::Caller => snapshot
+            .direct_callers_of(Path::new(&target.file), &target.symbol)
             .map_err(|_| "graph_query_failed")?
-            .callers
             .into_iter()
-            .flat_map(|group| {
-                group
-                    .callers
-                    .into_iter()
-                    .map(move |caller| NeighborLocation {
-                        path: PathBuf::from(&group.file),
-                        line: caller.line,
-                    })
+            .filter(|site| include_tests || !crate::inspect::job::is_test_file(&site.caller.file))
+            .map(|site| NeighborLocation {
+                path: PathBuf::from(site.caller.file),
+                line: site.line,
             })
-            .take(DEFAULT_FRONTIER_LIMIT)
             .collect(),
         Direction::Callee => {
-            call_tree_result(snapshot, &seed.path, &target.symbol, 1, include_tests)
+            let mut locations = Vec::new();
+            for site in snapshot
+                .outgoing_calls_of(target)
                 .map_err(|_| "graph_query_failed")?
-                .children
-                .into_iter()
-                .filter(|node| node.resolved)
-                .take(DEFAULT_FRONTIER_LIMIT)
-                .map(|node| NeighborLocation {
-                    path: PathBuf::from(node.file),
-                    line: node.line,
-                })
-                .collect()
+            {
+                let node = match site.target {
+                    Some(node) => Some(node),
+                    None => snapshot
+                        .nodes_for_stored(&site.target_file, &site.target_symbol)
+                        .map_err(|_| "graph_query_failed")?
+                        .into_iter()
+                        .filter(|node| node.symbol == site.target_symbol)
+                        .min_by_key(|node| node.line),
+                };
+                if let Some(node) = node {
+                    if include_tests || !crate::inspect::job::is_test_file(&node.file) {
+                        locations.push(NeighborLocation {
+                            path: PathBuf::from(node.file),
+                            line: node.line,
+                        });
+                    }
+                }
+            }
+            locations
         }
     };
+    locations.sort_by(|left, right| left.path.cmp(&right.path).then(left.line.cmp(&right.line)));
+    locations.dedup_by(|left, right| left.path == right.path && left.line == right.line);
+    locations.truncate(DEFAULT_FRONTIER_LIMIT);
     Ok(locations)
 }
 
@@ -372,7 +441,8 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
     snapshot: &CallGraphStore,
     seeds: &[GatherNode],
     include_tests: bool,
-) -> Result<Vec<GatherNode>, String> {
+    sources: &mut GatherSourceCache,
+) -> Result<GatherGraph, String> {
     let identity = graph_identity(snapshot)?;
     let runtime = ctx.gather_runtime();
     {
@@ -386,8 +456,33 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
         }
     }
     let mut seen: HashSet<_> = seeds.iter().map(|seed| seed.id.clone()).collect();
-    let mut result = Vec::new();
+    let mut result = GatherGraph::default();
+    let mut queues = Vec::new();
     for seed in seeds {
+        let candidates = match snapshot.nodes_for(&seed.path, &seed.name) {
+            Ok(nodes) => nodes,
+            Err(_) => {
+                result.gaps.push(GatherGap {
+                    seed_id: seed.id.clone(),
+                    state: "graph_query_failed",
+                });
+                queues.push(VecDeque::new());
+                continue;
+            }
+        };
+        let target = candidates
+            .into_iter()
+            .filter(|node| node.line <= seed.line && seed.line <= node.end_line)
+            .min_by_key(|node| node.end_line.saturating_sub(node.line));
+        let Some(target) = target else {
+            result.gaps.push(GatherGap {
+                seed_id: seed.id.clone(),
+                state: "seed_unresolved",
+            });
+            queues.push(VecDeque::new());
+            continue;
+        };
+        let mut queue = VecDeque::new();
         for direction in [Direction::Caller, Direction::Callee] {
             let key = identity.clone().map(|identity| NeighborKey {
                 identity,
@@ -408,7 +503,17 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
                 Some(locations) => locations,
                 None => {
                     // Graph queries must not hold the cache lock.
-                    let locations = query_neighbors(snapshot, seed, direction, include_tests)?;
+                    let locations =
+                        match query_neighbors(snapshot, &target, direction, include_tests) {
+                            Ok(locations) => locations,
+                            Err(_) => {
+                                result.gaps.push(GatherGap {
+                                    seed_id: seed.id.clone(),
+                                    state: "graph_query_failed",
+                                });
+                                continue;
+                            }
+                        };
                     if let Some(key) = key {
                         let mut cache = runtime
                             .neighbors
@@ -424,14 +529,21 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
                     locations
                 }
             };
-            for location in locations {
-                let Some(mut node) = render_node(
-                    ctx,
+            queue.extend(locations.into_iter().map(|location| (direction, location)));
+        }
+        queues.push(queue);
+    }
+    loop {
+        let mut progressed = false;
+        for (seed, queue) in seeds.iter().zip(&mut queues) {
+            while let Some((direction, location)) = queue.pop_front() {
+                let Some(mut node) = render_cached(
                     snapshot.project_root(),
                     &location.path,
                     location.line,
                     DEFAULT_BODY_LINE_BUDGET,
                     include_tests,
+                    sources,
                 ) else {
                     continue;
                 };
@@ -448,11 +560,16 @@ pub(in crate::commands::semantic_search) fn collect_callgraph_neighbors(
                     },
                     seed.id
                 );
-                result.push(node);
-                if result.len() >= DEFAULT_FRONTIER_LIMIT {
+                result.nodes.push(node);
+                progressed = true;
+                if result.nodes.len() >= DEFAULT_FRONTIER_LIMIT {
                     return Ok(result);
                 }
+                break;
             }
+        }
+        if !progressed {
+            break;
         }
     }
     Ok(result)

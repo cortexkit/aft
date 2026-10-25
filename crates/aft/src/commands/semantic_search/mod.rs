@@ -9,6 +9,13 @@ pub mod extensions;
 pub(crate) mod external_disk_check;
 mod external_exact;
 mod external_pattern;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "not called until the search handler attaches gather"
+    )
+)]
 pub(crate) mod gather;
 pub mod generation_token;
 pub mod lexical_lane;
