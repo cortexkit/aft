@@ -24,6 +24,8 @@ export interface AftTransportOptions extends BridgeRequestOptions {
 }
 
 export interface ToolCallOptions extends AftTransportOptions {
+  /** Host context stays outside agent arguments and is sent only for search. */
+  searchContext?: string;
   /** Server-owned dry-run flag placed at the top level of the tool_call request. */
   preview?: boolean;
   /**

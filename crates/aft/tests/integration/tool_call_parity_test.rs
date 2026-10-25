@@ -490,6 +490,7 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
                     arguments.clone(),
                     &FormatContext::from_tool_call("inspect", &arguments, &root),
                     &ToolCallContext {
+                        search_context: None,
                         request_id: "forced-pair".into(),
                         project_root: root.clone(),
                         standard_edit_grammar: true,

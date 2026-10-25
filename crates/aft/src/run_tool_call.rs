@@ -311,6 +311,7 @@ pub enum ToolCallOutcome {
 /// These fields cannot be supplied through the agent's arguments object.
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
+    pub search_context: Option<crate::search_context::SearchContext>,
     pub project_root: PathBuf,
     pub session_id: Option<String>,
     pub request_id: String,
@@ -939,6 +940,12 @@ fn raw_request_from_translated(
         params.remove("command");
     }
     params.remove("session_id");
+    params.remove("search_context");
+    if command == "semantic_search" {
+        if let Some(context) = &ctx.search_context {
+            params.insert("search_context".into(), json!(context.as_str()));
+        }
+    }
     // The caller's role comes from the request envelope, never from the
     // agent's arguments: an agent must not be able to claim it is a worker
     // to lift the default hard kill on its commands.
@@ -972,6 +979,7 @@ fn raw_request_from_translated(
 pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
     if let Some(map) = args.as_object_mut() {
         map.remove("preview");
+        map.remove("search_context");
     }
     args
 }
@@ -1197,6 +1205,7 @@ mod tests {
     ) -> String {
         let format = crate::subc_format::FormatContext::from_tool_call(name, &args, root);
         let tool_ctx = ToolCallContext {
+            search_context: None,
             project_root: root.to_path_buf(),
             session_id: Some("slow-shape".into()),
             request_id: "slow-shape".into(),
@@ -1642,6 +1651,7 @@ mod tests {
 
         fn context(preview: bool) -> ToolCallContext {
             ToolCallContext {
+                search_context: None,
                 project_root: PathBuf::from("/workspace"),
                 session_id: Some("session-realistic".to_string()),
                 request_id: "subc-7-42".to_string(),
@@ -1654,6 +1664,30 @@ mod tests {
                 worker_session: false,
                 host_tool_names: None,
             }
+        }
+
+        #[test]
+        fn gather_context_envelope_overrides_forged_arguments_for_search_only() {
+            let mut ctx = context(false);
+            ctx.search_context = Some(crate::search_context::SearchContext::new("trace-marker"));
+            let params = json!({"query": "how is config loaded", "search_context": "forged"})
+                .as_object()
+                .unwrap()
+                .clone();
+            let request =
+                raw_request_from_translated("semantic_search".into(), params.clone(), &ctx)
+                    .unwrap();
+            assert_eq!(request.params["search_context"], "trace-marker");
+            let other = raw_request_from_translated("status".into(), params.clone(), &ctx).unwrap();
+            assert!(other.params.get("search_context").is_none());
+            let absent =
+                raw_request_from_translated("semantic_search".into(), params, &context(false))
+                    .unwrap();
+            assert!(absent.params.get("search_context").is_none());
+            assert_eq!(
+                strip_agent_preview_arg_owned(json!({"query": "q", "search_context": "forged"})),
+                json!({"query": "q"})
+            );
         }
 
         #[test]
