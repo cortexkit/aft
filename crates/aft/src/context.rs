@@ -4515,6 +4515,7 @@ pub struct AppContext {
     /// The search reranker backend, rebuilt off the search path whenever the
     /// published config or the daemon mode changes.
     rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
+    gather_runtime: crate::commands::semantic_search::gather::GatherRuntime,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
@@ -5374,6 +5375,7 @@ impl AppContext {
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
             rerank_slot: Default::default(),
+            gather_runtime: Default::default(),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
             artifact_owner_status: parking_lot::Mutex::new(None),
@@ -9384,6 +9386,12 @@ impl AppContext {
         &self,
     ) -> &crate::commands::semantic_search::rerank::slot::BackendSlot {
         &self.rerank_slot
+    }
+
+    pub(crate) fn gather_runtime(
+        &self,
+    ) -> &crate::commands::semantic_search::gather::GatherRuntime {
+        &self.gather_runtime
     }
 
     /// Start building the reranker backend for `config` in the background when

@@ -9,6 +9,7 @@ pub mod extensions;
 pub(crate) mod external_disk_check;
 mod external_exact;
 mod external_pattern;
+pub(crate) mod gather;
 pub mod generation_token;
 pub mod lexical_lane;
 pub mod memo;
