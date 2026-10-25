@@ -1006,6 +1006,16 @@ was bounded. An invalid regex is refused with grep's `invalid_pattern` error and
 `pattern` alone ranks the files it matches, definitions first, one result per file. `pattern`
 cannot yet be combined with `path`.
 
+#### Related-code gathering
+
+When user config enables `search.gather.enabled`, each natural-language search adds related call-graph symbols after the ranked results. Ranking and agent arguments do not change. A query with `pattern` also gathers without changing its ranking. Pattern-only and empty-query searches do not walk.
+
+The added section starts with `Related code (gathered for this search` and contains at most 12 symbols and 12 KB. The whole response stays within the existing 50 KB cap. Its final state line reports rounds, kept and considered counts, the decision source, and the context source (`host trace` or `query only`). A missing identity or current stored turn uses query-only context.
+
+Gather uses at most 5 seed symbols, 40 candidates per round, 3 rounds, 3 seconds per decision and 8 seconds for the full walk. Values above 40 for the frontier are clamped. Decision results are cached per session for 10 minutes. A graph that is not ready, a walk error, a decision failure or a timeout keeps the normal search results and adds one disclosed state line. A path in another project reports `callgraph=unavailable reason=other_project`.
+
+Without a configured decision backend, selection is deterministic and makes no network request. The `endpoint` backend sends trace text and candidate code to its endpoint outside host redaction. See [gather configuration and privacy](config.md#related-code-gathering) before enabling it. Files that the session may not read are not read or shown.
+
 #### Cross-project search
 
 Pass `path` to search another project or plain folder on the same machine — a sibling
