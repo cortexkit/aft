@@ -115,11 +115,13 @@ static TEST_TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
 
 /// Install the production transport for this process's daemon connection.
 pub(super) fn install_subc_transport(connection_file: &Path) {
+    let transport: Arc<dyn ConsentTransport> = Arc::new(SharedSubcConsent(Arc::new(
+        SubcConsentTransport::new(connection_file.to_path_buf()),
+    )));
     *TRANSPORT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(SharedSubcConsent(
-        Arc::new(SubcConsentTransport::new(connection_file.to_path_buf())),
-    )));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&transport));
+    super::secret_consent::install_subc_transport(transport);
 }
 
 /// Replace the transport for consent tests; the module loop's production

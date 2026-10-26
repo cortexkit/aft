@@ -6,20 +6,14 @@
 //! asked. Cingulate's allow alone grants nothing: the caller resolves again
 //! afterwards, and only a vault grant allows a substitution.
 //!
-//! This entry point is deliberately none of the three existing consent paths:
-//! [`super::access_grants::ask_route`] (which returns `Unavailable` for a
-//! codemode call), `consent::run_with_consent` (Consent routes only) and
-//! `consent::requested_ask` (filesystem `AccessGrant`s only). A secret
-//! question never becomes an `AccessGrant`, and the filesystem paths are
-//! untouched by it.
+//! Secret questions share the Cingulate transport with filesystem permission
+//! asks, but never become filesystem `AccessGrant`s. In particular, a bound
+//! codemode call may ask about a secret under its head's authorization scope
+//! even though it may not file a filesystem permission ask.
 
 use crate::secret::SecretScope;
 
 /// The consent kind a secret ask files under.
-///
-/// SUBC has not confirmed this name yet; the
-/// adapter is the one place it is spelled, so the confirmation changes one
-/// constant, not every call site.
 pub const SECRET_CONSENT_KIND: &str = "secret_use";
 
 /// What the consent adapter is asked to file for one label.
@@ -27,6 +21,10 @@ pub const SECRET_CONSENT_KIND: &str = "secret_use";
 pub struct SecretConsentRequest {
     /// The authorization scope the ask is filed under.
     pub scope: SecretScope,
+    /// The originating route's project root, used only for the scoped transport.
+    pub project_root: std::path::PathBuf,
+    /// The originating route's session, used only for the scoped transport.
+    pub session: String,
     /// The label the vault is waiting on.
     pub label: String,
     /// The vault's identifier for the pending decision.
@@ -92,9 +90,8 @@ pub trait SecretConsentTransport: Send + Sync {
 
 /// The dispatcher installed for this process.
 ///
-/// `None` means no secret consent transport is connected, which is the state
-/// until SUBC confirms the consent kind. A pending vault answer then ends the
-/// call with `access_unavailable`, never with a silent start.
+/// `None` means no secret consent transport is connected. A pending vault
+/// answer then ends the call with `access_unavailable`, never a silent start.
 static TRANSPORT: std::sync::LazyLock<
     std::sync::Mutex<Option<std::sync::Arc<dyn SecretConsentTransport>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
@@ -138,15 +135,17 @@ pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
 
 /// The `consent.request` parameter shape a secret ask carries.
 ///
-/// It is built here, not by the filesystem `request_params`, because a secret
-/// ask has no path and names a vault request instead. The shape follows the
-/// same envelope the Cingulate client already sends: `kind` plus the fields the
-/// consent service accepts, with no unknown members.
+/// Cingulate renders the vault's statement, not filer-authored prose. Forward
+/// exactly one item without decoding or re-encoding the statement; the daemon
+/// carries the authorization stamp outside this body.
 pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
     serde_json::json!({
         "kind": SECRET_CONSENT_KIND,
-        "label": request.label,
-        "request_id": request.request_id,
-        "statement_b64url": request.statement_b64url,
+        "secret_use": {
+            "items": [{
+                "request_id": request.request_id,
+                "statement_b64url": request.statement_b64url,
+            }],
+        },
     })
 }

@@ -30,8 +30,154 @@ use crate::secret::{
     file_consent, withhold_consent, CallScopes, ConsentOutcome, EligibilityForm, Ineligibility,
     LabelOutcome, Resolution, SecretConsentRequest, SecretScope,
 };
+use std::sync::Arc;
+use std::time::Duration;
 use subc_protocol::call_mode::CallMode;
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
+
+const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Use the same scoped daemon connection and reserved AFT filer as permission
+/// asks. The production vault remains the fail-closed stand-in.
+pub(super) fn install_subc_transport(transport: Arc<dyn super::consent::ConsentTransport>) {
+    crate::secret::consent::install_transport(Some(Arc::new(SubcSecretConsent {
+        transport,
+        runtime: tokio::runtime::Handle::current(),
+    })));
+}
+
+struct SubcSecretConsent {
+    transport: Arc<dyn super::consent::ConsentTransport>,
+    runtime: tokio::runtime::Handle,
+}
+
+fn consent_unavailable(detail: &str) -> ConsentOutcome {
+    ConsentOutcome::Unavailable {
+        detail: detail.into(),
+    }
+}
+
+/// Generic secret cards have `el_` ids and their own states; filesystem
+/// permission cards use a different response contract.
+fn decode_secret_elicitation(result: &serde_json::Value) -> Option<&str> {
+    result
+        .as_object()
+        .filter(|object| object.len() == 1)?
+        .get("elicitation_id")?
+        .as_str()
+        .filter(|id| id.starts_with("el_") && id.len() > 3)
+}
+
+fn decode_secret_record(record: &serde_json::Value) -> ConsentOutcome {
+    if record.get("kind").and_then(serde_json::Value::as_str) != Some("secret_use") {
+        return consent_unavailable("Cingulate did not return a secret-use card");
+    }
+    match record.get("state").and_then(serde_json::Value::as_str) {
+        Some("pending") => ConsentOutcome::Pending,
+        // The answer is only a cue to retry the vault, never a grant or denial
+        // to apply locally. In particular, a decline also retries secret.use.
+        Some("granted" | "declined") => ConsentOutcome::Answered,
+        Some("expired" | "withdrawn") => {
+            consent_unavailable("the secret-use card ended without an answer")
+        }
+        _ => consent_unavailable("Cingulate returned an unknown secret-use card state"),
+    }
+}
+
+impl SubcSecretConsent {
+    async fn call(
+        &self,
+        request: &SecretConsentRequest,
+        method: &'static str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, super::consent::ConsentError> {
+        let stamp = request.scope.stamp();
+        let call = super::consent::ConsentCall {
+            scope: subc_protocol::ScopeSelector::new(
+                stamp.owner.clone(),
+                stamp.scope_ref.clone(),
+                Some(stamp.scope_epoch),
+            ),
+            project_root: request.project_root.clone(),
+            session: request.session.clone(),
+            method,
+            params,
+            timeout,
+        };
+        tokio::time::timeout(timeout, self.transport.call(call))
+            .await
+            .map_err(|_| {
+                super::consent::ConsentError::Unavailable("secret consent timed out".into())
+            })?
+    }
+
+    async fn file_or_withdraw(
+        &self,
+        request: &SecretConsentRequest,
+        withdraw: bool,
+    ) -> ConsentOutcome {
+        // Cingulate deduplicates the exact ordered items for this filer. Refile
+        // unchanged to recover the same card across retries or a lost reply,
+        // without refreshing its deadline or introducing a local idempotency key.
+        let filed = match self
+            .call(
+                request,
+                "consent.request",
+                crate::secret::request_params(request),
+                SECRET_CONSENT_TIMEOUT,
+            )
+            .await
+        {
+            Ok(filed) => filed,
+            Err(_) => return consent_unavailable("Cingulate could not file the secret-use card"),
+        };
+        let Some(id) = decode_secret_elicitation(&filed) else {
+            return consent_unavailable("Cingulate did not return a secret-use card id");
+        };
+        let hold = super::consent::hold_budget(None);
+        let (method, params, timeout) = if withdraw {
+            (
+                "consent.withdraw",
+                serde_json::json!({"elicitation_id": id}),
+                SECRET_CONSENT_TIMEOUT,
+            )
+        } else {
+            (
+                "consent.await",
+                serde_json::json!({"elicitation_id": id, "timeout_ms": hold.as_millis() as u64}),
+                hold + SECRET_CONSENT_TIMEOUT,
+            )
+        };
+        match self.call(request, method, params, timeout).await {
+            Ok(record) => decode_secret_record(&record),
+            Err(_) => consent_unavailable("Cingulate could not settle the secret-use card"),
+        }
+    }
+
+    fn dispatch(&self, request: &SecretConsentRequest, withdraw: bool) -> ConsentOutcome {
+        let future = self.file_or_withdraw(request, withdraw);
+        match tokio::runtime::Handle::try_current() {
+            Ok(current)
+                if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| self.runtime.block_on(future))
+            }
+            Ok(_) => consent_unavailable("secret consent cannot block a single-threaded runtime"),
+            Err(_) => self.runtime.block_on(future),
+        }
+    }
+}
+
+impl crate::secret::SecretConsentTransport for SubcSecretConsent {
+    fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        self.dispatch(request, false)
+    }
+
+    fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        self.dispatch(request, true)
+    }
+}
 
 /// Decide whether the call on `identity` may ask the vault, and under which
 /// scopes.
@@ -156,35 +302,41 @@ pub(super) struct PendingSecretConsent {
     pub(super) message: &'static str,
 }
 
+pub(super) enum SecretConsentFiling {
+    Answered,
+    Pending(PendingSecretConsent),
+}
+
 /// File the consent a `FileConsent` outcome asks for, under the call's
 /// authorization scope.
 ///
-/// A filing failure ends the call with `access_unavailable`; a filed ask ends
-/// it with `access_pending` and the label's own message, so no child, job or
-/// proxy starts while the answer is outstanding.
+/// A filing failure or expired card ends the call with `access_unavailable`;
+/// a pending card holds it with `access_pending`. An answer only tells the
+/// launch to ask the vault again before starting any child, job or proxy.
 pub(super) fn file_secret_consent(
+    identity: &RouteIdentity,
     scopes: &CallScopes,
     label: &str,
     request_id: &str,
     statement_b64url: &str,
-) -> Result<PendingSecretConsent, &'static str> {
+) -> Result<SecretConsentFiling, &'static str> {
     let request = SecretConsentRequest {
         scope: scopes.authorization.clone(),
+        project_root: identity.project_root.clone(),
+        session: identity.session.clone(),
         label: label.to_string(),
         request_id: request_id.to_string(),
         statement_b64url: statement_b64url.to_string(),
     };
     match file_consent(&request) {
-        // Cingulate could not place the ask: nothing is held, nothing starts.
+        // No usable card or answer: nothing is held, nothing starts.
         ConsentOutcome::Unavailable { .. } => Err(crate::secret::SECRET_ACCESS_UNAVAILABLE),
-        // Answered or still open, the ask is filed and the call is held. Either
-        // way the retried call resolves again; Cingulate's answer alone has
-        // granted nothing.
-        ConsentOutcome::Answered | ConsentOutcome::Pending => Ok(PendingSecretConsent {
+        ConsentOutcome::Answered => Ok(SecretConsentFiling::Answered),
+        ConsentOutcome::Pending => Ok(SecretConsentFiling::Pending(PendingSecretConsent {
             request,
             label: label.to_string(),
             message: crate::secret::SECRET_ACCESS_PENDING_MESSAGE,
-        }),
+        })),
     }
 }
 
@@ -222,8 +374,8 @@ pub(crate) enum LaunchDecision {
 /// `secret_refused` before the vault is asked anything, then resolution decides
 /// between proceeding, holding the call for consent, and refusing. A label the
 /// vault needs an answer for files one consent ask under the call's
-/// authorization scope, and Cingulate's answer alone never grants: the retried
-/// launch resolves again.
+/// authorization scope. An answer retries the vault immediately; a pending
+/// card holds the launch until the caller retries. Neither answer grants here.
 pub(crate) fn resolve_label_for_launch(
     identity: &RouteIdentity,
     vault: &dyn crate::secret::SecretVault,
@@ -248,8 +400,18 @@ pub(crate) fn resolve_label_for_launch(
         LabelOutcome::FileConsent {
             request_id,
             statement_b64url,
-        } => match file_secret_consent(&scopes, label, &request_id, &statement_b64url) {
-            Ok(pending) => LaunchDecision::Pending(pending),
+        } => match file_secret_consent(identity, &scopes, label, &request_id, &statement_b64url) {
+            Ok(SecretConsentFiling::Pending(pending)) => LaunchDecision::Pending(pending),
+            Ok(SecretConsentFiling::Answered) => {
+                match vault.resolve(&scopes.authorization, label) {
+                    Resolution::Granted { rule, grant_id, .. } => {
+                        LaunchDecision::Proceed { rule, grant_id }
+                    }
+                    other => LaunchDecision::Refuse(crate::secret::outcome_for_second_resolve(
+                        label, &other,
+                    )),
+                }
+            }
             Err(code) => LaunchDecision::Refuse(crate::secret::refuse(
                 code,
                 label,
