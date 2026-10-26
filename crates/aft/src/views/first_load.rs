@@ -5936,7 +5936,9 @@ mod v3_bootstrap_tests {
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
         let source = b"fn fresh_checkout() { let marker = 42; }\n";
         std::fs::write(root.path().join("file.rs"), source).unwrap();
-        std::fs::File::open(root.path().join("file.rs"))
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join("file.rs"))
             .unwrap()
             .set_times(
                 std::fs::FileTimes::new()

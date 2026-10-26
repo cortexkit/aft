@@ -91,7 +91,9 @@ fn stat_evidence_staging_never_ages_out_under_a_prepared_generation_pin() {
         .unwrap();
     let staging = stage(&view, &generation.to_string(), "crashed-writer");
     fs::write(&staging, b"partly written database").unwrap();
-    fs::File::open(&staging)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
         .unwrap()
         .set_times(
             fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(60)),
