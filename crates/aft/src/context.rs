@@ -4612,6 +4612,8 @@ pub struct AppContext {
     // probe again after repeated load disconnects.
     search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32, Option<Instant>)>,
     search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
+    legacy_search_publication:
+        parking_lot::Mutex<Arc<crate::search_index::LegacySearchPublicationGate>>,
     pub(crate) search_corpus_refresh_lane: Arc<crate::runtime_drain::SearchCorpusRefreshLane>,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
@@ -5438,6 +5440,7 @@ impl AppContext {
             search_pending_install: Arc::default(),
             search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
+            legacy_search_publication: Default::default(),
             search_corpus_refresh_lane: Arc::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
@@ -8958,6 +8961,11 @@ impl AppContext {
                 return None;
             };
             let mut next = next;
+            if next.views.enabled {
+                self.legacy_search_publication.lock().revoke();
+            } else if guard.views.enabled {
+                *self.legacy_search_publication.lock() = Arc::default();
+            }
             next.aft_search_registered = next.tool_registered("aft_search");
             #[cfg(test)]
             let next = self.app.isolate_test_config(next);
@@ -11932,6 +11940,12 @@ impl AppContext {
         &self.search_index
     }
 
+    pub(crate) fn legacy_search_publication_gate(
+        &self,
+    ) -> Arc<crate::search_index::LegacySearchPublicationGate> {
+        self.legacy_search_publication.lock().clone()
+    }
+
     pub(crate) fn lexical_views_enabled(&self) -> bool {
         let config = self.config();
         config.views.enabled
@@ -12476,6 +12490,7 @@ impl AppContext {
         if self.config().views.enabled {
             return SearchIndexShutdownOutcome::Skipped;
         }
+        let _publication = self.legacy_search_publication_gate().install();
         use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
         if self.cache_unavailable_reason().is_some() {
             return Failed("cache root is unavailable");

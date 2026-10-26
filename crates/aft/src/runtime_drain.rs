@@ -2411,12 +2411,14 @@ fn spawn_search_corpus_refresh_admitted(
     let content_generation_flag = ctx.configure_content_generation_flag();
     let persist_epoch_flag = ctx.search_persist_epoch_flag();
     let persist_epoch = ctx.next_search_persist_epoch();
+    let publication_gate = ctx.legacy_search_publication_gate();
     let lifecycle = ctx.subc_lifecycle_admission();
     let cold_build_limiter = ctx.cold_build_limiter();
     ctx.search_corpus_refresh_lane.submit(
         root.clone(),
         Box::new(move |cancel| {
             let _terminal_guard = receiver_terminal_guard;
+            let _publication = publication_gate.install();
             log_ctx::with_session(session_id, || {
                 let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
                     &cold_build_limiter,
@@ -2453,6 +2455,7 @@ fn spawn_search_corpus_refresh_admitted(
                 };
                 let keep_going = || {
                     !cancel.load(std::sync::atomic::Ordering::Acquire)
+                        && publication_gate.allowed()
                         && lifecycle.is_current(&generation_flag, generation)
                         && persist_epoch_flag.current() == persist_epoch
                 };

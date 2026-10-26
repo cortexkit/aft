@@ -394,6 +394,86 @@ fn artifact_write_allowed(project_root: &Path, cache_dir: &Path, write_path: &Pa
         && SearchIndex::check_disk_cache_format(cache_dir).is_ok()
 }
 
+/// Revokes only legacy search publication when a checkout switches to views.
+/// Shared holders cover the final rename, not the build or serialization, so
+/// ordinary legacy publications never wait for one another.
+pub(crate) struct LegacySearchPublicationGate {
+    allowed: std::sync::atomic::AtomicBool,
+    publication: parking_lot::RwLock<()>,
+    #[cfg(test)]
+    before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Default for LegacySearchPublicationGate {
+    fn default() -> Self {
+        Self {
+            allowed: std::sync::atomic::AtomicBool::new(true),
+            publication: parking_lot::RwLock::new(()),
+            #[cfg(test)]
+            before_publish: Default::default(),
+        }
+    }
+}
+
+thread_local! {
+    static LEGACY_SEARCH_PUBLICATION: std::cell::RefCell<Option<Arc<LegacySearchPublicationGate>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct LegacySearchPublicationScope {
+    previous: Option<Arc<LegacySearchPublicationGate>>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for LegacySearchPublicationScope {
+    fn drop(&mut self) {
+        LEGACY_SEARCH_PUBLICATION.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+impl LegacySearchPublicationGate {
+    pub(crate) fn allowed(&self) -> bool {
+        self.allowed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn revoke(&self) {
+        let _publication = self.publication.write();
+        self.allowed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn install(self: &Arc<Self>) -> LegacySearchPublicationScope {
+        LegacySearchPublicationScope {
+            previous: LEGACY_SEARCH_PUBLICATION.with(|slot| slot.replace(Some(self.clone()))),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn publish(&self, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_publish.lock().take() {
+            hook();
+        }
+        let _publication = self.publication.read();
+        if !self.allowed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "legacy search publication revoked by views",
+            ));
+        }
+        operation()
+    }
+}
+
+fn publish_legacy_search_cache(
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let gate = LEGACY_SEARCH_PUBLICATION.with(|slot| slot.borrow().clone());
+    match gate {
+        Some(gate) => gate.publish(operation),
+        None => operation(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
     base: Option<Arc<BasePostings>>,
@@ -5364,14 +5444,18 @@ fn write_cache_file_from_sources(
         drop(writer);
 
         check_search_build(keep_going)?;
-        fs::rename(&tmp_cache, &cache_path)?;
-        // Credit the bytes handed to the kernel; this cache is not a durable log.
-        crate::write_ledger::credit(
-            domain,
-            plan.project_root.display().to_string(),
-            file_bytes,
-            file_bytes,
-        );
+        publish_legacy_search_cache(|| {
+            fs::rename(&tmp_cache, &cache_path)?;
+            // Account inside the publication fence so a completed views bind
+            // cannot be followed by credit for an older legacy publication.
+            crate::write_ledger::credit(
+                domain,
+                plan.project_root.display().to_string(),
+                file_bytes,
+                file_bytes,
+            );
+            Ok(())
+        })?;
         let file = open_cache_file_read(&cache_path)?;
         Ok(BasePostings {
             file: Arc::new(file),
@@ -10960,6 +11044,84 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    fn lexical_views_paused_legacy_publication(turn_views_on: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "old_marker\n").unwrap();
+        let mut initial = SearchIndex::build_with_limit_serial(&root, 1024);
+        assert!(initial.write_to_disk(&cache, None));
+        let original = fs::read(cache.join("cache.bin")).unwrap();
+        fs::write(root.join("a.rs"), "new_marker\n").unwrap();
+        let context = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let gate = context.legacy_search_publication_gate();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *gate.before_publish.lock() = Some(Box::new(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        let build_root = root.clone();
+        let build_cache = cache.clone();
+        let build_gate = gate.clone();
+        let build = std::thread::spawn(move || {
+            let _publication = build_gate.install();
+            SearchIndex::build_with_limit_to_cache_dir_cancellable(
+                &build_root,
+                1024,
+                &build_cache,
+                &|| true,
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        if turn_views_on {
+            context.update_config(|config| config.views.enabled = true);
+            assert!(!gate.allowed());
+        } else {
+            context.update_config(|config| config.search_index_max_file_size += 1);
+            context.advance_configure_generation();
+            context.mark_subc_unbound();
+            assert!(gate.allowed());
+        }
+        release_tx.send(()).unwrap();
+        let result = build.join().unwrap();
+        if turn_views_on {
+            assert!(result.is_none());
+            assert_eq!(fs::read(cache.join("cache.bin")).unwrap(), original);
+            context.update_config(|config| config.views.enabled = false);
+            assert!(context.legacy_search_publication_gate().allowed());
+            assert!(
+                !gate.allowed(),
+                "old workers stay revoked after views are disabled"
+            );
+        } else {
+            assert!(result.is_some_and(|index| index.is_ready()));
+            assert_ne!(fs::read(cache.join("cache.bin")).unwrap(), original);
+        }
+        assert!(fs::read_dir(&cache).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cache.bin.tmp.")));
+    }
+
+    #[test]
+    fn lexical_views_cutover_revokes_admitted_legacy_cache_rename() {
+        lexical_views_paused_legacy_publication(true);
+    }
+
+    #[test]
+    fn lexical_views_off_preserves_admitted_publication_after_reconfigure_and_unbind() {
+        lexical_views_paused_legacy_publication(false);
+    }
+
     struct IsolatedLegacyMemoIndexes {
         indexes: Arc<Mutex<super::LegacyMemoIndexes>>,
         previous: Option<Arc<Mutex<super::LegacyMemoIndexes>>>,

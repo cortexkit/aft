@@ -5706,6 +5706,7 @@ fn schedule_artifact_loads_admitted(
         let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
         let search_pending_install = ctx.search_pending_install();
         let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
+        let search_publication_gate = ctx.legacy_search_publication_gate();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         search_artifact_load_start = Some(start_tx);
 
@@ -5713,6 +5714,7 @@ fn schedule_artifact_loads_admitted(
         mark_search_rebuild_spawn_for_debug();
         thread::spawn(move || {
             let _terminal_guard = search_rx_terminal_guard;
+            let _publication = search_publication_gate.install();
             if start_rx.recv().is_err() {
                 #[cfg(test)]
                 note_configure_artifact_load_cancellation_for_test();
@@ -5941,14 +5943,14 @@ fn schedule_artifact_loads_admitted(
                     if search_persist_epoch_flag.current() != search_persist_epoch {
                         return;
                     }
-                    let index = SearchIndex::rebuild_or_refresh_with_strategy(
+                    let Some(index) = SearchIndex::build_with_limit_to_cache_dir_cancellable(
                         &root_for_search,
                         search_index_max_file_size,
-                        current_head,
-                        None,
-                        Some(&cache_dir),
-                        VerifyStrategy::StatFirst,
-                    );
+                        &cache_dir,
+                        &|| search_publication_gate.allowed(),
+                    ) else {
+                        return;
+                    };
                     delay_search_rebuild_publish_for_debug();
                     index
                 };
