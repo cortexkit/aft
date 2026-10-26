@@ -12,6 +12,35 @@ use std::sync::atomic::AtomicUsize;
 /// row, and the marker row saying the run's vector matches that chunk row.
 const ROWS_PER_ONE_CHUNK_FILE: u64 = 3;
 
+#[test]
+fn reconciled_delta_does_not_request_another_source_walk() {
+    let manifest =
+        super::super::manifest_v2::ManifestV2::new(super::super::manifest_v2::ManifestHeader {
+            producers: Producers {
+                trigram: "unused".into(),
+                semantic: None,
+                callgraph: "unused".into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+    let mut delta = LiveDelta::new(Arc::new(ComposedGeneration::new(
+        "published",
+        manifest,
+        None,
+    )));
+    let path = super::super::RelPath::new(b"file.rs".to_vec()).unwrap();
+    let mut entry = super::super::snapshot::LiveEntry::new(DiskState::of_bytes(b"new"), 1);
+    delta.apply(path.clone(), entry.clone());
+    assert!(super::needs_reload(&delta.snapshot()));
+    entry.reconciliation = super::super::readiness::ReconciledDelta::Reconciled;
+    delta.apply(path.clone(), entry);
+    assert!(!super::needs_reload(&delta.snapshot()));
+    delta.record_intent(path);
+    assert!(super::needs_reload(&delta.snapshot()));
+}
+
 /// The test prints public setup, query answers, a v3 file inventory and exact
 /// reader-floor bytes. Query expectations come from an independent cold index,
 /// not the view.

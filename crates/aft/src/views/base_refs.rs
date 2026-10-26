@@ -680,7 +680,7 @@ pub fn publish_worker(
     request: WorkerPublication<'_>,
     observer: Option<&dyn DurabilityObserver>,
 ) -> Result<WorkerOutcome> {
-    publish_worker_with(request, observer, &mut |_| Ok(()))
+    publish_worker_with(request, observer, &mut |_| Ok(()), &mut || Ok(()))
 }
 
 /// [`publish_worker`] with a step that runs once the final generation name is
@@ -688,10 +688,14 @@ pub fn publish_worker(
 /// its manifest is durable) and before the pointer CAS. Plane finishers
 /// rename private derived files to that name here. An error aborts the job
 /// like a failed verify.
+/// `final_validate` runs after marker and registry verification, immediately
+/// before the pointer CAS, so admission and artifact work cannot stale a
+/// checkout's freshness proof.
 pub fn publish_worker_with(
     request: WorkerPublication<'_>,
     observer: Option<&dyn DurabilityObserver>,
     before_cas: &mut dyn FnMut(&str) -> Result<()>,
+    final_validate: &mut dyn FnMut() -> Result<()>,
 ) -> Result<WorkerOutcome> {
     let WorkerPublication {
         storage,
@@ -844,6 +848,9 @@ pub fn publish_worker_with(
             })
         });
     if let Err(error) = verified {
+        return Err(abort(error, marker));
+    }
+    if let Err(error) = final_validate() {
         return Err(abort(error, marker));
     }
 

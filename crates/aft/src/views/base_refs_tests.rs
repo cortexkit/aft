@@ -403,6 +403,62 @@ fn a_failed_verify_cleans_up_its_intent_before_any_pointer_moves() {
 }
 
 #[test]
+fn final_checkout_validation_runs_after_marker_validation_and_can_refuse_cas() {
+    let _serial = v3::serial_for_test();
+    for remove_base_before_validation in [false, true] {
+        let storage = tempfile::tempdir().unwrap();
+        let (identity, generation) =
+            publish_test_base(storage.path(), &[("src/changed.rs", b"old")]);
+        let header = identity.header(&generation);
+        let root = storage.path().join("worker-root");
+        std::fs::create_dir(&root).unwrap();
+        let finished = std::cell::Cell::new(false);
+        let validated = std::cell::Cell::new(false);
+        let result = publish_worker_with(
+            WorkerPublication {
+                storage: storage.path(),
+                family: FAMILY,
+                worker_scope: "worker-a",
+                root: &root,
+                base: &header,
+                delta: worker_delta(&identity, &generation, b"new"),
+                previous: None,
+            },
+            None,
+            &mut |_| {
+                finished.set(true);
+                if remove_base_before_validation {
+                    with_base_barrier(storage.path(), FAMILY, |tx| {
+                        tx.execute(
+                            "UPDATE members SET state='evicting' WHERE scope=?1",
+                            [&identity.scope],
+                        )?;
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            },
+            &mut || {
+                assert!(finished.get());
+                validated.set(true);
+                Err(BaseRefError::Unavailable(
+                    "HEAD changed after admission".into(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(validated.get(), !remove_base_before_validation);
+        assert!(refs(storage.path()).is_empty());
+        let worker = v3::view_dir(storage.path(), FAMILY, "worker-a").unwrap();
+        assert!(ViewStore::existing_dir(worker)
+            .unwrap()
+            .current_generation_read_only()
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
 fn a_landed_cas_is_published_and_never_erased_as_abort_cleanup() {
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();

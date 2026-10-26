@@ -730,7 +730,9 @@ pub struct CheckoutSemanticMemory {
 fn needs_reload(snapshot: &Snapshot) -> bool {
     snapshot.generation().name() == "empty"
         || snapshot.pending_intent().next().is_some()
-        || snapshot.live_entries().next().is_some()
+        || snapshot
+            .live_entries()
+            .any(|(_, entry)| entry.reconciliation != super::readiness::ReconciledDelta::Reconciled)
 }
 
 /// Whether reconciling `snapshot` needs a cold-build slot. A reconcile walks

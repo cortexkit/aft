@@ -18,6 +18,17 @@ use super::manifest_v2::{EntryV2, ManifestV2, Producers};
 use super::snapshot::{ComposedGeneration, DiskState};
 use super::{RelPath, Result, ViewError};
 
+/// Whether a live delta's bytes were stably observed, independently of whether
+/// its plane artifacts have finished materializing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReconciledDelta {
+    #[default]
+    Unreconciled,
+    Reconciled,
+    /// Repeated unstable reads supplied no bytes safe to insert.
+    Pending,
+}
+
 /// The state of one plane for one manifest entry.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]

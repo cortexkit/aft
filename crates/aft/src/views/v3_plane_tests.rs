@@ -150,6 +150,7 @@ impl Fixture {
             },
             None,
             before_cas,
+            &mut || Ok(()),
         )
         .unwrap()
         {

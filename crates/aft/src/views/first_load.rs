@@ -602,7 +602,11 @@ impl SiblingLoader {
                 }
             }
             for (path, entry) in checkout.entries {
-                delta.apply(path, entry);
+                if entry.reconciliation == super::readiness::ReconciledDelta::Pending {
+                    delta.record_intent(path);
+                } else {
+                    delta.apply(path, entry);
+                }
             }
             for (path, patch) in checkout.readiness {
                 delta.set_readiness(path, patch);
@@ -1332,6 +1336,7 @@ struct ObservedStat {
     #[cfg(unix)]
     device: u64,
     recorded_ns: u128,
+    delivery_seq: u64,
 }
 
 /// Publish stat evidence together with the extracted content it validates.
@@ -1353,6 +1358,7 @@ impl ObservedStat {
                 metadata.dev()
             },
             recorded_ns,
+            delivery_seq: 0,
         }
     }
 
@@ -1418,6 +1424,67 @@ mod stat_tests {
         );
         assert_eq!(driver.take_reconcile_work().reads, 1);
         assert!(snapshot.install_cut().is_some());
+    }
+
+    #[test]
+    fn unstable_strict_reads_retry_three_times_and_name_pending_without_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"initial").unwrap();
+        let (driver, access) = driver(root.path(), storage.path());
+        *driver.read_hook.lock().unwrap() = Some(Box::new(|file, attempt| {
+            std::fs::write(file, vec![b'x'; 20 + attempt]).unwrap();
+        }));
+        let base = driver.installed_snapshot().generation().clone();
+        let (snapshot, _) = driver.verified_bind(&access, base).unwrap();
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        assert_eq!(snapshot.pending_intent().collect::<Vec<_>>(), vec![&path]);
+        assert_eq!(
+            snapshot.disk_state(&path),
+            super::super::snapshot::DiskState::Absent
+        );
+        assert_eq!(driver.take_reconcile_work().reads, 3);
+        assert!(driver.observed.lock().unwrap().stats.is_empty());
+    }
+
+    #[test]
+    fn event_during_exception_read_invalidates_even_unchanged_stats() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"unchanged").unwrap();
+        let (driver, access) = driver(root.path(), storage.path());
+        let driver = Arc::new(driver);
+        let weak = Arc::downgrade(&driver);
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let changed = path.clone();
+        *driver.read_hook.lock().unwrap() = Some(Box::new(move |_, attempt| {
+            if attempt == 0 {
+                weak.upgrade().unwrap().record_change(changed.clone());
+            }
+        }));
+        driver.reconcile(&access).unwrap();
+        assert_eq!(driver.take_reconcile_work().reads, 2);
+        assert_eq!(driver.observed.lock().unwrap().stats[&path].delivery_seq, 1);
+    }
+
+    #[test]
+    fn overflow_updates_the_canonical_epoch_and_preserves_bundle_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, access) = driver(root.path(), storage.path());
+        let before = driver.installed_snapshot();
+        driver.record_watcher_overflow();
+        let after = driver.installed_snapshot();
+        assert_eq!(
+            after.watcher(),
+            super::super::snapshot::WatcherState::Overflowed
+        );
+        assert!(after.install_cut().unwrap().epoch > before.install_cut().unwrap().epoch);
+        assert!(Arc::ptr_eq(
+            after.readers().unwrap(),
+            before.readers().unwrap()
+        ));
+        assert!(driver.validate_cut(&access, &before, 0).is_err());
     }
 
     #[test]
@@ -1510,8 +1577,26 @@ pub struct CheckoutDriver {
     publication_transition: std::sync::Mutex<()>,
     retry: std::sync::atomic::AtomicBool,
     watcher_cookies: crate::watcher_backend::cookie::CookieBarrier,
+    delivery: std::sync::Mutex<DeliveryState>,
+    #[cfg(test)]
+    read_hook: std::sync::Mutex<Option<ReadHook>>,
     #[cfg(test)]
     work: std::sync::Mutex<ReconcileWork>,
+}
+
+#[derive(Default)]
+struct DeliveryState {
+    seq: u64,
+    paths: BTreeMap<RelPath, u64>,
+}
+
+#[cfg(test)]
+type ReadHook = Box<dyn Fn(&std::path::Path, usize) + Send>;
+
+enum StableRead {
+    Absent,
+    Bytes(Vec<u8>, ObservedStat),
+    Pending,
 }
 
 struct PreparedReaders {
@@ -1531,6 +1616,66 @@ pub(crate) struct ReconcileWork {
 }
 
 impl CheckoutDriver {
+    fn stable_read(
+        &self,
+        path: &RelPath,
+        absolute: &std::path::Path,
+        recorded_ns: u128,
+        first_seq: u64,
+    ) -> Result<StableRead, PlaneError> {
+        for attempt in 0..3 {
+            let seq = if attempt == 0 {
+                first_seq
+            } else {
+                self.delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .seq
+            };
+            let before = self.source_stat(absolute, recorded_ns)?;
+            let bytes = super::assembly::read_working_tree_file(absolute)
+                .map_err(|error| SiblingLoader::error(error.to_string()))?;
+            #[cfg(test)]
+            {
+                if let Some(bytes) = &bytes {
+                    let mut work = self.work.lock().unwrap();
+                    work.reads += 1;
+                    work.content_hash_bytes += bytes.len();
+                }
+                if let Some(hook) = &*self.read_hook.lock().unwrap() {
+                    hook(absolute, attempt);
+                }
+            }
+            let after = self.source_stat(absolute, recorded_ns)?;
+            let delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let unchanged = delivery.paths.get(path).copied().unwrap_or(0) <= seq;
+            drop(delivery);
+            match (before, after, bytes) {
+                (None, None, None) if unchanged => return Ok(StableRead::Absent),
+                (Some(mut before), Some(after), Some(bytes)) if unchanged => {
+                    let stable = before.stamp == after.stamp;
+                    #[cfg(unix)]
+                    let stable = stable && before.device == after.device;
+                    if stable {
+                        before.delivery_seq = seq;
+                        return Ok(StableRead::Bytes(bytes, before));
+                    }
+                }
+                _ => {}
+            }
+            // A changing file must not contribute bytes to a ready generation.
+            // Back off between bounded attempts; tests inject changes directly.
+            #[cfg(not(test))]
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(1 << attempt));
+            }
+        }
+        Ok(StableRead::Pending)
+    }
+
     /// Verifies this checkout against `base` and returns a reconciliation cut.
     /// Unsupported freshness proofs use strict reconciliation instead. This
     /// does not publish or install the cut; those steps still validate its epoch
@@ -1593,6 +1738,9 @@ impl CheckoutDriver {
             publish_fence: std::sync::RwLock::new(None),
             observed: Default::default(),
             watcher_cookies: Default::default(),
+            delivery: Default::default(),
+            #[cfg(test)]
+            read_hook: Default::default(),
             installed: std::sync::Mutex::new(Arc::new(InstalledBundle {
                 seq: 0,
                 composed,
@@ -1642,6 +1790,15 @@ impl CheckoutDriver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let installed = Arc::make_mut(&mut installed);
+        {
+            let mut delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.seq += 1;
+            let seq = delivery.seq;
+            delivery.paths.insert(path.clone(), seq);
+        }
         installed.revision += 1;
         // Keep prior membership until reconciliation, but mark the edited path
         // as unreflected so queries cannot report stale data as installed.
@@ -1671,22 +1828,28 @@ impl CheckoutDriver {
 
     /// Invalidates stale builds and indexed membership until strict reconciliation.
     pub fn record_watcher_overflow(&self) {
+        let mut delta = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut installed = self
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let installed = Arc::make_mut(&mut installed);
         installed.revision += 1;
-        let mut delta =
-            super::snapshot::LiveDelta::new(Arc::clone(installed.snapshot.generation()));
-        for (path, entry) in installed.snapshot.live_entries() {
-            delta.apply(path.clone(), entry.clone());
-        }
-        for path in installed.snapshot.pending_intent() {
-            delta.record_intent(path.clone());
-        }
-        delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
+        delta.bump_epoch();
         delta.set_watcher(super::snapshot::WatcherState::Overflowed);
-        installed.snapshot = delta.snapshot();
+        installed.snapshot = delta
+            .snapshot()
+            .with_readers(installed.readers.clone())
+            .with_install_cut(InstallCut {
+                seq: installed.seq,
+                resident: installed.composed.clone(),
+                epoch: delta.epoch(),
+                version: delta.version(),
+                intent_version: delta.snapshot().intent_version(),
+            });
     }
 
     /// Creates an exclusive root cookie. This does not enable verified bind;
@@ -1829,6 +1992,11 @@ impl FirstLoadDriver for CheckoutDriver {
                     .unwrap_or_default()
                     .as_secs(),
             ) * 1_000_000_000;
+            let delivery_seq = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .seq;
             let before = self.source_stat(&absolute, recorded_ns)?;
             if !pending.contains(&path) {
                 if let (Some(old), Some(cached), Some(current)) = (
@@ -1836,7 +2004,15 @@ impl FirstLoadDriver for CheckoutDriver {
                     previous.stats.get(&path),
                     before.as_ref(),
                 ) {
-                    if cached.reusable(current) {
+                    let delivered = self
+                        .delivery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .paths
+                        .get(&path)
+                        .copied()
+                        .unwrap_or(0);
+                    if cached.reusable(current) && delivered <= cached.delivery_seq {
                         let mut entry = old.clone();
                         entry.seq = revision;
                         entries.insert(path.clone(), entry);
@@ -1845,27 +2021,20 @@ impl FirstLoadDriver for CheckoutDriver {
                     }
                 }
             }
-            let Some(bytes) = super::assembly::read_working_tree_file(&absolute)
-                .map_err(|error| SiblingLoader::error(error.to_string()))?
-            else {
-                continue;
-            };
-            let after = self.source_stat(&absolute, recorded_ns)?;
-            if let (Some(before), Some(after)) = (before, after) {
-                let stable = before.stamp == after.stamp;
-                #[cfg(unix)]
-                let stable = stable && before.device == after.device;
-                if stable {
-                    stats.insert(path.clone(), before);
-                }
-            }
-            #[cfg(test)]
-            {
-                let mut work = self.work.lock().unwrap();
-                work.reads += 1;
-                work.content_hash_bytes += bytes.len();
-            }
+            let (bytes, evidence) =
+                match self.stable_read(&path, &absolute, recorded_ns, delivery_seq)? {
+                    StableRead::Absent => continue,
+                    StableRead::Bytes(bytes, evidence) => (bytes, evidence),
+                    StableRead::Pending => {
+                        let mut entry = LiveEntry::new(installed.disk_state(&path), revision);
+                        entry.reconciliation = super::readiness::ReconciledDelta::Pending;
+                        entries.insert(path, entry);
+                        continue;
+                    }
+                };
+            stats.insert(path.clone(), evidence);
             let mut entry = LiveEntry::new(super::snapshot::DiskState::of_bytes(&bytes), revision);
+            entry.reconciliation = super::readiness::ReconciledDelta::Reconciled;
             for plane in &self.planes {
                 if plane.applies_to(&path) {
                     #[cfg(test)]
@@ -2408,6 +2577,10 @@ impl CheckoutDriver {
                 }
                 Ok(())
             },
+            &mut || {
+                self.validate_cut(access, snapshot, 0)
+                    .map_err(|error| super::base_refs::BaseRefError::Unavailable(error.reason))
+            },
         );
         drop(live);
         match outcome {
@@ -2495,7 +2668,14 @@ impl QueryState for CheckoutDriver {
         gaps.extend(
             snapshot
                 .live_entries()
-                .filter(|(path, _)| applicable(path))
+                .filter(|(path, entry)| {
+                    applicable(path)
+                        && (entry.reconciliation != super::readiness::ReconciledDelta::Reconciled
+                            || !matches!(
+                                snapshot.plane_readiness(path, plane),
+                                Some(super::readiness::PlaneState::Ready { .. })
+                            ))
+                })
                 .map(|(path, _)| path.clone()),
         );
         for (path, _entry) in snapshot.generation().entries() {

@@ -535,6 +535,7 @@ pub struct LiveEntry {
     /// The watcher or intent sequence that produced this state.
     pub seq: u64,
     pub attachments: BTreeMap<FamilyPlane, PlaneAttachment>,
+    pub reconciliation: super::readiness::ReconciledDelta,
 }
 
 impl fmt::Debug for LiveEntry {
@@ -553,6 +554,7 @@ impl LiveEntry {
             disk,
             seq,
             attachments: BTreeMap::new(),
+            reconciliation: Default::default(),
         }
     }
 }
