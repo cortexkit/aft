@@ -2477,7 +2477,7 @@ impl FirstLoadDriver for CheckoutDriver {
                     }
                 }
             }
-            let (bytes, evidence) =
+            let (bytes, stat_evidence) =
                 match self.stable_read(&path, &absolute, recorded_ns, delivery_seq)? {
                     StableRead::Absent => continue,
                     StableRead::Bytes(bytes, evidence) => (bytes, evidence),
@@ -2488,7 +2488,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         continue;
                     }
                 };
-            stats.insert(path.clone(), evidence);
+            stats.insert(path.clone(), stat_evidence);
             let content = crate::blob_store::v2::ContentHash::of(&bytes);
             #[cfg(test)]
             {
