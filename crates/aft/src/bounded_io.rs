@@ -355,7 +355,15 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
             response.data["gaps"] = serde_json::json!([gap]);
         }
         let text = response.data["text"].as_str().unwrap_or_default();
-        response.data["text"] = serde_json::json!(format!("{text}\n\n{gap}"));
+        // Coverage details precede the shared trailer so the last line remains
+        // the list's machine-readable count and narrowing advice.
+        let text = match text.rsplit_once("\n\n") {
+            Some((body, trailer)) if trailer.starts_with("shown ") => {
+                format!("{body}\n\n{gap}\n\n{trailer}")
+            }
+            _ => format!("{text}\n\n{gap}"),
+        };
+        response.data["text"] = serde_json::json!(text);
         return response;
     }
     match error {
