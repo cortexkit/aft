@@ -460,6 +460,230 @@ pub fn plan_binder(
     }
 }
 
+/// Attempts per path before a strict read gives up on an unstable file.
+pub const STABLE_READ_ATTEMPTS: usize = 3;
+
+/// Reads `path` strictly: the file's stat (size, modification time and, on
+/// unix, device and inode) must be equal before and after the read, up to
+/// [`STABLE_READ_ATTEMPTS`] times. An unstable file is never accepted.
+pub fn read_stable(path: &Path) -> std::io::Result<Vec<u8>> {
+    fn stamp(metadata: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>, u64, u64) {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let identity = (0, 0);
+        (
+            metadata.len(),
+            metadata.modified().ok(),
+            identity.0,
+            identity.1,
+        )
+    }
+    for _ in 0..STABLE_READ_ATTEMPTS {
+        let before = std::fs::symlink_metadata(path)?;
+        if !before.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        let bytes = std::fs::read(path)?;
+        let after = std::fs::symlink_metadata(path)?;
+        if stamp(&before) == stamp(&after) && bytes.len() as u64 == after.len() {
+            return Ok(bytes);
+        }
+    }
+    Err(std::io::Error::other(
+        "file kept changing during strict reads",
+    ))
+}
+
+/// Inputs of one base build: the membership the configured walker produced
+/// for `root`, and the effective identity inputs.
+pub struct BaseBuildInput<'a> {
+    pub storage: &'a Path,
+    pub family: &'a str,
+    pub root: &'a Path,
+    pub paths: &'a [super::RelPath],
+    pub policy: crate::blob_store::v2::TrigramPolicy,
+    pub semantic_producer: Option<String>,
+    pub callgraph_producer: String,
+    pub ignore_fingerprint: Option<String>,
+    /// A comparable base's `(peak allocated build bytes, files, source bytes)`.
+    pub history: Option<(u64, u64, u64)>,
+    pub budget: super::eviction::DiskBudget,
+}
+
+/// What [`build_base`] did.
+#[derive(Debug)]
+pub enum BaseBuild {
+    /// This process built and first-published the base; it keeps the claim
+    /// and owns the readiness successors.
+    Published {
+        identity: BaseIdentity,
+        generation: String,
+        claim: BuildClaim,
+    },
+    /// Another live owner is building it.
+    Busy,
+    /// The bind takes the strict path for this reason.
+    Strict(String),
+}
+
+/// Builds a membership-keyed base from strict, stability-checked reads of
+/// `input.paths`, keyed by the tagged membership-and-content digest
+/// (`head_tree = None`, no `git_oid`). Single-flight through the build claim;
+/// admission through the v3 disk budget with the ruled initial reservation.
+/// The first publication happens once membership and the lexical plane are
+/// complete; graph and semantic entries stay pending for readiness successors.
+pub fn build_base(
+    input: BaseBuildInput<'_>,
+    observer: Option<&dyn DurabilityObserver>,
+) -> Result<BaseBuild> {
+    let BaseBuildInput {
+        storage,
+        family,
+        root,
+        paths,
+        policy,
+        semantic_producer,
+        callgraph_producer,
+        ignore_fingerprint,
+        history,
+        budget,
+    } = input;
+    let mut bytes = std::collections::BTreeMap::new();
+    let mut source_bytes = 0u64;
+    let header = super::manifest_v2::ManifestHeader {
+        producers: super::manifest_v2::Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: semantic_producer.clone(),
+            callgraph: callgraph_producer,
+        },
+        head_tree: None,
+        ignore_fingerprint,
+        segment: None,
+    };
+    let mut manifest = ManifestV2::new_v3(
+        header,
+        None,
+        super::manifest_v2::PublishedFrontier::default(),
+    );
+    for path in paths {
+        #[cfg(unix)]
+        let relative = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(path.as_bytes()).to_owned()
+        };
+        #[cfg(not(unix))]
+        let relative =
+            std::ffi::OsString::from(String::from_utf8_lossy(path.as_bytes()).into_owned());
+        let source = read_stable(&root.join(relative))?;
+        source_bytes += source.len() as u64;
+        let planes = super::manifest_v2::EntryPlanes {
+            trigram: Some(PlaneState::pending("lexical plane not built")),
+            semantic: semantic_producer
+                .as_ref()
+                .filter(|_| super::semantic::applies_to(path))
+                .map(|_| PlaneState::pending("awaiting the base owner")),
+            callgraph: Some(PlaneState::pending("awaiting the base owner")),
+        };
+        manifest.insert(
+            path.clone(),
+            super::manifest_v2::EntryV2::regular(
+                crate::blob_store::v2::ContentHash::of(&source),
+                source.len() as u64,
+                planes,
+            ),
+        )?;
+        bytes.insert(path.clone(), source);
+    }
+    let identity = BaseIdentity::of(family, &manifest)?;
+    let claim = match claim_base(storage, family, &identity.scope, observer)? {
+        ClaimOutcome::Claimed(claim) => claim,
+        ClaimOutcome::Busy { .. } => return Ok(BaseBuild::Busy),
+        ClaimOutcome::CapReached { .. } => return Ok(BaseBuild::Strict("live_base_cap".into())),
+    };
+    // Admission first: the reservation charges the build before any byte.
+    let request = initial_reservation(paths.len() as u64, source_bytes, history);
+    let admitted = {
+        let lock = v3::ReservationLock::acquire(storage)?;
+        let mut registry = v3::open_base_refs_registry(storage, family, &lock, None)?;
+        match budget.admit_v3(&mut registry, request) {
+            Ok(admitted) => admitted.reservation,
+            Err(refusal) => {
+                drop(registry);
+                drop(lock);
+                claim.release()?;
+                return Ok(BaseBuild::Strict(refusal.to_string()));
+            }
+        }
+    };
+    let release = |reservation: v3::Reservation| -> Result<()> {
+        let lock = v3::ReservationLock::acquire(storage)?;
+        let mut registry = v3::RegistryWriter::open_for_barrier(storage, family, &lock)?;
+        registry.release(reservation)?;
+        Ok(())
+    };
+    let built = (|| -> Result<String> {
+        let registered = with_base_barrier(storage, family, |tx| {
+            register_base_in(tx, storage, family, &identity.scope)
+        })?;
+        if registered.1 {
+            boundary(observer, DurabilityStep::BaseRegistered)?;
+        }
+        let mut live = crate::pins::LivePin::create_v3(storage, family, &identity.scope)
+            .map_err(|error| BaseRefError::Io(std::io::Error::other(error.to_string())))?;
+        super::trigram::materialize_v3(storage, family, &mut manifest, &bytes, &mut live, policy)
+            .map_err(|error| BaseRefError::Io(std::io::Error::other(error.reason)))?;
+        if !claim.verify_held()? {
+            return Err(BaseRefError::Unavailable(
+                "the build claim was taken over".into(),
+            ));
+        }
+        match publish_base(storage, family, &manifest, observer)? {
+            BasePublication::Published { generation, .. } => Ok(generation),
+            BasePublication::Lost { current } => Err(BaseRefError::Unavailable(format!(
+                "another publisher moved the base pointer to {current:?}"
+            ))),
+        }
+    })();
+    release(admitted)?;
+    let generation = built?;
+    claim.mark_serving()?;
+    Ok(BaseBuild::Published {
+        identity,
+        generation,
+        claim,
+    })
+}
+
+/// Publishes a readiness successor of the claimed base: `update` edits a
+/// copy of the current manifest (filling pending planes), and the result must
+/// pass [`check_successor`]. A model outage is recorded as `Failed` here
+/// without touching the lexical plane.
+pub fn publish_successor(
+    claim: &BuildClaim,
+    update: impl FnOnce(&mut ManifestV2),
+    observer: Option<&dyn DurabilityObserver>,
+) -> Result<String> {
+    if !claim.verify_held()? {
+        return Err(BaseRefError::Unavailable(
+            "the build claim was taken over".into(),
+        ));
+    }
+    let base = super::base_refs::resolve_base(&claim.storage, &claim.family, &claim.scope)?;
+    let mut next = base.manifest().clone();
+    drop(base);
+    update(&mut next);
+    match publish_base(&claim.storage, &claim.family, &next, observer)? {
+        BasePublication::Published { generation, .. } => Ok(generation),
+        BasePublication::Lost { current } => Err(BaseRefError::Unavailable(format!(
+            "the base pointer moved to {current:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 #[path = "base_builder_tests.rs"]
 mod tests;
