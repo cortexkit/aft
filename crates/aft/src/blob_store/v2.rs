@@ -44,6 +44,9 @@ pub const STORE_SCHEMA_VERSION: i64 = 1;
 /// Payload encoding version of trigram blobs. Bumping it must also change the
 /// trigram policy fingerprint, because that fingerprint is part of every key.
 pub const TRIGRAM_PAYLOAD_SCHEMA: u32 = 1;
+/// Layout of a v3 symbol-plane payload (`views::symbol_store`). The symbol
+/// plane exists only in v3; no v2 store is ever opened for it.
+pub const SYMBOL_PAYLOAD_SCHEMA: u32 = 1;
 
 const STORE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -84,16 +87,28 @@ pub enum FamilyPlane {
     Trigram,
     Semantic,
     Callgraph,
+    /// Parsed symbols of one file, keyed by content, language and the
+    /// extraction schema. A v3-only plane: it has no manifest readiness and
+    /// no v2 store, so it is deliberately absent from [`Self::ALL`], which
+    /// the manifest, v2 GC, eviction and per-entry code iterate. The v3
+    /// plane-row sweep covers it through [`Self::V3_STORES`].
+    Symbol,
 }
 
 impl FamilyPlane {
+    /// The planes a manifest entry, a v2 family store and the v2 GC know.
+    /// Never add [`Self::Symbol`] here: `EntryPlanes::get_mut` has no field
+    /// for it and panics.
     pub const ALL: [Self; 3] = [Self::Trigram, Self::Semantic, Self::Callgraph];
+    /// Every plane that can have a store under `blobs/v3/<family>/`.
+    pub const V3_STORES: [Self; 4] = [Self::Trigram, Self::Semantic, Self::Callgraph, Self::Symbol];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Trigram => "trigram",
             Self::Semantic => "semantic",
             Self::Callgraph => "callgraph",
+            Self::Symbol => "symbol",
         }
     }
 
@@ -102,6 +117,7 @@ impl FamilyPlane {
             Self::Trigram => TRIGRAM_PAYLOAD_SCHEMA,
             Self::Semantic => crate::blob_store::SEMANTIC_PAYLOAD_SCHEMA,
             Self::Callgraph => crate::blob_store::CALLGRAPH_PAYLOAD_SCHEMA,
+            Self::Symbol => SYMBOL_PAYLOAD_SCHEMA,
         }
     }
 }
@@ -1890,6 +1906,20 @@ mod tests {
             },
         }
         .family_key()
+    }
+
+    #[test]
+    fn symbol_is_not_a_manifest_plane() {
+        // `EntryPlanes::get_mut` panics for Symbol because a manifest entry
+        // has no symbol state. That panic is unreachable only while every
+        // list the manifest, v2 store, GC, eviction and per-entry code
+        // iterates (`FamilyPlane::ALL`) excludes the v3-only symbol plane.
+        assert!(!FamilyPlane::ALL.contains(&FamilyPlane::Symbol));
+        assert!(FamilyPlane::V3_STORES.contains(&FamilyPlane::Symbol));
+        for plane in FamilyPlane::ALL {
+            assert!(FamilyPlane::V3_STORES.contains(&plane));
+        }
+        assert_eq!(FamilyPlane::Symbol.as_str(), "symbol");
     }
 
     #[test]

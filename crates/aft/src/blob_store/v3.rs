@@ -24,6 +24,10 @@ pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
 pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+/// Sweep epochs a symbol-plane row survives without being touched. Symbol
+/// rows are a reusable cache that no manifest names, so the plane-row sweep
+/// ages them out by epoch instead of by marking.
+pub const SYMBOL_RETENTION_SWEEPS: i64 = 8;
 const TIMEOUT_MS: i64 = 5_000;
 mod connections;
 mod copy;
@@ -1315,7 +1319,8 @@ impl RegistryWriter<'_> {
             complete: true,
             ..PlaneRowSweep::default()
         };
-        for plane in FamilyPlane::ALL {
+        // Every v3 plane store, including the v3-only symbol plane.
+        for plane in FamilyPlane::V3_STORES {
             let path = self.dir.join(format!("{}.sqlite", plane.as_str()));
             if !path.try_exists()? {
                 cursor.after.remove(plane.as_str());
@@ -1349,6 +1354,15 @@ impl RegistryWriter<'_> {
                 .and_then(|hex| super::v2::parse_hex32(hex))
                 .map(|key| key.to_vec())
                 .unwrap_or_default();
+            // No manifest names a symbol row, so marking never protects one.
+            // A symbol row is instead kept until it has gone untouched for
+            // SYMBOL_RETENTION_SWEEPS sweep epochs; every other plane is
+            // collected as soon as it is unmarked and older than this epoch.
+            let collect_below = if plane == FamilyPlane::Symbol {
+                epoch.saturating_sub(SYMBOL_RETENTION_SWEEPS)
+            } else {
+                epoch
+            };
             loop {
                 if report.examined >= limit || deadline.is_some_and(|d| Instant::now() >= d) {
                     report.complete = false;
@@ -1357,7 +1371,7 @@ impl RegistryWriter<'_> {
                 let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let keys: Vec<Vec<u8>> = tx
                     .prepare(select)?
-                    .query_map(params![epoch, after], |r| r.get(0))?
+                    .query_map(params![collect_below, after], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 if keys.is_empty() {
                     tx.commit()?;
@@ -1369,7 +1383,7 @@ impl RegistryWriter<'_> {
                     let protected = <[u8; 32]>::try_from(key.as_slice())
                         .map_or(true, |key| marked.contains(&key));
                     if !protected {
-                        report.deleted += tx.execute(delete, params![key, epoch])? as u64;
+                        report.deleted += tx.execute(delete, params![key, collect_below])? as u64;
                     }
                 }
                 tx.commit()?;
@@ -1662,6 +1676,7 @@ pub fn v3_format_report(path: &Path) -> Result<V3FormatReport> {
         Some("semantic") => Kind::Plane(FamilyPlane::Semantic),
         Some("callgraph") => Kind::Plane(FamilyPlane::Callgraph),
         Some("trigram") => Kind::Plane(FamilyPlane::Trigram),
+        Some("symbol") => Kind::Plane(FamilyPlane::Symbol),
         _ => return Err(Error::InvalidIdentity),
     };
     let database = connections::shared(path, kind, false, true)?;

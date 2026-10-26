@@ -609,7 +609,10 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
 - The implemented registry remains `views_v3_registry` format/schema **1/1**.
   Reserve **2/2** for slice 4's base-reference protocol, **3/3** for 4v's token
   and stat-evidence protocol, **4/4** for slice 5's donor-seal protocol, and
-  **5/5** for 6a's symbol/import protocol. These versions gate the whole member
+  5/5, earlier reserved for 6a, is **not used** by 6a: its import ledger is a
+  sidecar file and its symbol plane is an ordinary plane store (see *Import
+  ledger and symbol plane* below), so neither changes the registry schema.
+  These versions gate the whole member
   protocol, including its sidecars; a version can advance without adding a
   registry table. An owning slice
   installs its complete schema through an explicit versioned upgrade, never a
@@ -633,10 +636,11 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
   registry-floor version that makes unsupported readers refuse.
 - Every artifact publication uses the combined v3 floor boundary. Slice 4
   requests registry floor 2 before its artifacts; 4v requests 3 before stat
-  evidence or tokens; 5 requests 4 before donor/seal publication; 6a requests 5
-  before **either** symbol-plane or import-ledger publication. Every publisher
-  also requests store floor 1. These are future written versions, not changes
-  to today's startup baseline.
+  evidence or tokens; 5 requests 4 before donor/seal publication. 6a writes
+  its symbol plane and import ledger only inside `blob_store::v3::publish`,
+  which requests registry floor 1 and store floor 1 before creating either
+  file. Every publisher also requests store floor 1. These are future written
+  versions, not changes to today's startup baseline.
 
 ### Assigned paths and owners
 
@@ -651,8 +655,8 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
 | 4v | `M/stat-evidence-<generation>.sqlite` | Stat-evidence 1/1, registry floor 3 | Generation-paired path/root/file identity, size/times, stable content digest, proven Git OID if any, observation-time conversion-policy digest and per-plane keys. No stat-cache or current-policy-only proof. |
 | 4v | `F/members.sqlite`: `view_tokens` rows | `views_v3_registry` 3/3 | Single-use advisory token bound to identity at first consumption, with expiry and consume state. Stored in daemon storage, never the checkout. Stat evidence and tokens do not replace freshness validation. |
 | 5 | `M/donor-<generation>-<fingerprint>.seal.json` beside `M/donor-<generation>-<fingerprint>.sqlite` | Donor seal 1, registry floor 4 | Atomically publish fingerprint, size and `journal_mode=DELETE` only after the detached donor is checkpointed and synced and has no WAL/SHM. A published manifest names only a completed seal. Never copy/clone a live SQLite file set. |
-| 6a | `F/symbol.sqlite` | `views_v3_store` 1/1, new-store layout 2; registry floor 5 | The v3 symbol plane uses the same immutable `payload`/`payload_digest` contract and reservation protocol. No in-place legacy conversion. |
-| 6a | `F/members.sqlite`: `imports` rows | `views_v3_registry` 5/5 | Record completion/rejection per artifact, compatible producer and destination plane, with owner-token claim/recovery semantics. Import into v3 only, stream inputs above 1 GiB and retain legacy bytes. |
+| 6a | `F/symbol.sqlite` | `views_v3_store` 1/1, new-store layout 2; store floor 1 | The v3 symbol plane uses the same immutable `payload`/`payload_digest` contract and reservation protocol. No in-place legacy conversion. Implemented; see *Import ledger and symbol plane*. |
+| 6a | `F/imports.sqlite` (sidecar, not a registry table) | Import ledger 1/1, `application_id` `0x41465449`; registry stays 1/1 or 2/2 | Record completion/rejection per legacy key, artifact, compatible producer and destination plane, with owner-token claim/recovery semantics. Import into v3 only, stream inputs above 1 GiB and retain legacy bytes. Implemented; see *Import ledger and symbol plane*. |
 
 The registry-version increments above are serial handoffs, not permission for
 an earlier slice to write a later owner's rows. Owners implement and test their
@@ -664,3 +668,115 @@ and member retention remain unchanged.
 Slice 4's binder must honour the `evicting` contract above: when it finds its
 member in `evicting`, it never uses that view directory, and either treats the
 member as absent and publishes a fresh one or waits for the eviction to finish.
+
+## Import ledger and symbol plane (6a)
+
+Sources: `crates/aft/src/migration/v3_import.rs` (ledger, decoders, staging,
+registration), `crates/aft/src/migration/v3_symbols.rs` (symbol importer) and
+`crates/aft/src/views/symbol_store.rs` (symbol plane). Imports write only
+under `blobs/v3/<family>/` and their own staging directory; they never write
+a v1 or v2 row, manifest, pointer or schema, and never move, change or delete
+a legacy file.
+
+### Symbol plane `F/symbol.sqlite`
+
+- An ordinary v3 plane store (`views_v3_store` 1/1, layout 2, `store_meta.plane
+  = 'symbol'`), opened and written through the same `blob_store::v3`
+  connections, `Publication` and `PlaneReader` as the other planes:
+  `FamilyPlane::Symbol`. It is a v3-only plane: it is not in
+  `FamilyPlane::ALL` (which manifests, v2 stores, v2 GC and eviction
+  iterate) but is in `FamilyPlane::V3_STORES`, which the v3 plane-row sweep
+  and `v3_format_report` use. No manifest entry records symbol readiness.
+- Key: BLAKE3 over the tag `aft/views-v3/symbol/v1`, then the content hash
+  (32 bytes), the language id and the producer id, each preceded by its
+  length as a big-endian u64. The producer id is
+  `aft-symbols/extraction-<SCHEMA_VERSION>` (`symbol_cache_disk::SCHEMA_VERSION`,
+  bumped on any grammar, query or extractor change), so a parser or schema
+  change produces a different key and misses. A source hash alone is never
+  a key.
+- Payload (payload schema 1): `u8` layout 1, then three length-prefixed
+  (`u32` LE) fields: producer id, language id, and the symbols as the JSON
+  array `symbols.bin` stores. A reader checks the layout, producer and
+  language against its key's inputs before decoding.
+- **GC.** Manifests never name symbol rows, so the sweep does not use marking
+  for them: it deletes a symbol row only when its `ref_epoch` is more than
+  `SYMBOL_RETENTION_SWEEPS` (8) sweep epochs old. A lookup that uses a row
+  touches it inside a publication, which restamps it.
+- **Residency.** Decoded symbol lists are shared as `Arc<Vec<Symbol>>`
+  through a process-wide cache in `views/symbol_store.rs`, bounded at 64 MiB
+  of estimated bytes; eviction from it never touches stored rows.
+- **Floor and accounting.** Written only inside `v3::publish` (registry floor
+  1, store floor 1, a reservation per batch); its bytes are part of the
+  family's namespace inventory like any plane store.
+
+### Import ledger `F/imports.sqlite`
+
+A sidecar SQLite file, not a registry table: `members.sqlite` and its
+version are unchanged. It is created, and every row transition is written,
+inside a `v3::publish` call (64 KiB reservation), so the file exists only
+after the v3 floor is raised and each write holds the reservation lock.
+Readers (status, prune eligibility, retention) copy the database and its WAL
+to a private temporary directory and read the copy, so a read never writes
+under the storage root.
+
+```sql
+CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, schema_text TEXT NOT NULL);
+CREATE TABLE imports (legacy_key TEXT NOT NULL, artifact TEXT NOT NULL,
+ producer TEXT NOT NULL, plane TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('claimed','staged','validated','registered','done','rejected')),
+ attempt INTEGER NOT NULL CHECK(attempt>=1), owner_pid INTEGER, owner_start INTEGER, owner_token TEXT,
+ source_hash BLOB, source_len INTEGER, staged_hash BLOB,
+ imported INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0,
+ reason TEXT, updated_ms INTEGER NOT NULL, completed_ms INTEGER,
+ PRIMARY KEY(legacy_key, artifact, producer, plane));
+```
+
+Format/schema 1/1, `application_id` `0x41465449` ("AFTI"), WAL,
+`synchronous=FULL`. A newer format is refused by name. `artifact` is
+`trigram` (`index/<key>/cache.bin`), `semantic` (`semantic/<key>/semantic.bin`)
+or `symbols` (`symbols/<key>/symbols.bin`); `producer` is the trigram policy
+fingerprint, the semantic producer id or the symbol producer id; `plane` is
+the destination plane. A row completes only its own (artifact, producer,
+plane): a semantic-only completion never suppresses a trigram or symbol
+import, and a producer change starts a new row.
+
+- **States.** `claimed → staged → validated → registered → done`, or
+  `rejected{reason}` from any non-terminal state. Each transition is one
+  `BEGIN IMMEDIATE` compare-and-set on the row's state and owner token. A
+  live owner makes other callers back off; a dead or released owner's row is
+  taken over with `attempt + 1` and resumes from its durable state,
+  repeating at most one idempotent step.
+- **staged:** the canonical conversion is streamed to
+  `<storage>/migration/v3/<family>/<legacy_key>/<artifact>-<plane>-<staged
+  hash prefix>.bundle` (temp, fsync, rename, directory sync), with the
+  legacy source's BLAKE3 and length recorded. Old binaries never look under
+  `migration/v3`. A bundle is a magic `AFTIMP03`, the artifact byte, entries
+  (`u8` 1, path, content hash, size, key, payload), then `u8` 0, the entry
+  count and a BLAKE3 of every earlier byte.
+- **validated:** the bundle is re-read and every key re-derived, and the
+  legacy source is re-hashed and must still be the converted bytes.
+- **registered:** every payload is in the destination plane, written in
+  batches of at most 32 MiB, each one `v3::publish` with a reservation of
+  twice its bytes plus 1 MiB. A refused reservation reports the plane's
+  named storage gap `storage_gap:<refusal>` (`v3_namespace_budget`,
+  `device_free_space_floor`, `reservation_ledger_unreadable`); the row keeps
+  its state with the owner released and the reason recorded, so a later
+  run resumes. Nothing falls back to a legacy reader.
+- **done:** the staging bundle is removed.
+
+Inputs have no size limit. The decoders stream: the trigram `cache.bin`
+is checksummed in one sequential pass, then inverted in file-id ranges
+whose postings fit a working-set budget (64 MiB by default), one pass over
+the posting blob per range; `semantic.bin` is decoded one file's rows at a
+time. Memory is bounded by the per-file tables (path, size and hash per
+file) plus the budget, never by the input size. The `semantic.bin` decoder
+is read-only and refuses trailing bytes (appended segments or a torn tail)
+rather than repairing or folding them; a path whose rows are not
+contiguous is skipped and left for the plane to embed.
+
+Imported trigram and semantic rows are not named by any manifest until a
+base or worker build reuses them (`contains`, then `put_or_touch`). A v3
+plane-row sweep that runs between the import and that build may collect
+them; the build then recomputes those files. Imported symbol rows follow the
+symbol plane's epoch rule above.
