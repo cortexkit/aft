@@ -5841,6 +5841,7 @@ mod v3_bootstrap_tests {
         }
         let subscription = crate::watcher_backend::subscription::start(
             &std::fs::canonicalize(root.path()).unwrap(),
+            crate::watcher_backend::InitialCoverage::Complete,
         );
         let driver = trigram_driver(root.path(), storage.path());
         let access = driver.access();
@@ -5902,6 +5903,7 @@ mod v3_bootstrap_tests {
         driver.take_reconcile_work();
         let _subscription = crate::watcher_backend::subscription::start(
             &std::fs::canonicalize(root.path()).unwrap(),
+            crate::watcher_backend::InitialCoverage::Complete,
         );
         let (snapshot, revision) = driver
             .verified_bind(&access, snapshot.generation().clone())
@@ -6018,6 +6020,7 @@ mod v3_bootstrap_tests {
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
         let _subscription = crate::watcher_backend::subscription::start(
             &std::fs::canonicalize(root.path()).unwrap(),
+            crate::watcher_backend::InitialCoverage::Complete,
         );
         let source = b"fn fresh_checkout() { let marker = 42; }\n";
         std::fs::write(root.path().join("file.rs"), source).unwrap();

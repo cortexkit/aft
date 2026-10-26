@@ -10,8 +10,10 @@ fn fixture() -> (
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("file.rs"), b"fn content() {}\n").unwrap();
-    let subscription =
-        crate::watcher_backend::subscription::start(&std::fs::canonicalize(root.path()).unwrap());
+    let subscription = crate::watcher_backend::subscription::start(
+        &std::fs::canonicalize(root.path()).unwrap(),
+        crate::watcher_backend::InitialCoverage::Complete,
+    );
     let policy = crate::blob_store::v2::TrigramPolicy {
         max_file_size: 1 << 20,
     };

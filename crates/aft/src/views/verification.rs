@@ -530,6 +530,7 @@ pub(crate) struct BindGuard {
     pub policy: Policy,
     pub inputs: Vec<PathBuf>,
     pub subscription: Option<crate::watcher_backend::subscription::Continuity>,
+    pub initial_coverage: Option<crate::watcher_backend::InitialCoverage>,
     /// Stable local identities and a native backend allow event-based refresh,
     /// but do not prove that all writes before a cookie reached the driver.
     pub steady_supported: bool,
@@ -543,8 +544,12 @@ impl BindGuard {
         };
         let mut policy = Policy::capture(root, &inputs)?;
         let root_stat = NativeStat::strict_read(root)?;
+        let registration = crate::watcher_backend::subscription::status(root);
         let steady_supported = root_stat.reuse_supported
-            && cfg!(any(target_os = "linux", target_os = "macos", windows));
+            && cfg!(any(target_os = "linux", target_os = "macos", windows))
+            && registration
+                .as_ref()
+                .is_some_and(|status| status.coverage.is_complete());
         let root_identity = root_stat.identity;
         let directory = match gitdir(root) {
             Ok(path) => Some((path.clone(), NativeStat::strict_read(&path)?.identity)),
@@ -609,7 +614,8 @@ impl BindGuard {
             index,
             policy,
             inputs,
-            subscription: crate::watcher_backend::subscription::current(root),
+            subscription: registration.as_ref().map(|status| status.continuity),
+            initial_coverage: registration.map(|status| status.coverage),
             steady_supported,
         })
     }
