@@ -37,8 +37,12 @@ fn reconciled_delta_does_not_request_another_source_walk() {
     entry.reconciliation = super::super::readiness::ReconciledDelta::Reconciled;
     delta.apply(path.clone(), entry);
     assert!(!super::needs_reload(&delta.snapshot()));
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("source-probe-must-not-run");
+    assert!(!super::needs_cold_reconcile(&delta.snapshot(), &missing));
     delta.record_intent(path);
     assert!(super::needs_reload(&delta.snapshot()));
+    assert!(super::needs_cold_reconcile(&delta.snapshot(), &missing));
 }
 
 /// The test prints public setup, query answers, a v3 file inventory and exact
