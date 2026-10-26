@@ -1009,6 +1009,13 @@ pub(crate) mod work_counters {
         pub(crate) static SOURCE_READS: Cell<usize> = const { Cell::new(0) };
         pub(crate) static OWNED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
         pub(crate) static RUST_MODULE_SCANS: Cell<usize> = const { Cell::new(0) };
+        /// Tree-sitter parses through this thread's retained parsers, by any
+        /// caller (FileParser, semantic chunking, symbol extraction).
+        pub(crate) static CACHED_PARSER_PARSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn cached_parser_parses() -> usize {
+        CACHED_PARSER_PARSES.with(Cell::get)
     }
 
     pub(crate) fn tree_parses() -> usize {
@@ -1037,6 +1044,8 @@ pub(crate) fn parse_source_with_cached_parser(
     source: &str,
     lang: LangId,
 ) -> Result<Tree, AftError> {
+    #[cfg(test)]
+    work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
     REUSABLE_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {

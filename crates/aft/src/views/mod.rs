@@ -49,6 +49,7 @@ pub mod readiness;
 pub mod registry;
 pub mod segment_store;
 pub mod snapshot;
+pub mod symbol_store;
 
 // Plane and runtime modules of the per-checkout views. Each starts as a
 // documented empty module that its plane fills in.

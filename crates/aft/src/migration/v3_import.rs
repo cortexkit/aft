@@ -241,7 +241,7 @@ impl SourceIdentity {
 
 /// A legacy source opened once, read only through bounded reads. It is opened
 /// read-only and never written, truncated or repaired.
-struct Source {
+pub(super) struct Source {
     file: fs::File,
     len: u64,
     identity: SourceIdentity,
@@ -282,6 +282,14 @@ impl Source {
         Ok(())
     }
 
+    /// A sequential reader over the whole source, through bounded reads.
+    pub(super) fn sequential(&mut self) -> SourceRead<'_> {
+        SourceRead {
+            source: self,
+            offset: 0,
+        }
+    }
+
     /// Whether the open file still has the identity it had when opened.
     fn unchanged(&self) -> bool {
         self.file
@@ -291,7 +299,10 @@ impl Source {
 
     /// One sequential pass over the whole file: its BLAKE3 and the CRC32 of
     /// each `[start, end)` range in `crc_ranges`.
-    fn checksum_pass(&mut self, crc_ranges: &[(u64, u64)]) -> Result<([u8; 32], Vec<u32>), String> {
+    pub(super) fn checksum_pass(
+        &mut self,
+        crc_ranges: &[(u64, u64)],
+    ) -> Result<([u8; 32], Vec<u32>), String> {
         let mut hasher = blake3::Hasher::new();
         let mut crcs = vec![crc32fast::Hasher::new(); crc_ranges.len()];
         let mut buffer = vec![0_u8; READ_CHUNK];
@@ -314,6 +325,28 @@ impl Source {
             *hasher.finalize().as_bytes(),
             crcs.into_iter().map(crc32fast::Hasher::finalize).collect(),
         ))
+    }
+}
+
+/// `Read` over a [`Source`] from its start; every read is at most
+/// [`READ_CHUNK`] bytes.
+pub(super) struct SourceRead<'a> {
+    source: &'a mut Source,
+    offset: u64,
+}
+
+impl Read for SourceRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.source.len - self.offset;
+        let len = (buf.len() as u64).min(remaining).min(READ_CHUNK as u64) as usize;
+        if len == 0 {
+            return Ok(0);
+        }
+        self.source
+            .read_at(self.offset, &mut buf[..len])
+            .map_err(io::Error::other)?;
+        self.offset += len as u64;
+        Ok(len)
     }
 }
 
@@ -1212,7 +1245,9 @@ pub(super) fn stage(
             }
             None => Err("the request carries no semantic producer".to_owned()),
         },
-        LegacyArtifact::Symbols => Err("SYMBOLS_PENDING".to_owned()),
+        LegacyArtifact::Symbols => {
+            super::v3_symbols::convert_symbols_streaming(&mut source, input.root, &mut emit)
+        }
     };
     if let Some(error) = write_error {
         writer.abandon();
@@ -1282,7 +1317,7 @@ pub(super) fn check_staged(
             )
             .map(|_| ())
         }
-        LegacyArtifact::Symbols => Err("SYMBOLS_PENDING".to_owned()),
+        LegacyArtifact::Symbols => super::v3_symbols::check_staged_entry(&entry),
     })
 }
 

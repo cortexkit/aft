@@ -311,8 +311,41 @@ pub(crate) fn check_disk_format(
 }
 
 fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
-    let mut reader = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+    let reader = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+    let mut entries = Vec::new();
+    for_each_raw_entry(reader, &mut |raw| {
+        let symbols: Vec<Symbol> = serde_json::from_slice(&raw.symbols_json)
+            .map_err(|error| format!("failed to decode cached symbols: {error}"))?;
+        entries.push(DiskSymbolEntry {
+            relative_path: raw.relative_path,
+            mtime: raw.mtime,
+            size: raw.size,
+            content_hash: raw.content_hash,
+            symbols,
+        });
+        Ok(())
+    })?;
+    Ok(DiskSymbolCache { entries })
+}
 
+/// One entry of `symbols.bin` with its symbols still in the stored JSON.
+pub(crate) struct RawSymbolEntry {
+    pub(crate) relative_path: PathBuf,
+    pub(crate) mtime: SystemTime,
+    pub(crate) size: u64,
+    pub(crate) content_hash: blake3::Hash,
+    pub(crate) symbols_json: Vec<u8>,
+}
+
+/// Streams the entries of a `symbols.bin` from `reader` to `visit`, one at a
+/// time, with the header, format, schema, bound and relative-path checks of
+/// the disk cache reader. A file of another format or extraction schema is an
+/// error, so a parser or schema change never yields entries. Oversized
+/// entries are skipped, as the cache reader skips them.
+pub(crate) fn for_each_raw_entry<R: Read>(
+    mut reader: R,
+    visit: &mut dyn FnMut(RawSymbolEntry) -> Result<(), String>,
+) -> Result<(), String> {
     let mut magic = [0u8; 8];
     reader
         .read_exact(&mut magic)
@@ -345,7 +378,6 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
     }
 
     let _project_root = PathBuf::from(read_string_with_len(&mut reader, root_len)?);
-    let mut entries = Vec::with_capacity(entry_count);
 
     for _ in 0..entry_count {
         let path_len = read_u32(&mut reader)? as usize;
@@ -390,23 +422,19 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
             continue;
         }
 
-        let mut symbol_bytes = vec![0u8; symbol_bytes_len];
+        let mut symbols_json = vec![0u8; symbol_bytes_len];
         reader
-            .read_exact(&mut symbol_bytes)
+            .read_exact(&mut symbols_json)
             .map_err(|error| format!("failed to read symbol payload: {error}"))?;
-        let symbols: Vec<Symbol> = serde_json::from_slice(&symbol_bytes)
-            .map_err(|error| format!("failed to decode cached symbols: {error}"))?;
-
-        entries.push(DiskSymbolEntry {
+        visit(RawSymbolEntry {
             relative_path,
             mtime: system_time_from_parts(mtime_secs, mtime_nanos)?,
             size,
             content_hash,
-            symbols,
-        });
+            symbols_json,
+        })?;
     }
-
-    Ok(DiskSymbolCache { entries })
+    Ok(())
 }
 
 fn write_cache_file(

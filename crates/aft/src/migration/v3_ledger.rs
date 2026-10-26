@@ -622,7 +622,12 @@ impl V3ImportRequest {
         if let Some(producer) = &self.semantic {
             rows.push(self.row(LegacyArtifact::Semantic, producer.id()));
         }
-        // SYMBOLS_ROW
+        if self.symbols {
+            rows.push(self.row(
+                LegacyArtifact::Symbols,
+                crate::views::symbol_store::SymbolProducer::current().id(),
+            ));
+        }
         rows
     }
 
