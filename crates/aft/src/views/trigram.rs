@@ -227,12 +227,7 @@ impl LexicalView {
         {
             return Err("lexical view has unverified writes".into());
         }
-        let source = crate::blob_store::v3::PlaneReader::open_existing(
-            &self.storage.artifacts,
-            &self.family,
-            FamilyPlane::Trigram,
-        )
-        .map_err(|error| error.to_string())?;
+        let mut source = None;
         let mut rows = Vec::new();
         for (path, disk) in snapshot.membership() {
             let DiskState::Present { content, size } = disk else {
@@ -266,7 +261,19 @@ impl LexicalView {
                     {
                         return Err(format!("lexical payload not ready: {}", absolute.display()));
                     }
+                    if source.is_none() {
+                        source = Some(
+                            crate::blob_store::v3::PlaneReader::open_existing(
+                                &self.storage.artifacts,
+                                &self.family,
+                                FamilyPlane::Trigram,
+                            )
+                            .map_err(|error| error.to_string())?,
+                        );
+                    }
                     let bytes = source
+                        .as_ref()
+                        .unwrap()
                         .payload(&key)
                         .map_err(|error| error.to_string())?
                         .ok_or_else(|| {
@@ -1199,6 +1206,20 @@ fn put_v3_payloads(
 
 type Residents = BTreeMap<(String, String), Arc<GenerationIndex>>;
 
+struct V3Payloads(Option<crate::blob_store::v3::PlaneReader>);
+
+impl super::segment_store::PayloadSource for V3Payloads {
+    fn payload(
+        &self,
+        key: &crate::blob_store::v2::FamilyKey,
+    ) -> Result<Option<Vec<u8>>, crate::blob_store::v2::StoreError> {
+        match &self.0 {
+            Some(source) => super::segment_store::PayloadSource::payload(source, key),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Resident immutable data shared across checkout opens. Register explicitly
 /// with `PlaneHooks::register_adapter`; construction alone changes no routing.
 pub struct TrigramAdapter {
@@ -1215,6 +1236,33 @@ thread_local! {
 }
 
 impl TrigramAdapter {
+    /// When the generation and its base have no content, a plane DB is optional.
+    /// Live-only additions still supply their own attachments to the reader.
+    fn v3_payloads(
+        &self,
+        route: &super::snapshot::V3Route,
+        snapshot: &Snapshot,
+    ) -> Result<V3Payloads, super::contracts::PlaneError> {
+        if !snapshot
+            .generation()
+            .entries()
+            .any(|(_, entry)| entry.content().is_some())
+            && !snapshot
+                .generation()
+                .base()
+                .is_some_and(|base| base.entries().any(|(_, entry)| entry.content().is_some()))
+        {
+            return Ok(V3Payloads(None));
+        }
+        crate::blob_store::v3::PlaneReader::open_existing(
+            &route.storage,
+            &route.family,
+            FamilyPlane::Trigram,
+        )
+        .map(|source| V3Payloads(Some(source)))
+        .map_err(|error| plane_error(error.to_string()))
+    }
+
     pub fn new(storage: PathBuf, policy: TrigramPolicy) -> Self {
         Self {
             storage,
@@ -1316,12 +1364,7 @@ impl TrigramAdapter {
         if !generation.segment_ids().is_empty() {
             return Err(plane_error("a v3 generation names a trigram segment"));
         }
-        let source = crate::blob_store::v3::PlaneReader::open_existing(
-            &route.storage,
-            &route.family,
-            FamilyPlane::Trigram,
-        )
-        .map_err(|e| plane_error(e.to_string()))?;
+        let source = self.v3_payloads(route, snapshot)?;
         let base = generation
             .base()
             .map_or(generation.as_ref(), |base| base.as_ref());

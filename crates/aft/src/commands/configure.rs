@@ -15479,6 +15479,24 @@ mod tests {
     }
 
     #[test]
+    fn lexical_views_public_empty_generation_and_live_only_addition_match_legacy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::write(
+            root.join("new.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+    }
+
+    #[test]
     fn lexical_views_public_late_legacy_completion_and_views_off_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
