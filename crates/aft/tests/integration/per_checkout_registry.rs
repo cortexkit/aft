@@ -1100,7 +1100,8 @@ fn a_publisher_killed_at_any_durability_boundary_leaves_protected_bytes_readable
         v2_steps.to_vec(),
         DurabilityStep::ALL
             .into_iter()
-            .filter(|step| !DurabilityStep::V3_ONLY.contains(step))
+            .filter(|step| !DurabilityStep::V3_ONLY.contains(step)
+                && !DurabilityStep::BASE_PATH.contains(step))
             .collect::<Vec<_>>()
     );
     for step in v2_steps {

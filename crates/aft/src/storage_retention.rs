@@ -40,7 +40,7 @@ const INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
 const PASS_BUDGET: Duration = Duration::from_secs(5);
 const PASS_ENTRIES: usize = 64;
-const TREE_ENTRIES: usize = 4096;
+pub(crate) const TREE_ENTRIES: usize = 4096;
 const TRASH_SCAN_HANDLES: usize = 64;
 const HISTORY_ENTRIES: usize = 8192;
 static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -1614,7 +1614,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
 }
 
-fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
+pub(crate) fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -4660,7 +4660,7 @@ enum V3Step {
 /// way, so they never keep a member. `Err` is uncertainty (an unreadable pin,
 /// or a `pins/` or `readers/` listing longer than the bound) and keeps the
 /// member without resetting its count, as the v2 family sweep does.
-fn v3_member_protected(
+pub(crate) fn v3_member_protected(
     tx: &rusqlite::Transaction<'_>,
     scope: &str,
     view_dir: &Path,
@@ -4887,10 +4887,16 @@ fn v3_finish_eviction(
     crate::views::registry::remove_view_dir(view_dir)?;
     registry
         .with_barrier(|tx| {
-            tx.execute(
+            let removed = tx.execute(
                 "DELETE FROM members WHERE scope=?1 AND state=?2",
                 rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
             )?;
+            // A deregistered worker's referrer and strict-rebuild rows go in
+            // the same transaction as its member row, after its directory.
+            if removed > 0 && crate::views::base_refs::has_base_refs(tx)? {
+                tx.execute("DELETE FROM base_refs WHERE worker_scope=?1", [scope])?;
+                tx.execute("DELETE FROM strict_rebuild WHERE worker_scope=?1", [scope])?;
+            }
             Ok(())
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -5202,6 +5208,44 @@ fn collect_v3_family(
                 last_scope: Some(last_scope),
             },
         )?;
+    }
+    // The base-reference sweep: referrer reconciliation, the two-sweep base
+    // reclaim and the plane-row sweep. It needs the registry's base-reference
+    // tables and runs under the reservation lock this visit already holds.
+    if !cancelled()
+        && Instant::now() < deadline
+        && registry.registry_version().map_err(v3)?
+            >= crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION
+    {
+        let plane_cursor = cursor_root(paths)?
+            .join("v3-plane-rows")
+            .join(format!("{family}.json"));
+        let bounds = crate::views::base_sweep::SweepBounds {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        match crate::views::base_sweep::sweep_family_locked(
+            storage,
+            family,
+            &lock,
+            None,
+            bounds,
+            Some(&plane_cursor),
+        ) {
+            Ok(swept) => {
+                report.removed_roots += swept.reclaimed_bases.len();
+                report.removed_blobs += swept.plane_rows_deleted as usize;
+                report.examined_blobs += swept.plane_rows_examined as usize;
+                report.stopped_early |= !swept.plane_rows_complete && swept.skipped.is_none();
+            }
+            Err(error) => {
+                if report.errors.len() < 16 {
+                    report
+                        .errors
+                        .push(format!("v3 base sweep of family {family}: {error}"));
+                }
+            }
+        }
     }
     // Every collector pass ends with a covering measurement, so committed
     // usage also reflects files removed by anything else since the last one.
@@ -12825,5 +12869,79 @@ mod v3_collector_tests {
             .exists());
         assert!(!storage.join("blobs/v3/reservations.lock").exists());
         assert!(member.join("data.bin").exists());
+    }
+}
+
+#[cfg(test)]
+mod v3_base_reference_collector_tests {
+    use super::*;
+    use crate::views::base_refs::tests::{
+        bind, plane_has, publish_test_base, published, put_rows, refs, worker_delta, FAMILY,
+    };
+    use crate::views::base_refs::with_base_barrier;
+
+    fn pass(storage: &Path) -> SweepReport {
+        let mut report = SweepReport::default();
+        collect_one_v3_family(
+            &StoragePaths::same(storage),
+            &|| false,
+            &mut report,
+            V3Bounds::PASS,
+        )
+        .unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        report
+    }
+
+    fn registered(storage: &Path, scope: &str) -> bool {
+        crate::blob_store::v3::LedgerReader::open_existing(storage, FAMILY)
+            .unwrap()
+            .member(scope)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn the_collector_keeps_a_referenced_base_and_reclaims_it_two_passes_after_its_worker_goes() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let (identity, generation) = publish_test_base(storage.path(), &[("src/a.rs", b"alpha")]);
+        put_rows(storage.path(), &[b"new"]);
+        let (_, composed) = published(
+            bind(
+                storage.path(),
+                "worker-a",
+                &identity,
+                &generation,
+                worker_delta(&identity, &generation, b"new"),
+                None,
+            )
+            .unwrap(),
+        );
+        drop(composed);
+        for _ in 0..3 {
+            pass(storage.path());
+            assert!(registered(storage.path(), &identity.scope));
+            assert!(plane_has(storage.path(), b"alpha"));
+        }
+        // The worker is deregistered: its rows go with its member row.
+        with_base_barrier(storage.path(), FAMILY, |tx| {
+            tx.execute(
+                "UPDATE members SET state='evicting' WHERE scope='worker-a'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        pass(storage.path());
+        assert!(!registered(storage.path(), "worker-a"));
+        assert!(refs(storage.path()).is_empty());
+        // That same pass counted the base once; the next one reclaims it.
+        assert!(registered(storage.path(), &identity.scope));
+        pass(storage.path());
+        assert!(!registered(storage.path(), &identity.scope));
+        pass(storage.path());
+        assert!(!plane_has(storage.path(), b"alpha"));
+        assert!(!storage.path().join("views/v3").exists());
     }
 }
