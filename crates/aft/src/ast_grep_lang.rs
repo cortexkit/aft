@@ -220,8 +220,104 @@ fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
     Ok(node.kind().into_owned())
 }
 
+/// A pattern-local namespace keeps written identifiers from becoming sentinels.
+/// This adapter is never used to parse source documents.
+#[derive(Clone)]
+struct SystemVerilogPatternLang {
+    prefix: String,
+    sigil: char,
+}
+
+impl SystemVerilogPatternLang {
+    fn new(pattern: &str) -> Self {
+        let occupied: std::collections::HashSet<usize> = pattern
+            .match_indices("__aft_meta_")
+            .filter_map(|(start, prefix)| {
+                pattern[start + prefix.len()..]
+                    .split_once('_')?
+                    .0
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        let index = (0..=occupied.len())
+            .find(|index| !occupied.contains(index))
+            .unwrap();
+        Self {
+            prefix: format!("__aft_meta_{index}_"),
+            sigil: '$',
+        }
+    }
+}
+
+impl Language for SystemVerilogPatternLang {
+    fn kind_to_id(&self, kind: &str) -> u16 {
+        AstGrepLang::SystemVerilog.kind_to_id(kind)
+    }
+    fn field_to_id(&self, field: &str) -> Option<u16> {
+        AstGrepLang::SystemVerilog.field_to_id(field)
+    }
+    fn build_pattern(
+        &self,
+        builder: &ast_grep_core::matcher::PatternBuilder,
+    ) -> Result<Pattern, PatternError> {
+        builder.build(|src| StrDoc::try_new(src, self.clone()))
+    }
+    fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        Cow::Owned(crate::systemverilog::transform_pattern(
+            query,
+            |count, name| format!("{}{count}_{name}", self.prefix),
+        ))
+    }
+    fn extract_meta_var(&self, source: &str) -> Option<ast_grep_core::meta_var::MetaVariable> {
+        let (count, name) = source.strip_prefix(&self.prefix)?.split_once('_')?;
+        let count = count
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=3).contains(n))?;
+        PhpPatternLang::Full.extract_meta_var(&format!("{}{name}", "µ".repeat(count)))
+    }
+    fn meta_var_char(&self) -> char {
+        self.sigil
+    }
+}
+
+impl LanguageExt for SystemVerilogPatternLang {
+    fn get_ts_language(&self) -> TSLanguage {
+        tree_sitter_systemverilog::LANGUAGE.into()
+    }
+}
+
+/// Compile a lexical HDL rewrite, preserving literal `$` text even in strings
+/// and comments. The template sigil is absent from all caller-written text.
+pub(crate) fn systemverilog_template(
+    template: &str,
+) -> Result<ast_grep_core::replacer::TemplateFix, &'static str> {
+    let occupied: std::collections::HashSet<char> = template.chars().collect();
+    let sigil = (0xE000..=0x10FFFF)
+        .filter_map(char::from_u32)
+        .find(|c| !occupied.contains(c))
+        .ok_or("SystemVerilog rewrite exhausted available template sigils")?;
+    let lang = SystemVerilogPatternLang {
+        prefix: String::new(),
+        sigil,
+    };
+    let mut anonymous = false;
+    let transformed = crate::systemverilog::transform_pattern(template, |count, name| {
+        anonymous |= count == 3 && (name.is_empty() || name.starts_with('_'));
+        format!("{}{name}", sigil.to_string().repeat(count))
+    });
+    if anonymous {
+        return Err("SystemVerilog rewrite requires named variadics such as $$$ARGS");
+    }
+    Ok(
+        ast_grep_core::replacer::TemplateFix::try_new(&transformed, &lang)
+            .expect("template construction is infallible"),
+    )
+}
+
 fn systemverilog_pattern(pattern: &str) -> Result<Pattern, PatternError> {
-    let lang = AstGrepLang::SystemVerilog;
+    let lang = SystemVerilogPatternLang::new(pattern);
     let pattern = pattern.trim();
     if pattern.is_empty() {
         return Err(PatternError::NoContent(
@@ -385,28 +481,7 @@ impl Language for AstGrepLang {
     /// character. We replace `$` with the expando char (`µ`) in meta-variable
     /// positions so tree-sitter can parse the pattern as valid code.
     fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
-        if *self == Self::SystemVerilog {
-            return Cow::Owned(crate::systemverilog::preprocess_pattern(query));
-        }
         pre_process_pattern_with_expando(query, self.expando_char())
-    }
-
-    fn extract_meta_var(&self, source: &str) -> Option<ast_grep_core::meta_var::MetaVariable> {
-        let expanded = if *self == Self::SystemVerilog {
-            let suffix = source.strip_prefix("__aft_meta_")?;
-            let (count, name) = suffix.split_once('_')?;
-            let count = count
-                .parse::<usize>()
-                .ok()
-                .filter(|n| (1..=3).contains(n))?;
-            format!("{}{}", "µ".repeat(count), name)
-        } else {
-            if !source.starts_with(self.expando_char()) {
-                return None;
-            }
-            source.replace(self.expando_char(), "µ")
-        };
-        PhpPatternLang::Full.extract_meta_var(&expanded)
     }
 
     fn expando_char(&self) -> char {
@@ -482,6 +557,69 @@ impl LanguageExt for AstGrepLang {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pascal_capture_names_preserve_internal_underscores() {
+        let lang = AstGrepLang::Pascal;
+        let grep = lang.ast_grep("program Demo; begin Writeln(value); end.");
+        let pattern = lang.compile_pattern("Writeln($FOO_BAR);").unwrap();
+        let found = grep.root().find(&pattern).unwrap();
+        assert_eq!(
+            found.get_env().get_match("FOO_BAR").unwrap().text(),
+            "value"
+        );
+        let edits = grep.root().replace_all(&pattern, "Write($FOO_BAR);");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            String::from_utf8(edits[0].inserted_text.clone()).unwrap(),
+            "Write(value);"
+        );
+    }
+
+    #[test]
+    fn systemverilog_literal_identifiers_cannot_become_metavariables() {
+        let lang = AstGrepLang::SystemVerilog;
+        let grep = lang.ast_grep("module m; initial begin send(actual); send(__aft_meta_1_ARG); send(__aft_meta_0_1_ARG); $FOO(actual); $BAR(actual); end endmodule");
+        for literal in ["__aft_meta_1_ARG", "__aft_meta_0_1_ARG"] {
+            let pattern = lang.compile_pattern(&format!("send({literal})")).unwrap();
+            let found = grep.root().find_all(&pattern).collect::<Vec<_>>();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].text(), format!("send({literal})"));
+            let edits = grep.root().replace_all(&pattern, "deliver(value)");
+            assert_eq!(edits.len(), 1);
+        }
+        let pattern = lang.compile_pattern("$[FOO]($ARG)").unwrap();
+        let found = grep.root().find_all(&pattern).collect::<Vec<_>>();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text(), "$FOO(actual)");
+        let template = systemverilog_template("$[BAR]($ARG)").unwrap();
+        let edits = grep.root().replace_all(&pattern, &template);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            String::from_utf8(edits[0].inserted_text.clone()).unwrap(),
+            "$BAR(actual)"
+        );
+    }
+
+    #[test]
+    fn systemverilog_rewrites_preserve_literal_dollars_and_unicode() {
+        let lang = AstGrepLang::SystemVerilog;
+        let grep = lang.ast_grep("module m; initial send(value, other); endmodule");
+        let pattern = lang.compile_pattern("send($$$ARGS)").unwrap();
+        let template =
+            systemverilog_template("$display(\"$ARG $$$ \\n\u{e000}\", $$$ARGS) /*/ $INSIDE */")
+                .unwrap();
+        assert_eq!(
+            template.used_vars(),
+            std::collections::HashSet::from(["ARGS"])
+        );
+        let edits = grep.root().replace_all(&pattern, &template);
+        assert_eq!(
+            String::from_utf8(edits[0].inserted_text.clone()).unwrap(),
+            "$display(\"$ARG $$$ \\n\u{e000}\", value, other) /*/ $INSIDE */"
+        );
+        assert!(systemverilog_template("send($$$)").is_err());
+    }
 
     #[test]
     fn systemverilog_patterns_bind_calls_declarations_and_variadic_arguments() {

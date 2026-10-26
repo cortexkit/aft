@@ -36,6 +36,44 @@ fn send(aft: &mut AftProcess, request: Value) -> Value {
 }
 
 #[test]
+fn systemverilog_literal_ast_rewrites_preview_apply_and_undo_only_exact_matches() {
+    let dir = project();
+    let file = dir.path().join("literal.sv");
+    let original = "module m; initial begin send(actual); send(__aft_meta_1_ARG); $FOO(actual); $BAR(actual); end endmodule\n";
+    fs::write(&file, original).unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for (pattern, expected) in [
+        ("send(__aft_meta_1_ARG)", "send(__aft_meta_1_ARG)"),
+        ("$[FOO]($ARG)", "$FOO(actual)"),
+    ] {
+        let result = send(
+            &mut aft,
+            json!({"id":"literal-search","command":"ast_search","lang":"systemverilog","pattern":pattern,"paths":[file]}),
+        );
+        assert_eq!(result["total_matches"], 1, "{result:#}");
+        assert_eq!(result["matches"][0]["text"], expected);
+    }
+    let request = json!({"id":"literal-preview","command":"ast_replace","lang":"systemverilog","pattern":"$[FOO]($ARG)","rewrite":"$[BAR]($ARG)","paths":[file],"dry_run":true});
+    let preview = send(&mut aft, request.clone());
+    assert_eq!(preview["success"], true, "{preview:#}");
+    assert_eq!(preview["total_replacements"], 1, "{preview:#}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    let mut apply = request;
+    apply["id"] = json!("literal-apply");
+    apply["dry_run"] = json!(false);
+    let result = send(&mut aft, apply);
+    assert_eq!(result["success"], true, "{result:#}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original.replace("$FOO(actual)", "$BAR(actual)")
+    );
+    let undo = send(&mut aft, json!({"id":"literal-undo","command":"undo"}));
+    assert_eq!(undo["success"], true, "{undo:#}");
+    assert_eq!(fs::read_to_string(file).unwrap(), original);
+}
+
+#[test]
 fn systemverilog_design_outline_and_scoped_zoom() {
     let dir = project();
     let mut aft = AftProcess::spawn();

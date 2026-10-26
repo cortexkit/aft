@@ -856,6 +856,23 @@ fn unqualified_symbol_name(scoped_name: &str) -> &str {
 mod tests {
     use super::*;
     #[test]
+    fn systemverilog_blob_round_trip_preserves_declaration_kinds() {
+        let blob = CallgraphBlob::extract(
+            "package p; task report(); endtask endpackage module m; endmodule",
+            "systemverilog",
+            "structural-sv-v1",
+        )
+        .unwrap();
+        let restored = CallgraphBlob::from_bytes(&blob.to_bytes().unwrap()).unwrap();
+        let data = restored.parse().unwrap().file_data("design.sv").unwrap();
+        for kind in [SymbolKind::Module, SymbolKind::Package, SymbolKind::Task] {
+            assert!(
+                data.symbol_metadata.values().any(|meta| meta.kind == kind),
+                "missing {kind:?}"
+            );
+        }
+    }
+    #[test]
     fn blob_extraction_is_deterministic_for_nested_callers() {
         let source = include_str!("../../../../benchmarks/aft-search/author_real_query.py");
         let first = CallgraphBlob::extract(source, "python", "determinism-test-v1").unwrap();
@@ -1094,6 +1111,9 @@ impl ParseBlob {
             let kind = match symbol.kind.as_str() {
                 "function" => SymbolKind::Function,
                 "method" => SymbolKind::Method,
+                "module" => SymbolKind::Module,
+                "package" => SymbolKind::Package,
+                "task" => SymbolKind::Task,
                 "class" => SymbolKind::Class,
                 "struct" => SymbolKind::Struct,
                 "interface" => SymbolKind::Interface,

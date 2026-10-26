@@ -99,7 +99,21 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     // silently destroying captured content. Reject that shape up front
     // with actionable guidance instead of producing literal `$$$` strings
     // in the agent's source files.
-    if has_anonymous_variadic(&rewrite) {
+    let systemverilog_template = if req
+        .params
+        .get("lang")
+        .and_then(|v| v.as_str())
+        .and_then(AstGrepLang::from_str)
+        == Some(AstGrepLang::SystemVerilog)
+    {
+        match crate::ast_grep_lang::systemverilog_template(&rewrite) {
+            Ok(template) => Some(template),
+            Err(message) => return Response::error(&req.id, "invalid_rewrite", message),
+        }
+    } else {
+        None
+    };
+    if systemverilog_template.is_none() && has_anonymous_variadic(&rewrite) {
         return Response::error(
             &req.id,
             "invalid_rewrite",
@@ -123,7 +137,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         .difference(&pattern_vars)
         .cloned()
         .collect::<Vec<_>>();
-    if !unbound.is_empty() {
+    if systemverilog_template.is_none() && !unbound.is_empty() {
         let mut unbound = unbound;
         unbound.sort();
         return Response::error(
@@ -231,6 +245,22 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if let Some(template) = &systemverilog_template {
+        let bound = compiled_pattern.defined_vars();
+        let mut unbound: Vec<_> = template
+            .used_vars()
+            .into_iter()
+            .filter(|name| !bound.contains(name))
+            .collect();
+        unbound.sort_unstable();
+        if !unbound.is_empty() {
+            return Response::error(&req.id, "invalid_rewrite", format!(
+                "ast_replace: rewrite references unbound metavariables: {}. Use $[NAME] for literal SystemVerilog system identifiers.",
+                unbound.join(", ")
+            ));
+        }
+    }
+
     let scope = match collect_ast_files(
         &req.id,
         None,
@@ -257,7 +287,11 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             let root = lang.ast_grep(&original);
             // Use replace_all to get ALL edits — root.replace() only replaces the FIRST match.
             // Pass the precompiled `&Pattern` rather than `&str` so we don't reparse per file.
-            let mut edits = root.root().replace_all(&compiled_pattern, rewrite.as_str());
+            let mut edits = if let Some(template) = &systemverilog_template {
+                root.root().replace_all(&compiled_pattern, template)
+            } else {
+                root.root().replace_all(&compiled_pattern, rewrite.as_str())
+            };
             if edits.is_empty() {
                 return Ok(None);
             }

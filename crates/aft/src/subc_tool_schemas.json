@@ -632,7 +632,7 @@
       "pattern",
       "lang"
     ],
-    "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'"
+    "description": "Search code patterns across filesystem using AST-aware matching.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nFor SystemVerilog/Verilog, $[NAME] matches a literal system identifier $NAME in patterns and rewrites.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'"
   },
   "ast_replace": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -689,7 +689,7 @@
       "rewrite",
       "lang"
     ],
-    "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements."
+    "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nFor SystemVerilog/Verilog, $[NAME] denotes literal $NAME in patterns and rewrites.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements."
   },
   "delete": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

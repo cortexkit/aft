@@ -65,6 +65,14 @@ describe("AST tool adapters", () => {
         name: "ast_search",
         rawArgs: { lang, pattern: '$display("value=%d", $VALUE)' },
       });
+      await tools.ast_grep_replace.execute(
+        { pattern: "$[FOO]($VALUE)", rewrite: "$[BAR]($VALUE)", lang, dryRun: true },
+        createSdkContext(projectRoot),
+      );
+      expect(calls.at(-1)).toMatchObject({
+        name: "ast_replace",
+        rawArgs: { lang, pattern: "$[FOO]($VALUE)", rewrite: "$[BAR]($VALUE)", dryRun: true },
+      });
     }
   });
 

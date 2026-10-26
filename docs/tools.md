@@ -606,6 +606,12 @@ Groovy path filtering covers `.groovy`, `.gvy`, `.gy`, `.gsh`, `*.gradle`, and `
 - `$VAR` matches a single AST node
 - `$$$` matches multiple nodes (variadic)
 
+For SystemVerilog/Verilog, use `$[NAME]` to match a literal system identifier
+`$NAME`, for example `"pattern": "$[FOO]($ARG)"`. This also works in rewrite
+templates: `$[BAR]($ARG)` preserves the literal `$BAR` and substitutes the
+captured argument. Strings, comments and HDL escaped identifiers remain literal;
+metavariables are recognized only in code tokens.
+
 Returns matches with file, line (1-based), column, matched text, and captured variable values.
 Add `contextLines: 3` to include surrounding lines.
 

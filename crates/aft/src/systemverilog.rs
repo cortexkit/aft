@@ -80,13 +80,19 @@ fn signature(source: &str, node: Node<'_>) -> String {
         .end_byte()
         .min(node.start_byte().saturating_add(MAX_SIGNATURE_BYTES));
     let mut end = limit;
+    let mut brace_depth = 0usize;
     let mut cursor = node.walk();
     for _ in 0..MAX_SIGNATURE_BYTES {
         let current = cursor.node();
         if current.start_byte() >= limit {
             break;
         }
-        if current.kind() == ";" {
+        match current.kind() {
+            "{" => brace_depth += 1,
+            "}" => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+        if current.kind() == ";" && brace_depth == 0 {
             end = current.end_byte();
             break;
         }
@@ -194,8 +200,12 @@ pub(crate) fn extract_symbols(source: &str, root: Node<'_>) -> Result<Vec<Symbol
     }
 }
 
-/// Encode metavariables without modifying HDL system names or literal text.
-pub(crate) fn preprocess_pattern(pattern: &str) -> String {
+/// Transform only metavariable tokens. `$[NAME]` denotes the literal system
+/// identifier `$NAME`; strings, comments and HDL escaped identifiers stay literal.
+pub(crate) fn transform_pattern(
+    pattern: &str,
+    mut capture: impl FnMut(usize, &str) -> String,
+) -> String {
     let mut out = String::with_capacity(pattern.len());
     let mut chars = pattern.chars().peekable();
     let mut previous = ' ';
@@ -224,7 +234,7 @@ pub(crate) fn preprocess_pattern(pattern: &str) -> String {
             out.push(c);
             let style = chars.next().unwrap();
             out.push(style);
-            let mut prev = style;
+            let mut prev = '\0';
             for c in chars.by_ref() {
                 out.push(c);
                 if (style == '/' && c == '\n') || (style == '*' && prev == '*' && c == '/') {
@@ -235,21 +245,48 @@ pub(crate) fn preprocess_pattern(pattern: &str) -> String {
         } else if c == '$'
             && !(previous.is_ascii_alphanumeric() || previous == '_' || previous == '$')
         {
+            if chars.peek() == Some(&'[') {
+                let mut literal = chars.clone();
+                literal.next();
+                let mut name = String::new();
+                while literal
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+                {
+                    name.push(literal.next().unwrap());
+                }
+                if !name.is_empty() && literal.next() == Some(']') {
+                    out.push('$');
+                    out.push_str(&name);
+                    chars = literal;
+                    previous = ']';
+                    continue;
+                }
+            }
             let mut count = 1;
             while chars.peek() == Some(&'$') {
                 chars.next();
                 count += 1;
             }
-            if count <= 3
-                && (count == 3
-                    || chars
-                        .peek()
-                        .is_some_and(|c| c.is_ascii_uppercase() || *c == '_'))
+            let mut name = String::new();
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
             {
-                out.push_str(&format!("__aft_meta_{count}_"));
+                name.push(chars.next().unwrap());
+            }
+            let valid_name = name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            if count <= 3 && (valid_name || (count == 3 && name.is_empty())) {
+                out.push_str(&capture(count, &name));
             } else {
                 out.extend(std::iter::repeat_n('$', count));
+                out.push_str(&name);
             }
+            previous = name.chars().last().unwrap_or('$');
+            continue;
         } else {
             out.push(c);
         }
@@ -379,7 +416,7 @@ mod tests {
             tree.root_node().to_sexp()
         );
         let symbols = extract_symbols(source, tree.root_node()).unwrap();
-        assert_eq!(symbols[0].name.trim_end(), "\\design.name");
+        assert_eq!(symbols[0].name, "\\design.name");
         assert_eq!(
             symbols[0].signature.as_deref(),
             Some("module \\design.name #(parameter MSG = \"a;b\") ();")
@@ -398,6 +435,34 @@ mod tests {
     fn systemverilog_pattern_preprocessing_preserves_hdl_literals() {
         let pattern =
             "$display(\"$ARG\", $ARG); // $COMMENT\n/* $BLOCK */ \\escaped$NAME foo$BAR($$$ARGS)";
-        assert_eq!(preprocess_pattern(pattern), "$display(\"$ARG\", __aft_meta_1_ARG); // $COMMENT\n/* $BLOCK */ \\escaped$NAME foo$BAR(__aft_meta_3_ARGS)");
+        assert_eq!(transform_pattern(pattern, |count, name| format!("__aft_meta_{count}_{name}")), "$display(\"$ARG\", __aft_meta_1_ARG); // $COMMENT\n/* $BLOCK */ \\escaped$NAME foo$BAR(__aft_meta_3_ARGS)");
+    }
+
+    #[test]
+    fn systemverilog_typedef_signatures_include_the_alias_after_member_semicolons() {
+        let source = "package p; typedef struct packed { logic a; logic b; } pair_t; typedef union packed { int a; int b; } word_t; endpackage";
+        let tree = parse(source);
+        assert!(!tree.root_node().has_error());
+        let symbols = extract_symbols(source, tree.root_node()).unwrap();
+        for name in ["pair_t", "word_t"] {
+            let signature = symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .signature
+                .as_ref()
+                .unwrap();
+            assert!(signature.ends_with(&format!("}} {name};")), "{signature}");
+        }
+    }
+
+    #[test]
+    fn systemverilog_comment_opener_cannot_also_close_the_comment() {
+        assert_eq!(
+            transform_pattern("/*/ $INSIDE */ send($ARG)", |_, name| format!(
+                "capture_{name}"
+            )),
+            "/*/ $INSIDE */ send(capture_ARG)"
+        );
     }
 }

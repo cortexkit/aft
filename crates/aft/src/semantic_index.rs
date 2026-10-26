@@ -1425,10 +1425,14 @@ const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
 /// V7 adds qualified symbol names for ranking metadata without changing embeddings.
 const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
-/// A V6/V7 base snapshot may be followed by these checksummed delta frames.
+/// V8 adds module/package/task symbol kinds. Older readers must refuse the
+/// version before decoding these bytes as corrupt data.
+const SEMANTIC_INDEX_VERSION_V8: u8 = 8;
+/// A V6–V8 base snapshot may be followed by these checksummed delta frames.
 /// The base stays independently readable, so an incomplete final frame can be discarded.
 const SEMANTIC_SEGMENT_MAGIC: &[u8; 8] = b"AFTSEG01";
-const SEMANTIC_SEGMENT_VERSION: u8 = 1;
+// V2 may contain V8 snapshots with the new symbol kinds; V1 remains readable.
+const SEMANTIC_SEGMENT_VERSION: u8 = 2;
 /// Error text prefix for a delta segment newer than
 /// [`SEMANTIC_SEGMENT_VERSION`]; the found version follows it. Segment decoding
 /// reports errors as strings, and this prefix lets the artifact-level reader
@@ -1455,7 +1459,7 @@ fn semantic_segment_refusal(
     )
 }
 /// Highest semantic base snapshot format this build reads (and writes).
-pub const SEMANTIC_BASE_FORMAT_VERSION: u32 = SEMANTIC_INDEX_VERSION_V7 as u32;
+pub const SEMANTIC_BASE_FORMAT_VERSION: u32 = SEMANTIC_INDEX_VERSION_V8 as u32;
 /// Highest semantic delta segment format this build reads (and writes).
 pub const SEMANTIC_SEGMENT_FORMAT_VERSION: u32 = SEMANTIC_SEGMENT_VERSION as u32;
 const SEMANTIC_SEGMENT_FRAME_HEADER_BYTES: usize = 8 + 8 + 32;
@@ -5051,7 +5055,7 @@ fn borrowed_artifact_identity(data_path: &Path) -> Result<(String, blake3::Hash)
     header
         .read_exact(&mut fixed)
         .map_err(|error| error.to_string())?;
-    if fixed[0] != SEMANTIC_INDEX_VERSION_V6 && fixed[0] != SEMANTIC_INDEX_VERSION_V7 {
+    if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&fixed[0]) {
         return Err(format!(
             "unsupported semantic artifact version {}",
             fixed[0]
@@ -8307,7 +8311,7 @@ impl SemanticIndex {
         let mut fixed = [0_u8; HEADER_BYTES_V2];
         file.read_exact(&mut fixed)
             .map_err(|error| error.to_string())?;
-        if fixed[0] != SEMANTIC_INDEX_VERSION_V6 && fixed[0] != SEMANTIC_INDEX_VERSION_V7 {
+        if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&fixed[0]) {
             return Err(format!(
                 "unsupported on-disk semantic version: {}",
                 fixed[0]
@@ -9023,7 +9027,7 @@ impl SemanticIndex {
         if segment_version > SEMANTIC_SEGMENT_VERSION {
             return Err(format!("{SEMANTIC_SEGMENT_NEWER_PREFIX}{segment_version}"));
         }
-        if segment_version != SEMANTIC_SEGMENT_VERSION {
+        if !(1..=SEMANTIC_SEGMENT_VERSION).contains(&segment_version) {
             return Err(format!(
                 "unsupported semantic segment version: {segment_version}"
             ));
@@ -9221,7 +9225,7 @@ impl SemanticIndex {
             .read_exact(&mut version_buf)
             .map_err(|error| error.to_string())?;
         let version = version_buf[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
+        if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version) {
             return Err(format!("unsupported on-disk semantic version: {version}"));
         }
         // Base rows, tombstones, and delta rows all resolve within this one load.
@@ -9290,11 +9294,11 @@ impl SemanticIndex {
             .read_exact(&mut version_buf)
             .ok()?;
         let version = version_buf[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
+        if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version) {
             slog_info!(
                 "cached semantic index version {} is not compatible with {}, rebuilding without deleting the shared artifact",
                 version,
-                SEMANTIC_INDEX_VERSION_V7
+                SEMANTIC_INDEX_VERSION_V8
             );
             return None;
         }
@@ -9625,7 +9629,7 @@ impl SemanticIndex {
         // V3/V4 load as compatible formats but are rejected on disk so snippets
         // and file sizes are rebuilt once. V6 remains accepted on disk and
         // yields qualified_name=None until the next V7 write.
-        let version = SEMANTIC_INDEX_VERSION_V7;
+        let version = SEMANTIC_INDEX_VERSION_V8;
         write_counted(writer, &[version], &mut bytes_written)?;
         write_counted(
             writer,
@@ -9820,6 +9824,7 @@ impl SemanticIndex {
             && version != SEMANTIC_INDEX_VERSION_V5
             && version != SEMANTIC_INDEX_VERSION_V6
             && version != SEMANTIC_INDEX_VERSION_V7
+            && version != SEMANTIC_INDEX_VERSION_V8
         {
             return Err(format!("unsupported version: {}", version));
         }
@@ -9831,7 +9836,8 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
-            || version == SEMANTIC_INDEX_VERSION_V7)
+            || version == SEMANTIC_INDEX_VERSION_V7
+            || version == SEMANTIC_INDEX_VERSION_V8)
             && total_len.is_some_and(|len| len < HEADER_BYTES_V2)
         {
             return Err("data too short for semantic index v2/v3/v4/v5/v6/v7 header".to_string());
@@ -9854,7 +9860,8 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
-            || version == SEMANTIC_INDEX_VERSION_V7;
+            || version == SEMANTIC_INDEX_VERSION_V7
+            || version == SEMANTIC_INDEX_VERSION_V8;
         let (fingerprint, summary_budget_limited) = if has_fingerprint_field {
             let fingerprint_len = read_u32_stream(&mut reader)? as usize;
             if total_len
@@ -9910,6 +9917,7 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
                 read_u32_stream(&mut reader)?
             } else {
@@ -9918,13 +9926,14 @@ impl SemanticIndex {
             let size = if version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
                 Some(read_u64_stream(&mut reader)?)
             } else {
                 None
             };
             let content_hash =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
+                if (SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version) {
                     let mut hash_bytes = [0u8; 32];
                     read_exact_stream(
                         &mut reader,
@@ -9956,17 +9965,17 @@ impl SemanticIndex {
                         secs, nanos
                     )
                 })?;
-            let path =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
-                    cached_path_under_root_with_memo(
-                        current_canonical_root,
-                        &PathBuf::from(path),
-                        canonical_parents,
-                    )
-                    .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
-                } else {
-                    PathBuf::from(path)
-                };
+            let path = if (SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version)
+            {
+                cached_path_under_root_with_memo(
+                    current_canonical_root,
+                    &PathBuf::from(path),
+                    canonical_parents,
+                )
+                .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
+            } else {
+                PathBuf::from(path)
+            };
             file_mtimes.insert(path.clone(), mtime);
             if let Some(size) = size {
                 file_sizes.insert(path.clone(), size);
@@ -9984,19 +9993,19 @@ impl SemanticIndex {
         let mut vector_bytes = vec![0u8; vec_bytes];
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
-            let file =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
-                    cached_path_under_root_with_memo(
-                        current_canonical_root,
-                        &raw_file,
-                        canonical_parents,
-                    )
-                    .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
-                } else {
-                    raw_file
-                };
+            let file = if (SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version)
+            {
+                cached_path_under_root_with_memo(
+                    current_canonical_root,
+                    &raw_file,
+                    canonical_parents,
+                )
+                .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
+            } else {
+                raw_file
+            };
             let name = read_string_stream(&mut reader, total_len)?;
-            let qualified_name = if version == SEMANTIC_INDEX_VERSION_V7 {
+            let qualified_name = if version >= SEMANTIC_INDEX_VERSION_V7 {
                 let qualified_name = read_string_stream(&mut reader, total_len)?;
                 if qualified_name.is_empty() {
                     None
@@ -15944,7 +15953,7 @@ Connection: close
     }
 
     #[test]
-    fn semantic_cache_v6_loads_and_v7_round_trips_qualified_names() {
+    fn semantic_cache_v6_and_v7_load_and_v8_round_trips_qualified_names() {
         let storage = tempfile::tempdir().expect("create storage dir");
         let project = storage.path().join("project");
         fs::create_dir_all(project.join("src")).expect("create project src");
@@ -16028,10 +16037,18 @@ Connection: close
             fingerprint_before
         );
 
-        let v7_bytes = index.to_bytes();
-        assert_eq!(v7_bytes[0], SEMANTIC_INDEX_VERSION_V7);
-        assert_ne!(v7_bytes, legacy_bytes);
-        let restored = SemanticIndex::from_bytes(&v7_bytes, &project_root).unwrap();
+        let current_bytes = index.to_bytes();
+        assert_eq!(current_bytes[0], SEMANTIC_INDEX_VERSION_V8);
+        // V7 has the same layout, but cannot contain the new HDL kinds.
+        let mut legacy_v7 = current_bytes.clone();
+        legacy_v7[0] = SEMANTIC_INDEX_VERSION_V7;
+        let legacy_v7 = SemanticIndex::from_bytes(&legacy_v7, &project_root).unwrap();
+        assert_eq!(
+            legacy_v7.entries[0].chunk.qualified_name.as_deref(),
+            Some("Service.alpha")
+        );
+        assert_ne!(current_bytes, legacy_bytes);
+        let restored = SemanticIndex::from_bytes(&current_bytes, &project_root).unwrap();
         assert_eq!(
             restored.entries[0].chunk.qualified_name.as_deref(),
             Some("Service.alpha")
@@ -16048,7 +16065,7 @@ Connection: close
         index.write_to_disk(storage.path(), "proj");
         let data_path = storage.path().join("semantic/proj/semantic.bin");
         let persisted = fs::read(&data_path).expect("read semantic.bin");
-        assert_eq!(persisted[0], SEMANTIC_INDEX_VERSION_V7);
+        assert_eq!(persisted[0], SEMANTIC_INDEX_VERSION_V8);
 
         let loaded = SemanticIndex::read_from_disk(
             storage.path(),
@@ -19661,6 +19678,133 @@ mod embedding_backend_retry_status_tests {
         let error = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap_err();
         assert!(error.contains("invalid semantic symbol kind"), "{error}");
         assert_eq!(u8_to_symbol_kind(8).unwrap(), SymbolKind::Heading);
+    }
+
+    #[test]
+    fn systemverilog_semantic_base_and_delta_round_trip_new_kinds() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0]; 3]);
+        let kinds = [SymbolKind::Module, SymbolKind::Package, SymbolKind::Task];
+        for (entry, kind) in index.entries.iter_mut().zip(&kinds) {
+            entry.chunk.kind = kind.clone();
+        }
+        let bytes = index.to_bytes();
+        assert_eq!(bytes[0], 8, "pre-HDL readers must see a newer base format");
+        let restored = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap();
+        assert_eq!(
+            restored
+                .entries
+                .iter()
+                .map(|e| e.chunk.kind.clone())
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        let paths = index
+            .entries
+            .iter()
+            .map(|entry| entry.chunk.file.clone())
+            .collect();
+        let frame = index.build_segment_frame(1, &paths).unwrap();
+        let payload = &frame[SEMANTIC_SEGMENT_FRAME_HEADER_BYTES..];
+        assert_eq!(
+            payload[0], 2,
+            "pre-HDL readers must refuse the delta before decoding it"
+        );
+        let (_, delta) = SemanticIndex::decode_segment_payload(
+            payload,
+            1,
+            &index.project_root,
+            index.fingerprint(),
+            index.dimension,
+            &mut ParentCanonicalizationMemo::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            delta
+                .entries
+                .iter()
+                .map(|e| e.chunk.kind.clone())
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        // Legacy frames remain readable when their snapshot contains old kinds.
+        let legacy = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        let paths = legacy
+            .entries
+            .iter()
+            .map(|entry| entry.chunk.file.clone())
+            .collect();
+        let frame = legacy.build_segment_frame(1, &paths).unwrap();
+        let mut payload = frame[SEMANTIC_SEGMENT_FRAME_HEADER_BYTES..].to_vec();
+        payload[0] = 1;
+        // The nested base follows its u64 length, at the end of the payload.
+        let base_len = legacy.delta_for_paths(&paths).to_bytes().len();
+        let base_start = payload.len() - base_len;
+        payload[base_start] = 7;
+        let (_, restored) = SemanticIndex::decode_segment_payload(
+            &payload,
+            1,
+            &legacy.project_root,
+            legacy.fingerprint(),
+            legacy.dimension,
+            &mut ParentCanonicalizationMemo::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.entries[0].chunk.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn systemverilog_semantic_future_formats_refuse_without_deleting_or_overwriting() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        let storage = tempfile::tempdir().unwrap();
+        let dir = storage.path().join("semantic/format-refusal");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("semantic.bin");
+        let base = index.to_bytes();
+        fs::write(&path, &base).unwrap();
+        assert!(SemanticIndex::read_from_disk(
+            storage.path(),
+            "format-refusal",
+            &index.project_root,
+            false,
+            None
+        )
+        .is_some());
+
+        let mut newer_base = base.clone();
+        newer_base[0] = SEMANTIC_INDEX_VERSION_V8 + 1;
+        let paths = index
+            .entries
+            .iter()
+            .map(|entry| entry.chunk.file.clone())
+            .collect();
+        let mut frame = index.build_segment_frame(1, &paths).unwrap();
+        frame[SEMANTIC_SEGMENT_FRAME_HEADER_BYTES] = SEMANTIC_SEGMENT_VERSION + 1;
+        let checksum = blake3::hash(&frame[SEMANTIC_SEGMENT_FRAME_HEADER_BYTES..]);
+        frame[16..SEMANTIC_SEGMENT_FRAME_HEADER_BYTES].copy_from_slice(checksum.as_bytes());
+        let mut newer_segment = base;
+        newer_segment.extend_from_slice(&frame);
+        for bytes in [newer_base, newer_segment] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(SemanticIndex::read_from_disk(
+                storage.path(),
+                "format-refusal",
+                &index.project_root,
+                false,
+                None
+            )
+            .is_none());
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "read must preserve newer data"
+            );
+            assert!(!index.write_to_disk(storage.path(), "format-refusal"));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "write must preserve newer data"
+            );
+        }
     }
 
     #[test]
