@@ -746,6 +746,8 @@ fn register_initial_tree(
             return Err(notify::Error::path_not_found().add_path(directory));
         }
         installed.insert(directory.clone());
+        #[cfg(test)]
+        tests::block_watch_walk(&directory);
         for entry in
             crate::watcher_filter::exclusion_read_dir(&directory).map_err(notify::Error::io)?
         {
