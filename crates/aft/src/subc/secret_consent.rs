@@ -76,10 +76,8 @@ fn decode_secret_record(record: &serde_json::Value) -> ConsentOutcome {
         Some("pending") => ConsentOutcome::Pending,
         // The answer is only a cue to retry the vault, never a grant or denial
         // to apply locally. In particular, a decline also retries secret.use.
-        Some("granted" | "declined") => ConsentOutcome::Answered,
-        Some("expired" | "withdrawn") => {
-            consent_unavailable("the secret-use card ended without an answer")
-        }
+        Some("answered") => ConsentOutcome::Answered,
+        Some("expired") => consent_unavailable("the secret-use card ended without an answer"),
         _ => consent_unavailable("Cingulate returned an unknown secret-use card state"),
     }
 }
@@ -94,7 +92,7 @@ impl SubcSecretConsent {
     ) -> Result<serde_json::Value, super::consent::ConsentError> {
         let stamp = request.scope.stamp();
         let call = super::consent::ConsentCall {
-            scope: subc_protocol::ScopeSelector::new(
+            scope: subc_protocol::scope::ScopeSelector::new(
                 stamp.owner.clone(),
                 stamp.scope_ref.clone(),
                 Some(stamp.scope_epoch),
@@ -112,11 +110,7 @@ impl SubcSecretConsent {
             })?
     }
 
-    async fn file_or_withdraw(
-        &self,
-        request: &SecretConsentRequest,
-        withdraw: bool,
-    ) -> ConsentOutcome {
+    async fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
         // Cingulate deduplicates the exact ordered items for this filer. Refile
         // unchanged to recover the same card across retries or a lost reply,
         // without refreshing its deadline or introducing a local idempotency key.
@@ -136,27 +130,22 @@ impl SubcSecretConsent {
             return consent_unavailable("Cingulate did not return a secret-use card id");
         };
         let hold = super::consent::hold_budget(None);
-        let (method, params, timeout) = if withdraw {
-            (
-                "consent.withdraw",
-                serde_json::json!({"elicitation_id": id}),
-                SECRET_CONSENT_TIMEOUT,
-            )
-        } else {
-            (
+        match self
+            .call(
+                request,
                 "consent.await",
                 serde_json::json!({"elicitation_id": id, "timeout_ms": hold.as_millis() as u64}),
                 hold + SECRET_CONSENT_TIMEOUT,
             )
-        };
-        match self.call(request, method, params, timeout).await {
+            .await
+        {
             Ok(record) => decode_secret_record(&record),
             Err(_) => consent_unavailable("Cingulate could not settle the secret-use card"),
         }
     }
 
-    fn dispatch(&self, request: &SecretConsentRequest, withdraw: bool) -> ConsentOutcome {
-        let future = self.file_or_withdraw(request, withdraw);
+    fn dispatch(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        let future = self.file(request);
         match tokio::runtime::Handle::try_current() {
             Ok(current)
                 if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
@@ -171,11 +160,14 @@ impl SubcSecretConsent {
 
 impl crate::secret::SecretConsentTransport for SubcSecretConsent {
     fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-        self.dispatch(request, false)
+        self.dispatch(request)
     }
 
-    fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-        self.dispatch(request, true)
+    fn withhold(&self, _request: &SecretConsentRequest) -> ConsentOutcome {
+        // Cingulate has not published a withdrawal method for secret_use cards
+        // yet. Do not send the filesystem permission method; the vault still
+        // governs release and the card's original deadline is unchanged.
+        consent_unavailable("secret-use card withdrawal is not supported")
     }
 }
 

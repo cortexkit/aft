@@ -556,12 +556,123 @@ fn approval_reply() -> serde_json::Value {
     }})
 }
 
+// The saved Cingulate 0.12.0 secret-use-approval-v1.1 responses live in
+// crates/aft/tests/fixtures/secret/cingulate-secret-use-v1.1/. These hashes pin
+// the reviewed response bytes independently of the decoder.
+const FILER_VECTORS: &[(&str, &str, &str)] = &[
+    (
+        "request",
+        include_str!("../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-request.json"),
+        "be75724519b10547d1baacdee20095f753130251b1519c10342ab19ed42364c9",
+    ),
+    (
+        "request-repeat",
+        include_str!(
+            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-request-repeat.json"
+        ),
+        "be75724519b10547d1baacdee20095f753130251b1519c10342ab19ed42364c9",
+    ),
+    (
+        "pending",
+        include_str!(
+            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-pending.json"
+        ),
+        "db39e1458276124efd66694d39f64e0ce34f0811c860b3ac4af2be6e6afbd0e6",
+    ),
+    (
+        "allowed",
+        include_str!(
+            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-allowed.json"
+        ),
+        "e5e665b918c4cb19750a8217457497c068eb4fb098df694da5f6dbd18511b286",
+    ),
+    (
+        "partial",
+        include_str!(
+            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-partial.json"
+        ),
+        "8ebc4ce81712071e97c1a53b471722c1ac83020ed468723b83fcb674785a6b99",
+    ),
+    (
+        "declined",
+        include_str!(
+            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-declined.json"
+        ),
+        "f49061b64579f5601883bd466aea4d0951915fc4e121c3e1390830003acc0c84",
+    ),
+    (
+        "expired",
+        include_str!(
+            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-expired.json"
+        ),
+        "95eb5015d42f4e3d059729696f12ac0bfc2447a6f74b24c450bef36a39b0a6c4",
+    ),
+    (
+        "refusals",
+        include_str!("../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-refusals.json"),
+        "66740bda26d96c0abd25e22244965209fcdee04e120bcd4d7214644e0580fa65",
+    ),
+];
+
+fn filer_vector(name: &str) -> serde_json::Value {
+    let (_, bytes, _) = FILER_VECTORS
+        .iter()
+        .find(|(key, _, _)| *key == name)
+        .unwrap();
+    serde_json::from_str(bytes).unwrap()
+}
+
+fn decode_filer_reply(
+    reply: &serde_json::Value,
+) -> Result<serde_json::Value, super::super::consent::ConsentError> {
+    super::super::consent::decode_result(&serde_json::to_vec(reply).unwrap())
+}
+
+fn filer_reply(name: &str) -> Result<serde_json::Value, super::super::consent::ConsentError> {
+    decode_filer_reply(&filer_vector(name)["reply"])
+}
+
+#[test]
+fn secret_filer_vectors_are_pinned_and_decode_the_published_card_states() {
+    use sha2::{Digest, Sha256};
+    for (name, bytes, hash) in FILER_VECTORS {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes.as_bytes())),
+            *hash,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        filer_reply("request").unwrap(),
+        filer_reply("request-repeat").unwrap()
+    );
+    assert_eq!(
+        decode_secret_elicitation(&filer_reply("request").unwrap()),
+        Some("el_1")
+    );
+    for name in ["allowed", "partial", "declined"] {
+        assert_eq!(
+            decode_secret_record(&filer_reply(name).unwrap()),
+            ConsentOutcome::Answered,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        decode_secret_record(&filer_reply("pending").unwrap()),
+        ConsentOutcome::Pending
+    );
+    assert!(matches!(
+        decode_secret_record(&filer_reply("expired").unwrap()),
+        ConsentOutcome::Unavailable { .. }
+    ));
+}
+
 #[derive(Default)]
 struct SecretCards {
     calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
     cards: StdMutex<std::collections::HashMap<String, String>>,
-    record: serde_json::Value,
-    refusal: Option<super::super::consent::ConsentError>,
+    record: &'static str,
+    refusal: Option<serde_json::Value>,
 }
 
 impl super::super::consent::ConsentTransport for SecretCards {
@@ -572,22 +683,23 @@ impl super::super::consent::ConsentTransport for SecretCards {
         self.calls.lock().unwrap().push(call.clone());
         let reply = match call.method {
             "consent.request" => match &self.refusal {
-                Some(error) => Err(error.clone()),
+                Some(reply) => decode_filer_reply(reply),
                 None => {
                     let key = serde_json::to_string(&call.params).unwrap();
                     let mut cards = self.cards.lock().unwrap();
-                    let next = format!("el_{}", cards.len() + 1);
-                    let id = cards.entry(key).or_insert(next);
-                    Ok(json!({"elicitation_id": id}))
+                    let sample = if cards.contains_key(&key) {
+                        "request-repeat"
+                    } else {
+                        "request"
+                    };
+                    let reply = filer_reply(sample).unwrap();
+                    cards.insert(key, reply["elicitation_id"].as_str().unwrap().into());
+                    Ok(reply)
                 }
             },
             "consent.await" => {
                 assert_eq!(call.params["elicitation_id"], "el_1");
-                Ok(self.record.clone())
-            }
-            "consent.withdraw" => {
-                assert_eq!(call.params, json!({"elicitation_id": "el_1"}));
-                Ok(json!({"kind": "secret_use", "state": "withdrawn"}))
+                filer_reply(self.record)
             }
             method => panic!("unexpected consent method: {method}"),
         };
@@ -638,18 +750,18 @@ fn install_cards(runtime: &tokio::runtime::Runtime, cards: Arc<SecretCards>) -> 
 fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
     let runtime = secret_consent_runtime();
     let cards = Arc::new(SecretCards {
-        record: json!({"kind": "secret_use", "state": "pending"}),
+        record: "pending",
         ..Default::default()
     });
     let _guard = install_cards(&runtime, cards.clone());
     let wire = secret_use_script(vec![approval_reply(), approval_reply()]);
     let vault = crate::secret::SubcSecretVault::new(wire.clone());
     let identity = head();
-    for _ in 0..2 {
-        assert!(matches!(
-            resolve_label_for_launch(&identity, &vault, "key"),
-            LaunchDecision::Pending(_)
-        ));
+    for decision in [
+        resolve_label_for_launch(&identity, &vault, "key"),
+        runtime.block_on(async { resolve_label_for_launch(&identity, &vault, "key") }),
+    ] {
+        assert!(matches!(decision, LaunchDecision::Pending(_)));
     }
     assert_eq!(cards.cards.lock().unwrap().len(), 1);
     assert_eq!(wire.calls.lock().unwrap().len(), 2);
@@ -662,13 +774,14 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
         item["statement_b64url"].as_str().unwrap()
     );
     for call in calls.iter().filter(|call| call.method == "consent.request") {
+        assert_eq!(call.params, filer_vector("request")["params"]);
         assert_eq!(
             super::super::consent::encode(call.method, &call.params).unwrap(),
             expected.as_bytes()
         );
     }
     let stamp = identity.scope.as_ref().unwrap();
-    let selector = subc_protocol::ScopeSelector::new(
+    let selector = subc_protocol::scope::ScopeSelector::new(
         stamp.owner.clone(),
         stamp.scope_ref.clone(),
         Some(stamp.scope_epoch),
@@ -681,9 +794,9 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
 }
 
 #[test]
-fn secret_allow_and_decline_both_retry_secret_use_and_only_the_vault_decides() {
+fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides() {
     let runtime = secret_consent_runtime();
-    for state in ["granted", "declined"] {
+    for state in ["allowed", "partial", "declined"] {
         for (reply, expected_code) in [
             (
                 json!({"result": {"status": "released", "kind": "agent_api_key", "key_b64url": "c2stZXhhbXBsZQ", "location": "header:X-Api-Key"}}),
@@ -696,7 +809,7 @@ fn secret_allow_and_decline_both_retry_secret_use_and_only_the_vault_decides() {
             (approval_reply(), Some(SECRETS_UNAVAILABLE)),
         ] {
             let cards = Arc::new(SecretCards {
-                record: json!({"kind": "secret_use", "state": state}),
+                record: state,
                 ..Default::default()
             });
             let _guard = install_cards(&runtime, cards.clone());
@@ -735,20 +848,19 @@ fn secret_allow_and_decline_both_retry_secret_use_and_only_the_vault_decides() {
 #[test]
 fn expired_or_refused_secret_cards_end_the_launch_without_retrying_the_vault() {
     let runtime = secret_consent_runtime();
-    let cases = [
-        None,
-        Some("elicitation_request_conflict"),
-        Some("elicitation_expired"),
-        Some("invalid_params"),
-        Some("elicitation_requester_refused"),
-    ];
+    let refusal_vectors = filer_vector("refusals");
+    let cases = std::iter::once(None).chain(
+        refusal_vectors["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| Some(case["reply"].clone())),
+    );
     for refusal in cases {
+        let refused = refusal.is_some();
         let cards = Arc::new(SecretCards {
-            record: json!({"kind": "secret_use", "state": "expired"}),
-            refusal: refusal.map(|code| super::super::consent::ConsentError::Refused {
-                code: code.into(),
-                message: "refused".into(),
-            }),
+            record: "expired",
+            refusal,
             ..Default::default()
         });
         let _guard = install_cards(&runtime, cards.clone());
@@ -765,7 +877,7 @@ fn expired_or_refused_secret_cards_end_the_launch_without_retrying_the_vault() {
         assert_eq!(wire.calls.lock().unwrap().len(), 1);
         assert_eq!(
             cards.calls.lock().unwrap().len(),
-            if refusal.is_some() { 1 } else { 2 }
+            if refused { 1 } else { 2 }
         );
     }
 }
@@ -773,6 +885,8 @@ fn expired_or_refused_secret_cards_end_the_launch_without_retrying_the_vault() {
 #[test]
 fn secret_cards_reject_unknown_or_permission_reply_shapes() {
     for record in [
+        json!({"kind": "secret_use", "state": "granted"}),
+        json!({"kind": "secret_use", "state": "declined"}),
         json!({"kind": "secret_use", "state": "withdrawn"}),
         json!({"kind": "secret_use", "state": "settled", "outcome": "allow_once"}),
         json!({"kind": "tool_permission", "state": "granted"}),
@@ -794,10 +908,10 @@ fn secret_cards_reject_unknown_or_permission_reply_shapes() {
 }
 
 #[test]
-fn a_pending_secret_card_is_withdrawn_using_its_original_item() {
+fn withholding_a_secret_card_fails_closed_without_an_unsupported_method() {
     let runtime = secret_consent_runtime();
     let cards = Arc::new(SecretCards {
-        record: json!({"kind": "secret_use", "state": "pending"}),
+        record: "pending",
         ..Default::default()
     });
     let _guard = install_cards(&runtime, cards.clone());
@@ -806,11 +920,13 @@ fn a_pending_secret_card_is_withdrawn_using_its_original_item() {
     let LaunchDecision::Pending(pending) = resolve_label_for_launch(&head(), &vault, "key") else {
         panic!("the card is pending")
     };
+    assert!(matches!(
+        crate::secret::withhold_consent(&pending.request),
+        ConsentOutcome::Unavailable { .. }
+    ));
     withdraw_secret_consent(&pending);
     let calls = cards.calls.lock().unwrap();
-    assert_eq!(calls.len(), 4);
-    assert_eq!(calls[0].params, calls[2].params);
-    assert_eq!(calls[3].method, "consent.withdraw");
+    assert_eq!(calls.len(), 2);
     assert_eq!(cards.cards.lock().unwrap().len(), 1);
 }
 
