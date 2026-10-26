@@ -537,7 +537,7 @@ impl ExactLane {
         )
     }
 
-    /// Accepts a read projection without requiring a mutable legacy index.
+    /// Accepts an optional SearchIndexSnapshot without requiring a mutable index.
     pub(crate) fn search_scoped_snapshot(
         &self,
         snapshot: Option<&crate::search_index::SearchIndexSnapshot>,

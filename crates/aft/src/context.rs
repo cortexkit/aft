@@ -11948,6 +11948,25 @@ impl AppContext {
             .is_some_and(|view| view.is_ready())
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_lexical_source_for_test(
+        &self,
+        source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+    ) {
+        let root = self.canonical_cache_root();
+        let family = self.memoized_artifact_cache_key(&root);
+        *self.lexical_view.lock() =
+            Some(Arc::new(crate::views::trigram::LexicalView::with_source(
+                root,
+                self.storage_paths(),
+                family,
+                crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: self.config().search_index_max_file_size,
+                },
+                source,
+            )));
+    }
+
     /// With views enabled, lexical queries use the checkout-local view rather
     /// than the legacy SearchIndex cache. The separate lexical driver keeps
     /// lexical service independent of semantic models.

@@ -8533,10 +8533,17 @@ fn run_configure_maintenance_unit_inner(
                 && ctx.config().views.enabled
                 && !job.root_too_broad
             {
-                finish_configure_view_load(
-                    ctx,
-                    prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
-                );
+                if ctx.config().indexes.semantic || ctx.config().indexes.callgraph {
+                    finish_configure_view_load(
+                        ctx,
+                        prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
+                    );
+                } else {
+                    ctx.clear_view_runtime();
+                }
+                if let Some(Err(error)) = ctx.lexical_view_snapshot("bind") {
+                    slog_warn!("lexical checkout view unavailable: {}", error);
+                }
             } else {
                 ctx.clear_view_runtime();
             }
@@ -15278,6 +15285,289 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": false } }))],
         }))
+    }
+
+    fn configure_lexical_views(root: &Path, storage: &Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode", "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": true },
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
+            }))]
+        }))
+    }
+
+    fn lexical_views_oracle(root: &Path) -> TestContext {
+        let oracle = test_context();
+        oracle.update_config(|config| {
+            config.project_root = Some(root.to_path_buf());
+            config.views.enabled = false;
+            config.indexes.trigram = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        oracle.set_canonical_cache_root(root.to_path_buf());
+        *oracle.search_index().write().unwrap() = Some(SearchIndex::build_with_limit_serial(
+            root,
+            oracle.config().search_index_max_file_size,
+        ));
+        oracle
+    }
+
+    fn lexical_views_test_source(
+        ctx: &AppContext,
+    ) -> Arc<crate::views::trigram::BaseBuilderTestSource> {
+        let root = ctx.canonical_cache_root();
+        let source = crate::views::trigram::BaseBuilderTestSource::new(
+            &root,
+            &ctx.storage_paths().artifacts,
+            &ctx.memoized_artifact_cache_key(&root),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: ctx.config().search_index_max_file_size,
+            },
+        );
+        ctx.install_lexical_source_for_test(source.clone());
+        source
+    }
+
+    fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
+        let oracle = lexical_views_oracle(root);
+        for (command, params, field) in [
+            (
+                "grep",
+                json!({"pattern": "TOKEN|needle", "include": "**/*.ts"}),
+                "matches",
+            ),
+            ("glob", json!({"pattern": "**/*.ts"}), "files"),
+            (
+                "semantic_search",
+                json!({"query": "OLDER_COMMIT_TOKEN"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "needle alpha"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "unfindable_token"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"pattern": "TOKEN|needle"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "needle", "pattern": "TOKEN|needle"}),
+                "results",
+            ),
+        ] {
+            let request = RawRequest {
+                id: format!("lexical-views-{command}"),
+                command: command.into(),
+                params,
+            };
+            let run = |ctx: &AppContext| match command {
+                "grep" => crate::commands::grep::handle_grep(&request, ctx),
+                "glob" => crate::commands::glob::handle_glob(&request, ctx),
+                _ => crate::commands::semantic_search::handle_semantic_search(&request, ctx),
+            };
+            let expected = run(&oracle);
+            let actual = run(ctx);
+            assert!(expected.success, "oracle {command}: {:?}", expected.data);
+            assert!(actual.success, "view {command}: {:?}", actual.data);
+            assert!(
+                expected.data[field].is_array(),
+                "{command}: {:?}",
+                expected.data
+            );
+            assert_eq!(
+                actual.data[field], expected.data[field],
+                "{command} {field}"
+            );
+            assert_eq!(actual.data["text"], expected.data["text"], "{command} text");
+        }
+        assert!(ctx
+            .lexical_view_route_counts()
+            .iter()
+            .all(|count| *count > 0));
+        assert_eq!(oracle.lexical_view_route_counts(), [0; 3]);
+    }
+
+    fn lexical_views_public_checkout(kind: OlderCheckoutKind) {
+        let temp = tempfile::tempdir().unwrap();
+        let (_owner, root, storage) = older_checkout_beside_live_owner(temp.path(), kind);
+        let root = std::fs::canonicalize(root).unwrap();
+        let builds = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexBuild,
+            root.display().to_string(),
+        );
+        let deltas = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexDelta,
+            root.display().to_string(),
+        );
+        let before = (
+            builds.physical_total_for_test(),
+            deltas.physical_total_for_test(),
+        );
+        let ctx = test_context();
+        let bound = handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx);
+        assert!(bound.success, "{:?}", bound.data);
+        let source = lexical_views_test_source(&ctx);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        lexical_views_assert_public_parity(&ctx, &root);
+
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 4;\nneedle alpha\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("new.ts"), "needle alpha beta\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "new.ts\n").unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::remove_file(root.join("shared.ts")).unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+
+        crate::runtime_drain::spawn_search_corpus_refresh(&ctx, root.clone(), ctx.config());
+        crate::runtime_drain::refresh_search_index_after_write(&ctx, &root.join("new.ts"));
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        ctx.flush_search_index_on_graceful_shutdown();
+        assert_eq!(
+            (
+                builds.physical_total_for_test(),
+                deltas.physical_total_for_test()
+            ),
+            before
+        );
+        let cache =
+            resolve_cache_dir_with_key(&ctx.memoized_artifact_cache_key(&root), Some(&storage));
+        // The owner fixture already wrote a cache. A routed checkout must not
+        // replace it with its own content, even after refresh and shutdown.
+        let owner_cache = std::fs::read(cache.join("cache.bin")).unwrap();
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        drop(ctx);
+        let restarted = test_context();
+        assert!(
+            handle_configure_for_test(&configure_lexical_views(&root, &storage), &restarted)
+                .success
+        );
+        restarted.install_lexical_source_for_test(source);
+        lexical_views_assert_public_parity(&restarted, &root);
+        assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
+    }
+
+    #[test]
+    fn lexical_views_public_linked_worktree_parity_edits_restart_and_writer_stop() {
+        lexical_views_public_checkout(OlderCheckoutKind::LinkedWorktree);
+    }
+
+    #[test]
+    fn lexical_views_public_plain_clone_parity_edits_restart_and_writer_stop() {
+        lexical_views_public_checkout(OlderCheckoutKind::PlainClone);
+    }
+
+    #[test]
+    fn lexical_views_public_late_legacy_completion_and_views_off_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_with_storage(&root, &storage), &ctx).success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+        assert!(!storage.join("blobs/v3").exists());
+        let stale =
+            SearchIndex::build_with_limit_serial(&root, ctx.config().search_index_max_file_size);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 7;\nneedle alpha\n",
+        )
+        .unwrap();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        let _source = lexical_views_test_source(&ctx);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        tx.send(stale).unwrap();
+        crate::runtime_drain::drain_search_index_events(&ctx);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        lexical_views_assert_public_parity(&ctx, &root);
+    }
+
+    #[test]
+    fn lexical_views_public_kill_child() {
+        let Some(root) = std::env::var_os("AFT_LEXICAL_KILL_ROOT") else {
+            return;
+        };
+        let storage = PathBuf::from(std::env::var_os("AFT_LEXICAL_KILL_STORAGE").unwrap());
+        let root = PathBuf::from(root);
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        let _source = lexical_views_test_source(&ctx);
+        lexical_views_assert_public_parity(&ctx, &root);
+        println!("LEXICAL_VIEW_PUBLISHED");
+        use std::io::{Read, Write};
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+    }
+
+    #[test]
+    fn lexical_views_public_forced_kill_reopens_current_tree() {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::configure::tests::lexical_views_public_kill_child",
+                "--nocapture",
+            ])
+            .env("AFT_LEXICAL_KILL_ROOT", &root)
+            .env("AFT_LEXICAL_KILL_STORAGE", &storage)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let mut published = false;
+        for line in std::io::BufReader::new(output).lines() {
+            if line.unwrap().contains("LEXICAL_VIEW_PUBLISHED") {
+                published = true;
+                break;
+            }
+        }
+        if !published {
+            let status = child.wait().unwrap();
+            panic!("child exited before publication handshake: {status}");
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 2;\nneedle alpha changed\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        let _source = lexical_views_test_source(&ctx);
+        lexical_views_assert_public_parity(&ctx, &root);
     }
 
     fn configure_search_with_max_file_size(

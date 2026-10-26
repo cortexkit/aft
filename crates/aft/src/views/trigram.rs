@@ -34,11 +34,16 @@ pub(crate) struct LexicalView {
     storage: crate::root_cache::StoragePaths,
     family: String,
     policy: TrigramPolicy,
-    driver: Arc<super::first_load::CheckoutDriver>,
-    loader: super::first_load::SiblingLoader,
-    access: super::contracts::ViewAccess,
+    source: Arc<dyn LexicalSnapshotSource>,
     query: std::sync::Mutex<()>,
     ready: std::sync::atomic::AtomicBool,
+}
+
+/// Supplies a verified checkout snapshot without exposing its storage layout
+/// to the lexical query engine. Implementations must never publish v1/v2 data.
+pub(crate) trait LexicalSnapshotSource: Send + Sync {
+    fn acquire(&self) -> Result<Snapshot, String>;
+    fn record_change(&self, path: &Path);
 }
 
 impl LexicalView {
@@ -56,57 +61,39 @@ impl LexicalView {
     }
 
     pub(crate) fn new(
+        _root: PathBuf,
+        _storage: crate::root_cache::StoragePaths,
+        _family: String,
+        _policy: TrigramPolicy,
+    ) -> Result<Self, String> {
+        // A legacy registration would write blobs/v2 even before loading. Until
+        // a v3-only source is available, refuse rather than silently creating it.
+        Err("v3-only lexical snapshot source unavailable".into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_source(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: TrigramPolicy,
-    ) -> Result<Self, String> {
-        let registry = super::registry::FamilyRegistry::open(&storage.artifacts, &family)
-            .map_err(|error| error.to_string())?;
-        let owner = registry
-            .register_view_with_storage(
-                &storage.durable,
-                &crate::path_identity::project_scope_key(&root),
-                &root,
-            )
-            .map_err(|error| error.to_string())?;
-        let bridge = Arc::new(super::first_load::TrigramBridge::new(
-            storage.artifacts.clone(),
-            policy,
-        ));
-        let adapter: Arc<dyn super::contracts::PlaneAdapter> = bridge.adapter.clone();
-        let driver = Arc::new(
-            super::first_load::CheckoutDriver::new(
-                owner.clone(),
-                super::manifest_v2::Producers {
-                    trigram: policy.fingerprint_hex(),
-                    semantic: None,
-                    callgraph: super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-                },
-                None,
-                Arc::new(super::first_load::ConfiguredMembershipWalker),
-                vec![bridge],
-            )
-            .with_adapters(vec![adapter.clone()]),
-        );
-        driver.register_write_intent();
-        Ok(Self {
+        source: Arc<dyn LexicalSnapshotSource>,
+    ) -> Self {
+        Self {
             root,
             storage,
             family,
             policy,
-            loader: super::first_load::SiblingLoader::new(driver.clone(), vec![adapter]),
-            driver,
-            access: super::contracts::ViewAccess::Owner(owner),
+            source,
             query: std::sync::Mutex::new(()),
             ready: std::sync::atomic::AtomicBool::new(false),
-        })
+        }
     }
 
     pub(crate) fn record_change(&self, path: &Path) {
         self.ready
             .store(false, std::sync::atomic::Ordering::Release);
-        self.driver.record_absolute_change(path);
+        self.source.record_change(path);
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -116,11 +103,7 @@ impl LexicalView {
     /// Keep acquisition separate from the read projection so a source that
     /// verifies a saved generation can supply the same query snapshot.
     fn acquire(&self) -> Result<Snapshot, String> {
-        use super::contracts::PlaneLoader;
-        self.loader
-            .load(&self.access)
-            .map(|outcome| outcome.snapshot)
-            .map_err(|error| error.to_string())
+        self.source.acquire()
     }
 
     pub(crate) fn snapshot(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
@@ -214,6 +197,98 @@ impl LexicalView {
             ),
         )
     }
+}
+
+#[cfg(test)]
+pub(crate) struct BaseBuilderTestSource {
+    root: PathBuf,
+    storage: PathBuf,
+    family: String,
+    policy: TrigramPolicy,
+    snapshots: std::sync::Mutex<BTreeMap<[u8; 32], (Snapshot, super::base_builder::BuildClaim)>>,
+}
+
+#[cfg(test)]
+impl BaseBuilderTestSource {
+    pub(crate) fn new(
+        root: &Path,
+        storage: &Path,
+        family: &str,
+        policy: TrigramPolicy,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            root: root.into(),
+            storage: storage.into(),
+            family: family.into(),
+            policy,
+            snapshots: Default::default(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl LexicalSnapshotSource for BaseBuilderTestSource {
+    fn acquire(&self) -> Result<Snapshot, String> {
+        let walk = strict_walk(&self.root, &self.policy, 0);
+        if !walk.gaps.is_empty() {
+            return Err(format!("strict test walk gaps: {:?}", walk.gaps));
+        }
+        let mut hash = blake3::Hasher::new();
+        for (path, entry) in &walk.entries {
+            hash.update(&(path.as_bytes().len() as u64).to_be_bytes());
+            hash.update(path.as_bytes());
+            if let DiskState::Present { content, .. } = entry.disk {
+                hash.update(content.as_bytes());
+            }
+        }
+        let key = *hash.finalize().as_bytes();
+        let mut snapshots = self.snapshots.lock().unwrap();
+        if let Some((snapshot, _)) = snapshots.get(&key) {
+            return Ok(snapshot.clone());
+        }
+        let paths = walk.entries.into_keys().collect::<Vec<_>>();
+        let built = super::base_builder::build_base(
+            super::base_builder::BaseBuildInput {
+                storage: &self.storage,
+                family: &self.family,
+                root: &self.root,
+                paths: &paths,
+                policy: self.policy,
+                semantic_producer: None,
+                callgraph_producer: super::callgraph::PRODUCER.into(),
+                ignore_fingerprint: None,
+                history: None,
+                budget: super::eviction::DiskBudget::default(),
+            },
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let super::base_builder::BaseBuild::Published {
+            identity, claim, ..
+        } = built
+        else {
+            return Err(format!("test base build refused: {built:?}"));
+        };
+        let base = super::base_refs::resolve_base(&self.storage, &self.family, &identity.scope)
+            .map_err(|error| error.to_string())?;
+        let worker = super::manifest_v2::ManifestV2::new_v3(
+            base.manifest().header().clone(),
+            Some(base.header()),
+            super::manifest_v2::PublishedFrontier::default(),
+        );
+        let composed = super::snapshot::ComposedGeneration::compose(
+            "lexical-test-worker",
+            worker,
+            base.into_generation(&self.storage, &self.family),
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let snapshot = super::snapshot::LiveDelta::new(Arc::new(composed)).snapshot();
+        snapshots.insert(key, (snapshot.clone(), claim));
+        Ok(snapshot)
+    }
+
+    fn record_change(&self, _: &Path) {}
 }
 
 /// Generation-local replacements and tombstones relative to the shared segment.
@@ -1287,13 +1362,14 @@ mod tests {
         let policy = TrigramPolicy {
             max_file_size: 1024 * 1024,
         };
-        let view = LexicalView::new(
+        let source = BaseBuilderTestSource::new(&root, &storage, "lexical-parity", policy);
+        let view = LexicalView::with_source(
             root.clone(),
             crate::root_cache::StoragePaths::same(&storage),
             "lexical-parity".into(),
             policy,
-        )
-        .unwrap();
+            source.clone(),
+        );
         let projected = view.snapshot().unwrap();
         let legacy =
             crate::search_index::SearchIndex::build_with_limit_serial(&root, policy.max_file_size)
@@ -1336,12 +1412,7 @@ mod tests {
                     .files
             );
         }
-        assert!(view
-            .driver
-            .installed_snapshot()
-            .generation()
-            .v3_route()
-            .is_some());
+        assert!(source.acquire().unwrap().generation().v3_route().is_some());
         assert!(!storage.join("blobs/v2").exists());
         assert!(!storage.join("views/v3").exists());
     }
