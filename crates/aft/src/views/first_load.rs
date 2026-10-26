@@ -566,6 +566,14 @@ impl SiblingLoader {
         access: &ViewAccess,
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
+        Self::reconciled_snapshot(self.driver.as_ref(), access, base)
+    }
+
+    fn reconciled_snapshot(
+        driver: &dyn FirstLoadDriver,
+        access: &ViewAccess,
+        base: Arc<ComposedGeneration>,
+    ) -> Result<(Snapshot, u64), PlaneError> {
         for _ in 0..3 {
             // Read before the walk, so an ignore edit racing the walk shows up
             // as a difference from this record rather than being recorded as
@@ -576,8 +584,8 @@ impl SiblingLoader {
                 }
                 _ => None,
             };
-            let checkout = self.driver.reconcile(access)?;
-            if checkout.cut.is_none() && self.driver.revision(access) != checkout.revision {
+            let checkout = driver.reconcile(access)?;
+            if checkout.cut.is_none() && driver.revision(access) != checkout.revision {
                 continue;
             }
             let mut delta = super::snapshot::LiveDelta::new(Arc::clone(&base));
@@ -1396,6 +1404,23 @@ mod stat_tests {
     }
 
     #[test]
+    fn verified_bind_hook_without_a_frontier_strictly_verifies_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), b"fn fresh() {}\n").unwrap();
+        let (driver, access) = driver(root.path(), storage.path());
+        let base = driver.installed_snapshot().generation().clone();
+        let (snapshot, _) = driver.verified_bind(&access, base).unwrap();
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        assert_eq!(
+            snapshot.disk_state(&path),
+            super::super::snapshot::DiskState::of_bytes(b"fn fresh() {}\n")
+        );
+        assert_eq!(driver.take_reconcile_work().reads, 1);
+        assert!(snapshot.install_cut().is_some());
+    }
+
+    #[test]
     fn stat_reconcile_detects_unreported_same_size_backdated_edit() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -1506,6 +1531,18 @@ pub(crate) struct ReconcileWork {
 }
 
 impl CheckoutDriver {
+    /// Verifies this checkout against `base` and returns a reconciliation cut.
+    /// Unsupported freshness proofs use strict reconciliation instead. This
+    /// does not publish or install the cut; those steps still validate its epoch
+    /// and installed-bundle identity. The hook is independent of plane selection.
+    pub fn verified_bind(
+        &self,
+        access: &ViewAccess,
+        base: Arc<ComposedGeneration>,
+    ) -> Result<(Snapshot, u64), PlaneError> {
+        SiblingLoader::reconciled_snapshot(self, access, base)
+    }
+
     pub fn take_revalidated_job(&self) -> bool {
         self.retry.swap(false, std::sync::atomic::Ordering::AcqRel)
     }
