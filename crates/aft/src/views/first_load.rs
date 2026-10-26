@@ -1237,6 +1237,9 @@ mod tests {
 pub trait CompositePlane: Send + Sync {
     fn plane(&self) -> FamilyPlane;
     fn applies_to(&self, path: &RelPath) -> bool;
+    fn bootstrap_policy(&self) -> Option<crate::blob_store::v2::TrigramPolicy> {
+        None
+    }
 
     /// Derive a payload key without extraction. Planes with deferred extraction
     /// may leave this absent and keep their own cheap attachment format.
@@ -1333,6 +1336,13 @@ pub trait CompositePlane: Send + Sync {
 /// adapters must return walker errors rather than silently truncating membership.
 pub trait MembershipWalker: Send + Sync {
     fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError>;
+    fn changed_files(
+        &self,
+        _root: &std::path::Path,
+        _candidates: &std::collections::BTreeSet<std::path::PathBuf>,
+    ) -> Result<Option<Vec<std::path::PathBuf>>, PlaneError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -1372,6 +1382,7 @@ struct ObservedCheckout {
     stats: BTreeMap<RelPath, ObservedStat>,
     evidence: BTreeMap<RelPath, super::verification::Evidence>,
     guard: Option<Arc<super::verification::BindGuard>>,
+    subscription: Option<crate::watcher_backend::subscription::Continuity>,
 }
 
 impl ObservedStat {
@@ -1440,13 +1451,13 @@ mod stat_tests {
     }
 
     #[test]
-    fn verified_bind_hook_without_a_frontier_strictly_verifies_membership() {
+    fn strict_reconcile_without_a_frontier_verifies_membership() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file.rs"), b"fn fresh() {}\n").unwrap();
         let (driver, access) = driver(root.path(), storage.path());
         let base = driver.installed_snapshot().generation().clone();
-        let (snapshot, _) = driver.verified_bind(&access, base).unwrap();
+        let (snapshot, _) = SiblingLoader::reconciled_snapshot(&driver, &access, base).unwrap();
         let path = RelPath::new(b"file.rs".to_vec()).unwrap();
         assert_eq!(
             snapshot.disk_state(&path),
@@ -1466,7 +1477,7 @@ mod stat_tests {
             std::fs::write(file, vec![b'x'; 20 + attempt]).unwrap();
         }));
         let base = driver.installed_snapshot().generation().clone();
-        let (snapshot, _) = driver.verified_bind(&access, base).unwrap();
+        let (snapshot, _) = SiblingLoader::reconciled_snapshot(&driver, &access, base).unwrap();
         let path = RelPath::new(b"file.rs".to_vec()).unwrap();
         assert_eq!(snapshot.pending_intent().collect::<Vec<_>>(), vec![&path]);
         assert_eq!(
@@ -1610,6 +1621,7 @@ pub struct CheckoutDriver {
     delivery: std::sync::Mutex<DeliveryState>,
     v3_reconcile: std::sync::atomic::AtomicBool,
     advisory_token: std::sync::Mutex<Option<String>>,
+    base_claim: std::sync::Mutex<Option<super::base_builder::BuildClaim>>,
     #[cfg(test)]
     read_hook: std::sync::Mutex<Option<ReadHook>>,
     #[cfg(test)]
@@ -1718,14 +1730,21 @@ impl CheckoutDriver {
     }
 
     /// Verifies this checkout against `base` and returns a reconciliation cut.
-    /// Unsupported freshness proofs use strict reconciliation instead. This
-    /// does not publish or install the cut; those steps still validate its epoch
-    /// and installed-bundle identity. The hook is independent of plane selection.
+    /// Unsupported freshness proofs use strict reconciliation instead.
+    /// A fresh checkout bootstraps a lexical-ready v3 base and publishes a v3
+    /// worker over it; it never falls back to legacy storage. Installation is
+    /// left to the caller and still validates the cut's epoch and bundle identity.
     pub fn verified_bind(
         &self,
         access: &ViewAccess,
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
+        self.check_owner(access)?;
+        if !self.owner.registry().is_v3_only() {
+            return Err(SiblingLoader::error(
+                "verified_bind requires a v3-only registration",
+            ));
+        }
         if let Some(token) = self
             .advisory_token
             .lock()
@@ -1747,11 +1766,189 @@ impl CheckoutDriver {
                 now,
             );
         }
-        self.v3_reconcile.store(
-            base.v3_route().is_some(),
-            std::sync::atomic::Ordering::Release,
+        let bootstrap = base.base_header().is_none();
+        self.v3_reconcile
+            .store(true, std::sync::atomic::Ordering::Release);
+        let base = if bootstrap {
+            self.bootstrap_v3_base(access, base)?
+        } else {
+            base
+        };
+        let (snapshot, revision) = SiblingLoader::reconciled_snapshot(self, access, base)?;
+        if !bootstrap {
+            return Ok((snapshot, revision));
+        }
+        let own = self.build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING)?;
+        if self
+            .planes
+            .iter()
+            .all(|plane| plane.plane() == FamilyPlane::Trigram)
+        {
+            if let Some(claim) = self
+                .base_claim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                claim
+                    .release()
+                    .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            }
+        }
+        let mut delta = LiveDelta::from_snapshot(&snapshot);
+        let draft = super::snapshot::derive_successor(
+            &delta.cut(),
+            own,
+            &super::snapshot::carry_disk_state_only,
         );
-        SiblingLoader::reconciled_snapshot(self, access, base)
+        delta
+            .replay_and_swap(draft, &super::snapshot::carry_disk_state_only)
+            .map_err(|error| SiblingLoader::error(format!("{error:?}")))?;
+        Ok((
+            delta
+                .snapshot()
+                .with_install_cut(snapshot.install_cut().unwrap().clone())
+                .with_reconciled_epoch(
+                    snapshot
+                        .reconciled_epoch()
+                        .unwrap_or(snapshot.install_cut().unwrap().epoch),
+                ),
+            revision,
+        ))
+    }
+
+    fn bootstrap_v3_base(
+        &self,
+        access: &ViewAccess,
+        seed: Arc<ComposedGeneration>,
+    ) -> Result<Arc<ComposedGeneration>, PlaneError> {
+        let policy = self
+            .planes
+            .iter()
+            .find_map(|plane| plane.bootstrap_policy())
+            .ok_or_else(|| {
+                SiblingLoader::error("v3 bootstrap requires a registered lexical plane")
+            })?;
+        if self.producers.trigram != policy.fingerprint_hex() {
+            return Err(SiblingLoader::error(
+                "v3 bootstrap lexical producer mismatch",
+            ));
+        }
+        let (checkout, _) = SiblingLoader::reconciled_snapshot(self, access, seed)?;
+        if checkout.pending_intent().next().is_some() {
+            return Err(SiblingLoader::error(
+                "v3 bootstrap has pending unstable paths",
+            ));
+        }
+        let route = self.owner.v3_route();
+        let ignore_fingerprint = checkout
+            .install_cut()
+            .and_then(|cut| cut.verification.as_ref())
+            .map(|g| g.policy.digest.clone());
+        let header = super::manifest_v2::ManifestHeader {
+            producers: self.producers.clone(),
+            head_tree: None,
+            ignore_fingerprint: ignore_fingerprint.clone(),
+            segment: None,
+        };
+        let mut manifest = super::manifest_v2::ManifestV2::new_v3(header, None, Default::default());
+        for (path, state) in checkout.membership() {
+            if let super::snapshot::DiskState::Present { content, size } = state {
+                manifest
+                    .insert(
+                        path,
+                        super::manifest_v2::EntryV2::regular(content, size, Default::default()),
+                    )
+                    .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            }
+        }
+        let expected = super::base_refs::BaseIdentity::of(&route.family, &manifest)
+            .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        let resolved =
+            match super::base_refs::resolve_base(&route.storage, &route.family, &expected.scope) {
+                Ok(base) => base,
+                Err(_) => {
+                    let paths: Vec<_> = manifest.entries().map(|(path, _)| path.clone()).collect();
+                    match super::base_builder::build_base(
+                        super::base_builder::BaseBuildInput {
+                            storage: &route.storage,
+                            family: &route.family,
+                            root: self.owner.root(),
+                            paths: &paths,
+                            policy,
+                            semantic_producer: self.producers.semantic.clone(),
+                            callgraph_producer: self.producers.callgraph.clone(),
+                            ignore_fingerprint,
+                            history: None,
+                            budget: Default::default(),
+                        },
+                        None,
+                    )
+                    .map_err(|e| SiblingLoader::error(e.to_string()))?
+                    {
+                        super::base_builder::BaseBuild::Published {
+                            identity, claim, ..
+                        } => {
+                            *self
+                                .base_claim
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(claim);
+                            super::base_refs::resolve_base(
+                                &route.storage,
+                                &route.family,
+                                &identity.scope,
+                            )
+                            .map_err(|e| SiblingLoader::error(e.to_string()))?
+                        }
+                        super::base_builder::BaseBuild::Busy => super::base_refs::resolve_base(
+                            &route.storage,
+                            &route.family,
+                            &expected.scope,
+                        )
+                        .map_err(|_| {
+                            SiblingLoader::error(
+                                "v3 base build busy; retain direct-scan coverage and retry",
+                            )
+                        })?,
+                        super::base_builder::BaseBuild::Strict(reason) => {
+                            return Err(SiblingLoader::error(format!(
+                                "v3 base admission refused: {reason}"
+                            )))
+                        }
+                    }
+                }
+            };
+        let header = resolved.header();
+        let generation = resolved.into_generation(&route.storage, &route.family);
+        let manifest = super::manifest_v2::ManifestV2::new_v3(
+            generation.header().clone(),
+            Some(header),
+            Default::default(),
+        );
+        let seed_route = generation.v3_route().unwrap().clone();
+        let composed =
+            ComposedGeneration::compose(generation.name(), manifest, generation.clone(), None)
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        Ok(Arc::new(composed.with_v3_route(seed_route)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v3(
+        storage: &std::path::Path,
+        family: &str,
+        scope: &str,
+        root: &std::path::Path,
+        producers: Producers,
+        walker: Arc<dyn MembershipWalker>,
+        planes: Vec<Arc<dyn CompositePlane>>,
+    ) -> Result<Self, PlaneError> {
+        let owner = super::registry::ViewRegistration::register_v3(storage, family, scope, root)
+            .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        let driver = Self::new(owner, producers, None, walker, planes);
+        driver
+            .v3_reconcile
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(driver)
     }
 
     pub fn set_view_token(&self, token: String) {
@@ -1759,6 +1956,10 @@ impl CheckoutDriver {
             .advisory_token
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+    }
+
+    pub fn access(&self) -> ViewAccess {
+        ViewAccess::Owner(self.owner.clone())
     }
 
     pub fn take_revalidated_job(&self) -> bool {
@@ -1815,6 +2016,7 @@ impl CheckoutDriver {
             delivery: Default::default(),
             v3_reconcile: Default::default(),
             advisory_token: Default::default(),
+            base_claim: Default::default(),
             #[cfg(test)]
             read_hook: Default::default(),
             installed: std::sync::Mutex::new(Arc::new(InstalledBundle {
@@ -1908,6 +2110,7 @@ impl CheckoutDriver {
 
     /// Invalidates stale builds and indexed membership until strict reconciliation.
     pub fn record_watcher_overflow(&self) {
+        crate::watcher_backend::subscription::gap(self.owner.root());
         let mut delta = self
             .live
             .lock()
@@ -2087,16 +2290,86 @@ impl FirstLoadDriver for CheckoutDriver {
                 )
             })
             .unwrap_or_default();
-        let mut entries = BTreeMap::new();
-        let mut stats = BTreeMap::new();
-        let mut evidence = BTreeMap::new();
+        let subscription = crate::watcher_backend::subscription::current(self.owner.root());
+        let mut changed = pending.clone();
+        changed.extend(
+            installed
+                .live_entries()
+                .filter(|(_, entry)| {
+                    entry.reconciliation != super::readiness::ReconciledDelta::Reconciled
+                })
+                .map(|(path, _)| path.clone()),
+        );
+        let mut candidates = std::collections::BTreeSet::new();
+        let mut policy_or_directory = false;
+        for path in &changed {
+            let relative = super::segment_store::rel_path_to_os(path)
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            let absolute = self.owner.root().join(relative);
+            let name = absolute.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            policy_or_directory |= matches!(
+                name,
+                ".gitattributes" | ".gitignore" | ".ignore" | ".aftignore"
+            ) || path.as_bytes().starts_with(b".git/")
+                || super::assembly::is_resolution_input(path.as_bytes())
+                || std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir());
+            candidates.insert(absolute);
+        }
+        let continuous = v3
+            && subscription.is_some()
+            && subscription == previous.subscription
+            && installed.watcher() == super::snapshot::WatcherState::Healthy
+            && guard
+                .as_ref()
+                .zip(previous.guard.as_ref())
+                .is_some_and(|(now, old)| now.root == old.root && now.policy == old.policy)
+            && !policy_or_directory;
+        let changed_files = if continuous {
+            self.walker.changed_files(self.owner.root(), &candidates)?
+        } else {
+            None
+        };
+        let incremental = changed_files.is_some();
+        let files = match changed_files {
+            Some(files) => files,
+            None => self.walker.files(self.owner.root())?,
+        };
+        let mut entries = if incremental {
+            previous.entries.clone()
+        } else {
+            BTreeMap::new()
+        };
+        let mut stats = if incremental {
+            previous.stats.clone()
+        } else {
+            BTreeMap::new()
+        };
+        let mut evidence = if incremental {
+            previous.evidence.clone()
+        } else {
+            BTreeMap::new()
+        };
+        if incremental {
+            for path in &changed {
+                entries.remove(path);
+                stats.remove(path);
+                evidence.remove(path);
+                let mut prefix = path.as_bytes().to_vec();
+                prefix.push(b'/');
+                entries.retain(|p, _| !p.as_bytes().starts_with(&prefix));
+                stats.retain(|p, _| !p.as_bytes().starts_with(&prefix));
+                evidence.retain(|p, _| !p.as_bytes().starts_with(&prefix));
+            }
+        }
         #[cfg(test)]
         {
-            self.work.lock().unwrap().walks += 1;
+            if !incremental {
+                self.work.lock().unwrap().walks += 1;
+            }
         }
-        // Full configured membership, even for copied and non-git roots. Stat
-        // reuse avoids source I/O, not the discovery of unreported changes.
-        for absolute in self.walker.files(self.owner.root())? {
+        // Restart and delivery gaps require full membership. A continuous
+        // subscription checks only reported files under the same walker policy.
+        for absolute in files {
             let relative = absolute
                 .strip_prefix(self.owner.root())
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
@@ -2168,9 +2441,11 @@ impl FirstLoadDriver for CheckoutDriver {
                                 })
                         })
                         && self.planes.iter().filter(|p| p.applies_to(&path)).all(|p| {
-                            record
-                                .key(p.plane())
-                                .is_some_and(|key| v3_contains(&route, &key))
+                            record.key(p.plane()).is_some_and(|key| {
+                                matches!(generation.plane_readiness(&path, p.plane()), Some(super::readiness::PlaneState::Ready { key: ready }) if *ready == key.to_hex())
+                                    && record.content().is_some_and(|content| p.key(&path, content).is_none_or(|expected| expected == key))
+                                    && v3_contains(&route, &key)
+                            })
                         })
                         && self
                             .delivery
@@ -2277,6 +2552,7 @@ impl FirstLoadDriver for CheckoutDriver {
             stats,
             evidence,
             guard: guard.clone(),
+            subscription,
         };
         let mut cut = installed.install_cut().cloned();
         if let Some(cut) = &mut cut {
@@ -2463,6 +2739,11 @@ impl FirstLoadDriver for CheckoutDriver {
         self.check_owner(access)?;
         if let Some(header) = snapshot.generation().base_header() {
             return self.build_v3_worker_generation(access, snapshot, header.clone());
+        }
+        if self.owner.registry().is_v3_only() {
+            return Err(SiblingLoader::error(
+                "v3-only driver requires verified_bind bootstrap before publication",
+            ));
         }
         super::io::WORK
             .own_generation_folds
@@ -4090,7 +4371,7 @@ impl CompositePlane for CallgraphBridge {
             &crate::blob_store::CallgraphKey::from_source_digest(
                 *content.as_bytes(),
                 language,
-                crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
+                super::callgraph::PRODUCER,
             )
             .full_key(),
         ))
@@ -4856,6 +5137,20 @@ thread_local! {
     pub(crate) static MEMBERSHIP_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 impl MembershipWalker for ConfiguredMembershipWalker {
+    fn changed_files(
+        &self,
+        root: &std::path::Path,
+        candidates: &std::collections::BTreeSet<std::path::PathBuf>,
+    ) -> Result<Option<Vec<std::path::PathBuf>>, PlaneError> {
+        let listing = crate::search_index::project_walk_lists(root, candidates);
+        if candidates
+            .iter()
+            .any(|path| listing.gap_for(path).is_some())
+        {
+            return Ok(None);
+        }
+        Ok(Some(listing.listed.into_iter().collect()))
+    }
     fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
         #[cfg(test)]
         MEMBERSHIP_WALKS.with(|walks| walks.set(walks.get() + 1));
@@ -4943,6 +5238,9 @@ impl TrigramBridge {
     }
 }
 impl CompositePlane for TrigramBridge {
+    fn bootstrap_policy(&self) -> Option<crate::blob_store::v2::TrigramPolicy> {
+        Some(self.policy)
+    }
     fn plane(&self) -> FamilyPlane {
         FamilyPlane::Trigram
     }
@@ -5421,5 +5719,154 @@ mod checkout_kind_tests {
                 .unwrap();
             assert!(path.is_file());
         }
+    }
+}
+
+#[cfg(test)]
+mod v3_bootstrap_tests {
+    use super::*;
+
+    fn inventory(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(
+            base: &std::path::Path,
+            path: &std::path::Path,
+            files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            if !path.exists() {
+                return;
+            }
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(base, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(base).unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn verified_bind_fresh_trigram_driver_bootstraps_and_publishes_only_v3() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = b"fn fresh_checkout() { let marker = 42; }\n";
+        std::fs::write(root.path().join("file.rs"), source).unwrap();
+        std::fs::File::open(root.path().join("file.rs"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
+        let legacy_v1 = storage.path().join("blobs/family");
+        let legacy_v2 = storage.path().join("blobs/v2/family");
+        for dir in [&legacy_v1, &legacy_v2] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("untouched"), b"legacy sentinel").unwrap();
+        }
+        let before = (inventory(&legacy_v1), inventory(&legacy_v2));
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let producers = Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: None,
+            callgraph: "unregistered".into(),
+        };
+        let plane = Arc::new(TrigramBridge::new(storage.path().to_owned(), policy));
+        let driver = CheckoutDriver::new_v3(
+            storage.path(),
+            "family",
+            "worker",
+            root.path(),
+            producers.clone(),
+            Arc::new(ConfiguredMembershipWalker),
+            vec![plane],
+        )
+        .unwrap();
+        let access = driver.access();
+        assert!(driver.owner.open_store(FamilyPlane::Trigram).is_err());
+        assert_eq!((inventory(&legacy_v1), inventory(&legacy_v2)), before);
+        let empty = driver.installed_snapshot().generation().clone();
+        let (snapshot, revision) = driver.verified_bind(&access, empty).unwrap();
+        assert!(snapshot.generation().base_header().is_some());
+        assert_eq!(snapshot.generation().v3_route().unwrap().scope, "worker");
+        assert!(snapshot.generation().header().head_tree.is_none());
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        assert_eq!(
+            snapshot.disk_state(&path),
+            super::super::snapshot::DiskState::of_bytes(source)
+        );
+        assert!(matches!(
+            snapshot.plane_readiness(&path, FamilyPlane::Trigram),
+            Some(super::super::readiness::PlaneState::Ready { .. })
+        ));
+        driver.install(&access, &snapshot, revision).unwrap();
+        assert!(!driver.installed_snapshot().needs_reconcile());
+        let route = driver.owner.v3_route();
+        let store = super::super::ViewStore::existing_dir(route.member_dir()).unwrap();
+        let generation = store.current_generation_read_only().unwrap().unwrap();
+        let manifest = store.load_manifest_v2(&generation).unwrap();
+        assert_eq!(
+            manifest.len(),
+            0,
+            "unchanged bytes inherit the lexical-ready base"
+        );
+        assert!(
+            super::super::verification::evidence_path(&route.member_dir(), &generation).exists()
+        );
+        assert_eq!((inventory(&legacy_v1), inventory(&legacy_v2)), before);
+        let ledger =
+            crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family").unwrap();
+        assert_eq!(
+            ledger
+                .read(|c| Ok(c.query_row(
+                    "SELECT COUNT(*) FROM view_sessions WHERE scope='worker'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )?))
+                .unwrap(),
+            1
+        );
+        let second = CheckoutDriver::new_v3(
+            storage.path(),
+            "family",
+            "worker",
+            root.path(),
+            producers,
+            Arc::new(ConfiguredMembershipWalker),
+            vec![Arc::new(TrigramBridge::new(
+                storage.path().to_owned(),
+                policy,
+            ))],
+        )
+        .unwrap();
+        let base = super::super::base_refs::open_foreign_v3(
+            storage.path(),
+            "family",
+            "worker",
+            &second.producers,
+        )
+        .unwrap()
+        .unwrap();
+        second.verified_bind(&second.access(), base).unwrap();
+        let work = second.take_reconcile_work();
+        assert_eq!(
+            work.walks, 1,
+            "membership-keyed bases still take strict startup verification"
+        );
+        assert_eq!(
+            work.reads, 0,
+            "generation-paired evidence avoids rereading stable source"
+        );
+        assert_eq!((inventory(&legacy_v1), inventory(&legacy_v2)), before);
     }
 }

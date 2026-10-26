@@ -7,6 +7,7 @@ pub(crate) mod cookie;
 #[cfg(test)]
 mod cookie_tests;
 pub(crate) mod flush;
+pub(crate) mod subscription;
 
 #[cfg(target_os = "macos")]
 mod fsevents;

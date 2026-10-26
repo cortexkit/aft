@@ -728,11 +728,7 @@ pub struct CheckoutSemanticMemory {
 /// before its vectors can be brought up to date. The initial snapshot (before
 /// any generation was published) always needs one.
 fn needs_reload(snapshot: &Snapshot) -> bool {
-    snapshot.generation().name() == "empty"
-        || snapshot.pending_intent().next().is_some()
-        || snapshot
-            .live_entries()
-            .any(|(_, entry)| entry.reconciliation != super::readiness::ReconciledDelta::Reconciled)
+    snapshot.needs_reconcile()
 }
 
 /// Whether reconciling `snapshot` needs a cold-build slot. A reconcile walks

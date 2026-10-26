@@ -203,18 +203,14 @@ impl Policy {
         hash.update(b"aft/views-v3/conversion-policy/1");
         let queries =
             crate::git_index_reader::GitQueries::new(root.to_path_buf(), Duration::from_secs(2));
-        let output = queries.config()?;
-        if !output.status.success() {
-            return Ok(Self {
-                digest: "non-git".into(),
-                reusable: false,
-            });
-        }
-        hash.update(&output.stdout);
-        let mut reusable = true;
+        let output = queries.config();
+        let mut reusable = output.as_ref().is_ok_and(|output| output.status.success());
+        hash.update(&[u8::from(reusable)]);
+        let config = output.map(|output| output.stdout).unwrap_or_default();
+        hash.update(&config);
         // Config --show-origin records include targets and worktree config.
         // Hash their bytes as well as the effective values, including empty files.
-        for item in output.stdout.split(|b| *b == 0) {
+        for item in config.split(|b| *b == 0) {
             if let Some(path) = item.strip_prefix(b"file:") {
                 let path = path_from_bytes(path)?;
                 metadata_source(
@@ -360,6 +356,7 @@ pub(crate) struct BindGuard {
     pub index: Option<(NativeStat, [u8; 32])>,
     pub policy: Policy,
     pub inputs: Vec<PathBuf>,
+    pub subscription: Option<crate::watcher_backend::subscription::Continuity>,
 }
 
 impl BindGuard {
@@ -407,6 +404,7 @@ impl BindGuard {
             index,
             policy,
             inputs,
+            subscription: crate::watcher_backend::subscription::current(root),
         })
     }
     pub fn validate(&self, root: &Path) -> io::Result<()> {

@@ -821,6 +821,12 @@ impl LiveDelta {
                 reconciled_epoch: None,
                 publication_base: None,
                 readers: None,
+                needs_reconcile: self.base.name() == "empty"
+                    || !self.intent.is_empty()
+                    || self.watcher != WatcherState::Healthy
+                    || self.entries.values().any(|entry| {
+                        entry.reconciliation != super::readiness::ReconciledDelta::Reconciled
+                    }),
             }),
         }
     }
@@ -1665,6 +1671,7 @@ pub fn carry_disk_state_only(path: &RelPath, generation: &ComposedGeneration) ->
 
 #[derive(Clone, Debug)]
 struct SnapshotInner {
+    needs_reconcile: bool,
     reconciled_epoch: Option<u64>,
     publication_base: Option<Option<String>>,
     generation: Arc<ComposedGeneration>,
@@ -1991,6 +1998,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Checks the cached reconciliation flag. Work is summarized when the
+    /// immutable snapshot is created, not by scanning the delta on each query.
+    pub fn needs_reconcile(&self) -> bool {
+        self.inner.needs_reconcile
+    }
+
     pub(crate) fn with_publication_base(mut self, base: Option<String>) -> Self {
         Arc::make_mut(&mut self.inner).publication_base = Some(base);
         self

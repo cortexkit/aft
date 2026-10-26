@@ -2293,6 +2293,7 @@ pub fn run_watcher_thread<W, E, F>(
                 return;
             }
             crate::slog_info!("watcher started: {}", root_path.display());
+            let _subscription = crate::watcher_backend::subscription::start(&root_path);
             let mut filter = WatcherFilterThread::new(
                 config,
                 matcher,

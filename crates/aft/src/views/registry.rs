@@ -236,7 +236,7 @@ struct RegistryInner {
     durable_storage: Mutex<Option<PathBuf>>,
     family: String,
     path: PathBuf,
-    connection: Mutex<TrackedConnection>,
+    connection: Option<Mutex<TrackedConnection>>,
     /// The disk limits this process applies to the family; see
     /// `views::eviction`. Shared by every handle on this registry file.
     budget: Mutex<super::eviction::DiskBudget>,
@@ -299,6 +299,30 @@ impl RegistryLocation {
 }
 
 impl FamilyRegistry {
+    /// Identity and barrier access for a v3-only owner. No legacy connection is
+    /// opened, including during session cleanup.
+    fn open_v3(storage: &Path, family: &str) -> RegistryResult<Self> {
+        let path = crate::blob_store::v3::family_dir(storage, family)
+            .map_err(token_store_error)?
+            .join("members.sqlite");
+        Ok(Self {
+            inner: Arc::new(RegistryInner {
+                storage: storage.to_path_buf(),
+                durable_storage: Mutex::new(None),
+                family: family.to_owned(),
+                path,
+                connection: None,
+                budget: Mutex::new(Default::default()),
+                size_caches: Mutex::default(),
+                ended_sessions: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
+    pub fn is_v3_only(&self) -> bool {
+        self.inner.connection.is_none()
+    }
+
     /// Opens the registry, creating it when absent.
     pub fn open(storage: &Path, family: &str) -> RegistryResult<Self> {
         let dir = family_dir(storage, family)?;
@@ -371,7 +395,7 @@ impl FamilyRegistry {
                 durable_storage: Mutex::new(None),
                 family: family.to_owned(),
                 path,
-                connection: Mutex::new(connection),
+                connection: Some(Mutex::new(connection)),
                 budget: Mutex::new(super::eviction::DiskBudget::default()),
                 size_caches: Mutex::default(),
                 ended_sessions: Mutex::new(Vec::new()),
@@ -408,13 +432,18 @@ impl FamilyRegistry {
             durable_storage: Mutex::new(None),
             family: family.to_owned(),
             path: path.clone(),
-            connection: Mutex::new(connection),
+            connection: Some(Mutex::new(connection)),
             budget: Mutex::new(super::eviction::DiskBudget::default()),
             size_caches: Mutex::default(),
             ended_sessions: Mutex::new(Vec::new()),
         });
         {
-            let mut connection = lock(&inner.connection);
+            let mut connection = lock(
+                inner
+                    .connection
+                    .as_ref()
+                    .expect("legacy registry connection"),
+            );
             if create {
                 crate::blob_store::retry_while_busy(
                     Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS),
@@ -446,21 +475,23 @@ impl FamilyRegistry {
     /// The registry connection, after writing any session ends queued while
     /// it was busy, so that nothing read through it sees a session that has
     /// already ended in this process.
-    fn connection(&self) -> MutexGuard<'_, TrackedConnection> {
+    fn connection(&self) -> RegistryResult<MutexGuard<'_, TrackedConnection>> {
+        let mutex = self.inner.connection.as_ref().ok_or_else(|| {
+            RegistryError::Incompatible(
+                "legacy registry operation on a v3-only registration".into(),
+            )
+        })?;
         #[cfg(test)]
         CONNECTION_BLOCKED.with(|hook| {
-            if matches!(
-                self.inner.connection.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ) {
+            if matches!(mutex.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
                 if let Some(blocked) = hook.borrow_mut().take() {
                     blocked.send(()).unwrap();
                 }
             }
         });
-        let connection = lock(&self.inner.connection);
+        let connection = lock(mutex);
         flush_ended_sessions(&self.inner, &connection);
-        connection
+        Ok(connection)
     }
 
     pub fn storage(&self) -> &Path {
@@ -534,6 +565,11 @@ impl FamilyRegistry {
         scope: &str,
         root: &Path,
     ) -> RegistryResult<ViewRegistration> {
+        if self.is_v3_only() {
+            return Err(RegistryError::Incompatible(
+                "use ViewRegistration::register_v3 for v3-only owners".into(),
+            ));
+        }
         self.bind_durable_storage(durable_storage)?;
         if matches!(root.try_exists(), Ok(true)) {
             let paths = crate::root_cache::StoragePaths::new(
@@ -554,7 +590,7 @@ impl FamilyRegistry {
             owner.start_time,
             SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let mut connection = self.connection();
+        let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(RUNTIME_SCHEMA)?;
         let previous: Option<String> = tx
@@ -633,7 +669,7 @@ impl FamilyRegistry {
 
     /// Every recorded view session, live or not.
     pub fn sessions(&self) -> RegistryResult<Vec<SessionRecord>> {
-        let connection = self.connection();
+        let connection = self.connection()?;
         read_sessions(&connection, None)
     }
 
@@ -647,7 +683,7 @@ impl FamilyRegistry {
             .filter(|session| !crate::pins::owner_is_live(&session.owner))
             .map(|session| session.session_id)
             .collect::<Vec<_>>();
-        let connection = self.connection();
+        let connection = self.connection()?;
         for session_id in &dead {
             connection.execute(
                 "DELETE FROM view_sessions WHERE session_id = ?1",
@@ -668,7 +704,7 @@ impl FamilyRegistry {
             owner.start_time,
             READER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        self.connection().execute(
+        self.connection()?.execute(
             "INSERT INTO readers (reader_id, label, owner_pid, owner_start, registered_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -687,11 +723,11 @@ impl FamilyRegistry {
     }
 
     pub fn members(&self) -> RegistryResult<Vec<MemberRecord>> {
-        read_members(&self.connection())
+        read_members(&*self.connection()?)
     }
 
     pub(crate) fn members_bounded(&self, limit: usize) -> RegistryResult<Vec<MemberRecord>> {
-        let connection = self.connection();
+        let connection = self.connection()?;
         let members = read_members_limited(&connection, limit.saturating_add(1))?;
         if members.len() > limit {
             return Err(RegistryError::Incompatible(format!(
@@ -702,13 +738,13 @@ impl FamilyRegistry {
     }
 
     pub fn member(&self, scope: &str) -> RegistryResult<Option<MemberRecord>> {
-        Ok(read_members(&self.connection())?
+        Ok(read_members(&*self.connection()?)?
             .into_iter()
             .find(|member| member.scope == scope))
     }
 
     pub fn readers(&self) -> RegistryResult<Vec<ReaderRecord>> {
-        let connection = self.connection();
+        let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT reader_id, label, owner_pid, owner_start, registered_at_ms
              FROM readers ORDER BY reader_id",
@@ -728,7 +764,7 @@ impl FamilyRegistry {
     }
 
     pub fn gc_epoch(&self) -> RegistryResult<u64> {
-        let epoch: i64 = self.connection().query_row(
+        let epoch: i64 = self.connection()?.query_row(
             "SELECT gc_epoch FROM registry_meta WHERE singleton = 1",
             [],
             |row| row.get(0),
@@ -738,7 +774,7 @@ impl FamilyRegistry {
 
     /// Records a successful publication of `scope`.
     pub fn note_publish(&self, scope: &str) -> RegistryResult<()> {
-        self.connection().execute(
+        self.connection()?.execute(
             "UPDATE members SET last_publish_ms = ?2 WHERE scope = ?1",
             params![scope, now_ms() as i64],
         )?;
@@ -759,7 +795,7 @@ impl FamilyRegistry {
     /// A live owner keeps the lease; a dead owner's lease is taken over.
     pub(crate) fn acquire_sweep(&self) -> RegistryResult<Option<SweepLease>> {
         let owner = current_owner();
-        let mut connection = self.connection();
+        let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let holder: Option<(i64, i64)> = tx
             .query_row(
@@ -812,7 +848,18 @@ impl FamilyRegistry {
         &self,
         body: impl FnOnce(&rusqlite::Connection) -> RegistryResult<T>,
     ) -> RegistryResult<T> {
-        body(&self.connection())
+        if self.is_v3_only() {
+            return crate::blob_store::v3::LedgerReader::open_existing(
+                self.storage(),
+                self.family(),
+            )
+            .map_err(token_store_error)?
+            .read(|c| {
+                body(c).map_err(|e| crate::blob_store::v3::Error::Io(std::io::Error::other(e)))
+            })
+            .map_err(token_store_error);
+        }
+        body(&*self.connection()?)
     }
 
     /// Runs `body` inside one IMMEDIATE transaction on the registry. This is
@@ -822,7 +869,14 @@ impl FamilyRegistry {
         &self,
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> RegistryResult<T>,
     ) -> RegistryResult<T> {
-        let mut connection = self.connection();
+        if self.is_v3_only() {
+            return super::base_refs::with_base_barrier(self.storage(), self.family(), |tx| {
+                flush_ended_sessions(&self.inner, tx);
+                body(tx).map_err(|e| super::base_refs::BaseRefError::Io(std::io::Error::other(e)))
+            })
+            .map_err(|e| RegistryError::Io(std::io::Error::other(e)));
+        }
+        let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = body(&tx)?;
         tx.commit()?;
@@ -851,7 +905,7 @@ impl FamilyRegistry {
             .filter(|reader| !crate::pins::owner_is_live(&reader.owner))
             .map(|reader| reader.reader_id)
             .collect::<Vec<_>>();
-        let connection = self.connection();
+        let connection = self.connection()?;
         for reader_id in &dead {
             connection.execute(
                 "DELETE FROM readers WHERE reader_id = ?1",
@@ -900,7 +954,7 @@ impl SweepLease {
     /// A forced admission pass ignores it. Failed or partial passes do not
     /// postpone a retry.
     pub(crate) fn due(&self, force: bool) -> RegistryResult<bool> {
-        let connection = self.registry.connection();
+        let connection = self.registry.connection()?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS sweep_schedule (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), completed_at_ms INTEGER NOT NULL)")?;
         let last: Option<i64> = connection
             .query_row(
@@ -917,7 +971,7 @@ impl SweepLease {
     }
 
     pub(crate) fn completed(&self) -> RegistryResult<()> {
-        self.registry.connection().execute("INSERT INTO sweep_schedule VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET completed_at_ms = excluded.completed_at_ms", params![now_ms() as i64])?;
+        self.registry.connection()?.execute("INSERT INTO sweep_schedule VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET completed_at_ms = excluded.completed_at_ms", params![now_ms() as i64])?;
         Ok(())
     }
 
@@ -934,10 +988,12 @@ impl SweepLease {
             return;
         }
         self.released = true;
-        let _ = self.registry.connection().execute(
+        if let Ok(connection) = self.registry.connection() {
+            let _ = connection.execute(
             "DELETE FROM sweep_lease WHERE singleton = 1 AND owner_pid = ?1 AND owner_start = ?2",
             params![i64::from(self.owner.pid), self.owner.start_time as i64],
         );
+        }
     }
 }
 
@@ -993,7 +1049,16 @@ impl Drop for ViewSession {
             ended_at_ms: now_ms(),
         };
         lock(&self.registry.inner.ended_sessions).push(ended);
-        match self.registry.inner.connection.try_lock() {
+        let Some(connection) = &self.registry.inner.connection else {
+            let registry = self.registry.clone();
+            let _ = std::thread::Builder::new()
+                .name("aft-v3-view-session-end".into())
+                .spawn(move || {
+                    let _ = registry.with_barrier(|_| Ok(()));
+                });
+            return;
+        };
+        match connection.try_lock() {
             Ok(connection) => flush_ended_sessions(&self.registry.inner, &connection),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 flush_ended_sessions(&self.registry.inner, &poisoned.into_inner())
@@ -1039,6 +1104,36 @@ pub struct SessionRecord {
 }
 
 impl ViewRegistration {
+    /// Registers only in blobs/v3. It grants no legacy store-write capability.
+    pub fn register_v3(
+        storage: &Path,
+        family: &str,
+        scope: &str,
+        root: &Path,
+    ) -> RegistryResult<Self> {
+        let registry = FamilyRegistry::open_v3(storage, family)?;
+        let root = std::fs::canonicalize(root)?;
+        let owner = current_owner();
+        let session_id = super::base_refs::fresh_nonce();
+        let view_dir = registry.with_barrier(|tx| {
+            let dir = super::base_refs::register_view_in(tx, storage, family, scope, &root)
+                .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
+            tx.execute("INSERT INTO view_sessions(session_id,scope,owner_pid,owner_start,opened_at_ms) VALUES(?1,?2,?3,?4,?5)",
+                params![session_id, scope, owner.pid, owner.start_time as i64, now_ms()])?;
+            Ok(dir)
+        })?;
+        Ok(Self {
+            registry: registry.clone(),
+            scope: scope.to_owned(),
+            root,
+            view_dir,
+            session: Arc::new(ViewSession {
+                registry,
+                session_id,
+                scope: scope.to_owned(),
+            }),
+        })
+    }
     pub fn registry(&self) -> &FamilyRegistry {
         &self.registry
     }
@@ -1065,6 +1160,9 @@ impl ViewRegistration {
     }
 
     pub fn write_access(&self) -> StoreWriteAccess {
+        if self.registry.is_v3_only() {
+            return StoreWriteAccess::v3_only(self.registry.storage(), self.family());
+        }
         StoreWriteAccess::for_registered_view(self.registry.storage(), self.registry.family())
     }
 
@@ -1084,6 +1182,9 @@ impl ViewRegistration {
 
     /// The view's own pointer and manifests in `views/v2/<scope>`.
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
+        if self.registry.is_v3_only() {
+            return Ok(super::ViewStore::open_dir(self.view_dir.clone())?);
+        }
         let view = super::ViewStore::open_dir(self.view_dir.clone())?
             .with_sweep_registry(self.registry.clone());
         view.recover_abandoned_derived(Some(self.registry()));
@@ -1211,10 +1312,12 @@ impl ReaderRegistration {
 
 impl Drop for ReaderRegistration {
     fn drop(&mut self) {
-        let _ = self.registry.connection().execute(
-            "DELETE FROM readers WHERE reader_id = ?1",
-            params![self.reader_id],
-        );
+        if let Ok(connection) = self.registry.connection() {
+            let _ = connection.execute(
+                "DELETE FROM readers WHERE reader_id = ?1",
+                params![self.reader_id],
+            );
+        }
     }
 }
 
@@ -1723,7 +1826,7 @@ mod tests {
         super::super::generation::schedule_generation_sweep(view.clone());
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let held = {
-            let mut connection = registry.connection();
+            let mut connection = registry.connection().unwrap();
             connection.busy_timeout(Duration::ZERO).unwrap();
             let blocked = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)

@@ -363,6 +363,7 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub struct StoreWriteAccess {
     storage: PathBuf,
     family: String,
+    legacy_allowed: bool,
 }
 
 impl StoreWriteAccess {
@@ -371,11 +372,19 @@ impl StoreWriteAccess {
         Self {
             storage: storage.to_path_buf(),
             family: family.to_owned(),
+            legacy_allowed: true,
         }
     }
 
     pub fn storage(&self) -> &Path {
         &self.storage
+    }
+    pub(crate) fn v3_only(storage: &Path, family: &str) -> Self {
+        Self {
+            storage: storage.to_path_buf(),
+            family: family.to_owned(),
+            legacy_allowed: false,
+        }
     }
 
     pub fn family(&self) -> &str {
@@ -442,6 +451,11 @@ pub struct FamilyStoreReader {
 impl FamilyStore {
     /// Opens (creating when absent) `<storage>/blobs/v2/<family>/<plane>.sqlite`.
     pub fn open(access: &StoreWriteAccess, plane: FamilyPlane) -> StoreResult<Self> {
+        if !access.legacy_allowed {
+            return Err(StoreError::InvalidFamily(
+                "v3-only registration cannot open a v2 writer".into(),
+            ));
+        }
         let path = plane_path(&access.storage, &access.family, plane)?;
         if let Some(parent) = path.parent() {
             crate::private_storage::open_dir(&access.storage, parent)?;
