@@ -3113,6 +3113,32 @@ mod deferred_semantic_search_tests {
         }
     }
 
+    #[test]
+    fn view_token_management_dispatch_reaches_the_default_off_guard() {
+        let storage = tempfile::tempdir().unwrap();
+        let context = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_owned()),
+                ..Default::default()
+            },
+        );
+        let response = super::dispatch_command(
+            request(
+                "token",
+                "view_token",
+                serde_json::json!({
+                    "root": storage.path().join("future"), "expected_tree": "a".repeat(40),
+                }),
+            ),
+            &context,
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["success"], false);
+        assert_eq!(wire["code"], "VIEW_TOKEN");
+        assert!(!storage.path().join("blobs").exists());
+    }
+
     fn slow_search_request(id: &str) -> RawRequest {
         request(
             id,
