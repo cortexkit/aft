@@ -1275,11 +1275,10 @@ pub trait CompositePlane: Send + Sync {
         delta: &mut super::manifest_v2::ManifestV2,
         live: &mut crate::pins::LivePin,
     ) -> Result<(), PlaneError> {
+        // A plane without v3 storage leaves its delta entries as they are
+        // (pending), which keeps them queued and honestly incomplete.
         let _ = (owner, route, staging, base, observed, delta, live);
-        Err(PlaneError {
-            plane: Some(self.plane()),
-            reason: "this plane has no v3 materialization".into(),
-        })
+        Ok(())
     }
 
     /// [`Self::finish_generation`] for a v3 member directory.
@@ -1982,8 +1981,8 @@ impl FirstLoadDriver for CheckoutDriver {
         seed_derived: bool,
     ) -> Result<Arc<ComposedGeneration>, PlaneError> {
         self.check_owner(access)?;
-        if snapshot.generation().base_header().is_some() {
-            return Err(binding_unavailable());
+        if let Some(header) = snapshot.generation().base_header() {
+            return self.build_v3_worker_generation(access, snapshot, header.clone());
         }
         super::io::WORK
             .own_generation_folds
@@ -2147,6 +2146,227 @@ impl FirstLoadDriver for CheckoutDriver {
             return Err(SiblingLoader::error("publication fence did not commit"));
         }
         Ok(generation)
+    }
+}
+
+impl CheckoutDriver {
+    /// Publishes this checkout's generation as a v3 worker that references the
+    /// base named by `header`. The header is only a lookup: the base is
+    /// authenticated (pin-then-verify, digests recomputed) before anything is
+    /// written. The published manifest is sparse: entries whose bytes differ
+    /// from the base, tombstones for base paths gone from the checkout, and
+    /// readiness overrides from the live delta's readiness patches; inherited
+    /// base entries are never copied. Plane rows go to the family's v3 plane
+    /// stores under a v3 live pin, derived files to the checkout's v3 member
+    /// directory, and the pointer CAS, referrer row and markers follow
+    /// `base_refs::publish_worker`. Nothing is written to v1 or v2 storage.
+    fn build_v3_worker_generation(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+        header: super::manifest_v2::BaseHeader,
+    ) -> Result<Arc<ComposedGeneration>, PlaneError> {
+        let failed =
+            |error: super::base_refs::BaseRefError| SiblingLoader::error(error.to_string());
+        let route = self.owner.v3_route();
+        let storage = route.storage.clone();
+        let family = route.family.clone();
+        let scope = route.scope.clone();
+        let base = super::base_refs::resolve_base(&storage, &family, &header.scope)
+            .and_then(|base| base.check_header(&header).map(|()| base))
+            .map_err(failed)?;
+        let base_header = base.header();
+        let base_generation = base.into_generation(&storage, &family);
+        // The sparse delta: fold this cut's changes into the installed
+        // worker delta. A path whose bytes equal the base's inherits the base
+        // entry (with any checkout-specific readiness patch as an override);
+        // a deleted base path becomes a tombstone.
+        let generation = snapshot.generation();
+        let inherited = |path: &RelPath,
+                         content: &crate::blob_store::v2::ContentHash,
+                         size: u64| {
+            generation.base().and_then(|base| base.entry(path)).filter(|entry| {
+                matches!(entry, super::manifest_v2::EntryV2::Regular { content: c, size: s, .. } if c == content && *s == size)
+            })
+        };
+        let patched = |path: &RelPath, entry: &super::manifest_v2::EntryV2| {
+            let mut entry = entry.clone();
+            if let (
+                Some(patch),
+                super::manifest_v2::EntryV2::Regular {
+                    content, planes, ..
+                },
+            ) = (snapshot.readiness_patches().get(path), &mut entry)
+            {
+                if patch.content == *content {
+                    for plane in FamilyPlane::ALL {
+                        if let Some(state) = patch.planes.get(plane) {
+                            *planes.get_mut(plane) = Some(state.clone());
+                        }
+                    }
+                }
+            }
+            entry
+        };
+        let mut updates = Vec::new();
+        let mut changed = std::collections::BTreeSet::new();
+        for (path, entry) in snapshot.live_entries() {
+            changed.insert(path.clone());
+            let update = match entry.disk {
+                super::snapshot::DiskState::Absent => None,
+                super::snapshot::DiskState::Present { content, size } => {
+                    match inherited(path, &content, size) {
+                        Some(base_entry) => Some(patched(path, base_entry)),
+                        None => {
+                            let mut planes = super::manifest_v2::EntryPlanes::default();
+                            for plane in &self.planes {
+                                if plane.applies_to(path) {
+                                    *planes.get_mut(plane.plane()) =
+                                        Some(super::readiness::PlaneState::pending(
+                                            "awaiting checkout materialization",
+                                        ));
+                                }
+                            }
+                            Some(super::manifest_v2::EntryV2::regular(content, size, planes))
+                        }
+                    }
+                }
+            };
+            updates.push((path.clone(), update));
+        }
+        for (path, patch) in snapshot.readiness_patches() {
+            if changed.contains(path) {
+                continue;
+            }
+            if let Some(base_entry) = generation.base().and_then(|base| base.entry(path)) {
+                if base_entry.content() == Some(patch.content) {
+                    updates.push((path.clone(), Some(patched(path, base_entry))));
+                }
+            }
+        }
+        let mut delta = generation
+            .fold(
+                &generation.header().producers,
+                updates,
+                &super::readiness::FillMap::default(),
+            )
+            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        delta
+            .set_base_header(base_header.clone())
+            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        // Register the v3 member and protect the private staging name before
+        // any plane writes derived files under it.
+        super::base_refs::with_base_barrier(&storage, &family, |tx| {
+            super::base_refs::register_view_in(tx, &storage, &family, &scope, self.owner.root())
+                .map(|_| ())
+        })
+        .map_err(failed)?;
+        let staging = format!(
+            "staging-{}-{}",
+            std::process::id(),
+            super::base_refs::fresh_nonce()
+        );
+        let _staging_pin = crate::pins::AssemblyPin::create(
+            &route.member_dir(),
+            family.clone(),
+            scope.clone(),
+            staging.clone(),
+            &[],
+        )
+        .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        let mut live = crate::pins::LivePin::create_v3(&storage, &family, &scope)
+            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        let observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .clone();
+        for plane in &self.planes {
+            plane.materialize_v3(
+                &self.owner,
+                &route,
+                &staging,
+                &base_generation,
+                &observed,
+                &mut delta,
+                &mut live,
+            )?;
+        }
+        // `Wold`: the installed v3 generation of this checkout, or the
+        // durable v3 pointer when the installed bundle is not one.
+        let previous = match generation.v3_route() {
+            Some(installed) if installed.scope == scope => Some(generation.name().to_owned()),
+            _ => super::ViewStore::existing_dir(route.member_dir())
+                .map(|store| store.current_generation_read_only())
+                .transpose()
+                .map_err(|error| SiblingLoader::error(error.to_string()))?
+                .flatten(),
+        };
+        let planes = &self.planes;
+        let outcome = super::base_refs::publish_worker_with(
+            super::base_refs::WorkerPublication {
+                storage: &storage,
+                family: &family,
+                worker_scope: &scope,
+                root: self.owner.root(),
+                base: &base_header,
+                delta,
+                previous,
+            },
+            None,
+            &mut |published| {
+                for plane in planes {
+                    plane
+                        .finish_generation_v3(&route, &staging, published)
+                        .map_err(|error| {
+                            super::base_refs::BaseRefError::Io(std::io::Error::other(error.reason))
+                        })?;
+                }
+                Ok(())
+            },
+        );
+        drop(live);
+        match outcome {
+            Ok(super::base_refs::WorkerOutcome::Published { composed, .. }) => {
+                let readers = PlaneReaders::open(access, composed.clone(), &self.adapters)?;
+                for adapter in &self.adapters {
+                    adapter
+                        .generation_published(access, &composed, &|| self.installed_snapshot())?;
+                }
+                let retired = self
+                    .prepared_readers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        composed.name().to_owned(),
+                        PreparedReaders {
+                            seq: snapshot.install_cut().map_or(0, |cut| cut.seq),
+                            readers,
+                        },
+                    );
+                drop(retired);
+                Ok(composed)
+            }
+            Ok(super::base_refs::WorkerOutcome::Lost {
+                current,
+                equivalent,
+            }) => {
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                Err(SiblingLoader::error(format!(
+                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: publication lost ({}, current {current:?}); revalidate a fresh job",
+                    if equivalent { "EquivalentWinner" } else { "Conflict" }
+                )))
+            }
+            Err(error) => {
+                // publish_worker already resolved any landed CAS into a
+                // published referrer; the next job revalidates from disk.
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                Err(SiblingLoader::error(format!(
+                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: v3 worker publication failed or may have landed; revalidate: {error}"
+                )))
+            }
+        }
     }
 }
 
@@ -3107,7 +3327,151 @@ mod composite_tests {
     }
 
     #[test]
-    fn unwired_worker_publication_refuses_before_any_legacy_write() {
+    fn a_base_referencing_worker_publishes_a_sparse_v3_generation_readable_after_restart() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        // A v3 base over the checkout's files as they are now.
+        std::fs::write(root.path().join("kept.rs"), b"kept content").unwrap();
+        std::fs::write(root.path().join("deleted.rs"), b"deleted content").unwrap();
+        let paths = ["deleted.rs", "file.rs", "kept.rs"]
+            .map(|name| RelPath::new(name.as_bytes().to_vec()).unwrap());
+        let super::super::base_builder::BaseBuild::Published { identity, .. } =
+            super::super::base_builder::build_base(
+                super::super::base_builder::BaseBuildInput {
+                    storage: storage.path(),
+                    family: "family",
+                    root: root.path(),
+                    paths: &paths,
+                    policy: crate::blob_store::v2::TrigramPolicy {
+                        max_file_size: 1 << 20,
+                    },
+                    semantic_producer: None,
+                    callgraph_producer: "extractor".into(),
+                    ignore_fingerprint: None,
+                    history: None,
+                    budget: super::super::eviction::DiskBudget::default(),
+                },
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("the only builder publishes");
+        };
+        let base = super::super::base_refs::resolve_base(storage.path(), "family", &identity.scope)
+            .unwrap();
+        // An installed worker generation that inherits the whole base; the
+        // header names the base only by its identity strings.
+        let worker = super::super::manifest_v2::ManifestV2::new_v3(
+            base.manifest().header().clone(),
+            Some(base.header()),
+            Default::default(),
+        );
+        let composed = Arc::new(
+            ComposedGeneration::compose(
+                "installed-worker",
+                worker,
+                base.into_generation(storage.path(), "family"),
+                None,
+            )
+            .unwrap(),
+        );
+        // The checkout then edits one file, adds one and deletes one.
+        let mut delta = LiveDelta::new(composed);
+        let rel = |name: &str| RelPath::new(name.as_bytes().to_vec()).unwrap();
+        std::fs::write(root.path().join("file.rs"), b"edited content").unwrap();
+        std::fs::write(root.path().join("added.rs"), b"added content").unwrap();
+        std::fs::remove_file(root.path().join("deleted.rs")).unwrap();
+        delta.apply(
+            rel("file.rs"),
+            LiveEntry::new(
+                super::super::snapshot::DiskState::of_bytes(b"edited content"),
+                1,
+            ),
+        );
+        delta.apply(
+            rel("added.rs"),
+            LiveEntry::new(
+                super::super::snapshot::DiskState::of_bytes(b"added content"),
+                2,
+            ),
+        );
+        delta.apply(
+            rel("deleted.rs"),
+            LiveEntry::new(super::super::snapshot::DiskState::Absent, 3),
+        );
+        // A path rewritten with its base bytes inherits, rather than copies.
+        delta.apply(
+            rel("kept.rs"),
+            LiveEntry::new(
+                super::super::snapshot::DiskState::of_bytes(b"kept content"),
+                4,
+            ),
+        );
+        let snapshot = delta.snapshot();
+        let published = driver
+            .build_own_generation(&access, &snapshot, false)
+            .unwrap();
+        let generation = published.name().to_owned();
+        assert!(published.v3_route().is_some());
+        drop(published);
+        // No v2 pointer moved and nothing went outside the v3 namespace.
+        assert!(driver
+            .owner
+            .view_store()
+            .unwrap()
+            .current_generation()
+            .unwrap()
+            .is_none());
+        assert!(!storage.path().join("views/v3").exists());
+        let member = crate::blob_store::v3::view_dir(storage.path(), "family", "local").unwrap();
+        let store = super::super::ViewStore::existing_dir(member).unwrap();
+        assert_eq!(
+            store.current_generation_read_only().unwrap().as_deref(),
+            Some(generation.as_str())
+        );
+        let manifest = store.load_manifest_v2(&generation).unwrap();
+        let header = manifest.base_header().unwrap();
+        assert_eq!(header.scope, identity.scope);
+        identity.check_header(header).unwrap();
+        // Sparse: only the changed paths, never the inherited base entries.
+        let entries: Vec<_> = manifest.entries().map(|(path, _)| path.clone()).collect();
+        assert_eq!(entries, vec![rel("added.rs"), rel("file.rs")]);
+        assert_eq!(
+            manifest.tombstones().iter().cloned().collect::<Vec<_>>(),
+            vec![rel("deleted.rs")]
+        );
+        assert!(manifest.readiness_overrides().is_empty());
+        // After a restart a fresh reader composes it over the authenticated base.
+        drop(driver);
+        let reader = super::super::base_refs::open_foreign_v3(
+            storage.path(),
+            "family",
+            "local",
+            &manifest.header().producers,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reader.name(), generation);
+        assert!(reader.entry(&rel("deleted.rs")).is_none());
+        assert_eq!(
+            reader
+                .entry(&rel("kept.rs"))
+                .and_then(|entry| entry.content()),
+            Some(crate::blob_store::v2::ContentHash::of(b"kept content"))
+        );
+        assert_eq!(
+            reader
+                .entry(&rel("file.rs"))
+                .and_then(|entry| entry.content()),
+            Some(crate::blob_store::v2::ContentHash::of(b"edited content"))
+        );
+        assert!(reader.entry(&rel("added.rs")).is_some());
+    }
+
+    #[test]
+    fn a_worker_header_naming_an_unknown_base_is_refused_before_any_write() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let (driver, _, _, access) = fixture(root.path(), storage.path());
@@ -3115,7 +3479,7 @@ mod composite_tests {
         let worker = super::super::manifest_v2::ManifestV2::new_v3(
             base.header().clone(),
             Some(super::super::manifest_v2::BaseHeader {
-                scope: "base".into(),
+                scope: super::super::base_refs::base_scope_for(&[1; 32]),
                 membership_digest: "11".repeat(32),
                 identity_digest: "22".repeat(32),
                 bound_generation: base.name().into(),
@@ -3125,15 +3489,12 @@ mod composite_tests {
         let composed = Arc::new(ComposedGeneration::compose("worker", worker, base, None).unwrap());
         let snapshot = LiveDelta::new(composed).snapshot();
         let store = driver.owner.view_store().unwrap();
-        assert!(store.current_generation().unwrap().is_none());
         let error = driver
             .build_own_generation(&access, &snapshot, false)
             .unwrap_err();
-        assert!(error
-            .reason
-            .contains("durable base publication binding is not wired"));
+        assert!(error.reason.contains("base unavailable"), "{error:?}");
         assert!(store.current_generation().unwrap().is_none());
-        assert!(!storage.path().join("blobs/v3").exists());
+        assert!(!storage.path().join("blobs/v3/family/views/local").exists());
     }
 
     #[test]
