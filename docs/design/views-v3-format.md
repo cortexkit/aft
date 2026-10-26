@@ -419,9 +419,15 @@ post-checkpoint empty file.
   `reader-floor.json` untouched; at the re-check it may leave `blobs/v3/`, the
   lock file and an empty registry, but no reservation row or plane store.
 - Assumptions: different storage roots on one device are not coordinated. On
-  non-unix the probe reports unsupported, so every reservation is refused as
-  `device_free_space_floor` (unverified on a native non-unix run).
-- Wiring these budgets into `DiskBudget` (`views/eviction.rs`) is slice 4's job.
+  Windows the probe is `GetDiskFreeSpaceExW` (caller-available bytes and
+  total bytes of the nearest existing ancestor); other non-unix targets
+  report unsupported, so every reservation there is refused as
+  `device_free_space_floor`. The Windows probe is compile-checked only so
+  far; a native Windows run is still owed.
+- `DiskBudget::admit_v3`/`extend_v3` (`views/eviction.rs`) admit v3
+  reservations against the family hard limit (refused as
+  `storage_gap:v3_family_hard_limit`, never a legacy fallback) and flag
+  usage above the 2 GiB target so the caller runs the family's v3 sweep.
 
 ## Retention collector
 
@@ -521,6 +527,60 @@ changed, and answers an equivalent configure without it. The digest
 of bytes and `st_mode` over `blobs/v3/` must be unchanged, and no v3 member
 may appear in a v2 registry. The tests are `#[ignore]`d (they take seven and
 thirteen minutes) and need `AFT_V0_60_0_BINARY`.
+
+## Base-reference protocol (registry 2/2)
+
+Source: `views/base_refs.rs`, `views/base_sweep.rs`, `views/base_builder.rs`.
+A 1/1 registry is upgraded in one barrier transaction, only by a writer that
+first raised the `views_v3_registry` floor to 2
+(`blob_store::v3::open_base_refs_registry`). Registries created by the copy
+path stay 1/1 until then. The added schema text is:
+
+```sql
+CREATE TABLE base_refs (worker_scope TEXT NOT NULL, base_scope TEXT NOT NULL, nonce TEXT NOT NULL,
+ membership_digest TEXT NOT NULL, worker_generation TEXT,
+ state TEXT NOT NULL CHECK(state IN ('intent','orphaned','published')),
+ owner_pid INTEGER NOT NULL, owner_start INTEGER NOT NULL, updated_epoch INTEGER NOT NULL,
+ PRIMARY KEY(worker_scope, base_scope, nonce));
+CREATE INDEX base_refs_by_base ON base_refs(base_scope);
+CREATE TABLE base_builds (base_scope TEXT NOT NULL PRIMARY KEY,
+ owner_pid INTEGER NOT NULL, owner_start INTEGER NOT NULL, owner_token TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt>=1),
+ state TEXT NOT NULL CHECK(state IN ('building','serving')), heartbeat_at_ms INTEGER NOT NULL);
+CREATE TABLE strict_rebuild (worker_scope TEXT NOT NULL, worker_generation TEXT NOT NULL,
+ reason TEXT NOT NULL, recorded_epoch INTEGER NOT NULL, PRIMARY KEY(worker_scope, worker_generation));
+CREATE TABLE base_sweeps (base_scope TEXT NOT NULL PRIMARY KEY,
+ unreferenced_sweeps INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ gc_epoch INTEGER NOT NULL, lease_pid INTEGER, lease_start INTEGER, reconcile_cursor TEXT,
+ dangling_base_edges INTEGER NOT NULL DEFAULT 0, live_base_cap_hits INTEGER NOT NULL DEFAULT 0);
+```
+
+- **Identity.** The membership digest is BLAKE3 over the length-prefixed
+  tag `aft/views-v3/base-membership/1`, the entry count, then per path (in
+  path order) the path bytes, an entry-kind byte, and mode, content hash,
+  size and resolution-input flag (regular files), target bytes (symlinks),
+  OID (gitlinks) or name (synthetic entries). Readiness is excluded. A
+  manifest with `head_tree`, any `git_oid`, a `base` header, tombstones or
+  overrides is not a base. The identity digest (tag
+  `aft/views-v3/base-identity/1`) covers family, all producers, the ignore
+  fingerprint, the platform family, `head_tree:none` and the membership
+  digest. The base scope is `base-m1-<identity hex>`.
+- **Authentication.** Every consumer resolves a base by pin-then-verify and
+  recomputes both digests from the pinned manifest; a `BaseHeader` is
+  checked against that result, never trusted. `bound_generation` is
+  diagnostic.
+- **Markers.** A `BaseRefMarker` is a read marker in `B/readers/<G>/` whose
+  file also carries a per-acquisition `nonce` (omitted, and so unchanged,
+  for ordinary readers).
+- **Sweep.** Runs under the reservation lock; marks current, read-marked
+  and pinned generations; reconciles at most 256 rows / 25 ms per pass from
+  a wrap-around position kept in `sweep_state.reconcile_cursor`; reclaims a
+  base after two consecutive unreferenced sweeps. The plane-row sweep keeps
+  its resume position at `retention/cursors/v3-plane-rows/<family>.json`
+  (format 1) when the retention collector runs it.
+- **Segments.** v3 generations carry no trigram segment yet: v3 has no
+  segment rows or segment collection, so readers build from payloads.
 
 ## Deferred implementation register
 
