@@ -78,6 +78,99 @@ const MAX_WALK_ENTRIES: usize = 200_000;
 /// `pins/` and `readers/`, then the generation directories under `readers/`.
 const MAX_WALK_DEPTH: usize = 3;
 
+/// The G4c storage gap a refused v3 admission reports. A refusal has no
+/// legacy fallback: the caller serves what v3 already holds and names the gap.
+pub const V3_HARD_LIMIT_GAP: &str = "storage_gap:v3_family_hard_limit";
+
+/// Why a v3 reservation was refused.
+#[derive(Debug)]
+pub enum V3Refusal {
+    /// Committed usage plus the request would cross the family hard limit.
+    HardLimit {
+        usage: u64,
+        request: u64,
+        limit: u64,
+    },
+    /// The ledger refused it (device floor, namespace budget) or failed.
+    Ledger(crate::blob_store::v3::Error),
+}
+
+impl fmt::Display for V3Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HardLimit {
+                usage,
+                request,
+                limit,
+            } => write!(
+                f,
+                "{V3_HARD_LIMIT_GAP}: {usage} used + {request} requested > {limit}"
+            ),
+            Self::Ledger(error) => write!(f, "storage_gap:{error}"),
+        }
+    }
+}
+
+impl std::error::Error for V3Refusal {}
+
+/// An admitted v3 reservation.
+#[derive(Debug)]
+pub struct V3Admission {
+    pub reservation: crate::blob_store::v3::Reservation,
+    /// Usage after this reservation is above the family target: the caller
+    /// runs the family's v3 sweep so reclaimable bytes go before the next
+    /// admission.
+    pub over_target: bool,
+}
+
+impl DiskBudget {
+    /// Admits a v3 reservation of `request` bytes against this family's
+    /// limits: the hard limit refuses, the target (the payload budget) only
+    /// asks for a sweep. Usage is the ledger's committed usage (last covering
+    /// measurement, committed charges since, and every outstanding
+    /// reservation), so concurrent builds are charged before they write.
+    pub fn admit_v3(
+        &self,
+        registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+        request: u64,
+    ) -> Result<V3Admission, V3Refusal> {
+        let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
+        if usage.saturating_add(request) > self.family_store_hard {
+            return Err(V3Refusal::HardLimit {
+                usage,
+                request,
+                limit: self.family_store_hard,
+            });
+        }
+        let reservation = registry.reserve(request).map_err(V3Refusal::Ledger)?;
+        Ok(V3Admission {
+            reservation,
+            over_target: usage.saturating_add(request) > self.family_payload,
+        })
+    }
+
+    /// Extends an admitted reservation before writing past it, under the same
+    /// hard limit.
+    pub fn extend_v3(
+        &self,
+        registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+        admission: &V3Admission,
+        additional: u64,
+    ) -> Result<(), V3Refusal> {
+        let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
+        if usage.saturating_add(additional) > self.family_store_hard {
+            return Err(V3Refusal::HardLimit {
+                usage,
+                request: additional,
+                limit: self.family_store_hard,
+            });
+        }
+        registry
+            .extend(&admission.reservation, additional)
+            .map_err(V3Refusal::Ledger)
+    }
+}
+
 /// The limits applied to one family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiskBudget {

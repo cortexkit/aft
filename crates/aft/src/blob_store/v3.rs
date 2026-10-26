@@ -186,6 +186,11 @@ pub fn set_free_space_for_test(free: u64, capacity: u64) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((free, capacity));
 }
+/// The platform probe itself, bypassing the test override.
+#[cfg(test)]
+pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
+    probe_free_space(path)
+}
 fn free_space(path: &Path) -> Option<(u64, u64)> {
     if let Some(value) = *FREE_SPACE
         .lock()
@@ -1100,6 +1105,45 @@ impl<'a> RegistryWriter<'a> {
             registry,
         })
     }
+    /// Grows a live reservation by `additional` bytes under the same
+    /// admission checks as [`Self::reserve`]: the device floor and the
+    /// namespace budget. An owner extends before it writes past its
+    /// reservation, never after.
+    pub fn extend(&mut self, reservation: &Reservation, additional: u64) -> Result<()> {
+        if reservation.registry != self.registry_identity()? {
+            return Err(Error::ReservationRegistryMismatch);
+        }
+        let storage = self.lock.storage.clone();
+        let path = self.dir.join("members.sqlite");
+        let id = reservation.id;
+        self.with_barrier(|tx| {
+            check_floor(&storage, additional, Some((&path, tx)))?;
+            if accounting(tx)?
+                .usage()
+                .checked_add(additional)
+                .is_none_or(|n| n > NAMESPACE_BUDGET)
+            {
+                return Err(Error::Refused("v3_namespace_budget"));
+            }
+            let updated = tx.execute(
+                "UPDATE reservations SET reserved_bytes=reserved_bytes+?1 WHERE id=?2 AND state='reserved'",
+                params![additional, id],
+            )?;
+            if updated != 1 {
+                return Err(Error::Refused("reservation_not_live"));
+            }
+            Ok(())
+        })
+    }
+    /// Bytes still reserved by a live reservation (0 once committed or
+    /// released).
+    pub fn reserved_bytes(&self, reservation: &Reservation) -> Result<u64> {
+        Ok(self.connection()?.query_row(
+            "SELECT CASE WHEN state='reserved' THEN reserved_bytes ELSE 0 END FROM reservations WHERE id=?1",
+            [reservation.id],
+            |r| r.get(0),
+        )?)
+    }
     fn registry_identity(&self) -> Result<RegistryIdentity> {
         let path = fs::canonicalize(self.dir.join("members.sqlite"))?;
         Ok(RegistryIdentity {
@@ -1113,6 +1157,7 @@ struct RegistryIdentity {
     path: PathBuf,
     file: Option<FileIdentity>,
 }
+#[derive(Debug)]
 pub struct Reservation {
     id: i64,
     before: u64,
