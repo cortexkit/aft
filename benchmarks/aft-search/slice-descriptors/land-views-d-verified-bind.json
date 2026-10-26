@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/lib.rs"
+  ],
+  "slices": [
+    "views-d-verified-bind"
+  ],
+  "note": "The only ranking fence hit is crates/aft/src/lib.rs, which exports the git index reader module brought in from 4v-1. Views stay default-off and unrouted in this step; no search, routing or ranking code changes, so ranked rows must remain byte-identical."
+}
