@@ -212,6 +212,8 @@ mod bash_selector_tests;
 mod codemode;
 mod consent;
 pub(crate) use consent::directory_scope;
+// The secret vault seam and its consent adapter. They read ragged route
+// fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
 mod flow_read;
 mod health;
@@ -220,6 +222,7 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod secret_consent;
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -10505,9 +10508,15 @@ async fn handle_tool_call(
             .map(|run| run.io_budget.clone())
             .unwrap_or_else(|| crate::bounded_io::Budget::after(Duration::from_secs(25)));
         phase_trace.mark_executor_submitted();
+        // The vault scopes are read once per submitted call, outside the job,
+        // from the same identity the job runs with. A launch inside the job
+        // reads them through `SecretScopeGuard`, so a background command keeps
+        // them for its whole life.
+        let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _deferred_wake_scope = completion_wake.install();
+            let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));

@@ -37,6 +37,30 @@ pub enum Location {
     Json(String),
 }
 
+/// The vault's location spellings (wire-contract §15 `secret.deposit`):
+/// `authorization_bearer`, `header:<name>`, `query:<name>` or
+/// `json_pointer:<pointer>`.
+///
+/// AFT reads them from a `secret.use` release, which names where to put the
+/// released key. The crate's own [`location_kind_token`] spelling stays as it
+/// is: audit records name the location they evaluated, and that vocabulary is
+/// already committed.
+pub fn parse_vault_location(token: &str) -> Option<Location> {
+    if token == "authorization_bearer" {
+        return Some(Location::Bearer);
+    }
+    let (prefix, name) = token.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    match prefix {
+        "header" => Some(Location::Header(name.to_string())),
+        "query" => Some(Location::Query(name.to_string())),
+        "json_pointer" => Some(Location::Json(name.to_string())),
+        _ => None,
+    }
+}
+
 /// Short name of a location kind, used in audit records.
 pub fn location_kind_token(location: &Location) -> String {
     match location {

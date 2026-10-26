@@ -124,6 +124,12 @@ jobs:
           node-version: "24"
       - name: Rust formatting
         run: cargo fmt --all -- --check
+      - name: Test-only secret vault stays out of release builds
+        # V5: fails when a dependency edge, a default feature or another crate
+        # would compile the fake vault into a shipped build.
+        run: |
+          bash scripts/check-secret-test-fake.test.sh
+          bash scripts/check-secret-test-fake.sh
       - name: Install workspace deps
         run: bun install --frozen-lockfile
       - name: Bun lint

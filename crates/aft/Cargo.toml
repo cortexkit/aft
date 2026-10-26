@@ -95,6 +95,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 test-timing-hooks = []
 # In-process integration fixtures need the real binary for native re-exec.
 test-sandbox-launcher = []
+# Compiles the test-only secret vault (V5). Nothing in the product reads it:
+# a release profile must never enable it, and
+# `scripts/check-secret-test-fake.sh` fails CI when one does.
+secret-test-fake = []
 semantic-chunk-census = []
 
 [dependencies]
@@ -168,6 +172,10 @@ rustc-hash = "2"
 rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
 aft-tokenizer = { path = "../aft-tokenizer", version = "0.62.0" }
+# The placeholder grammar, key-location rules and audit record AFT's vault
+# seam speaks. AFT owns the crate; basal links it later.
+secret-rules = { path = "../secret-rules", version = "0.1.0" }
+zeroize = "1"
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.

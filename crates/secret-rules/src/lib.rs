@@ -23,8 +23,8 @@ pub use audit::{
 };
 pub use location::{
     apply_target_edits, evaluate_request_with_connect, is_json_content_type, location_kind_token,
-    Edit, HeaderEdit, HeaderEditKind, HeaderField, HeaderValueForm, LabelOutcome, LabelRule,
-    Location, RequestOutcome, RequestRefusal, RequestView,
+    parse_vault_location, Edit, HeaderEdit, HeaderEditKind, HeaderField, HeaderValueForm,
+    LabelOutcome, LabelRule, Location, RequestOutcome, RequestRefusal, RequestView,
 };
 pub use material::{
     check_admissible, encode_for_location, key_is_substring_of_placeholder, MaterialRefusal,
