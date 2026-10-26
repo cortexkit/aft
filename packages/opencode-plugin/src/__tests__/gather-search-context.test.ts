@@ -197,7 +197,7 @@ for (const version of [1, 2] as const) {
       expect(f.gatherMessageReads()).toBe(0);
       expect(f.sentOptions()).not.toHaveProperty("searchContext");
     });
-    test(`V${version} pattern-only fallback ${String(query)} reads no context`, async () => {
+    test(`V${version} rule-denied pattern-only path ${String(query)} reads no context or search`, async () => {
       const f = openCodeGatherFixture({
         enabled: true,
         version,
@@ -206,8 +206,18 @@ for (const version of [1, 2] as const) {
           throw Object.assign(new Error("external rule denied"), { _tag: "DeniedError" });
         },
       });
-      await f.search({ query, pattern: "load_config", path: external });
-      expect(f.calls).toHaveLength(1);
+      const search = f.search({ query, pattern: "load_config", path: external });
+      if (version === 2) {
+        await expect(search).rejects.toThrow(`${external} was not searched`);
+      } else {
+        const result = await search;
+        expect(JSON.parse(typeof result === "string" ? result : result.output)).toMatchObject({
+          success: false,
+          code: "permission_denied",
+          message: expect.stringContaining(`${external} was not searched`),
+        });
+      }
+      expect(f.calls).toHaveLength(0);
       expect(f.readerConstructions()).toBe(0);
       expect(f.gatherMessageReads()).toBe(0);
       expect(f.sentOptions()).not.toHaveProperty("searchContext");
@@ -330,7 +340,7 @@ for (const version of [1, 2] as const) {
     expect(f.gatherMessageReads()).toBe(0);
   });
 
-  test(`V${version} project-only permission fallback carries context in options`, async () => {
+  test(`V${version} rule-denied semantic path reads no context or search`, async () => {
     const f = openCodeGatherFixture({
       enabled: true,
       version,
@@ -340,12 +350,21 @@ for (const version of [1, 2] as const) {
         throw error;
       },
     });
-    const result = await f.search({ query: "how is config loaded", path: external });
-    expect(typeof result === "string" ? result : result.output).toContain(
-      "searching the project index only",
-    );
-    expect(f.trace()).toContain(`visible-${f.defaultSession}`);
-    expect(f.calls[0].rawArgs).toEqual({ query: "how is config loaded" });
+    const search = f.search({ query: "how is config loaded", path: external });
+    if (version === 2) {
+      await expect(search).rejects.toThrow(`${external} was not searched`);
+    } else {
+      const result = await search;
+      expect(JSON.parse(typeof result === "string" ? result : result.output)).toMatchObject({
+        success: false,
+        code: "permission_denied",
+        message: expect.stringContaining(`${external} was not searched`),
+      });
+    }
+    expect(f.calls).toHaveLength(0);
+    expect(f.readerConstructions()).toBe(0);
+    expect(f.gatherMessageReads()).toBe(0);
+    expect(f.sentOptions()).not.toHaveProperty("searchContext");
   });
 
   test(`V${version} concurrent sessions do not share context`, async () => {
