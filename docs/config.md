@@ -632,11 +632,27 @@ If gather output cannot fit, the `gather_notice` field reports `gather: skipped 
 
 Gather runs on natural-language searches, also for a query used with `pattern`. It does not change ranking or agent arguments. Pattern-only and empty-query searches do not walk. If identity or the current stored turn is unavailable, AFT uses the query only. A missing decision backend uses deterministic selection and makes no network request.
 
-The decision backend, endpoint, model and `api_key_env` are user-tier settings. AFT appends `/chat/completions` to the configured base URL unless the URL ends with `/chat/completions`. The key comes from the environment entry named by `api_key_env`, not from project config. In daemon (`subc`) mode, the key comes from the daemon module's environment. The usual daemon custody grants apply.
+The decision backend, endpoint, model, `api_key_env` and `threshold` are user-tier settings. Backend `endpoint` appends `/chat/completions` to the configured base URL unless the URL ends with `/chat/completions`. The key comes from the environment entry named by `api_key_env`, not from project config. In daemon (`subc`) mode, the key comes from the daemon module's environment. The usual daemon custody grants apply.
+
+Backend `decisions` uses the native Inception Mercury Decide API. It appends `/decisions` unless the URL ends with `/decisions`. For example, use these decision settings:
+
+```jsonc
+{
+  "backend": "decisions",
+  "endpoint": "https://api.inceptionlabs.ai/v1",
+  "model": "mercury-decide",
+  "api_key_env": "INCEPTION_API_KEY",
+  "threshold": 0.5
+}
+```
+
+The `threshold` must be greater than 0 and less than 1. Its default is 0.5. A keep, expand or stop answer at or above this value selects that operation. Kept candidates use descending `noul` order. AFT selects expansion independently from keep.
+
+This backend sends the same conversation text and candidate code as backend `endpoint`. The privacy warning below applies to the two backends.
 
 User harness search overrides now keep the base `search.rerank` block when the harness sets only `search.gather`. An explicit harness `search.rerank` block replaces the whole base rerank block, as before.
 
-**Privacy:** Backend `endpoint` sends the trace and candidate symbol code to the configured endpoint. Host redaction does not apply to this request. Use a local endpoint for private code. This version has no redaction hook. AFT does not log the trace, prompts, model requests or responses. It does not read conversation text while gather is off.
+**Privacy:** Backends `endpoint` and `decisions` send conversation text and candidate symbol code to the configured endpoint. Host redaction does not apply to this request. Use a local endpoint for private code. This version has no redaction hook. AFT does not log conversation text, prompts, model requests or responses. It does not read conversation text while `gather` is off.
 
 OpenCode 1 and Pi send the agent's thinking and assistant text shown to the user before the call. They add the newest user text last. OpenCode 2.1 sends only the current assistant message's thinking and text. It does not send a user message.
 

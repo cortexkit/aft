@@ -161,23 +161,37 @@ impl Endpoint {
                 }
                 let request: serde_json::Value =
                     serde_json::from_slice(&bytes[start..start + length]).unwrap();
-                let payload: serde_json::Value =
+                let native = request.get("state").is_some();
+                let payload: serde_json::Value = if native {
+                    request["state"].clone()
+                } else {
                     serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
-                        .unwrap();
+                        .unwrap()
+                };
                 captured.lock().unwrap().push(payload.clone());
                 if !delay.is_zero() {
                     let (_hold, wait) = std::sync::mpsc::channel::<()>();
                     let _ = wait.recv_timeout(delay);
                 }
-                let ids: Vec<_> = payload["frontier"]
+                let ids: Vec<_> = payload[if native { "candidates" } else { "frontier" }]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|node| node["id"].clone())
                     .collect();
-                let decision = json!({"keep":ids,"expand":if stop {vec![]} else {ids},"stop":stop});
-                let body =
-                    json!({"choices":[{"message":{"content":decision.to_string()}}]}).to_string();
+                let decision =
+                    json!({"keep":ids,"expand":if stop {vec![]} else {ids.clone()},"stop":stop});
+                let body = if native {
+                    let mut answers = serde_json::Map::new();
+                    for i in 0..ids.len() {
+                        answers.insert(format!("keep_{i}"), json!({"type":"noul","noul":1.0}));
+                        answers.insert(format!("expand_{i}"), json!({"type":"noul","noul":0.0}));
+                    }
+                    answers.insert("stop".into(), json!({"type":"noul","noul":1.0}));
+                    json!({"answers":answers}).to_string()
+                } else {
+                    json!({"choices":[{"message":{"content":decision.to_string()}}]}).to_string()
+                };
                 let _ = write!(stream, "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
             }
         });
@@ -220,6 +234,28 @@ impl Drop for Endpoint {
             thread.join().unwrap();
         }
     }
+}
+
+#[test]
+fn gather_search_test_native_decisions_full_walk() {
+    let f = Fixture::new(true);
+    let endpoint = Endpoint::new(200, Duration::ZERO, true);
+    endpoint.configure(&f, 2000, 6000);
+    f.ctx.update_config(|config| {
+        config.search.gather.as_mut().unwrap().decision = Some(
+            serde_json::from_value(json!({
+                "backend":"decisions", "endpoint":endpoint.url, "model":"mercury-decide"
+            }))
+            .unwrap(),
+        );
+    });
+    let response = f.search(true, None, QUERY, None, true);
+    assert!(response.success);
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.contains("model=mercury-decide"), "{text}");
+    assert!(text.contains("parse_config"), "{text}");
+    assert!(!text.contains("fallback=1:"), "{text}");
+    assert_eq!(endpoint.count(), 1);
 }
 
 #[test]

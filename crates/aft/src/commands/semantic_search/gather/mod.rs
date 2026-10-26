@@ -3,6 +3,7 @@
 //! A `GatherGap` names its seed and does not discard other seeds.
 
 mod decision;
+mod decisions;
 mod endpoint;
 mod graph;
 mod render;

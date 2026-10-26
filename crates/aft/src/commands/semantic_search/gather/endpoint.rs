@@ -67,8 +67,6 @@ impl DecisionModel for EndpointDecisionModel {
         if Instant::now() >= deadline {
             return Err(DecisionError::Timeout);
         }
-        let client =
-            crate::platform_tls::blocking_client().map_err(|_| DecisionError::Unavailable)?;
         let frontier: Vec<_> = input
             .frontier
             .iter()
@@ -99,52 +97,7 @@ impl DecisionModel for EndpointDecisionModel {
             "temperature": 0,
             "stream": false,
         });
-        let mut request = client.post(&self.endpoint).json(&body);
-        if let Some(name) = &self.api_key_env {
-            let key = std::env::var(name)
-                .ok()
-                .filter(|key| !key.is_empty())
-                .ok_or(DecisionError::Unavailable)?;
-            request = request.bearer_auth(key);
-        }
-        // Setup consumes the same budget as the connection and response body.
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(DecisionError::Timeout)?;
-        let response = request.timeout(remaining).send().map_err(http_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(if status.is_client_error() || status.is_redirection() {
-                DecisionError::Refused
-            } else {
-                DecisionError::Unavailable
-            });
-        }
-        let mut bytes = Vec::new();
-        response
-            .take(RESPONSE_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                if Instant::now() >= deadline
-                    || error.kind() == std::io::ErrorKind::TimedOut
-                    || error
-                        .get_ref()
-                        .and_then(|error| error.downcast_ref::<reqwest::Error>())
-                        .is_some_and(reqwest::Error::is_timeout)
-                {
-                    DecisionError::Timeout
-                } else {
-                    DecisionError::Unavailable
-                }
-            })?;
-        if Instant::now() >= deadline {
-            return Err(DecisionError::Timeout);
-        }
-        if bytes.len() > RESPONSE_LIMIT as usize {
-            return Err(DecisionError::Invalid);
-        }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| DecisionError::Invalid)?;
+        let value = post_json(&self.endpoint, self.api_key_env.as_deref(), &body, deadline)?;
         let content = value
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -164,4 +117,62 @@ fn http_error(error: reqwest::Error) -> DecisionError {
     } else {
         DecisionError::Unavailable
     }
+}
+
+pub(super) fn post_json(
+    endpoint: &str,
+    api_key_env: Option<&str>,
+    body: &Value,
+    deadline: Instant,
+) -> Result<Value, DecisionError> {
+    if Instant::now() >= deadline {
+        return Err(DecisionError::Timeout);
+    }
+    let client = crate::platform_tls::blocking_client().map_err(|_| DecisionError::Unavailable)?;
+    let mut request = client.post(endpoint).json(body);
+    if let Some(name) = api_key_env {
+        let key = std::env::var(name)
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or(DecisionError::Unavailable)?;
+        request = request.bearer_auth(key);
+    }
+    // Setup consumes the same budget as the connection and response body.
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(DecisionError::Timeout)?;
+    let response = request.timeout(remaining).send().map_err(http_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(if status.is_client_error() || status.is_redirection() {
+            DecisionError::Refused
+        } else {
+            DecisionError::Unavailable
+        });
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(RESPONSE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            if Instant::now() >= deadline
+                || error.kind() == std::io::ErrorKind::TimedOut
+                || error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<reqwest::Error>())
+                    .is_some_and(reqwest::Error::is_timeout)
+            {
+                DecisionError::Timeout
+            } else {
+                DecisionError::Unavailable
+            }
+        })?;
+    if Instant::now() >= deadline {
+        return Err(DecisionError::Timeout);
+    }
+    if bytes.len() > RESPONSE_LIMIT as usize {
+        return Err(DecisionError::Invalid);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| DecisionError::Invalid)
 }

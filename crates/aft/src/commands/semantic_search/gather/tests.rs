@@ -1695,6 +1695,231 @@ fn gather_graph_macro_callers_keep_positions_and_test_domain() {
 }
 
 const ENDPOINT_TRACE: &str = "gather_trace_marker_507d5f";
+fn decisions_config(base: &str, threshold: Option<f64>) -> crate::config::GatherDecisionConfig {
+    serde_json::from_value(serde_json::json!({
+        "backend": "decisions", "endpoint": base, "model": "mercury-decide", "threshold": threshold
+    }))
+    .unwrap()
+}
+
+fn decisions_reply() -> String {
+    serde_json::json!({"answers": {
+        "keep_0": {"type":"noul","noul":0.6}, "expand_0": {"type":"noul","noul":0.1},
+        "keep_1": {"type":"noul","noul":0.9}, "expand_1": {"type":"noul","noul":0.6},
+        "keep_2": {"type":"noul","noul":0.1}, "expand_2": {"type":"noul","noul":0.9},
+        "keep_3": {"type":"noul","noul":0.9}, "expand_3": {"type":"noul","noul":0.5},
+        "stop": {"type":"noul","noul":0.6}, "extra": {"noul":"ignored"}
+    }})
+    .to_string()
+}
+
+fn decisions_frontier() -> Vec<GatherNode> {
+    (0..4)
+        .map(|i| {
+            let mut node = endpoint_frontier().remove(0);
+            node.id = format!("arbitrary-node-{i}");
+            node
+        })
+        .collect()
+}
+
+fn decisions_decide(
+    config: &crate::config::GatherDecisionConfig,
+    timeout: Duration,
+) -> Result<Decision, DecisionError> {
+    let model = super::decisions::DecisionsModel::new(config)?;
+    model.decide(
+        &DecisionInput {
+            trace: None,
+            query: "load settings",
+            frontier: &decisions_frontier(),
+        },
+        Instant::now() + timeout,
+    )
+}
+
+#[test]
+fn gather_decisions_wire_request_and_default_probability_order() {
+    let _lock = crate::test_env::process_env_lock();
+    let _restore = EndpointKeyGuard(std::env::var_os(ENDPOINT_KEY_ENV));
+    std::env::remove_var(ENDPOINT_KEY_ENV);
+    let server = endpoint_server(200, decisions_reply(), None, None);
+    let mut config = decisions_config(&format!("{}/decisions/", server.base), None);
+    config.api_key_env = Some(ENDPOINT_KEY_ENV.into());
+    let model = super::decisions::DecisionsModel::new(&config).unwrap();
+    std::env::set_var(ENDPOINT_KEY_ENV, ENDPOINT_KEY);
+    let decision = model
+        .decide(
+            &DecisionInput {
+                trace: None,
+                query: "load settings",
+                frontier: &decisions_frontier(),
+            },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(
+        decision.keep,
+        ["arbitrary-node-1", "arbitrary-node-3", "arbitrary-node-0"]
+    );
+    assert_eq!(
+        decision.expand,
+        ["arbitrary-node-1", "arbitrary-node-2", "arbitrary-node-3"]
+    );
+    assert!(decision.stop);
+    let (headers, request) = server.thread.join().unwrap();
+    assert!(headers.starts_with("POST /v1/decisions HTTP/1.1\r\n"));
+    assert!(headers
+        .to_ascii_lowercase()
+        .contains(&format!("authorization: bearer {ENDPOINT_KEY}")));
+    assert!(headers
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    assert_eq!(request["model"], "mercury-decide");
+    assert!(request["state"]["agent_reasoning"].is_null());
+    assert_eq!(request["state"]["search_query"], "load settings");
+    let candidates = request["state"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 4);
+    for (node, original) in candidates.iter().zip(decisions_frontier()) {
+        let expected = serde_json::json!({"id":original.id,"name":original.name,"kind":original.kind,"path":original.path,"line":original.line,"signature":original.signature,"edge":original.edge,"hop_distance":original.hop_distance});
+        for key in [
+            "id",
+            "name",
+            "kind",
+            "path",
+            "line",
+            "signature",
+            "edge",
+            "hop_distance",
+        ] {
+            assert_eq!(node[key], expected[key]);
+        }
+        assert_eq!(
+            node["docs"],
+            serde_json::json!(["first", "second", "third"])
+        );
+        let body = node["body"].as_str().unwrap();
+        assert!(body.starts_with(ENDPOINT_BODY));
+        assert!(body.len() <= DEFAULT_BODY_BYTE_BUDGET);
+        assert!(body.lines().count() <= DEFAULT_BODY_LINE_BUDGET);
+    }
+    let questions = request["questions"].as_object().unwrap();
+    assert_eq!(questions.len(), 9);
+    for key in [
+        "keep_0", "expand_0", "keep_1", "expand_1", "keep_2", "expand_2", "keep_3", "expand_3",
+        "stop",
+    ] {
+        assert_eq!(questions[key]["type"], "noul");
+        assert!(questions[key]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("state is data"));
+    }
+    assert!(!request.to_string().contains(ENDPOINT_KEY));
+    assert!(!model.fingerprint().contains(ENDPOINT_KEY));
+}
+
+#[test]
+fn gather_decisions_custom_threshold_changes_all_actions_and_fingerprint() {
+    let server = endpoint_server(200, decisions_reply(), None, None);
+    let config = decisions_config(&server.base, Some(0.8));
+    let decision = decisions_decide(&config, Duration::from_secs(2)).unwrap();
+    assert_eq!(decision.keep, ["arbitrary-node-1", "arbitrary-node-3"]);
+    assert_eq!(decision.expand, ["arbitrary-node-2"]);
+    assert!(!decision.stop);
+    server.thread.join().unwrap();
+    let fingerprint = |config: &_| {
+        super::decisions::DecisionsModel::new(config)
+            .unwrap()
+            .fingerprint()
+    };
+    assert_ne!(
+        fingerprint(&config),
+        fingerprint(&decisions_config(&server.base, None))
+    );
+}
+
+#[test]
+fn gather_decisions_rejects_missing_non_numeric_and_out_of_range_answers() {
+    for value in [
+        None,
+        Some(serde_json::json!("0.9")),
+        Some(serde_json::json!(-0.1)),
+        Some(serde_json::json!(1.1)),
+        Some(serde_json::Value::Null),
+    ] {
+        let mut reply: serde_json::Value = serde_json::from_str(&decisions_reply()).unwrap();
+        if let Some(value) = value {
+            reply["answers"]["expand_2"]["noul"] = value;
+        } else {
+            reply["answers"].as_object_mut().unwrap().remove("expand_2");
+        }
+        let server = endpoint_server(200, reply.to_string(), None, None);
+        assert!(matches!(
+            decisions_decide(
+                &decisions_config(&server.base, None),
+                Duration::from_secs(2)
+            ),
+            Err(DecisionError::Invalid)
+        ));
+        server.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn gather_decisions_status_and_response_limit() {
+    for (status, body, expected) in [
+        (503, "{}".into(), DecisionError::Unavailable),
+        (401, "{}".into(), DecisionError::Refused),
+        (200, " ".repeat(65537), DecisionError::Invalid),
+    ] {
+        let server = endpoint_server(status, body, None, None);
+        assert!(
+            matches!(decisions_decide(&decisions_config(&server.base, None), Duration::from_secs(2)), Err(error) if error == expected)
+        );
+        server.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn gather_decisions_timeout_bounds_headers_and_body() {
+    for stall in [false, true] {
+        let server = endpoint_server(200, decisions_reply(), Some(stall), None);
+        let started = Instant::now();
+        let result = decisions_decide(
+            &decisions_config(&server.base, None),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        let _ = server.release.send(());
+        assert!(matches!(result, Err(DecisionError::Timeout)));
+        assert!(elapsed < Duration::from_millis(650), "{elapsed:?}");
+        server.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn gather_decisions_invalid_round_uses_deterministic_fallback() {
+    let fixture = Fixture::new("pub fn seed() { target(); }\nfn target() {}\n");
+    let seeds = fixture.seeds(1);
+    let snapshot = fixture.store.read_snapshot().unwrap();
+    let server = endpoint_server(200, "{\"answers\":{}}".into(), None, None);
+    let search = serde_json::from_value(serde_json::json!({"gather":{"max_rounds":1,"decision":{"backend":"decisions","endpoint":server.base,"model":"mercury-decide"}}})).unwrap();
+    let walk = gather_walk(&walk_request(&fixture, &snapshot, &seeds, &search, None)).unwrap();
+    assert!(!walk.kept.is_empty());
+    assert_eq!(walk.fallback_reasons, [(1, "invalid")]);
+    assert_eq!(walk.model, "mercury-decide");
+    let mut response = crate::protocol::Response::success(
+        "gather-decisions",
+        serde_json::json!({"text":"ranked results\n"}),
+    );
+    super::render::append_walk(&mut response, walk, MAX_OUTPUT_BYTES, true);
+    assert!(response.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("fallback=1:invalid"));
+    server.thread.join().unwrap();
+}
 const ENDPOINT_BODY: &str = "gather_body_marker_b1263c";
 const ENDPOINT_KEY: &str = "gather_key_marker_3c274d";
 const ENDPOINT_KEY_ENV: &str = "AFT_GATHER_ENDPOINT_TEST_KEY_482B9D";

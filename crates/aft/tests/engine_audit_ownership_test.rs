@@ -286,6 +286,7 @@ fn slices() -> Vec<Slice> {
             landed_paths: vec![
                 "crates/aft/src/commands/semantic_search/extensions.rs",
                 "crates/aft/src/commands/semantic_search/gather/decision.rs",
+                "crates/aft/src/commands/semantic_search/gather/decisions.rs",
                 "crates/aft/src/commands/semantic_search/gather/endpoint.rs",
                 "crates/aft/src/commands/semantic_search/gather/graph.rs",
                 "crates/aft/src/commands/semantic_search/gather/mod.rs",
@@ -483,7 +484,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        41,
+        42,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {

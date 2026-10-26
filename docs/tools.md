@@ -1041,7 +1041,7 @@ If a skip state cannot fit, the `gather_notice` field reports `gather: skipped o
 
 A search with `path` in a different project reports `callgraph=unavailable reason=other_project`.
 
-Without a configured decision backend, selection is deterministic and makes no network request. The `endpoint` backend sends trace text and candidate code to its endpoint. Host redaction does not apply to this request. See [gather configuration and privacy](config.md#related-code-gathering) before enabling it. Gather does not read or show files that the session cannot read.
+Without a configured decision backend, selection is deterministic and makes no network request. The `endpoint` and `decisions` backends send conversation text and candidate code to their endpoints. Host redaction does not apply to this request. See [configuration and privacy](config.md#related-code-gathering) before enabling it. AFT does not read or show files that the session cannot read.
 
 #### Cross-project search
 

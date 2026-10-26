@@ -88,6 +88,11 @@ test("gather documentation states endpoint egress", async () => {
   expect(config).toContain("Host redaction does not apply to this request.");
   expect(config).toContain("local endpoint");
   expect(config).toContain("api_key_env");
+  expect(config).toContain('"backend": "decisions"');
+  expect(config).toContain('"endpoint": "https://api.inceptionlabs.ai/v1"');
+  expect(config).toContain('"model": "mercury-decide"');
+  expect(config).toContain('"api_key_env": "INCEPTION_API_KEY"');
+  expect(config).toContain("`threshold`");
   expect(config).toContain("deterministic");
   expect(config).toContain("project config");
   expect(tools).toContain("Related code (gathered for this search");

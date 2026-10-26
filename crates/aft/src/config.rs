@@ -660,7 +660,7 @@ pub struct RerankConfig {
 }
 
 /// Search settings outside the semantic embedding backend.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -674,7 +674,7 @@ pub fn gather_enabled(enabled: Option<bool>) -> bool {
     enabled == Some(true)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatherConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -695,7 +695,7 @@ pub struct GatherConfig {
     pub max_output_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatherDecisionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -706,12 +706,30 @@ pub struct GatherDecisionConfig {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_gather_threshold"
+    )]
+    pub threshold: Option<f64>,
+}
+
+pub(crate) fn deserialize_gather_threshold<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|value| !value.is_finite() || value <= 0.0 || value >= 1.0) {
+        return Err(serde::de::Error::custom(
+            "gather threshold must be strictly between 0 and 1",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatherDecisionBackend {
     Endpoint,
+    Decisions,
 }
 
 impl Config {

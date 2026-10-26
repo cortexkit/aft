@@ -117,7 +117,10 @@ impl WalkClock for SystemWalkClock {
 enum Mode<'a> {
     Deterministic,
     Model(Box<dyn DecisionModel + 'a>),
-    Failed(&'static str),
+    Failed {
+        backend: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl Mode<'_> {
@@ -125,14 +128,14 @@ impl Mode<'_> {
         match self {
             Self::Deterministic => "deterministic",
             Self::Model(model) => model.name(),
-            Self::Failed(_) => "endpoint",
+            Self::Failed { backend, .. } => backend,
         }
     }
 
     fn fingerprint(&self) -> String {
         match self {
             Self::Model(model) => model.fingerprint(),
-            Self::Failed(reason) => format!("endpoint:{reason}"),
+            Self::Failed { backend, reason } => format!("{backend}:{reason}"),
             Self::Deterministic => "deterministic/v1".into(),
         }
     }
@@ -146,7 +149,15 @@ fn selected_mode<'a>(request: &GatherWalkRequest<'a>) -> Mode<'a> {
         .and_then(|raw| raw.decision.as_ref());
     match decision.and_then(|raw| raw.backend) {
         None => Mode::Deterministic,
-        Some(GatherDecisionBackend::Endpoint) => {
+        Some(backend) => {
+            let backend_name = match backend {
+                GatherDecisionBackend::Endpoint => "endpoint",
+                GatherDecisionBackend::Decisions => "decisions",
+            };
+            let failed = || Mode::Failed {
+                backend: backend_name,
+                reason: "configuration_failure",
+            };
             let configured = decision.is_some_and(|raw| {
                 raw.endpoint
                     .as_deref()
@@ -157,14 +168,27 @@ fn selected_mode<'a>(request: &GatherWalkRequest<'a>) -> Mode<'a> {
                         .is_some_and(|value| !value.trim().is_empty())
             });
             if !configured {
-                Mode::Failed("configuration_failure")
+                failed()
             } else {
                 match request.model {
                     Some(model) => Mode::Model(Box::new(model)),
-                    None => match super::endpoint::EndpointDecisionModel::new(decision.unwrap()) {
-                        Ok(model) => Mode::Model(Box::new(model)),
-                        Err(_) => Mode::Failed("configuration_failure"),
-                    },
+                    None => {
+                        let config = decision.unwrap();
+                        let model: Result<Box<dyn DecisionModel>, _> = match backend {
+                            GatherDecisionBackend::Endpoint => {
+                                super::endpoint::EndpointDecisionModel::new(config)
+                                    .map(|model| Box::new(model) as Box<dyn DecisionModel>)
+                            }
+                            GatherDecisionBackend::Decisions => {
+                                super::decisions::DecisionsModel::new(config)
+                                    .map(|model| Box::new(model) as Box<dyn DecisionModel>)
+                            }
+                        };
+                        match model {
+                            Ok(model) => Mode::Model(model),
+                            Err(_) => failed(),
+                        }
+                    }
                 }
             }
         }
@@ -470,7 +494,7 @@ pub(super) fn walk_with_neighbors(
                     rerank_ties(request, &mut frontier, &settings, clock, round_deadline);
                     Ok(deterministic_decision(&frontier, remaining))
                 }
-                Mode::Failed(reason) => {
+                Mode::Failed { reason, .. } => {
                     record_failure(&mut result, round, reason);
                     cacheable = false;
                     rerank_ties(request, &mut frontier, &settings, clock, round_deadline);

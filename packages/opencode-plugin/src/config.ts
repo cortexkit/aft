@@ -205,10 +205,11 @@ const GatherConfigSchema = z.object({
   enabled: z.boolean().optional(),
   decision: z
     .object({
-      backend: z.enum(["endpoint"]).optional(),
+      backend: z.enum(["endpoint", "decisions"]).optional(),
       endpoint: z.string().trim().min(1).optional(),
       model: z.string().trim().min(1).optional(),
       api_key_env: z.string().trim().min(1).optional(),
+      threshold: z.number().gt(0).lt(1).optional(),
     })
     .transform((decision) => definedEntries(decision))
     .optional(),
@@ -2057,7 +2058,7 @@ function projectGatherStrippedKeys(gather: GatherConfig | undefined): string[] {
   ] as const) {
     if (gather[key] !== undefined) stripped.push(`search.gather.${key}`);
   }
-  for (const key of ["backend", "endpoint", "model", "api_key_env"] as const) {
+  for (const key of ["backend", "endpoint", "model", "api_key_env", "threshold"] as const) {
     if (gather.decision?.[key] !== undefined) stripped.push(`search.gather.decision.${key}`);
   }
   return stripped;

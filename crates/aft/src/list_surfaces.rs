@@ -365,8 +365,20 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "commands/semantic_search/gather/endpoint.rs",
         enclosing_item: "decide",
-        location_or_primitive: "body lines .take(DEFAULT_BODY_LINE_BUDGET), docs .take(3), response .take(RESPONSE_LIMIT + 1)",
-        reason: "decide bounds source excerpts in the internal decision prompt and refuses oversized endpoint response bytes; these limits do not shorten an agent response list",
+        location_or_primitive: "body lines .take(DEFAULT_BODY_LINE_BUDGET), docs .take(3)",
+        reason: "decide bounds source excerpts in the internal decision prompt, not an agent response list",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/endpoint.rs",
+        enclosing_item: "http_error",
+        location_or_primitive: "post_json response .take(RESPONSE_LIMIT + 1)",
+        reason: "post_json reads at most one byte past the internal response limit and refuses oversized responses for both decision backends, not an agent response list",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/decisions.rs",
+        enclosing_item: "decide",
+        location_or_primitive: "body lines .take(DEFAULT_BODY_LINE_BUDGET), docs .take(3)",
+        reason: "decide bounds source excerpts in the internal decisions request, not an agent response list; each candidate keeps its path and line for a full source read",
     },
     ExclusionEntry {
         file: "commands/semantic_search/gather/graph.rs",

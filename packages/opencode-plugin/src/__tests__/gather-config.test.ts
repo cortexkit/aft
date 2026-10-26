@@ -22,10 +22,11 @@ const limits = {
   max_output_bytes: 12288,
 };
 const decision = {
-  backend: "endpoint",
+  backend: "decisions",
   endpoint: "https://example.test/decision",
   model: "test-model",
   api_key_env: "TEST_GATHER_KEY",
+  threshold: 0.7,
 };
 
 async function fixture(
@@ -57,6 +58,14 @@ async function fixture(
 }
 
 describe.serial("gather config", () => {
+  test("decisions threshold accepts only probabilities strictly between zero and one", () => {
+    expect(AftConfigSchema.safeParse({ search: { gather: { decision } } }).success).toBe(true);
+    for (const threshold of [0, 1, -0.1, 1.1, "0.5", Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(
+        AftConfigSchema.safeParse({ search: { gather: { decision: { threshold } } } }).success,
+      ).toBe(false);
+    }
+  });
   test("public loader enforces enablement in base and active harness tiers", async () => {
     await fixture((f) => {
       const cases = [

@@ -362,6 +362,8 @@ pub struct RawGatherDecision {
     pub model: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
     pub api_key_env: Option<String>,
+    #[serde(deserialize_with = "crate::config::deserialize_gather_threshold")]
+    pub threshold: Option<f64>,
 }
 
 /// Raw `search.rerank`. Parsing only: defaults and clamps belong to the search
@@ -1891,7 +1893,7 @@ fn merge_trusted_search(base: Option<RawSearch>, next: Option<RawSearch>) -> Opt
         );
         if let Some(next) = next.decision {
             let base = base.decision.get_or_insert_with(RawGatherDecision::default);
-            take_defined!(base, next, backend, endpoint, model, api_key_env);
+            take_defined!(base, next, backend, endpoint, model, api_key_env, threshold);
         }
     }
     Some(base)
@@ -1948,6 +1950,7 @@ fn resolve_search_config(raw: Option<&RawSearch>) -> SearchConfig {
                         endpoint: decision.endpoint.clone(),
                         model: decision.model.clone(),
                         api_key_env: decision.api_key_env.clone(),
+                        threshold: decision.threshold,
                     })
                     .filter(|decision| *decision != GatherDecisionConfig::default()),
                 max_rounds: gather.max_rounds,
@@ -2735,6 +2738,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
                 ("endpoint", decision.endpoint.is_some()),
                 ("model", decision.model.is_some()),
                 ("api_key_env", decision.api_key_env.is_some()),
+                ("threshold", decision.threshold.is_some()),
             ] {
                 if present {
                     push_drop(
@@ -3794,7 +3798,7 @@ mod tests {
 
     #[test]
     fn gather_config_project_fields_are_dropped() {
-        let gather = serde_json::json!({"enabled":true,"decision":{"backend":"endpoint","endpoint":"https://example.test","model":"test","api_key_env":"TEST_KEY"},"max_rounds":3,"max_nodes":12,"max_frontier":40,"decision_timeout_ms":3000,"deadline_ms":8000,"max_output_bytes":12288});
+        let gather = serde_json::json!({"enabled":true,"decision":{"backend":"decisions","endpoint":"https://example.test","model":"test","api_key_env":"TEST_KEY","threshold":0.7},"max_rounds":3,"max_nodes":12,"max_frontier":40,"decision_timeout_ms":3000,"deadline_ms":8000,"max_output_bytes":12288});
         for harness in [Harness::Opencode, Harness::Pi] {
             for nested in [false, true] {
                 let fields = serde_json::json!({"search":{"gather":gather}});
@@ -3818,6 +3822,7 @@ mod tests {
                     "decision.endpoint",
                     "decision.model",
                     "decision.api_key_env",
+                    "decision.threshold",
                     "max_rounds",
                     "max_nodes",
                     "max_frontier",
@@ -3834,6 +3839,28 @@ mod tests {
                 assert_eq!(result.config.search, SearchConfig::default());
             }
         }
+    }
+
+    #[test]
+    fn gather_config_decisions_threshold_validation_and_resolution() {
+        for threshold in [
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!(-0.1),
+            serde_json::json!(1.1),
+            serde_json::json!("0.5"),
+        ] {
+            let doc = serde_json::json!({"search":{"gather":{"decision":{"threshold":threshold}}}});
+            assert!(serde_json::from_value::<RawAftConfig>(doc).is_err());
+        }
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{"search":{"gather":{"decision":{"backend":"decisions","threshold":0.7}}},"harnesses":{"opencode":{"search":{"gather":{"decision":{"model":"mercury-decide"}}}}}}"#,
+        )]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let search = serde_json::to_value(result.config.search).unwrap();
+        assert_eq!(search["gather"]["decision"]["backend"], "decisions");
+        assert_eq!(search["gather"]["decision"]["threshold"], 0.7);
     }
 
     #[test]

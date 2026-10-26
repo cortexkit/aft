@@ -25,7 +25,7 @@ pub(crate) const BUILD_BACKOFF: Duration = Duration::from_secs(2);
 pub(crate) const MAX_BUILD_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Everything that decides which backend a context uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BuildInputs {
     pub(crate) search: SearchConfig,
     /// The embedding connection settings; the Synapse reranker reuses them.
