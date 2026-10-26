@@ -2333,7 +2333,9 @@ impl FirstLoadDriver for CheckoutDriver {
                 .as_ref()
                 .zip(previous.guard.as_ref())
                 .is_some_and(|(now, old)| now.root == old.root && now.policy == old.policy)
-            && guard.as_ref().is_some_and(|guard| guard.policy.reusable)
+            && guard
+                .as_ref()
+                .is_some_and(|guard| guard.policy.reusable && guard.steady_supported)
             && !policy_or_directory;
         let changed_files = if continuous {
             self.walker.changed_files(self.owner.root(), &candidates)?
@@ -5395,7 +5397,8 @@ impl CheckoutDriver {
                     .install_cut()
                     .and_then(|cut| cut.verification.as_ref())
                     .is_some_and(|guard| {
-                        guard.subscription.is_none()
+                        !guard.steady_supported
+                            || guard.subscription.is_none()
                             || crate::watcher_backend::subscription::current(self.owner.root())
                                 != guard.subscription
                     })
@@ -5873,6 +5876,15 @@ mod v3_bootstrap_tests {
         assert_eq!(driver.take_reconcile_work().walks, 1);
         driver.install(&access, &snapshot, revision).unwrap();
         assert!(!driver.installed_snapshot().needs_reconcile());
+        let installed = driver.installed_snapshot();
+        let mut cut = installed.install_cut().unwrap().clone();
+        let mut guard = cut.verification.as_ref().unwrap().as_ref().clone();
+        guard.steady_supported = false;
+        cut.verification = Some(Arc::new(guard));
+        driver
+            .install(&access, &installed.with_install_cut(cut), revision)
+            .unwrap();
+        assert!(driver.installed_snapshot().needs_reconcile());
     }
 
     #[test]
