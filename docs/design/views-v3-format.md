@@ -658,6 +658,33 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
 | 6a | `F/symbol.sqlite` | `views_v3_store` 1/1, new-store layout 2; store floor 1 | The v3 symbol plane uses the same immutable `payload`/`payload_digest` contract and reservation protocol. No in-place legacy conversion. Implemented; see *Import ledger and symbol plane*. |
 | 6a | `F/imports.sqlite` (sidecar, not a registry table) | Import ledger 1/1, `application_id` `0x41465449`; registry stays 1/1 or 2/2 | Record completion/rejection per legacy key, artifact, compatible producer and destination plane, with owner-token claim/recovery semantics. Import into v3 only, stream inputs above 1 GiB and retain legacy bytes. Implemented; see *Import ledger and symbol plane*. |
 
+#### Stat evidence and advisory tokens
+
+Registry 3/3 is an exact-predecessor upgrade of 2/2 under the v3 reservation
+barrier, after raising only `views_v3_registry` to 3 and `views_v3_store` to 1.
+It adds `view_tokens(nonce TEXT PRIMARY KEY, root BLOB NOT NULL,
+expected_tree TEXT NOT NULL, minted_ms INTEGER NOT NULL, expires_ms INTEGER NOT NULL,
+bound_root BLOB, bound_gitdir BLOB, consumed_ms INTEGER)`. Root is the canonical
+future checkout path. The two bound identity blobs and consume time are all
+NULL at mint and all set in one first-consumption transaction. A consumed row
+is retained until expiry so replay and identity mismatch can be distinguished;
+neither can authorize verification or publication. The lifetime is ten minutes.
+Identity blobs are versioned JSON, not a Git stat-cache tuple. Older registry
+readers supporting at most 2 refuse registry 3; v1/v2 store formats are unchanged.
+
+Stat-evidence 1/1 uses `application_id=0x41465445`, `PRAGMA user_version=1`, and
+`evidence_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL,
+generation TEXT NOT NULL, root BLOB NOT NULL, policy TEXT NOT NULL)` plus
+`stat_evidence(path BLOB PRIMARY KEY, record BLOB NOT NULL)`. Records are
+versioned JSON containing root/file identity, size, mtime, ctime or Windows
+ChangeTime, observation time, content digest, an optional proven Git OID,
+the policy digest paired with that observation, and per-plane keys. The file
+is staged and synced before the generation pointer CAS and is reusable only
+when its generation, root, policy, file identity, timestamps and racy checks
+all agree. Missing, corrupt or future evidence means reading source again.
+Evidence does not upgrade membership-keyed bases to tree-keyed identities.
+
 The registry-version increments above are serial handoffs, not permission for
 an earlier slice to write a later owner's rows. Owners implement and test their
 assigned schema and encoding before publishing any such bytes. Registration

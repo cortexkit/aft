@@ -2613,6 +2613,22 @@ impl super::first_load::CompositePlane for SemanticPlane {
     fn applies_to(&self, rel_path: &RelPath) -> bool {
         applies_to(rel_path)
     }
+    fn attachment_key(&self, attachment: &super::snapshot::PlaneAttachment) -> Option<FamilyKey> {
+        attachment
+            .downcast_ref::<SemanticAttachment>()
+            .map(|a| a.key)
+    }
+    fn cached_attachment(
+        &self,
+        content: ContentHash,
+        key: FamilyKey,
+    ) -> super::snapshot::PlaneAttachment {
+        Arc::new(SemanticAttachment {
+            content,
+            producer: self.producer.id(),
+            key,
+        })
+    }
 
     fn attachment(
         &self,

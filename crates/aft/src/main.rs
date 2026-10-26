@@ -1518,6 +1518,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
         "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "view_token" => aft::commands::view_token::handle_view_token(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => {

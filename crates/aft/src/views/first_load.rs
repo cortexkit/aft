@@ -1238,6 +1238,29 @@ pub trait CompositePlane: Send + Sync {
     fn plane(&self) -> FamilyPlane;
     fn applies_to(&self, path: &RelPath) -> bool;
 
+    /// Derive a payload key without extraction. Planes with deferred extraction
+    /// may leave this absent and keep their own cheap attachment format.
+    fn key(
+        &self,
+        _path: &RelPath,
+        _content: crate::blob_store::v2::ContentHash,
+    ) -> Option<crate::blob_store::v2::FamilyKey> {
+        None
+    }
+    fn cached_attachment(
+        &self,
+        _content: crate::blob_store::v2::ContentHash,
+        key: crate::blob_store::v2::FamilyKey,
+    ) -> super::snapshot::PlaneAttachment {
+        Arc::new(CachedAttachment(key))
+    }
+    fn attachment_key(
+        &self,
+        _attachment: &super::snapshot::PlaneAttachment,
+    ) -> Option<crate::blob_store::v2::FamilyKey> {
+        None
+    }
+
     /// Called during strict reconciliation with the very bytes that were hashed.
     /// May compute extraction data, but must not write artifacts or read source.
     fn attachment(
@@ -1337,6 +1360,7 @@ struct ObservedStat {
     device: u64,
     recorded_ns: u128,
     delivery_seq: u64,
+    native: Option<super::verification::NativeStat>,
 }
 
 /// Publish stat evidence together with the extracted content it validates.
@@ -1346,6 +1370,8 @@ struct ObservedStat {
 struct ObservedCheckout {
     entries: BTreeMap<RelPath, LiveEntry>,
     stats: BTreeMap<RelPath, ObservedStat>,
+    evidence: BTreeMap<RelPath, super::verification::Evidence>,
+    guard: Option<Arc<super::verification::BindGuard>>,
 }
 
 impl ObservedStat {
@@ -1359,10 +1385,14 @@ impl ObservedStat {
             },
             recorded_ns,
             delivery_seq: 0,
+            native: None,
         }
     }
 
     fn reusable(&self, current: &Self) -> bool {
+        if let (Some(old), Some(current)) = (&self.native, &current.native) {
+            return old.reusable(current, self.recorded_ns);
+        }
         #[cfg(unix)]
         {
             self.stamp == current.stamp && self.device == current.device
@@ -1578,6 +1608,8 @@ pub struct CheckoutDriver {
     retry: std::sync::atomic::AtomicBool,
     watcher_cookies: crate::watcher_backend::cookie::CookieBarrier,
     delivery: std::sync::Mutex<DeliveryState>,
+    v3_reconcile: std::sync::atomic::AtomicBool,
+    advisory_token: std::sync::Mutex<Option<String>>,
     #[cfg(test)]
     read_hook: std::sync::Mutex<Option<ReadHook>>,
     #[cfg(test)]
@@ -1597,6 +1629,15 @@ enum StableRead {
     Absent,
     Bytes(Vec<u8>, ObservedStat),
     Pending,
+}
+
+#[derive(Clone)]
+struct CachedAttachment(crate::blob_store::v2::FamilyKey);
+
+fn v3_contains(route: &super::snapshot::V3Route, key: &crate::blob_store::v2::FamilyKey) -> bool {
+    crate::blob_store::v3::PlaneReader::open_existing(&route.storage, &route.family, key.plane())
+        .and_then(|reader| reader.contains(key))
+        .unwrap_or(false)
 }
 
 struct PreparedReaders {
@@ -1640,7 +1681,7 @@ impl CheckoutDriver {
                 if let Some(bytes) = &bytes {
                     let mut work = self.work.lock().unwrap();
                     work.reads += 1;
-                    work.content_hash_bytes += bytes.len();
+                    let _ = bytes;
                 }
                 if let Some(hook) = &*self.read_hook.lock().unwrap() {
                     hook(absolute, attempt);
@@ -1656,7 +1697,7 @@ impl CheckoutDriver {
             match (before, after, bytes) {
                 (None, None, None) if unchanged => return Ok(StableRead::Absent),
                 (Some(mut before), Some(after), Some(bytes)) if unchanged => {
-                    let stable = before.stamp == after.stamp;
+                    let stable = before.stamp == after.stamp && before.native == after.native;
                     #[cfg(unix)]
                     let stable = stable && before.device == after.device;
                     if stable {
@@ -1685,7 +1726,39 @@ impl CheckoutDriver {
         access: &ViewAccess,
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
+        if let Some(token) = self
+            .advisory_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let route = self.owner.v3_route();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            // Token rejection is advisory; every outcome follows the same
+            // verification path. Tree-base warming is not enabled yet.
+            let _ = super::registry::consume_view_token(
+                &route.storage,
+                &route.family,
+                &token,
+                self.owner.root(),
+                now,
+            );
+        }
+        self.v3_reconcile.store(
+            base.v3_route().is_some(),
+            std::sync::atomic::Ordering::Release,
+        );
         SiblingLoader::reconciled_snapshot(self, access, base)
+    }
+
+    pub fn set_view_token(&self, token: String) {
+        *self
+            .advisory_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
     }
 
     pub fn take_revalidated_job(&self) -> bool {
@@ -1727,6 +1800,7 @@ impl CheckoutDriver {
                 epoch: delta.epoch(),
                 version: delta.version(),
                 intent_version: delta.snapshot().intent_version(),
+                verification: None,
             });
         Self {
             owner,
@@ -1739,6 +1813,8 @@ impl CheckoutDriver {
             observed: Default::default(),
             watcher_cookies: Default::default(),
             delivery: Default::default(),
+            v3_reconcile: Default::default(),
+            advisory_token: Default::default(),
             #[cfg(test)]
             read_hook: Default::default(),
             installed: std::sync::Mutex::new(Arc::new(InstalledBundle {
@@ -1823,6 +1899,10 @@ impl CheckoutDriver {
                 epoch: delta.epoch(),
                 version: delta.version(),
                 intent_version: delta.snapshot().intent_version(),
+                verification: installed
+                    .snapshot
+                    .install_cut()
+                    .and_then(|cut| cut.verification.clone()),
             });
     }
 
@@ -1849,6 +1929,10 @@ impl CheckoutDriver {
                 epoch: delta.epoch(),
                 version: delta.version(),
                 intent_version: delta.snapshot().intent_version(),
+                verification: installed
+                    .snapshot
+                    .install_cut()
+                    .and_then(|cut| cut.verification.clone()),
             });
     }
 
@@ -1970,8 +2054,42 @@ impl FirstLoadDriver for CheckoutDriver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let v3 = self.v3_reconcile.load(std::sync::atomic::Ordering::Acquire)
+            || installed.generation().v3_route().is_some();
+        let guard = if v3 {
+            Some(Arc::new(
+                super::verification::BindGuard::capture(self.owner.root(), None)
+                    .map_err(|e| SiblingLoader::error(e.to_string()))?,
+            ))
+        } else {
+            None
+        };
+        let route = self.owner.v3_route();
+        let durable = if v3 && previous.entries.is_empty() {
+            super::base_refs::open_foreign_v3(
+                &route.storage,
+                &route.family,
+                &route.scope,
+                &self.producers,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let persisted = durable
+            .as_ref()
+            .and_then(|generation| {
+                super::verification::read_evidence(
+                    &route.member_dir(),
+                    generation.name(),
+                    guard.as_ref().unwrap(),
+                )
+            })
+            .unwrap_or_default();
         let mut entries = BTreeMap::new();
         let mut stats = BTreeMap::new();
+        let mut evidence = BTreeMap::new();
         #[cfg(test)]
         {
             self.work.lock().unwrap().walks += 1;
@@ -1986,12 +2104,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
             // Round down to the second so coarse filesystem timestamps in the
             // observation's second are also treated as racily clean.
-            let recorded_ns = u128::from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ) * 1_000_000_000;
+            let recorded_ns = super::verification::now_ns();
             let delivery_seq = self
                 .delivery
                 .lock()
@@ -2012,11 +2125,79 @@ impl FirstLoadDriver for CheckoutDriver {
                         .get(&path)
                         .copied()
                         .unwrap_or(0);
-                    if cached.reusable(current) && delivered <= cached.delivery_seq {
+                    let policy_matches = !v3
+                        || guard.as_ref().is_some_and(|guard| {
+                            guard.policy.reusable
+                                && previous.guard.as_ref().is_some_and(|old| {
+                                    old.policy == guard.policy && old.root == guard.root
+                                })
+                        });
+                    let keys_present = old.attachments.values().all(|a| {
+                        a.downcast_ref::<CachedAttachment>()
+                            .is_none_or(|cached| v3_contains(&route, &cached.0))
+                    });
+                    if cached.reusable(current)
+                        && delivered <= cached.delivery_seq
+                        && policy_matches
+                        && keys_present
+                    {
                         let mut entry = old.clone();
                         entry.seq = revision;
                         entries.insert(path.clone(), entry);
-                        stats.insert(path, cached.clone());
+                        stats.insert(path.clone(), cached.clone());
+                        if let Some(record) = previous.evidence.get(&path) {
+                            evidence.insert(path.clone(), record.clone());
+                        }
+                        continue;
+                    }
+                }
+            }
+            if !pending.contains(&path) && guard.as_ref().is_some_and(|g| g.policy.reusable) {
+                if let (Some(record), Some(current), Some(generation)) =
+                    (persisted.get(&path), before.as_ref(), durable.as_ref())
+                {
+                    if record.stat.reusable(
+                        current.native.as_ref().unwrap_or(&record.stat),
+                        record.observed_ns,
+                    ) && current.native.is_some()
+                        && record.content().is_some_and(|content| {
+                            generation.disk_state(&path)
+                                == (super::snapshot::DiskState::Present {
+                                    content,
+                                    size: record.size,
+                                })
+                        })
+                        && self.planes.iter().filter(|p| p.applies_to(&path)).all(|p| {
+                            record
+                                .key(p.plane())
+                                .is_some_and(|key| v3_contains(&route, &key))
+                        })
+                        && self
+                            .delivery
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .paths
+                            .get(&path)
+                            .copied()
+                            .unwrap_or(0)
+                            == 0
+                    {
+                        let mut entry = LiveEntry::new(generation.disk_state(&path), revision);
+                        entry.reconciliation = super::readiness::ReconciledDelta::Reconciled;
+                        for plane in &self.planes {
+                            if plane.applies_to(&path) {
+                                let key = record.key(plane.plane()).unwrap();
+                                entry.attachments.insert(
+                                    plane.plane(),
+                                    plane.cached_attachment(record.content().unwrap(), key),
+                                );
+                            }
+                        }
+                        let mut current = current.clone();
+                        current.recorded_ns = record.observed_ns;
+                        stats.insert(path.clone(), current);
+                        entries.insert(path.clone(), entry);
+                        evidence.insert(path, record.clone());
                         continue;
                     }
                 }
@@ -2033,18 +2214,58 @@ impl FirstLoadDriver for CheckoutDriver {
                     }
                 };
             stats.insert(path.clone(), evidence);
-            let mut entry = LiveEntry::new(super::snapshot::DiskState::of_bytes(&bytes), revision);
+            let content = crate::blob_store::v2::ContentHash::of(&bytes);
+            #[cfg(test)]
+            {
+                self.work.lock().unwrap().content_hash_bytes += bytes.len();
+            }
+            let mut entry = LiveEntry::new(
+                super::snapshot::DiskState::Present {
+                    content,
+                    size: bytes.len() as u64,
+                },
+                revision,
+            );
             entry.reconciliation = super::readiness::ReconciledDelta::Reconciled;
+            let mut keys = BTreeMap::new();
             for plane in &self.planes {
                 if plane.applies_to(&path) {
+                    let key = plane.key(&path, content);
+                    if v3 && key.is_some_and(|key| v3_contains(&route, &key)) {
+                        let key = key.unwrap();
+                        keys.insert(format!("{:?}", plane.plane()), key.to_hex());
+                        entry
+                            .attachments
+                            .insert(plane.plane(), plane.cached_attachment(content, key));
+                        continue;
+                    }
                     #[cfg(test)]
                     {
                         self.work.lock().unwrap().attachments += 1;
                     }
-                    entry
-                        .attachments
-                        .insert(plane.plane(), plane.attachment(&path, &bytes)?);
+                    let attachment = plane.attachment(&path, &bytes)?;
+                    if let Some(key) = key.or_else(|| plane.attachment_key(&attachment)) {
+                        keys.insert(format!("{:?}", plane.plane()), key.to_hex());
+                    }
+                    entry.attachments.insert(plane.plane(), attachment);
                 }
+            }
+            if let (Some(guard), Some(stat)) =
+                (&guard, stats.get(&path).and_then(|s| s.native.clone()))
+            {
+                evidence.insert(
+                    path.clone(),
+                    super::verification::Evidence {
+                        version: 1,
+                        stat,
+                        observed_ns: recorded_ns,
+                        content: content.to_hex(),
+                        size: bytes.len() as u64,
+                        git_oid: None,
+                        policy: guard.policy.digest.clone(),
+                        keys,
+                    },
+                );
             }
             entries.insert(path, entry);
         }
@@ -2054,11 +2275,17 @@ impl FirstLoadDriver for CheckoutDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ObservedCheckout {
             entries: entries.clone(),
             stats,
+            evidence,
+            guard: guard.clone(),
         };
+        let mut cut = installed.install_cut().cloned();
+        if let Some(cut) = &mut cut {
+            cut.verification = guard;
+        }
         Ok(ReconciledCheckout {
             revision,
             entries,
-            cut: installed.install_cut().cloned(),
+            cut,
             readiness: installed.readiness_patches().clone(),
             publication_base: Some(publication_base),
         })
@@ -2155,6 +2382,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 epoch: successor.epoch(),
                 version: successor.version(),
                 intent_version: successor.snapshot().intent_version(),
+                verification: cut.verification.clone(),
             });
         if snapshot.reconciled_epoch().is_some() {
             if let Some(base) = snapshot.publication_base() {
@@ -2575,9 +2803,30 @@ impl CheckoutDriver {
                             super::base_refs::BaseRefError::Io(std::io::Error::other(error.reason))
                         })?;
                 }
+                if let Some(guard) = snapshot
+                    .install_cut()
+                    .and_then(|cut| cut.verification.as_ref())
+                {
+                    let evidence = self
+                        .observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .evidence
+                        .clone();
+                    super::verification::write_evidence(&route, published, guard, &evidence)
+                        .map_err(super::base_refs::BaseRefError::Io)?;
+                }
                 Ok(())
             },
             &mut || {
+                if let Some(guard) = snapshot
+                    .install_cut()
+                    .and_then(|cut| cut.verification.as_ref())
+                {
+                    guard
+                        .validate(self.owner.root())
+                        .map_err(super::base_refs::BaseRefError::Io)?;
+                }
                 self.validate_cut(access, snapshot, 0)
                     .map_err(|error| super::base_refs::BaseRefError::Unavailable(error.reason))
             },
@@ -3822,6 +4071,30 @@ impl CompositePlane for CallgraphBridge {
         use super::contracts::PlaneAdapter;
         self.adapter.applies_to(path)
     }
+    fn key(
+        &self,
+        path: &RelPath,
+        content: crate::blob_store::v2::ContentHash,
+    ) -> Option<crate::blob_store::v2::FamilyKey> {
+        let language = if super::assembly::is_resolution_input(path.as_bytes()) {
+            "config".to_owned()
+        } else {
+            let path = std::str::from_utf8(path.as_bytes()).ok()?;
+            format!(
+                "{:?}",
+                crate::parser::detect_language(std::path::Path::new(path))?
+            )
+            .to_lowercase()
+        };
+        Some(crate::blob_store::v2::FamilyKey::from(
+            &crate::blob_store::CallgraphKey::from_source_digest(
+                *content.as_bytes(),
+                language,
+                crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
+            )
+            .full_key(),
+        ))
+    }
     fn attachment(
         &self,
         path: &RelPath,
@@ -3993,6 +4266,25 @@ impl CompositePlane for CallgraphBridge {
             if delta.get(path).is_none()
                 || super::snapshot::DiskState::in_generation(delta, path) != entry.disk
             {
+                continue;
+            }
+            if let Some(cached) = entry
+                .attachments
+                .get(&FamilyPlane::Callgraph)
+                .and_then(|a| a.downcast_ref::<CachedAttachment>())
+            {
+                live.protect(&[cached.0])
+                    .map_err(|e| error(e.to_string()))?;
+                if !v3_contains(route, &cached.0) {
+                    return Err(error(
+                        "cached callgraph row disappeared before protection".into(),
+                    ));
+                }
+                if let Some(super::manifest_v2::EntryV2::Regular { planes, .. }) =
+                    delta.get_mut(path)
+                {
+                    planes.callgraph = Some(super::readiness::PlaneState::ready(&cached.0));
+                }
                 continue;
             }
             let attachment = entry
@@ -4657,6 +4949,19 @@ impl CompositePlane for TrigramBridge {
     fn applies_to(&self, path: &RelPath) -> bool {
         !path.is_synthetic()
     }
+    fn key(
+        &self,
+        _: &RelPath,
+        content: crate::blob_store::v2::ContentHash,
+    ) -> Option<crate::blob_store::v2::FamilyKey> {
+        Some(
+            crate::blob_store::v2::TrigramKey {
+                content,
+                policy: self.policy,
+            }
+            .family_key(),
+        )
+    }
     fn attachment(
         &self,
         _: &RelPath,
@@ -4698,7 +5003,7 @@ impl CompositePlane for TrigramBridge {
     }
     fn materialize_v3(
         &self,
-        owner: &super::registry::ViewRegistration,
+        _owner: &super::registry::ViewRegistration,
         route: &super::snapshot::V3Route,
         _: &str,
         _: &Arc<ComposedGeneration>,
@@ -4706,15 +5011,53 @@ impl CompositePlane for TrigramBridge {
         delta: &mut super::manifest_v2::ManifestV2,
         live: &mut crate::pins::LivePin,
     ) -> Result<(), PlaneError> {
-        super::trigram::materialize_v3_observed(
-            &route.storage,
-            &route.family,
-            owner.root(),
-            delta,
-            observed,
-            live,
-            self.policy,
-        )
+        let mut keys = Vec::new();
+        let mut payloads = Vec::new();
+        for (path, entry) in delta.entries() {
+            let super::manifest_v2::EntryV2::Regular { content, .. } = entry else {
+                continue;
+            };
+            let key = self.key(path, *content).unwrap();
+            live.protect(&[key])
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+            if !v3_contains(route, &key) {
+                let attachment = observed
+                    .get(path)
+                    .filter(|e| e.disk == super::snapshot::DiskState::in_generation(delta, path))
+                    .and_then(|e| e.attachments.get(&FamilyPlane::Trigram))
+                    .and_then(|a| a.downcast_ref::<super::trigram::Attachment>())
+                    .filter(|a| a.content == *content && a.policy == self.policy.fingerprint())
+                    .ok_or_else(|| {
+                        SiblingLoader::error(
+                            "trigram row missing; reconcile source before retrying",
+                        )
+                    })?;
+                payloads.push((key, attachment.payload.encode()));
+            }
+            keys.push((path.clone(), key));
+        }
+        if !payloads.is_empty() {
+            let request = payloads
+                .iter()
+                .map(|(_, p)| p.len() as u64)
+                .sum::<u64>()
+                .saturating_mul(2)
+                .saturating_add(1 << 20);
+            crate::blob_store::v3::publish(&route.storage, &route.family, request, None, |p| {
+                for (key, payload) in &payloads {
+                    p.put(key, payload, FamilyPlane::Trigram.payload_schema())?;
+                }
+                Ok(())
+            })
+            .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        }
+        for (path, key) in keys {
+            if let Some(super::manifest_v2::EntryV2::Regular { planes, .. }) = delta.get_mut(&path)
+            {
+                planes.trigram = Some(super::readiness::PlaneState::ready(&key));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4730,7 +5073,9 @@ impl CheckoutDriver {
         }
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
-                Ok(Some(ObservedStat::new(&metadata, recorded_ns)))
+                let mut stat = ObservedStat::new(&metadata, recorded_ns);
+                stat.native = super::verification::NativeStat::read(path).ok();
+                Ok(Some(stat))
             }
             Ok(_) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -4814,6 +5159,7 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                             epoch: live.epoch(),
                             version: live.version(),
                             intent_version: live.snapshot().intent_version(),
+                            verification: None,
                         });
                 }
                 let snapshot = self

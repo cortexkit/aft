@@ -52,6 +52,7 @@ const META: &str = "CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHEC
 /// [`RegistryWriter::upgrade_to_base_refs`], only by a writer that raised the
 /// registry reader floor to 2 first.
 pub const REGISTRY_BASE_REFS_VERSION: u32 = 2;
+pub const REGISTRY_VERIFICATION_VERSION: u32 = 3;
 macro_rules! registry_v1_schema {
     () => {
         "
@@ -97,6 +98,21 @@ CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
 const REGISTRY_SCHEMA: &str = registry_v1_schema!();
 const BASE_REFS_SCHEMA: &str = base_refs_schema!();
 const REGISTRY_SCHEMA_V2: &str = concat!(registry_v1_schema!(), base_refs_schema!());
+macro_rules! view_tokens_schema {
+    () => {
+        "CREATE TABLE view_tokens (nonce TEXT NOT NULL PRIMARY KEY, root BLOB NOT NULL,
+ expected_tree TEXT NOT NULL, minted_ms INTEGER NOT NULL, expires_ms INTEGER NOT NULL,
+ bound_root BLOB, bound_gitdir BLOB, consumed_ms INTEGER,
+ CHECK((bound_root IS NULL AND bound_gitdir IS NULL AND consumed_ms IS NULL) OR
+       (bound_root IS NOT NULL AND bound_gitdir IS NOT NULL AND consumed_ms IS NOT NULL)));"
+    };
+}
+const VIEW_TOKENS_SCHEMA: &str = view_tokens_schema!();
+const REGISTRY_SCHEMA_V3: &str = concat!(
+    registry_v1_schema!(),
+    base_refs_schema!(),
+    view_tokens_schema!()
+);
 const PLANE_SCHEMA: &str = "
 CREATE TABLE store_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), plane TEXT NOT NULL, gc_epoch INTEGER NOT NULL);
 CREATE TABLE blob_payloads (full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key)=32),
@@ -487,6 +503,7 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
         // A registry of the base-reference protocol carries its own exact
         // text; any other version/schema pair falls through to the drift check.
         (Kind::Registry, 2, 2) if layout == 0 => Some(REGISTRY_SCHEMA_V2),
+        (Kind::Registry, 3, 3) if layout == 0 => Some(REGISTRY_SCHEMA_V3),
         _ => kind.schema_for(layout),
     };
     let Some(compiled_schema) = compiled_schema else {
@@ -507,6 +524,11 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
                     == (
                         u64::from(REGISTRY_BASE_REFS_VERSION),
                         REGISTRY_BASE_REFS_VERSION,
+                    )
+                || (version, schema)
+                    == (
+                        u64::from(REGISTRY_VERIFICATION_VERSION),
+                        REGISTRY_VERIFICATION_VERSION,
                     )
         }
         Kind::Plane(_) => version == u64::from(FORMAT_VERSION) && schema == SCHEMA_VERSION,
@@ -906,6 +928,8 @@ impl<'a> RegistryWriter<'a> {
             )?;
             if (version, schema) == (REGISTRY_BASE_REFS_VERSION, REGISTRY_BASE_REFS_VERSION)
                 && text == format!("{META}{REGISTRY_SCHEMA_V2}")
+                || (version, schema) == (REGISTRY_VERIFICATION_VERSION, REGISTRY_VERIFICATION_VERSION)
+                    && text == format!("{META}{REGISTRY_SCHEMA_V3}")
             {
                 return Ok(());
             }
@@ -928,6 +952,19 @@ impl<'a> RegistryWriter<'a> {
                 "UPDATE format_meta SET format_version=?1,schema_version=?1,schema_text=?2 WHERE singleton=1",
                 params![REGISTRY_BASE_REFS_VERSION, format!("{META}{REGISTRY_SCHEMA_V2}")],
             )?;
+            Ok(())
+        })
+    }
+    /// Adds only the registered v3 token protocol; plane stores and legacy
+    /// registries retain their own versions and schema.
+    pub fn upgrade_to_verification(&mut self) -> Result<()> {
+        self.upgrade_to_base_refs()?;
+        self.with_barrier(|tx| {
+            let version: u32 = tx.query_row("SELECT format_version FROM format_meta WHERE singleton=1", [], |r| r.get(0))?;
+            if version == REGISTRY_VERIFICATION_VERSION { return Ok(()); }
+            tx.execute_batch(VIEW_TOKENS_SCHEMA)?;
+            tx.execute("UPDATE format_meta SET format_version=?1,schema_version=?1,schema_text=?2 WHERE singleton=1",
+                params![REGISTRY_VERIFICATION_VERSION, format!("{META}{REGISTRY_SCHEMA_V3}")])?;
             Ok(())
         })
     }
@@ -1437,6 +1474,25 @@ pub fn open_base_refs_registry<'a>(
     )
     .map_err(|e| Error::Io(std::io::Error::other(e)))?
 }
+/// Raises the verification floor before any token or stat-evidence bytes exist.
+pub fn open_verification_registry<'a>(
+    storage: &Path,
+    family: &str,
+    lock: &'a ReservationLock,
+) -> Result<RegistryWriter<'a>> {
+    crate::reader_floor::publish_v3_with_floor(
+        storage,
+        REGISTRY_VERIFICATION_VERSION,
+        FORMAT_VERSION,
+        || {
+            let mut registry = open_base_refs_registry(storage, family, lock, None)?;
+            registry.upgrade_to_verification()?;
+            Ok(registry)
+        },
+    )
+    .map_err(|e| Error::Io(std::io::Error::other(e)))?
+}
+
 fn publish_under_lock<T>(
     storage: &Path,
     family: &str,

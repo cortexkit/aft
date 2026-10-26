@@ -100,6 +100,8 @@ export {
   readBinaryIdentity,
   writeStampedFileDigest,
 } from "./binary-identity.js";
+export { mintViewToken, type ViewToken } from "./view-token.js";
+
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,

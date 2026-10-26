@@ -64,6 +64,7 @@ pub mod semantic;
 pub mod semantic_arena;
 pub mod semantic_runtime;
 pub mod trigram;
+mod verification;
 
 #[cfg(test)]
 mod dispatch_parity_probe;

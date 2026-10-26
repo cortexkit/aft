@@ -1314,6 +1314,7 @@ mod mutation_tests {
             epoch: live.epoch(),
             version: live.version(),
             intent_version: 0,
+            verification: None,
         };
         let changed = RelPath::new(b"changed.rs".to_vec()).unwrap();
         let transient = RelPath::new(b"transient.rs".to_vec()).unwrap();
@@ -1376,6 +1377,7 @@ mod mutation_tests {
             epoch: live.epoch(),
             version: live.version(),
             intent_version: 0,
+            verification: None,
         };
         let mut walked = LiveDelta::new(live.base().clone());
         walked.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"B"), 2));
@@ -1410,6 +1412,7 @@ mod mutation_tests {
             epoch: live.epoch(),
             version: live.version(),
             intent_version: 0,
+            verification: None,
         };
         let mut walked = LiveDelta::new(live.base().clone());
         walked.apply(file.clone(), LiveEntry::new(DiskState::of_bytes(b"B"), 2));
@@ -1684,6 +1687,7 @@ pub struct InstallCut {
     pub epoch: u64,
     pub version: u64,
     pub intent_version: u64,
+    pub(crate) verification: Option<Arc<super::verification::BindGuard>>,
 }
 
 /// A lease on resident adapters. Query snapshots retain this lease, so removing

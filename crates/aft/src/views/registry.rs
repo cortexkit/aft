@@ -1410,6 +1410,191 @@ fn now_ms() -> u64 {
     crate::pins::now_ms()
 }
 
+pub const VIEW_TOKEN_TTL_MS: u64 = 600_000;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ViewToken {
+    pub token: String,
+    pub expires_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TokenUse {
+    Accepted { expected_tree: String },
+    Forged,
+    Expired,
+    WrongRoot,
+    WrongTree,
+    IdentityMismatch,
+    Replayed,
+}
+
+/// Canonicalize an existing parent without requiring the future checkout to
+/// exist. A later symlink substitution changes the canonical consumption root.
+pub fn canonical_token_root(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "token root must be absolute without parent components",
+        ));
+    }
+    let mut parent = path;
+    let mut suffix = Vec::new();
+    while !parent.try_exists()? {
+        suffix.push(
+            parent
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("no existing root ancestor"))?
+                .to_os_string(),
+        );
+        parent = parent
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no existing root ancestor"))?;
+    }
+    let mut result = std::fs::canonicalize(parent)?;
+    for component in suffix.into_iter().rev() {
+        result.push(component);
+    }
+    Ok(result)
+}
+
+fn token_store_error(error: crate::blob_store::v3::Error) -> RegistryError {
+    RegistryError::Io(std::io::Error::other(error))
+}
+
+/// Minting is advisory and creates only the registered v3 token row. No base,
+/// source bytes, view pointer or legacy row is written.
+pub fn mint_view_token(
+    storage: &Path,
+    family: &str,
+    root: &Path,
+    tree: &str,
+    now_ms: u64,
+) -> RegistryResult<ViewToken> {
+    if !matches!(tree.len(), 40 | 64)
+        || !tree
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(RegistryError::InvalidScope(
+            "expected tree must be a lowercase Git object ID".into(),
+        ));
+    }
+    let root = canonical_token_root(root)?;
+    let root_bytes = encode_root(&root).ok_or_else(|| {
+        RegistryError::InvalidScope("token root cannot be represented exactly".into())
+    })?;
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| RegistryError::Io(std::io::Error::other(error.to_string())))?;
+    let token = crate::blob_store::v2::to_hex(&nonce);
+    let expires_ms = now_ms
+        .checked_add(VIEW_TOKEN_TTL_MS)
+        .ok_or_else(|| RegistryError::InvalidScope("token clock overflow".into()))?;
+    let lock =
+        crate::blob_store::v3::ReservationLock::acquire(storage).map_err(token_store_error)?;
+    let mut registry = crate::blob_store::v3::open_verification_registry(storage, family, &lock)
+        .map_err(token_store_error)?;
+    registry.with_barrier(|tx| {
+        tx.execute("DELETE FROM view_tokens WHERE expires_ms<=?1", [now_ms])?;
+        tx.execute("INSERT INTO view_tokens(nonce,root,expected_tree,minted_ms,expires_ms) VALUES(?1,?2,?3,?4,?5)", params![token, root_bytes, tree, now_ms, expires_ms])?;
+        Ok(())
+    }).map_err(token_store_error)?;
+    Ok(ViewToken { token, expires_ms })
+}
+
+/// A token never supplies a freshness proof. Even an accepted token only
+/// suggests which tree to pre-warm; callers must still reconcile the checkout.
+pub fn consume_view_token(
+    storage: &Path,
+    family: &str,
+    token: &str,
+    root: &Path,
+    now_ms: u64,
+) -> RegistryResult<TokenUse> {
+    let root = canonical_token_root(root)?;
+    let directory = match super::verification::gitdir(&root) {
+        Ok(directory) => directory,
+        Err(_) => return Ok(TokenUse::IdentityMismatch),
+    };
+    let identities = match (
+        super::verification::NativeStat::read(&root),
+        super::verification::NativeStat::read(&directory),
+    ) {
+        (Ok(root), Ok(gitdir)) => (root.identity, (directory, gitdir.identity)),
+        _ => return Ok(TokenUse::IdentityMismatch),
+    };
+    let queries =
+        crate::git_index_reader::GitQueries::new(root.clone(), std::time::Duration::from_secs(2));
+    let tree = queries.head_tree()?;
+    if !tree.status.success() {
+        return Ok(TokenUse::WrongTree);
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_owned();
+    let bound_root = serde_json::to_vec(&identities.0)
+        .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
+    let bound_gitdir = serde_json::to_vec(&identities.1)
+        .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
+    consume_token_identity(
+        storage,
+        family,
+        token,
+        &root,
+        &tree,
+        &bound_root,
+        &bound_gitdir,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_token_identity(
+    storage: &Path,
+    family: &str,
+    token: &str,
+    root: &Path,
+    tree: &str,
+    root_identity: &[u8],
+    gitdir_identity: &[u8],
+    now_ms: u64,
+) -> RegistryResult<TokenUse> {
+    // A forged token does not create a family or advance its reader floor.
+    if !crate::blob_store::v3::family_dir(storage, family)
+        .map_err(token_store_error)?
+        .join("members.sqlite")
+        .try_exists()?
+    {
+        return Ok(TokenUse::Forged);
+    }
+    let lock =
+        crate::blob_store::v3::ReservationLock::acquire(storage).map_err(token_store_error)?;
+    let mut registry =
+        crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, &lock)
+            .map_err(token_store_error)?;
+    if registry.registry_version().map_err(token_store_error)?
+        < crate::blob_store::v3::REGISTRY_VERIFICATION_VERSION
+    {
+        return Ok(TokenUse::Forged);
+    }
+    registry.with_barrier(|tx| {
+        type Row = (Vec<u8>, String, u64, u64, Option<Vec<u8>>, Option<Vec<u8>>, Option<u64>);
+        let row: Option<Row> = tx.query_row("SELECT root,expected_tree,minted_ms,expires_ms,bound_root,bound_gitdir,consumed_ms FROM view_tokens WHERE nonce=?1", [token], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+        let Some((expected_root, expected_tree, minted, expires, bound_root, bound_gitdir, consumed)) = row else { return Ok(TokenUse::Forged); };
+        if now_ms < minted || now_ms >= expires { return Ok(TokenUse::Expired); }
+        if Some(expected_root) != encode_root(root) { return Ok(TokenUse::WrongRoot); }
+        if expected_tree != tree { return Ok(TokenUse::WrongTree); }
+        if consumed.is_some() {
+            return Ok(if bound_root.as_deref() == Some(root_identity) && bound_gitdir.as_deref() == Some(gitdir_identity) { TokenUse::Replayed } else { TokenUse::IdentityMismatch });
+        }
+        let changed = tx.execute("UPDATE view_tokens SET bound_root=?1,bound_gitdir=?2,consumed_ms=?3 WHERE nonce=?4 AND consumed_ms IS NULL", params![root_identity, gitdir_identity, now_ms, token])?;
+        Ok(if changed == 1 { TokenUse::Accepted { expected_tree } } else { TokenUse::Replayed })
+    }).map_err(token_store_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1686,5 +1871,200 @@ mod tests {
             matches!(result, Err(PinError::NotRegistered(_))),
             "{result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod view_token_tests {
+    use super::*;
+    const TREE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn view_token_mints_before_root_exists_and_binds_both_identities_once() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("future");
+        let minted = mint_view_token(storage.path(), "family", &root, TREE, 10).unwrap();
+        assert!(!root.exists());
+        let ledger =
+            crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family").unwrap();
+        assert!(ledger.read(|c| Ok(c.query_row("SELECT bound_root IS NULL AND bound_gitdir IS NULL AND consumed_ms IS NULL FROM view_tokens", [], |r| r.get::<_, bool>(0))?)).unwrap());
+        assert_eq!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                &minted.token,
+                &root,
+                TREE,
+                b"root-id",
+                b"gitdir-id",
+                11
+            )
+            .unwrap(),
+            TokenUse::Accepted {
+                expected_tree: TREE.into()
+            }
+        );
+        assert_eq!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                &minted.token,
+                &root,
+                TREE,
+                b"root-id",
+                b"gitdir-id",
+                12
+            )
+            .unwrap(),
+            TokenUse::Replayed
+        );
+        for (root_id, gitdir_id) in [
+            (b"replacement".as_slice(), b"gitdir-id".as_slice()),
+            (b"root-id".as_slice(), b"replacement".as_slice()),
+        ] {
+            assert_eq!(
+                consume_token_identity(
+                    storage.path(),
+                    "family",
+                    &minted.token,
+                    &root,
+                    TREE,
+                    root_id,
+                    gitdir_id,
+                    12
+                )
+                .unwrap(),
+                TokenUse::IdentityMismatch
+            );
+        }
+        let floor = crate::reader_floor::read(storage.path()).unwrap().unwrap();
+        assert_eq!(floor.stores["views_v3_registry"], 3);
+        assert_eq!(floor.stores["views_v3_store"], 1);
+        assert!(!storage.path().join("blobs/family").exists());
+        assert!(!storage.path().join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn view_token_concurrent_first_consumption_has_exactly_one_winner() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("future");
+        let token = mint_view_token(storage.path(), "family", &root, TREE, 1).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let outcomes = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..2)
+                .map(|_| {
+                    let start = &start;
+                    let token = &token.token;
+                    let root = &root;
+                    let storage = storage.path();
+                    scope.spawn(move || {
+                        start.wait();
+                        consume_token_identity(
+                            storage, "family", token, root, TREE, b"root", b"gitdir", 2,
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|j| j.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, TokenUse::Accepted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| **r == TokenUse::Replayed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn view_token_forged_expired_wrong_root_and_wrong_tree_never_consume() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("future");
+        assert_eq!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                "forged",
+                &root,
+                TREE,
+                b"r",
+                b"g",
+                1
+            )
+            .unwrap(),
+            TokenUse::Forged
+        );
+        assert!(!storage.path().join("blobs/v3").exists());
+        let token = mint_view_token(storage.path(), "family", &root, TREE, 10).unwrap();
+        for (nonce, path, tree, now, expected) in [
+            ("forged", root.clone(), TREE, 11, TokenUse::Forged),
+            (
+                &token.token,
+                root.join("wrong"),
+                TREE,
+                11,
+                TokenUse::WrongRoot,
+            ),
+            (
+                &token.token,
+                root.clone(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                11,
+                TokenUse::WrongTree,
+            ),
+            (
+                &token.token,
+                root.clone(),
+                TREE,
+                token.expires_ms,
+                TokenUse::Expired,
+            ),
+            (&token.token, root.clone(), TREE, 9, TokenUse::Expired),
+        ] {
+            assert_eq!(
+                consume_token_identity(
+                    storage.path(),
+                    "family",
+                    nonce,
+                    &path,
+                    tree,
+                    b"r",
+                    b"g",
+                    now
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            consume_token_identity(
+                storage.path(),
+                "family",
+                &token.token,
+                &root,
+                TREE,
+                b"r",
+                b"g",
+                11
+            )
+            .unwrap(),
+            TokenUse::Accepted { .. }
+        ));
     }
 }

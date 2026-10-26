@@ -79,6 +79,7 @@ pub mod undo;
 pub mod untrust_filter_project;
 pub(crate) mod url_output;
 mod url_resolution;
+pub mod view_token;
 pub mod write;
 pub mod writes_census;
 pub mod zoom;
