@@ -113,6 +113,7 @@ pub mod gh_shim_ticket;
 pub(crate) mod gh_shim_worker_broker;
 #[cfg(unix)]
 pub(crate) mod gh_shim_worker_endpoints;
+pub mod git_index_reader;
 pub(crate) mod git_probe;
 pub mod github_read;
 pub mod grep_executor;
