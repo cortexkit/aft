@@ -1840,6 +1840,62 @@ fn gather_decisions_custom_threshold_changes_all_actions_and_fingerprint() {
 }
 
 #[test]
+fn gather_decisions_rejects_answers_without_noul_type() {
+    for answer in [
+        serde_json::json!({"noul": 0.9}),
+        serde_json::json!({"type": "bool", "noul": 0.9}),
+    ] {
+        let mut reply: serde_json::Value = serde_json::from_str(&decisions_reply()).unwrap();
+        reply["answers"]["keep_1"] = answer;
+        let server = endpoint_server(200, reply.to_string(), None, None);
+        assert!(matches!(
+            decisions_decide(
+                &decisions_config(&server.base, None),
+                Duration::from_secs(2)
+            ),
+            Err(DecisionError::Invalid)
+        ));
+        server.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn gather_decision_url_appends_suffix_by_path_not_host() {
+    use super::endpoint::decision_url;
+    assert_eq!(
+        decision_url("https://decisions", "/decisions").unwrap(),
+        "https://decisions/decisions"
+    );
+    assert_eq!(
+        decision_url("https://api.example.test/v1/", "/decisions").unwrap(),
+        "https://api.example.test/v1/decisions"
+    );
+    assert_eq!(
+        decision_url("https://api.example.test/v1/decisions", "/decisions").unwrap(),
+        "https://api.example.test/v1/decisions"
+    );
+    assert_eq!(
+        decision_url(
+            "http://127.0.0.1:8080/v1/chat/completions/",
+            "/chat/completions"
+        )
+        .unwrap(),
+        "http://127.0.0.1:8080/v1/chat/completions"
+    );
+    for refused in [
+        "ftp://api.example.test/v1",
+        "https://user:secret@api.example.test/v1",
+        "https://api.example.test/v1?x=1",
+        "https://api.example.test/v1#f",
+    ] {
+        assert_eq!(
+            decision_url(refused, "/decisions"),
+            Err(DecisionError::Refused)
+        );
+    }
+}
+
+#[test]
 fn gather_decisions_rejects_missing_non_numeric_and_out_of_range_answers() {
     for value in [
         None,

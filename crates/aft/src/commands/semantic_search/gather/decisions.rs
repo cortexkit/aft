@@ -19,22 +19,7 @@ impl DecisionsModel {
             .as_ref()
             .filter(|model| !model.trim().is_empty())
             .ok_or(DecisionError::Refused)?;
-        let url = url::Url::parse(endpoint).map_err(|_| DecisionError::Refused)?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(DecisionError::Refused);
-        }
-        let base = url.as_str().trim_end_matches('/');
-        let endpoint = if base.ends_with("/decisions") {
-            base.to_owned()
-        } else {
-            format!("{base}/decisions")
-        };
+        let endpoint = super::endpoint::decision_url(endpoint, "/decisions")?;
         let threshold = config.threshold.unwrap_or(0.5);
         if !threshold.is_finite() || threshold <= 0.0 || threshold >= 1.0 {
             return Err(DecisionError::Refused);

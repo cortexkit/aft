@@ -646,7 +646,7 @@ Backend `decisions` uses the native Inception Mercury Decide API. It appends `/d
 }
 ```
 
-The `threshold` must be greater than 0 and less than 1. Its default is 0.5. A keep, expand or stop answer at or above this value selects that operation. Kept candidates use descending `noul` order. AFT selects expansion independently from keep.
+The `threshold` must be greater than 0 and less than 1. Its default is 0.5. A keep, expand or stop answer at or above this value selects that operation. Kept candidates use descending `noul` order. Candidates with equal values keep their frontier order. AFT selects expansion independently from keep.
 
 This backend sends the same conversation text and candidate code as backend `endpoint`. The privacy warning below applies to the two backends.
 

@@ -23,22 +23,7 @@ impl EndpointDecisionModel {
             .as_ref()
             .filter(|model| !model.trim().is_empty())
             .ok_or(DecisionError::Refused)?;
-        let url = url::Url::parse(endpoint).map_err(|_| DecisionError::Refused)?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(DecisionError::Refused);
-        }
-        let base = url.as_str().trim_end_matches('/');
-        let endpoint = if base.ends_with("/chat/completions") {
-            base.to_owned()
-        } else {
-            format!("{base}/chat/completions")
-        };
+        let endpoint = decision_url(endpoint, "/chat/completions")?;
         Ok(Self {
             endpoint,
             model: model.clone(),
@@ -117,6 +102,27 @@ fn http_error(error: reqwest::Error) -> DecisionError {
     } else {
         DecisionError::Unavailable
     }
+}
+
+/// Validates a decision base URL and appends `suffix` unless the URL path
+/// already ends with it. The check uses the path, so a host name cannot match.
+pub(super) fn decision_url(endpoint: &str, suffix: &str) -> Result<String, DecisionError> {
+    let url = url::Url::parse(endpoint).map_err(|_| DecisionError::Refused)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(DecisionError::Refused);
+    }
+    let base = url.as_str().trim_end_matches('/');
+    Ok(if url.path().trim_end_matches('/').ends_with(suffix) {
+        base.to_owned()
+    } else {
+        format!("{base}{suffix}")
+    })
 }
 
 pub(super) fn post_json(
