@@ -2548,6 +2548,9 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             | LangId::Toml => false,
         };
 
+        let is_comment = matches!(kind, "comment" | "line_comment" | "block_comment");
+        let should_include =
+            should_include && (!is_comment || attached_comment(&prev, &current, source, lang));
         if should_include {
             range.start_line = prev.start_position().row as u32;
             range.start_col = prev.start_position().column as u32;
@@ -2558,6 +2561,45 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
     }
 
     range
+}
+
+/// Only own-line, adjacent documentation belongs to a declaration. File
+/// directives and decorative banners must survive replacing that declaration.
+fn attached_comment(comment: &Node, declaration: &Node, source: &str, lang: LangId) -> bool {
+    let line_start = source[..comment.start_byte()]
+        .rfind('\n')
+        .map_or(0, |pos| pos + 1);
+    if !source[line_start..comment.start_byte()]
+        .trim_matches('\u{feff}')
+        .trim()
+        .is_empty()
+        || !is_adjacent_line(comment, declaration, source)
+    {
+        return false;
+    }
+    let text = node_text(source, comment);
+    if text.starts_with("////") || text.starts_with("/***") {
+        return false;
+    }
+    if lang == LangId::Ruby
+        && comment.start_position().row < 2
+        && (text.contains("frozen_string_literal:")
+            || text.contains("coding:")
+            || text.contains("coding=")
+            || text.starts_with("#!"))
+    {
+        return false;
+    }
+    let decoration = text.trim_start_matches(['/', '#', '-', '*']).trim_start();
+    if decoration.starts_with("===")
+        || decoration.starts_with("---")
+        || decoration.starts_with("***")
+        || decoration.starts_with("SPDX-License-Identifier:")
+        || decoration.starts_with("Copyright ")
+    {
+        return false;
+    }
+    true
 }
 
 /// Check if two nodes are on adjacent lines (no blank line between them).
@@ -2572,16 +2614,19 @@ fn is_adjacent_line(upper: &Node, lower: &Node, source: &str) -> bool {
     // Check that there's no blank line between them. Only the bytes between
     // the two nodes are scanned: splitting the whole file into lines here made
     // every documented symbol cost a pass over the entire file. The gap text
-    // starts with the rest of `upper`'s last row and ends with the start of
-    // `lower`'s first row, so the pieces strictly between the first and last
-    // newline are exactly the rows in between.
+    // starts at `upper`'s end and ends at `lower`'s start. Skip the first piece
+    // only when it is the tail of `upper`'s last row, not a separate blank row.
     let gap_start = upper.end_byte().min(source.len());
     let gap_end = lower.start_byte().clamp(gap_start, source.len());
     let gap = &source[gap_start..gap_end];
     #[cfg(test)]
     ADJACENT_LINE_BYTES_SCANNED.with(|bytes| bytes.set(bytes.get() + gap.len()));
     let mut rows = gap.split('\n');
-    rows.next();
+    // A newline-inclusive comment ends at column zero of the next row;
+    // that first gap row is then a real blank, not the comment's tail.
+    if upper.end_position().column != 0 {
+        rows.next();
+    }
     let mut rows = rows.peekable();
     while let Some(row) = rows.next() {
         if rows.peek().is_some() && row.trim().is_empty() {
@@ -13066,6 +13111,83 @@ mod audit11_regressions {
         assert_eq!(
             replaced_bytes(source, LangId::Html, "A", "<h1>C</h1>"),
             "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn trailing_comments_and_ruby_magic() {
+        assert_eq!(
+            replaced_bytes(
+                "int old; // old note\r\nint target() { return 1; }\r\n",
+                LangId::C,
+                "target",
+                "int target() { return 2; }"
+            ),
+            b"int old; // old note\r\nint target() { return 2; }\r\n"
+        );
+        for prefix in [
+            "# frozen_string_literal: true\n",
+            "# coding: utf-8\n",
+            "# coding=utf-8\n",
+            "#!/usr/bin/env ruby\n",
+            "#!/usr/bin/env ruby\n# frozen_string_literal: true\n",
+        ] {
+            let source = format!("{prefix}def target\n  1\nend\n");
+            let expected = format!("{prefix}def target\n  2\nend\n");
+            assert_eq!(
+                replaced_bytes(&source, LangId::Ruby, "target", "def target\n  2\nend"),
+                expected.as_bytes(),
+                "prefix: {prefix:?}"
+            );
+        }
+        for prefix in [
+            "// SPDX-License-Identifier: MIT\n",
+            "// Copyright Example\n",
+            "// === banner ===\n",
+        ] {
+            let source = format!("{prefix}int target() {{ return 1; }}\n");
+            let expected = format!("{prefix}int target() {{ return 2; }}\n");
+            assert_eq!(
+                replaced_bytes(&source, LangId::C, "target", "int target() { return 2; }"),
+                expected.as_bytes(),
+                "prefix: {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_banners_and_detached_docs() {
+        for prefix in [
+            "//// banner\r\n",
+            "/*** banner */\r\n",
+            "/// SPDX-License-Identifier: MIT\r\n",
+            "/// Copyright Example\r\n",
+            "/// === banner ===\r\n",
+            "/// detached\r\n\r\n",
+            "/// detached\n\n",
+            "//! module docs\r\n\r\n",
+        ] {
+            let source = format!("{prefix}#[inline]\r\nfn target() {{}}\r\n");
+            let expected = format!("{prefix}fn target() {{ let x = 1; }}\r\n");
+            assert_eq!(
+                replaced_bytes(
+                    &source,
+                    LangId::Rust,
+                    "target",
+                    "fn target() { let x = 1; }"
+                ),
+                expected.as_bytes(),
+                "prefix: {prefix:?}"
+            );
+        }
+        assert_eq!(
+            replaced_bytes(
+                "/// attached docs\r\n#[inline]\r\nfn target() {}\r\n",
+                LangId::Rust,
+                "target",
+                "fn target() { let x = 1; }"
+            ),
+            b"fn target() { let x = 1; }\r\n"
         );
     }
 

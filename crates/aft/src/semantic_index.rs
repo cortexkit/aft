@@ -12473,7 +12473,7 @@ mod tests {
     // why Windows cannot reproduce the hash); keep Windows -D warnings clean.
     #[cfg(unix)]
     const RUST_QUERY_BASELINE_OUTPUT_HASH: &str =
-        "36315439db74ed8e186076f79ed261079b2b13a4443ed4272861a2518c78d98b";
+        "412db7d3c319fa8e1fe25b5ac81c680be5f2cf22a03ce9e64bd8ab307ffcddd5";
 
     struct CountingLocalProvider {
         calls: Arc<AtomicUsize>,
@@ -12687,9 +12687,9 @@ mod tests {
     // Unix-only: chunk embed text bakes the OS-native relative path into its
     // header (file-summary chunks), so a Windows run hashes "tests\fixtures\…"
     // and can never reproduce the unix-captured baseline even with LF-forced
-    // sources. The property under test — the query-free Rust walk reproduces
-    // the old RS_QUERY output byte-for-byte — is platform-independent and is
-    // pinned where the baseline was captured.
+    // sources. This pins the query-free Rust walk's normalized fixture output
+    // under the current shared range policy. Intentional range-policy changes
+    // can change the hash; walk/query parity is checked separately in the parser.
     #[cfg(unix)]
     #[test]
     fn rust_semantic_fixture_output_matches_query_baseline() {
