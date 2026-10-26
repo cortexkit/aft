@@ -38,7 +38,8 @@ const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
-    let _pin = ctx.pin_config();
+    let config = ctx.config();
+    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
             crate::bounded_io::command(req, ctx, handle_glob_inner)

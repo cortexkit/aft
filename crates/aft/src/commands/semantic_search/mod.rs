@@ -777,7 +777,6 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    let _pin = ctx.pin_config();
     let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
@@ -811,6 +810,8 @@ fn handle_semantic_search_with_disk_fallback(
     ctx: &AppContext,
     allow_disk_fallback: bool,
 ) -> Response {
+    let config = ctx.config();
+    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
