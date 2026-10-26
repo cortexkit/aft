@@ -301,7 +301,14 @@ fn repeated_same_base_republications_do_not_grow_the_rows() {
         &v3::view_dir(storage.path(), FAMILY, "worker-a").unwrap(),
     );
     assert_eq!(refs(storage.path()).len(), 6);
-    let report = sweep(storage.path());
+    // Only the row cap may cut this pass; a slow machine must not.
+    let lock = ReservationLock::acquire(storage.path()).unwrap();
+    let bounds = SweepBounds {
+        reconcile_time: Duration::from_secs(60),
+        ..SweepBounds::default()
+    };
+    let report = sweep_family_locked(storage.path(), FAMILY, &lock, None, bounds, None).unwrap();
+    drop(lock);
     assert!(report.reconcile_complete, "{report:?}");
     let rows = refs(storage.path());
     assert_eq!(rows.len(), 1, "{rows:?}");

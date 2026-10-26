@@ -2,8 +2,8 @@
 //! (with the build claim) single-flight construction.
 //!
 //! A base is published once its membership and lexical plane are complete.
-//! From then on its membership digest, identity and trigram segment are
-//! fixed; its pointer moves only to readiness successors, which may turn
+//! From then on its membership digest, identity and trigram segment (none,
+//! for v3 generations today) are fixed; its pointer moves only to readiness successors, which may turn
 //! `Pending` into `Ready` or `Failed`, `Failed` into `Ready`, and nothing
 //! else. A `Ready` key never changes.
 
@@ -177,11 +177,12 @@ pub const CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(15);
 /// Ruled cap of live bases per family, counting claimed or registered but
 /// unpublished bases.
 pub const LIVE_BASES_PER_FAMILY: i64 = 64;
-/// Initial build reservation cap and extension step (pre-slice-4 ruling).
+/// Initial build reservation cap and extension step, as fixed by the
+/// maintainers' pre-slice-4 ruling (docs/design/views-slice4-opening.md).
 pub const INITIAL_RESERVATION_CAP: u64 = 1 << 30;
 pub const RESERVATION_STEP: u64 = 256 << 20;
 
-/// The ruled initial reservation for a base of `files` members and
+/// The initial reservation (docs/design/views-slice4-opening.md) for a base of `files` members and
 /// `source_bytes` bytes: `ceil_MiB(64 MiB + max(64 KiB × N, 2 × B,
 /// 1.25 × P × max(N/Np, B/Bp)))`, capped at 1 GiB. `history` is a comparable
 /// base's `(peak allocated build bytes P, Np, Bp)`; it is ignored when absent
@@ -533,7 +534,7 @@ pub enum BaseBuild {
 /// Builds a membership-keyed base from strict, stability-checked reads of
 /// `input.paths`, keyed by the tagged membership-and-content digest
 /// (`head_tree = None`, no `git_oid`). Single-flight through the build claim;
-/// admission through the v3 disk budget with the ruled initial reservation.
+/// admission through the v3 disk budget, starting with [`initial_reservation`].
 /// The first publication happens once membership and the lexical plane are
 /// complete; graph and semantic entries stay pending for readiness successors.
 pub fn build_base(

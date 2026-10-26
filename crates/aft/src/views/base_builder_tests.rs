@@ -24,7 +24,8 @@ fn dead_claim(storage: &Path, scope: &str, token: &str, attempt: i64) {
 
 #[test]
 fn the_initial_reservation_follows_the_ruled_formula_and_cap() {
-    // The ruling's AFT fixture: 5,377 files / 87,031,923 bytes, no history.
+    // The opening note's AFT fixture: 5,377 files / 87,031,923 bytes, no
+    // history, which it says reserves 401 MiB.
     assert_eq!(initial_reservation(5_377, 87_031_923, None), 401 * MIB);
     // A 200,000-file repository is capped at 1 GiB, not refused.
     assert_eq!(

@@ -570,7 +570,8 @@ CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   recomputes both digests from the pinned manifest; a `BaseHeader` is
   checked against that result, never trusted. `bound_generation` is
   diagnostic.
-- **Markers.** A `BaseRefMarker` is a read marker in `B/readers/<G>/` whose
+- **Markers.** A `BaseRefMarker` is a read marker in `M/readers/<G>/`, where
+  `M` is the base's member directory and `G` its current generation, whose
   file also carries a per-acquisition `nonce` (omitted, and so unchanged,
   for ordinary readers).
 - **Sweep.** Runs under the reservation lock; marks current, read-marked
