@@ -5323,7 +5323,7 @@ impl CompositePlane for TrigramBridge {
                     .get(path)
                     .filter(|e| e.disk == super::snapshot::DiskState::in_generation(delta, path))
                     .and_then(|e| e.attachments.get(&FamilyPlane::Trigram))
-                    .and_then(|a| a.downcast_ref::<super::trigram::Attachment>())
+                    .and_then(|a| a.downcast_ref::<super::live_delta::Attachment>())
                     .filter(|a| a.content == *content && a.policy == self.policy.fingerprint())
                     .ok_or_else(|| {
                         SiblingLoader::error(

@@ -785,7 +785,7 @@ pub(crate) mod tests {
     #[test]
     fn v3_registration_is_advertised_but_not_prepared() {
         let formats = persisted_format::formats_json();
-        // The registry reads the base-reference protocol (2/2); plane stores
+        // The registry reads verification format/schema version 3; plane stores
         // keep format 1. Neither appears in the startup baseline floor.
         for (name, version) in [("views_v3_registry", 3), ("views_v3_store", 1)] {
             assert_eq!(formats["stores"][name], version, "{name}");
