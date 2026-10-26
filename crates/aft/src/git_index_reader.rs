@@ -534,7 +534,6 @@ impl GitQueries {
                 "check-attr",
                 "--stdin",
                 "-z",
-                "--",
                 "filter",
                 "text",
                 "eol",
