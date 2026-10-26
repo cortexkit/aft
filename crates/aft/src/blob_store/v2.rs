@@ -97,7 +97,7 @@ impl FamilyPlane {
         }
     }
 
-    const fn payload_schema(self) -> u32 {
+    pub(crate) const fn payload_schema(self) -> u32 {
         match self {
             Self::Trigram => TRIGRAM_PAYLOAD_SCHEMA,
             Self::Semantic => crate::blob_store::SEMANTIC_PAYLOAD_SCHEMA,

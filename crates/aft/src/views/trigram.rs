@@ -697,6 +697,72 @@ pub fn materialize(
     })
 }
 
+/// The lexical plane of a v3 generation (a base, or a worker's delta): every
+/// regular entry's trigram payload goes into `blobs/v3/<family>/trigram.sqlite`
+/// through one v3 publication, after `live` protects every key, and the entry
+/// becomes `Ready`. `bytes` holds the strictly read source of each entry; an
+/// entry whose bytes no longer hash to its content fails the whole call.
+///
+/// No segment is written: v3 has no segment rows or segment collection yet,
+/// so v3 generations carry `segment: None` and readers build from payloads.
+pub fn materialize_v3(
+    storage: &Path,
+    family: &str,
+    manifest: &mut super::manifest_v2::ManifestV2,
+    bytes: &BTreeMap<RelPath, Vec<u8>>,
+    live: &mut crate::pins::LivePin,
+    policy: TrigramPolicy,
+) -> Result<(), super::contracts::PlaneError> {
+    if manifest.header().producers.trigram != policy.fingerprint_hex() {
+        return Err(plane_error("trigram producer mismatch"));
+    }
+    let mut payloads = Vec::new();
+    for (path, entry) in manifest.entries() {
+        let super::manifest_v2::EntryV2::Regular { content, size, .. } = entry else {
+            continue;
+        };
+        let source = bytes
+            .get(path)
+            .ok_or_else(|| plane_error(format!("no strict read for {path:?}")))?;
+        if ContentHash::of(source) != *content || source.len() as u64 != *size {
+            return Err(plane_error("source changed during trigram construction"));
+        }
+        let key = crate::blob_store::v2::TrigramKey {
+            content: *content,
+            policy,
+        }
+        .family_key();
+        payloads.push((
+            path.clone(),
+            key,
+            TrigramPayload::extract(source, &policy).encode(),
+        ));
+    }
+    // Protect every key before the first put, as the v2 materializer does.
+    live.protect(&payloads.iter().map(|(_, key, _)| *key).collect::<Vec<_>>())
+        .map_err(|e| plane_error(e.to_string()))?;
+    let request = payloads
+        .iter()
+        .map(|(_, _, payload)| payload.len() as u64)
+        .sum::<u64>()
+        .saturating_mul(2)
+        .saturating_add(1 << 20);
+    let schema = FamilyPlane::Trigram.payload_schema();
+    crate::blob_store::v3::publish(storage, family, request, None, |publication| {
+        for (_, key, payload) in &payloads {
+            publication.put(key, payload, schema)?;
+        }
+        Ok(())
+    })
+    .map_err(|e| plane_error(e.to_string()))?;
+    for (path, key, _) in &payloads {
+        if let Some(super::manifest_v2::EntryV2::Regular { planes, .. }) = manifest.get_mut(path) {
+            planes.trigram = Some(super::readiness::PlaneState::ready(key));
+        }
+    }
+    Ok(())
+}
+
 type Residents = BTreeMap<(String, String), Arc<GenerationIndex>>;
 
 /// Resident immutable data shared across checkout opens. Register explicitly
