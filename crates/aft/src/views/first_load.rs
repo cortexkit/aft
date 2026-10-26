@@ -2095,8 +2095,8 @@ impl CheckoutDriver {
         delta.record_intent(path);
         // Membership is unchanged, so are the ignore rules it was walked under.
         delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
-        // A known path cannot repair an earlier stream-wide delivery gap.
-        delta.set_watcher(installed.snapshot.watcher());
+        // One known-path event cannot prove that delivery remained continuous
+        // for the whole watcher stream.
         installed.snapshot = delta
             .snapshot()
             .with_readers(installed.readers.clone())
@@ -4216,6 +4216,17 @@ mod composite_tests {
             ),
         );
         let snapshot = delta.snapshot();
+        // The install check needs an identity recorded by the driver. Reconcile
+        // and install here; the name `installed-worker` alone is not that proof.
+        let (reconciled, revision) = SiblingLoader::reconciled_snapshot(
+            driver.as_ref(),
+            &access,
+            snapshot.generation().clone(),
+        )
+        .unwrap();
+        driver.install(&access, &reconciled, revision).unwrap();
+        let snapshot =
+            snapshot.with_install_cut(driver.installed_snapshot().install_cut().unwrap().clone());
         let published = driver
             .build_own_generation(&access, &snapshot, false)
             .unwrap();
@@ -5383,10 +5394,10 @@ impl CheckoutDriver {
                     .snapshot
                     .install_cut()
                     .and_then(|cut| cut.verification.as_ref())
-                    .and_then(|guard| guard.subscription)
-                    .is_some_and(|expected| {
-                        crate::watcher_backend::subscription::current(self.owner.root())
-                            != Some(expected)
+                    .is_some_and(|guard| {
+                        guard.subscription.is_none()
+                            || crate::watcher_backend::subscription::current(self.owner.root())
+                                != guard.subscription
                     })
         };
         if stale {
@@ -5839,6 +5850,32 @@ mod v3_bootstrap_tests {
     }
 
     #[test]
+    fn no_subscription_keeps_v3_queries_on_the_strict_path_until_registration() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        std::fs::write(root.path().join("file.rs"), b"fn observed() {}\n").unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        let access = driver.access();
+        let (snapshot, revision) = driver
+            .verified_bind(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &snapshot, revision).unwrap();
+        assert!(driver.installed_snapshot().needs_reconcile());
+        driver.take_reconcile_work();
+        let _subscription = crate::watcher_backend::subscription::start(
+            &std::fs::canonicalize(root.path()).unwrap(),
+        );
+        let (snapshot, revision) = driver
+            .verified_bind(&access, snapshot.generation().clone())
+            .unwrap();
+        assert_eq!(driver.take_reconcile_work().walks, 1);
+        driver.install(&access, &snapshot, revision).unwrap();
+        assert!(!driver.installed_snapshot().needs_reconcile());
+    }
+
+    #[test]
     fn v3_lazy_attachments_probe_the_actual_producer_key_before_extraction() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let root = tempfile::tempdir().unwrap();
@@ -5934,6 +5971,9 @@ mod v3_bootstrap_tests {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        let _subscription = crate::watcher_backend::subscription::start(
+            &std::fs::canonicalize(root.path()).unwrap(),
+        );
         let source = b"fn fresh_checkout() { let marker = 42; }\n";
         std::fs::write(root.path().join("file.rs"), source).unwrap();
         std::fs::OpenOptions::new()
