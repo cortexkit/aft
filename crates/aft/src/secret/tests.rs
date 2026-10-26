@@ -243,27 +243,31 @@ fn the_fake_collects_audit_records_in_order() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_secret_consent_carries_the_vaults_request_and_no_answer() {
+fn a_secret_consent_files_exactly_the_single_phone_item() {
+    use sha2::{Digest, Sha256};
+    let vector = include_str!("../../tests/fixtures/secret/single-phone-get.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(vector.as_bytes())),
+        "81794c4c98c77fb57813d8cb4c396c52da17bab4c1e8e7f56c113f4a521cb4a8"
+    );
+    let vector: serde_json::Value = serde_json::from_str(vector).unwrap();
+    let item = &vector["result"]["secretUse"]["items"][0];
+    let request_id = item["request_id"].as_str().unwrap();
+    let statement = item["statement_b64url"].as_str().unwrap();
     let request = SecretConsentRequest {
         scope: production_scope(),
         label: "repo".into(),
-        request_id: "req-9".into(),
-        statement_b64url: "c3RhdGVtZW50".into(),
+        request_id: request_id.into(),
+        statement_b64url: statement.into(),
     };
-    let params = request_params(&request);
-    assert_eq!(params["kind"], serde_json::json!(SECRET_CONSENT_KIND));
-    assert_eq!(params["label"], serde_json::json!("repo"));
-    assert_eq!(params["request_id"], serde_json::json!("req-9"));
-    assert_eq!(
-        params["statement_b64url"],
-        serde_json::json!("c3RhdGVtZW50")
+    let expected = format!(
+        r#"{{"kind":"secret_use","secret_use":{{"items":[{{"request_id":"{request_id}","statement_b64url":"{statement}"}}]}}}}"#
     );
-    // A secret ask borrows nothing from the filesystem grant shape, and it
-    // carries no answer: only Cingulate's record decides.
-    assert!(params.get("paths").is_none());
-    assert!(params.get("call_key").is_none());
-    assert!(params.get("args_hash").is_none());
-    assert!(params.get("outcome").is_none());
+    assert_eq!(
+        serde_json::to_string(&request_params(&request)).unwrap(),
+        expected
+    );
     let rendered = format!("{request:?}");
-    assert!(rendered.contains("req-9"), "{rendered}");
+    assert!(rendered.contains(request_id), "{rendered}");
+    assert!(!rendered.contains(statement), "{rendered}");
 }
