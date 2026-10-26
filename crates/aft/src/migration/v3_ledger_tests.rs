@@ -1,4 +1,5 @@
 use std::path::Path;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -7,6 +8,7 @@ use crate::migration::v3_import::tests::{
     checkout, deterministic, legacy_semantic, legacy_trigram, producer, snapshot_tree, FAMILY, KEY,
     POLICY,
 };
+#[cfg(unix)]
 use crate::views::segment_store::TrigramPayload;
 
 fn request(storage: &Path, root: &Path, semantic: Option<SemanticProducer>) -> V3ImportRequest {
@@ -371,9 +373,12 @@ fn a_ledger_from_a_newer_build_is_refused_by_name() {
 // durable boundary of the trigram import; the next run must finish the import
 // from that state with nothing lost, duplicated or left in staging.
 
+#[cfg(unix)]
 const KILL_SUBJECT: &str = "AFT_V3_IMPORT_KILL_SUBJECT";
+#[cfg(unix)]
 const KILL_AT: &str = "AFT_V3_IMPORT_KILL_AT";
 
+#[cfg(unix)]
 fn step_name(step: V3Step) -> String {
     match step {
         V3Step::BatchRegistered(batch) => format!("batch-{batch}"),
@@ -381,11 +386,13 @@ fn step_name(step: V3Step) -> String {
     }
 }
 
+#[cfg(unix)]
 struct Park {
     at: String,
     ready: PathBuf,
 }
 
+#[cfg(unix)]
 impl V3ImportObserver for Park {
     fn reached(&self, artifact: LegacyArtifact, step: V3Step) {
         if artifact != LegacyArtifact::Trigram || step_name(step) != self.at {

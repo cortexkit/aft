@@ -608,11 +608,11 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
 
 - The implemented registry remains `views_v3_registry` format/schema **1/1**.
   Reserve **2/2** for slice 4's base-reference protocol, **3/3** for 4v's token
-  and stat-evidence protocol, **4/4** for slice 5's donor-seal protocol, and
-  5/5, earlier reserved for 6a, is **not used** by 6a: its import ledger is a
-  sidecar file and its symbol plane is an ordinary plane store (see *Import
-  ledger and symbol plane* below), so neither changes the registry schema.
-  These versions gate the whole member
+  and stat-evidence protocol and **4/4** for slice 5's donor-seal protocol.
+  Version 5/5, earlier reserved for slice 6a's symbol and import protocol, is
+  **not used**: the import ledger is a sidecar file and the symbol plane is an
+  ordinary plane store (see *Import ledger and symbol plane* below), so neither
+  changes the registry schema. These versions gate the whole member
   protocol, including its sidecars; a version can advance without adding a
   registry table. An owning slice
   installs its complete schema through an explicit versioned upgrade, never a
@@ -636,11 +636,11 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
   registry-floor version that makes unsupported readers refuse.
 - Every artifact publication uses the combined v3 floor boundary. Slice 4
   requests registry floor 2 before its artifacts; 4v requests 3 before stat
-  evidence or tokens; 5 requests 4 before donor/seal publication. 6a writes
-  its symbol plane and import ledger only inside `blob_store::v3::publish`,
-  which requests registry floor 1 and store floor 1 before creating either
-  file. Every publisher also requests store floor 1. These are future written
-  versions, not changes to today's startup baseline.
+  evidence or tokens; 5 requests 4 before donor/seal publication. Slice 6a
+  writes its symbol plane and import ledger only inside
+  `blob_store::v3::publish`, which requests registry floor 1 and store floor 1
+  before creating either file. Every publisher also requests store floor 1.
+  These are future written versions, not changes to today's startup baseline.
 
 ### Assigned paths and owners
 
@@ -669,10 +669,11 @@ Slice 4's binder must honour the `evicting` contract above: when it finds its
 member in `evicting`, it never uses that view directory, and either treats the
 member as absent and publishes a fresh one or waits for the eviction to finish.
 
-## Import ledger and symbol plane (6a)
+## Import ledger and symbol plane
 
-Sources: `crates/aft/src/migration/v3_import.rs` (ledger, decoders, staging,
-registration), `crates/aft/src/migration/v3_symbols.rs` (symbol importer) and
+Sources: `crates/aft/src/migration/v3_import.rs` (decoders, staging,
+registration), `crates/aft/src/migration/v3_ledger.rs` (ledger and driver),
+`crates/aft/src/migration/v3_symbols.rs` (symbol importer) and
 `crates/aft/src/views/symbol_store.rs` (symbol plane). Imports write only
 under `blobs/v3/<family>/` and their own staging directory; they never write
 a v1 or v2 row, manifest, pointer or schema, and never move, change or delete
@@ -688,7 +689,8 @@ a legacy file.
   iterate) but is in `FamilyPlane::V3_STORES`, which the v3 plane-row sweep
   and `v3_format_report` use. No manifest entry records symbol readiness.
 - Key: BLAKE3 over the tag `aft/views-v3/symbol/v1`, then the content hash
-  (32 bytes), the language id and the producer id, each preceded by its
+  (32 bytes), the language id (the parser's `LangId` name, for example
+  `Rust`) and the producer id, each preceded by its
   length as a big-endian u64. The producer id is
   `aft-symbols/extraction-<SCHEMA_VERSION>` (`symbol_cache_disk::SCHEMA_VERSION`,
   bumped on any grammar, query or extractor change), so a parser or schema
@@ -715,9 +717,10 @@ A sidecar SQLite file, not a registry table: `members.sqlite` and its
 version are unchanged. It is created, and every row transition is written,
 inside a `v3::publish` call (64 KiB reservation), so the file exists only
 after the v3 floor is raised and each write holds the reservation lock.
-Readers (status, prune eligibility, retention) copy the database and its WAL
-to a private temporary directory and read the copy, so a read never writes
-under the storage root.
+Readers (status, prune eligibility, retention) use this process's ledger
+connection when it has one; otherwise they copy the database and its WAL to a
+private temporary directory and read the copy, so a read never writes under
+the storage root. `aft cache prune-legacy` reads `members.sqlite` the same way.
 
 ```sql
 CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -766,9 +769,10 @@ import, and a producer change starts a new row.
 - **done:** the staging bundle is removed.
 
 Inputs have no size limit. The decoders stream: the trigram `cache.bin`
-is checksummed in one sequential pass, then inverted in file-id ranges
-whose postings fit a working-set budget (64 MiB by default), one pass over
-the posting blob per range; `semantic.bin` is decoded one file's rows at a
+is checksummed in one sequential pass, its postings are counted per file in
+one pass over the posting blob, then inverted in file-id ranges whose
+postings fit a working-set budget (64 MiB by default), one more pass per
+range; `semantic.bin` is decoded one file's rows at a
 time. Memory is bounded by the per-file tables (path, size and hash per
 file) plus the budget, never by the input size. The `semantic.bin` decoder
 is read-only and refuses trailing bytes (appended segments or a torn tail)

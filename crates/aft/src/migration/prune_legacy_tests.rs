@@ -261,8 +261,8 @@ fn a_set_a_live_v3_import_reads_is_never_prune_eligible() {
     drop(held);
 }
 
-/// The slice-4 base protocol is consulted: a live base build in the family
-/// of the same name pins the legacy set; a dead builder does not.
+/// The v3 registry's base-build claims are consulted: a live base build in
+/// the family of the same name pins the legacy set; a dead builder does not.
 #[test]
 fn a_live_v3_base_build_pins_the_family_legacy_set() {
     let _serial = v3::serial_for_test();
