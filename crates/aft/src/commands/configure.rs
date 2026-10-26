@@ -15488,6 +15488,22 @@ mod tests {
         assert!(handle_configure_for_test(&configure_with_storage(&root, &storage), &ctx).success);
         wait_for_search_index_ready(&ctx, Duration::from_secs(10));
         assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+        let floor = std::fs::read(storage.join("reader-floor.json")).ok();
+        assert!(crate::commands::grep::handle_grep(&grep_request("needle"), &ctx).success);
+        let off_glob: RawRequest = serde_json::from_value(json!({
+            "id": "lexical-off-glob", "command": "glob", "pattern": "**/*"
+        }))
+        .unwrap();
+        assert!(crate::commands::glob::handle_glob(&off_glob, &ctx).success);
+        assert!(
+            crate::commands::semantic_search::handle_semantic_search(
+                &semantic_search_request("needle"),
+                &ctx
+            )
+            .success
+        );
+        assert_eq!(std::fs::read(storage.join("reader-floor.json")).ok(), floor);
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
         assert!(!storage.join("blobs/v3").exists());
         let stale =
             SearchIndex::build_with_limit_serial(&root, ctx.config().search_index_max_file_size);
@@ -15598,6 +15614,8 @@ mod tests {
             )
             .success
         );
+        let initialized = ctx.lexical_view_snapshot("bind").unwrap();
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
         let source = ctx.lexical_source_for_test();
         let counted = Arc::new(Counted {
             source,
