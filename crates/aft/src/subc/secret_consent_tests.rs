@@ -370,7 +370,11 @@ fn every_ineligible_form_refuses_with_secret_refused_and_never_resolves() {
         };
         assert_eq!(outcome.code(), Some(SECRET_REFUSED), "{name}");
         assert_eq!(vault.resolve_calls(), 0, "{name}: no resolve may happen");
-        assert_eq!(vault.material_calls(), 0, "{name}: no material may be asked");
+        assert_eq!(
+            vault.material_calls(),
+            0,
+            "{name}: no material may be asked"
+        );
     }
 }
 
@@ -599,11 +603,7 @@ fn a_run_whose_parent_link_is_not_live_is_ineligible() {
     // Every non-`linked` state, and a stamp that carries no state at all, is a
     // link the daemon has not confirmed: the run has no head lifetime to
     // follow, so it never reaches the vault.
-    for state in [
-        Some(ParentState::Pending),
-        Some(ParentState::Ended),
-        None,
-    ] {
+    for state in [Some(ParentState::Pending), Some(ParentState::Ended), None] {
         let run = bound(&head, run_stamp("run-1", "head", 7, state));
         assert_eq!(
             call_scopes(&run),

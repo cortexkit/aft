@@ -238,9 +238,9 @@ pub(crate) fn resolve_label_for_launch(
     let outcome = crate::secret::outcome_for(label, &vault.resolve(&scopes.authorization, label));
     match outcome {
         LabelOutcome::Proceed => match vault.resolve(&scopes.authorization, label) {
-            Resolution::Granted {
-                rule, grant_id, ..
-            } => LaunchDecision::Proceed { rule, grant_id },
+            Resolution::Granted { rule, grant_id, .. } => {
+                LaunchDecision::Proceed { rule, grant_id }
+            }
             // A vault that grants on one call and then does not on the next is
             // not a vault this launch can proceed on.
             other => LaunchDecision::Refuse(crate::secret::outcome_for(label, &other)),
