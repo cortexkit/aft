@@ -111,7 +111,8 @@ impl PersistedStore {
             PersistedStore::ArtifactOwner => crate::artifact_owner::SCHEMA_VERSION,
             PersistedStore::BackupMeta => crate::backup::SCHEMA_VERSION,
             PersistedStore::BashTask => crate::bash_background::persistence::SCHEMA_VERSION,
-            PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store => 1,
+            PersistedStore::ViewsV3Registry => crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION,
+            PersistedStore::ViewsV3Store => 1,
         }
     }
 
