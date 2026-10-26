@@ -62,6 +62,30 @@ fn root() -> ProjectRootId {
         .clone()
 }
 
+/// A run stamp linked to `parent` with an explicit link state and the parent's
+/// epoch, so a test can vary exactly one of them.
+fn run_stamp(
+    name: &str,
+    parent: &str,
+    parent_epoch: u64,
+    state: Option<subc_protocol::scope::ParentState>,
+) -> ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "ref": name,
+        "scope_epoch": 7,
+        "kind": "ephemeral",
+        "owner_authorized": true,
+        "parent": {
+            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "ref": parent,
+            "scope_epoch": parent_epoch,
+        },
+        "parent_state": state,
+    }))
+    .unwrap()
+}
+
 fn principal(id: &str) -> AuthenticatedPrincipal {
     AuthenticatedPrincipal::RouteBind {
         trust: PrincipalTrust::FirstParty,
@@ -331,13 +355,22 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
 
 #[test]
 fn every_ineligible_form_refuses_with_secret_refused_and_never_resolves() {
-    let vault = FakeVault::new();
     for (name, identity, expected) in ineligible_cases() {
         assert_eq!(call_scopes(&identity), Err(expected), "{name}");
-        let outcome = refuse_ineligible("repo", expected);
+        // The check above is structural; this one proves the launch entry a
+        // bash or fetch launch actually calls stops here. A vault that would
+        // grant the label is installed, so a launch that reached it would
+        // proceed: the counts below are only zero if the seam refused first.
+        let vault = FakeVault::new();
+        vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
+        vault.set_material("repo", vec![b"first-key-material-1".to_vec()]);
+        let decision = resolve_label_for_launch(&identity, &vault, "repo");
+        let LaunchDecision::Refuse(outcome) = decision else {
+            panic!("{name}: an ineligible scope must refuse, got {decision:?}");
+        };
         assert_eq!(outcome.code(), Some(SECRET_REFUSED), "{name}");
-        // The refusal happens before any vault call.
-        assert_eq!(vault.resolve_calls(), 0, "{name}");
+        assert_eq!(vault.resolve_calls(), 0, "{name}: no resolve may happen");
+        assert_eq!(vault.material_calls(), 0, "{name}: no material may be asked");
     }
 }
 
@@ -557,4 +590,97 @@ fn a_worker_run_parented_to_its_own_head_is_still_eligible() {
         call_scopes(&worker_run),
         Err(Ineligibility::WorkerRunSession)
     );
+}
+
+#[test]
+fn a_run_whose_parent_link_is_not_live_is_ineligible() {
+    use subc_protocol::scope::ParentState;
+    let head = head();
+    // Every non-`linked` state, and a stamp that carries no state at all, is a
+    // link the daemon has not confirmed: the run has no head lifetime to
+    // follow, so it never reaches the vault.
+    for state in [
+        Some(ParentState::Pending),
+        Some(ParentState::Ended),
+        None,
+    ] {
+        let run = bound(&head, run_stamp("run-1", "head", 7, state));
+        assert_eq!(
+            call_scopes(&run),
+            Err(Ineligibility::RunNotBound),
+            "{state:?}"
+        );
+    }
+}
+
+#[test]
+fn a_run_parented_at_another_epoch_than_its_bound_head_is_ineligible() {
+    use subc_protocol::scope::ParentState;
+    let head = head();
+    // The bound head's stamp is at epoch 7; a link one generation either way
+    // names a different head lifetime, so the run cannot borrow this head.
+    for parent_epoch in [8u64, 6] {
+        let run = bound(
+            &head,
+            run_stamp("run-1", "head", parent_epoch, Some(ParentState::Linked)),
+        );
+        assert_eq!(
+            call_scopes(&run),
+            Err(Ineligibility::WorkerRunSession),
+            "parent epoch {parent_epoch}"
+        );
+    }
+    // The matching epoch is the only one that is eligible.
+    let run = bound(
+        &head,
+        run_stamp("run-1", "head", 7, Some(ParentState::Linked)),
+    );
+    assert!(call_scopes(&run).is_ok());
+}
+
+#[test]
+fn a_run_bound_to_a_head_stamp_of_the_wrong_kind_is_ineligible() {
+    use subc_protocol::scope::ParentState;
+    // The bound route's help is a prefrontal-core stamp, but of a worker kind:
+    // only a Head stamp makes a codemode run's head an agent's head.
+    let worker_headed = classic(Some(parented_stamp("head", "worker", "head")));
+    let run = bound(
+        &worker_headed,
+        run_stamp("run-1", "head", 7, Some(ParentState::Linked)),
+    );
+    assert_eq!(call_scopes(&run), Err(Ineligibility::HeadScopeNotAlfonso));
+
+    // An ephemeral stamp on the bound head is not a Head either.
+    let ephemeral_headed = classic(Some(parented_stamp("head", "ephemeral", "root")));
+    let run = bound(
+        &ephemeral_headed,
+        run_stamp("run-1", "head", 7, Some(ParentState::Linked)),
+    );
+    assert_eq!(call_scopes(&run), Err(Ineligibility::HeadScopeNotAlfonso));
+}
+
+#[test]
+fn a_run_bound_to_an_unauthorized_head_stamp_is_ineligible() {
+    use subc_protocol::scope::ParentState;
+    // The head route's stamp has the right owner and kind but is not
+    // owner-authorized, which is part of being an Alfonso stamp. The launch
+    // entry must refuse it without asking the vault anything.
+    let mut unauthorized = stamp("head", "head");
+    unauthorized.owner_authorized = false;
+    let head = classic(Some(unauthorized));
+    let run = bound(
+        &head,
+        run_stamp("run-1", "head", 7, Some(ParentState::Linked)),
+    );
+    assert_eq!(call_scopes(&run), Err(Ineligibility::HeadScopeNotAlfonso));
+
+    let vault = FakeVault::new();
+    vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
+    let decision = resolve_label_for_launch(&run, &vault, "repo");
+    let LaunchDecision::Refuse(outcome) = decision else {
+        panic!("an unauthorized head stamp must refuse, got {decision:?}");
+    };
+    assert_eq!(outcome.code(), Some(SECRET_REFUSED));
+    assert_eq!(vault.resolve_calls(), 0);
+    assert_eq!(vault.material_calls(), 0);
 }

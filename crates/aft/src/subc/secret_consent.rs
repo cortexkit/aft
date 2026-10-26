@@ -28,7 +28,7 @@ use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 use crate::secret::{
     file_consent, withhold_consent, CallScopes, ConsentOutcome, EligibilityForm, Ineligibility,
-    SecretConsentRequest, SecretScope,
+    LabelOutcome, Resolution, SecretConsentRequest, SecretScope,
 };
 use subc_protocol::call_mode::CallMode;
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
@@ -196,6 +196,68 @@ pub(super) fn withdraw_secret_consent(pending: &PendingSecretConsent) {
 /// Whether a stamp is one this seam may ever hand to a vault.
 pub(super) fn is_command_stamp(stamp: &ScopeStamp) -> bool {
     alfonso_of_kind(stamp, &COMMAND_SCOPE_KINDS)
+}
+
+/// What one launch decided for one label, before anything starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchDecision {
+    /// The label may be used: the rule to follow and the grant to ask for
+    /// material with.
+    Proceed {
+        /// The label's rule, as the vault resolved it.
+        rule: secret_rules::location::LabelRule,
+        /// The grant the material call names.
+        grant_id: String,
+    },
+    /// The launch is held until the user answers the filed ask.
+    Pending(PendingSecretConsent),
+    /// The launch ends with this outcome, whose code names the reason.
+    Refuse(LabelOutcome),
+}
+
+/// Resolve one scanned label for the launch on `identity`: the one entry a
+/// bash or fetch launch calls for each label it found in the command text.
+///
+/// The order is the outcome table's: an ineligible scope refuses with
+/// `secret_refused` before the vault is asked anything, then resolution decides
+/// between proceeding, holding the call for consent, and refusing. A label the
+/// vault needs an answer for files one consent ask under the call's
+/// authorization scope, and Cingulate's answer alone never grants: the retried
+/// launch resolves again.
+pub(crate) fn resolve_label_for_launch(
+    identity: &RouteIdentity,
+    vault: &dyn crate::secret::SecretVault,
+    label: &str,
+) -> LaunchDecision {
+    let (scopes, _) = match call_scopes(identity) {
+        Ok(scopes) => scopes,
+        Err(reason) => {
+            return LaunchDecision::Refuse(crate::secret::refuse_ineligible(label, reason))
+        }
+    };
+    let outcome = crate::secret::outcome_for(label, &vault.resolve(&scopes.authorization, label));
+    match outcome {
+        LabelOutcome::Proceed => match vault.resolve(&scopes.authorization, label) {
+            Resolution::Granted {
+                rule, grant_id, ..
+            } => LaunchDecision::Proceed { rule, grant_id },
+            // A vault that grants on one call and then does not on the next is
+            // not a vault this launch can proceed on.
+            other => LaunchDecision::Refuse(crate::secret::outcome_for(label, &other)),
+        },
+        LabelOutcome::FileConsent {
+            request_id,
+            statement_b64url,
+        } => match file_secret_consent(&scopes, label, &request_id, &statement_b64url) {
+            Ok(pending) => LaunchDecision::Pending(pending),
+            Err(code) => LaunchDecision::Refuse(crate::secret::refuse(
+                code,
+                label,
+                "the consent ask could not be filed",
+            )),
+        },
+        refusal => LaunchDecision::Refuse(refusal),
+    }
 }
 
 /// The eligibility answer for the tool call executing on this thread.
