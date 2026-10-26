@@ -685,6 +685,17 @@ when its generation, root, policy, file identity, timestamps and racy checks
 all agree. Missing, corrupt or future evidence means reading source again.
 Evidence does not upgrade membership-keyed bases to tree-keyed identities.
 
+Evidence staging is `M/.stat-evidence-<generation>.sqlite.tmp.<nonce>` (and
+SQLite's `-journal`, `-wal`, `-shm` suffixes if present), so a crashed write has
+an attributable generation. The prepared-generation pin is acquired before
+the manifest or evidence is exposed and remains held through publication.
+The existing generation sweep discovers the permanent database and these
+temporaries and retires them in the same pin-checked claim as the generation;
+its existing moved-file/unlink accounting includes their bytes. Current and
+pinned generations retain evidence and staging regardless of age. Abandoned
+staging is removed only when its generation retires, never by a second sweep
+or by a timer that can bypass a live pin.
+
 Policy capture uses counted `git config --list --show-origin -z` **and**
 `git var GIT_ATTR_SYSTEM` / `git var GIT_ATTR_GLOBAL`, rather than guessing
 an installation prefix for attribute sources. This supersedes the earlier

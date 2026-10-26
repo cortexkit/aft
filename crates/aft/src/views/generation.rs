@@ -19,6 +19,10 @@ use serde::{
 
 use super::{Result, ViewError, ViewStore};
 
+#[cfg(test)]
+#[path = "generation/stat_evidence_tests.rs"]
+mod stat_evidence_tests;
+
 // Protection scans must finish within one common allowance before any unlink.
 pub(super) const GENERATION_DIRECTORY_LIMIT: usize = 65_536;
 const MAX_CLAIM_FILES: usize = 16;
@@ -92,6 +96,48 @@ fn unlink_generation_file(path: &Path) -> Option<u64> {
     let bytes = fs::symlink_metadata(path).ok()?.len();
     fs::remove_file(path).ok()?;
     Some(bytes)
+}
+
+fn stat_evidence_namespace(view_dir: &Path) -> bool {
+    fn named(path: &Path, name: &str) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|actual| {
+                if cfg!(windows) {
+                    actual.eq_ignore_ascii_case(name)
+                } else {
+                    actual == name
+                }
+            })
+    }
+    let Some(views) = view_dir.parent() else {
+        return false;
+    };
+    let Some(family) = views.parent() else {
+        return false;
+    };
+    let Some(v3) = family.parent() else {
+        return false;
+    };
+    let Some(blobs) = v3.parent() else {
+        return false;
+    };
+    named(views, "views") && named(v3, "v3") && named(blobs, "blobs")
+}
+
+fn stat_evidence_generation(name: &str) -> Option<&str> {
+    name.strip_prefix("stat-evidence-")
+        .and_then(|name| {
+            [".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix))
+        })
+        .or_else(|| {
+            name.strip_prefix(".stat-evidence-")
+                .and_then(|name| name.split_once(".sqlite.tmp."))
+                .filter(|(_, nonce)| !nonce.is_empty())
+                .map(|(generation, _)| generation)
+        })
 }
 
 // A view has at most one cleanup worker. Publications arriving during a sweep
@@ -780,6 +826,7 @@ impl ViewStore {
 
     fn has_superseded_artifacts(&self) -> Result<bool> {
         let current = self.pointer_census()?.generation;
+        let evidence = stat_evidence_namespace(self.view_dir());
         let (entries, reached_end) =
             bounded_directory_entries(self.view_dir(), 0, GENERATION_DIRECTORY_LIMIT)?;
         if !reached_end {
@@ -820,7 +867,8 @@ impl ViewStore {
                         name.split_once(".json.tmp.")
                             .map(|(generation, _)| generation)
                     })
-                });
+                })
+                .or_else(|| evidence.then(|| stat_evidence_generation(name)).flatten());
             if generation.is_some_and(|generation| current.as_deref() != Some(generation)) {
                 return Ok(true);
             }
@@ -855,6 +903,7 @@ impl ViewStore {
         let mut generations = std::collections::BTreeSet::new();
         let mut derived_owners = std::collections::BTreeSet::new();
         let mut temporaries: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let evidence = stat_evidence_namespace(self.view_dir());
         // A directory over the limit is examined one window per pass, so the
         // leak it holds can still shrink. Each pass moves the window on.
         let windows = OVERSIZED_WINDOWS.get_or_init(Default::default);
@@ -912,9 +961,12 @@ impl ViewStore {
                 .or_else(|| {
                     name.strip_prefix(".manifest-")
                         .and_then(|s| s.split_once(".json.tmp.").map(|(generation, _)| generation))
-                });
+                })
+                .or_else(|| evidence.then(|| stat_evidence_generation(name)).flatten());
             if let Some(generation) = generation {
-                if name.starts_with(".manifest-") {
+                if name.starts_with(".manifest-")
+                    || (evidence && name.starts_with(".stat-evidence-"))
+                {
                     temporaries
                         .entry(generation.to_owned())
                         .or_default()
@@ -1069,13 +1121,20 @@ impl ViewStore {
             // claim bound stops this pass partway, the manifest may be left
             // without its sidecar (blob GC then decodes the JSON), but the
             // sidecar is never left behind its manifest.
-            for path in [
+            let mut artifacts = vec![
                 self.view_dir().join(format!("derived-{generation}.sqlite")),
                 self.view_dir().join(format!("derived-{generation}.ref")),
                 self.trigram_path(generation)?,
                 sidecar.clone(),
                 self.manifest_path(generation)?,
-            ] {
+            ];
+            if stat_evidence_namespace(self.view_dir()) {
+                artifacts.insert(
+                    3,
+                    super::verification::evidence_path(self.view_dir(), generation),
+                );
+            }
+            for path in artifacts {
                 let sqlite = path.extension().is_some_and(|ext| ext == "sqlite");
                 // A kept clone-baseline manifest keeps its sidecar too.
                 if keep_derived

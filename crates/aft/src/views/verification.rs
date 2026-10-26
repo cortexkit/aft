@@ -625,8 +625,9 @@ pub(crate) fn evidence_path(dir: &Path, generation: &str) -> PathBuf {
     dir.join(format!("stat-evidence-{generation}.sqlite"))
 }
 
-/// Writes the evidence before the CAS. Its generation and content digests are
-/// checked on read, so an unpublished or obsolete sidecar supplies no proof.
+/// Writes evidence while the caller holds the prepared-generation pin, before
+/// the CAS. Generation and content digests are checked on read, so an
+/// unpublished or obsolete sidecar supplies no proof.
 pub(crate) fn write_evidence(
     route: &super::snapshot::V3Route,
     generation: &str,
@@ -644,7 +645,7 @@ pub(crate) fn write_evidence(
     let dir = route.member_dir();
     let destination = evidence_path(&dir, generation);
     let staging = dir.join(format!(
-        "stat-evidence-{}.staging",
+        ".stat-evidence-{generation}.sqlite.tmp.{}",
         super::base_refs::fresh_nonce()
     ));
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
