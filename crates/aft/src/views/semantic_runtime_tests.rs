@@ -38,11 +38,11 @@ fn reconciled_delta_does_not_request_another_source_walk() {
     delta.apply(path.clone(), entry);
     assert!(!super::needs_reload(&delta.snapshot()));
     let root = tempfile::tempdir().unwrap();
-    let missing = root.path().join("source-probe-must-not-run");
-    assert!(!super::needs_cold_reconcile(&delta.snapshot(), &missing));
+    std::fs::create_dir(root.path().join("file.rs")).unwrap();
+    assert!(!super::needs_cold_reconcile(&delta.snapshot(), root.path()));
     delta.record_intent(path);
     assert!(super::needs_reload(&delta.snapshot()));
-    assert!(super::needs_cold_reconcile(&delta.snapshot(), &missing));
+    assert!(super::needs_cold_reconcile(&delta.snapshot(), root.path()));
 }
 
 /// The test prints public setup, query answers, a v3 file inventory and exact
