@@ -978,7 +978,7 @@ mod tests {
         drop(generation);
     }
 
-    fn legacy_inventory(storage: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn inventory(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         fn visit(
             root: &std::path::Path,
             dir: &std::path::Path,
@@ -5898,7 +5898,7 @@ mod v3_bootstrap_tests {
         }
     }
 
-    fn inventory(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn legacy_inventory(storage: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         fn visit(
             base: &std::path::Path,
             path: &std::path::Path,
