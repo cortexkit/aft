@@ -8,21 +8,29 @@ use crate::{
 
 pub fn handle_view_token(request: &RawRequest, context: &AppContext) -> Response {
     if !context.config().views.enabled {
-        return Response::error(&request.id, "view tokens require views to be enabled");
+        return Response::error(
+            &request.id,
+            "VIEW_TOKEN",
+            "view tokens require views to be enabled",
+        );
     }
     let Some(root) = request.params.get("root").and_then(|v| v.as_str()) else {
-        return Response::error(&request.id, "root is required");
+        return Response::error(&request.id, "VIEW_TOKEN", "root is required");
     };
     let Some(tree) = request.params.get("expected_tree").and_then(|v| v.as_str()) else {
-        return Response::error(&request.id, "expected_tree is required");
+        return Response::error(&request.id, "VIEW_TOKEN", "expected_tree is required");
     };
     let Some(project) = context.canonical_cache_root_opt() else {
-        return Response::error(&request.id, "view token requires a configured repository");
+        return Response::error(
+            &request.id,
+            "VIEW_TOKEN",
+            "view token requires a configured repository",
+        );
     };
     let storage = context.storage_paths().artifacts;
     let family = match crate::search_index::artifact_cache_key_read_only(&project, &storage) {
         Ok(family) => family,
-        Err(error) => return Response::error(&request.id, &error.to_string()),
+        Err(error) => return Response::error(&request.id, "VIEW_TOKEN", &error.to_string()),
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -39,7 +47,7 @@ pub fn handle_view_token(request: &RawRequest, context: &AppContext) -> Response
             &request.id,
             serde_json::json!({ "token": token.token, "expires_ms": token.expires_ms, "advisory": true }),
         ),
-        Err(error) => Response::error(&request.id, &error.to_string()),
+        Err(error) => Response::error(&request.id, "VIEW_TOKEN", &error.to_string()),
     }
 }
 

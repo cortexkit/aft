@@ -7,7 +7,7 @@ test("view token uses a management request, not an agent tool", async () => {
   const transport = {
     send: async (...args: unknown[]) => {
       calls.push(args);
-      return { success: true, data: { token: "opaque", expires_ms: 100, advisory: true } };
+      return { success: true, token: "opaque", expires_ms: 100, advisory: true };
     },
   } as unknown as AftProjectTransport;
   expect(await mintViewToken(transport, "/future/root", "abc")).toEqual({
@@ -18,8 +18,8 @@ test("view token uses a management request, not an agent tool", async () => {
 
 test("view token refuses a non-advisory or failed response", async () => {
   for (const response of [
-    { success: false, error: "views disabled", data: {} },
-    { success: true, data: { token: "opaque", expires_ms: 100, advisory: false } },
+    { success: false, code: "VIEW_TOKEN", message: "views disabled" },
+    { success: true, token: "opaque", expires_ms: 100, advisory: false },
   ]) {
     const transport = { send: async () => response } as unknown as AftProjectTransport;
     await expect(mintViewToken(transport, "/future/root", "abc")).rejects.toThrow();

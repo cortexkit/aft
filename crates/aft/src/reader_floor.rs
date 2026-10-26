@@ -787,7 +787,7 @@ pub(crate) mod tests {
         let formats = persisted_format::formats_json();
         // The registry reads the base-reference protocol (2/2); plane stores
         // keep format 1. Neither appears in the startup baseline floor.
-        for (name, version) in [("views_v3_registry", 2), ("views_v3_store", 1)] {
+        for (name, version) in [("views_v3_registry", 3), ("views_v3_store", 1)] {
             assert_eq!(formats["stores"][name], version, "{name}");
             let store = PersistedStore::from_name(name).expect("registered store");
             assert!(PersistedStore::ALL.contains(&store));

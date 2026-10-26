@@ -17,9 +17,13 @@ export async function mintViewToken(
     expected_tree: expectedTree,
   });
   if (!response.success) {
-    throw new Error(response.error ?? "View token mint failed");
+    throw new Error(typeof response.message === "string" ? response.message : "View token mint failed");
   }
-  const value = response.data;
+  const data = response;
+  if (typeof data !== "object" || data === null) {
+    throw new Error("Invalid advisory view token response");
+  }
+  const value = data as Record<string, unknown>;
   if (
     typeof value.token !== "string" ||
     typeof value.expires_ms !== "number" ||
