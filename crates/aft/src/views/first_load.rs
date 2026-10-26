@@ -14,6 +14,10 @@ use super::snapshot::{
 };
 use super::RelPath;
 
+#[cfg(test)]
+#[path = "first_load/overflow_recovery_tests.rs"]
+mod overflow_recovery_tests;
+
 /// A complete strict content walk under the checkout's current ignore rules.
 /// The revision must change for every delivered edit, write intent, watcher gap,
 /// or membership change; a partial walk must return an error, not this value.
@@ -2195,7 +2199,12 @@ impl CheckoutDriver {
         }
         match live.watcher() {
             super::snapshot::WatcherState::Healthy => Ok(()),
-            super::snapshot::WatcherState::Reconciling if strict => Ok(()),
+            super::snapshot::WatcherState::Reconciling
+            | super::snapshot::WatcherState::Overflowed
+                if strict =>
+            {
+                Ok(())
+            }
             _ => Err(SiblingLoader::error(format!(
                 "{CHECKOUT_CHANGED_BEFORE_INSTALL}: watcher is not healthy or strictly reconciled"
             ))),
