@@ -681,8 +681,9 @@ struct ViewState {
     tracker: FailureTracker,
     live: Option<Arc<Mutex<crate::pins::LivePin>>>,
     /// The live pin in the v3 member directory, for fills of a generation
-    /// published in the v3 namespace. Its keys are kept until the process
-    /// ends: post-fold trimming covers only the v2 pin so far.
+    /// published in the v3 namespace. It is carried across generation
+    /// publications but not trimmed after folds yet (only the v2 pin is), so
+    /// it keeps its keys until the view state holding it is dropped.
     live_v3: Option<Arc<Mutex<crate::pins::LivePin>>>,
     active_fills: usize,
     cache: Option<(CacheKey, Arc<SemanticIndex>)>,

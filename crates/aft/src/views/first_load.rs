@@ -2151,9 +2151,9 @@ impl FirstLoadDriver for CheckoutDriver {
 
 impl CheckoutDriver {
     /// Publishes this checkout's generation as a v3 worker that references the
-    /// base named by `header`. The header is only a lookup: the base is
-    /// authenticated (pin-then-verify, digests recomputed) before anything is
-    /// written. The published manifest is sparse: entries whose bytes differ
+    /// base named by `header`. The header is only a lookup: the base is pinned
+    /// and authenticated (digests recomputed) before any of this worker's plane
+    /// artifacts or its manifest is written. The published manifest is sparse: entries whose bytes differ
     /// from the base, tombstones for base paths gone from the checkout, and
     /// readiness overrides from the live delta's readiness patches; inherited
     /// base entries are never copied. Plane rows go to the family's v3 plane
@@ -2359,8 +2359,9 @@ impl CheckoutDriver {
                 )))
             }
             Err(error) => {
-                // publish_worker already resolved any landed CAS into a
-                // published referrer; the next job revalidates from disk.
+                // If the CAS landed, its referrer is published or left as an
+                // intent row for reconciliation; the next job revalidates
+                // from disk.
                 self.retry.store(true, std::sync::atomic::Ordering::Release);
                 Err(SiblingLoader::error(format!(
                     "{CHECKOUT_CHANGED_BEFORE_INSTALL}: v3 worker publication failed or may have landed; revalidate: {error}"
@@ -3443,7 +3444,8 @@ mod composite_tests {
             vec![rel("deleted.rs")]
         );
         assert!(manifest.readiness_overrides().is_empty());
-        // After a restart a fresh reader composes it over the authenticated base.
+        // With the driver gone, a fresh reader composes the published delta
+        // over the authenticated base.
         drop(driver);
         let reader = super::super::base_refs::open_foreign_v3(
             storage.path(),

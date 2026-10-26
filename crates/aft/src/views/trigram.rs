@@ -931,7 +931,7 @@ impl TrigramAdapter {
 impl TrigramAdapter {
     /// A v3 generation has no segment file: v3 keeps no segment rows, so the
     /// base's segment is assembled in memory from the base's stored payloads
-    /// (one build per base generation, shared through the segment cache), and
+    /// (shared through the segment cache while an index holds it), and
     /// the worker's changed entries load as the usual overlay. Missing or
     /// not-ready payloads stay direct-scan gaps, as on the v2 path.
     fn open_v3_index(

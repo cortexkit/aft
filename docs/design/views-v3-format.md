@@ -583,7 +583,7 @@ CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
 - **Segments.** v3 generations carry no trigram segment: v3 has no segment
   rows, files or segment collection. A reader assembles the base
   generation's segment in memory from the base's stored trigram payloads
-  (once per base generation per process) and loads the worker's changed
+  (shared through the segment cache while an index holds it) and loads the worker's changed
   entries as the usual overlay. No new on-disk rows were added for this.
 - **Derived graphs.** A base's derived call graph is
   `M/derived-<generation>-a<attempt>-<owner_token>.sqlite`, named by the
