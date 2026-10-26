@@ -11,6 +11,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
+pub mod base_builder;
+pub mod base_refs;
+pub mod base_sweep;
 mod generation;
 #[cfg(test)]
 pub(crate) use generation::{

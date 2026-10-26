@@ -112,6 +112,9 @@ pub enum Hold {
     OpenInProcess,
     /// Its sessions, protection or files could not be read with certainty.
     Uncertain(String),
+    /// A v3 base that a `base_refs` row, a live `base_builds` claim or this
+    /// sweep's marked worker edges still reference.
+    Referenced,
 }
 
 impl fmt::Display for Hold {
@@ -121,6 +124,7 @@ impl fmt::Display for Hold {
             Self::Protected => write!(f, "protected generation"),
             Self::OpenInProcess => write!(f, "open in this process"),
             Self::Uncertain(reason) => write!(f, "uncertain: {reason}"),
+            Self::Referenced => write!(f, "referenced base"),
         }
     }
 }
@@ -686,6 +690,56 @@ fn hold_inside_barrier(
         Ok(false) => Ok(None),
         Ok(true) => Ok(Some(Hold::OpenInProcess)),
         Err(reason) => Ok(Some(Hold::Uncertain(reason))),
+    }
+}
+
+/// Why the v3 base `scope` cannot be reclaimed now, read inside the v3
+/// registry barrier `tx`. Every deleter of a v3 base (the reference sweep's
+/// two-step reclaim, the retention collector and any future LRU eviction)
+/// goes through this check; none parses a manifest inside the barrier.
+///
+/// One indexed `base_refs` query, the `base_builds` claim, then the bounded
+/// `readers/`/`pins/`/session listing. A query error or an over-long listing
+/// is [`Hold::Uncertain`].
+pub(crate) fn v3_base_hold(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> Option<Hold> {
+    use rusqlite::OptionalExtension;
+    let referenced = tx
+        .query_row(
+            "SELECT 1 FROM base_refs WHERE base_scope=?1 LIMIT 1",
+            [scope],
+            |_| Ok(()),
+        )
+        .optional();
+    match referenced {
+        Ok(Some(())) => return Some(Hold::Referenced),
+        Ok(None) => {}
+        Err(error) => return Some(Hold::Uncertain(error.to_string())),
+    }
+    let claim = tx
+        .query_row(
+            "SELECT owner_pid,owner_start FROM base_builds WHERE base_scope=?1",
+            [scope],
+            |r| {
+                Ok(crate::pins::PinOwner {
+                    pid: r.get(0)?,
+                    start_time: r.get(1)?,
+                })
+            },
+        )
+        .optional();
+    match claim {
+        Ok(Some(owner)) if crate::pins::owner_is_live(&owner) => return Some(Hold::Referenced),
+        Ok(_) => {}
+        Err(error) => return Some(Hold::Uncertain(error.to_string())),
+    }
+    match crate::storage_retention::v3_member_protected(tx, scope, view_dir) {
+        Ok(false) => None,
+        Ok(true) => Some(Hold::Protected),
+        Err(reason) => Some(Hold::Uncertain(reason)),
     }
 }
 

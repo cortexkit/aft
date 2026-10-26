@@ -590,9 +590,13 @@ pub fn open_foreign_generation(
     let manifest = store.load_manifest_v2(protected.generation())?;
     manifest.ensure_producers(producers)?;
     if manifest.base_header().is_some() {
-        return Err(super::ViewError::InvalidManifest(
-            "durable v3 base resolution is not wired".into(),
-        ));
+        // A base reference is valid only in a v3 worker manifest under
+        // `blobs/v3/<family>/views/<scope>`, opened through
+        // `open_foreign_v3_generation`. A v2 view naming a base is a corrupt
+        // edge: its header cannot be authenticated, and it is never trusted.
+        return Err(super::ViewError::InvalidManifest(format!(
+            "foreign view {scope} names a base outside the v3 namespace; refusing an unauthenticated base header"
+        )));
     }
     Ok(Some(std::sync::Arc::new(
         super::snapshot::ComposedGeneration::new(
@@ -601,6 +605,25 @@ pub fn open_foreign_generation(
             Some(super::snapshot::Residency::Protected(protected)),
         ),
     )))
+}
+
+/// Opens a v3 worker's published generation for a foreign or parent-folder
+/// reader: a dual pin-then-verify of the worker and, through the authenticated
+/// base resolver, of the base it names. The bundle owns both markers and its
+/// answers carry the worker's `PublishedFrontier`. A base that stays missing or
+/// moving through every attempt is reported unavailable, never replaced.
+// No production caller until the parent-folder and foreign-reader routing
+// slices select v3 workers; tests exercise it now.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn open_foreign_v3_generation(
+    storage: &std::path::Path,
+    family: &str,
+    scope: &str,
+    producers: &super::manifest_v2::Producers,
+) -> super::Result<Option<std::sync::Arc<super::snapshot::ComposedGeneration>>> {
+    super::base_refs::open_foreign_v3(storage, family, scope, producers).map_err(|error| {
+        super::ViewError::InvalidManifest(format!("foreign view {scope} unavailable: {error}"))
+    })
 }
 
 #[cfg(test)]
@@ -652,7 +675,7 @@ mod producer_tests {
         assert!(
             error
                 .to_string()
-                .contains("durable v3 base resolution is not wired"),
+                .contains("refusing an unauthenticated base header"),
             "{error}"
         );
         assert_eq!(

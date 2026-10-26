@@ -232,6 +232,17 @@ impl ManifestV2 {
     pub fn base_header(&self) -> Option<&BaseHeader> {
         self.base.as_ref()
     }
+    /// Rebinds a v3 worker delta to `header`. The worker publisher calls this
+    /// with the header of the base it authenticated, never a caller's string.
+    pub fn set_base_header(&mut self, header: BaseHeader) -> Result<()> {
+        if !self.v3 || self.base.is_none() {
+            return Err(ViewError::InvalidManifest(
+                "only a v3 worker delta can be rebound to a base".into(),
+            ));
+        }
+        self.base = Some(header);
+        Ok(())
+    }
     pub fn published(&self) -> Option<&PublishedFrontier> {
         self.published.as_ref()
     }
