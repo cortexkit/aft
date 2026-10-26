@@ -472,7 +472,7 @@ pub const DEFAULT_SESSION_ID: &str = "__default__";
 ///
 /// Two-stage parse: deserialize this first to get `id` + `command`, then
 /// dispatch on `command` and pull specific params from the flattened `params`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RawRequest {
     /// Unique while pending on one standalone connection, across all sessions.
     /// Reusing an ID is allowed after the earlier response has completed.
@@ -493,6 +493,21 @@ pub struct RawRequest {
     /// All remaining fields are captured here for per-command deserialization.
     #[serde(flatten)]
     pub params: serde_json::Value,
+}
+
+impl std::fmt::Debug for RawRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RawRequest")
+            .field("id", &self.id)
+            .field("command", &self.command)
+            .field("session_id", &self.session_id)
+            .field(
+                "param_count",
+                &self.params.as_object().map_or(0, |params| params.len()),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl RawRequest {

@@ -9782,6 +9782,13 @@ async fn handle_tool_call(
     }
     let mut route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
         note_route_tool_call(&identity, metrics);
+        let mut envelope = envelope;
+        let context_field = envelope
+            .as_object_mut()
+            .and_then(|body| body.remove("search_context"));
+        let search_context =
+            crate::search_context::SearchContext::from_request_field(context_field.as_ref())
+                .unwrap_or_default();
         let mut call = match serde_json::from_value::<
             cortexkit_role_tool_provider::call::ToolCallRequest,
         >(envelope)
@@ -9800,6 +9807,7 @@ async fn handle_tool_call(
                 .await
             }
         };
+        call.arguments = strip_agent_preview_arg_owned(call.arguments);
         if let Some(error) = tool_provider::shell_capability_refusal(
             &call.name,
             tool_provider::admission_trusted(&identity, &call),
@@ -9859,6 +9867,7 @@ async fn handle_tool_call(
             provider_shell_selector(&call.name, args);
         }
         RouteRequest::ToolCall(ToolCallRequest {
+            search_context,
             name: call.name,
             arguments,
             edit_slot_survives: None,
@@ -10430,6 +10439,12 @@ async fn handle_tool_call(
     }
     let lane = command_lane(&bare_name);
     let tool_call_context = ToolCallContext {
+        // Only a first-party host can supply context to the decision model.
+        search_context: if matches!(bind_trust, BindTrust::Untrusted) {
+            None
+        } else {
+            call.search_context
+        },
         project_root: identity.project_root.clone(),
         session_id: Some(identity.session.clone()),
         request_id: request_id.clone(),
@@ -11508,6 +11523,7 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
                 return Err(SubcError::Json(error));
             };
             Ok(RouteRequest::ToolCall(ToolCallRequest {
+                search_context: None,
                 name,
                 arguments,
                 edit_slot_survives: None,
@@ -11560,6 +11576,11 @@ fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>
 /// `schema_pin`) keep the shared type's wire names.
 #[derive(Debug, Deserialize)]
 struct ToolCallRequest {
+    #[serde(
+        default,
+        deserialize_with = "crate::search_context::deserialize_optional"
+    )]
+    search_context: Option<crate::search_context::SearchContext>,
     name: String,
     #[serde(default)]
     arguments: Value,

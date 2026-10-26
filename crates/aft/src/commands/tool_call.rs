@@ -100,6 +100,10 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let tool_ctx = ToolCallContext {
+        search_context: crate::search_context::SearchContext::from_request_field(
+            req.params.get("search_context"),
+        )
+        .unwrap_or_default(),
         project_root,
         session_id: Some(req.session().to_string()),
         request_id: req.id.clone(),
@@ -146,4 +150,62 @@ fn response_with_text(mut response: Response, text: String) -> Response {
         response.data = json!({ "text": text });
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gather_context_standalone_envelope_reaches_only_search() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for (name, expected) in [("search", Some("trace-marker")), ("status", None)] {
+            let req = serde_json::from_value(json!({
+                "id": "carrier", "command": "tool_call", "name": name,
+                "arguments": {"query": "how is config loaded", "search_context": "forged"},
+                "search_context": "trace-marker",
+            }))
+            .unwrap();
+            let response = handle_with_dispatch(&req, &ctx, &|request, _| {
+                Response::success(request.id, json!({"received": request.params}))
+            });
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(
+                response.data["received"]
+                    .get("search_context")
+                    .and_then(Value::as_str),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn gather_context_standalone_drops_wrong_envelope_types_without_content() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for value in [
+            json!(null),
+            json!(42),
+            json!(true),
+            json!(["trace-marker"]),
+            json!({"trace-marker": true}),
+        ] {
+            let req = serde_json::from_value(json!({
+                "id": "carrier", "command": "tool_call", "name": "search",
+                "arguments": {"query": "how is config loaded"}, "search_context": value,
+            }))
+            .unwrap();
+            let response = handle_with_dispatch(&req, &ctx, &|request, _| {
+                assert!(request.params.get("search_context").is_none());
+                Response::success(request.id, json!({}))
+            });
+            assert!(response.success);
+            assert!(!response.data.to_string().contains("trace-marker"));
+        }
+    }
 }

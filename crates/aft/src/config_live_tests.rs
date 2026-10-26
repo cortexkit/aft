@@ -98,6 +98,31 @@ fn staged_sources_are_cleared_at_entry_and_on_unwind() {
 }
 
 #[test]
+fn gather_config_live_user_and_project_disable() {
+    let fixture = Fixture::new(r#"{"search":{"gather":{"enabled":false}}}"#, Some("{}"));
+    write(
+        &fixture.user_path,
+        r#"{"search":{"gather":{"enabled":true,"max_nodes":7}}}"#,
+    );
+    let outcome = fixture.reload();
+    assert!(applied(&outcome).contains(&"search.gather"));
+    assert!(deferred(&outcome).is_empty());
+    assert_eq!(
+        serde_json::to_value(&fixture.ctx.config().search).unwrap()["gather"]["enabled"],
+        true
+    );
+    write(
+        &fixture.project_path,
+        r#"{"search":{"gather":{"enabled":false,"max_nodes":99}}}"#,
+    );
+    let outcome = fixture.reload();
+    assert!(applied(&outcome).contains(&"search.gather"));
+    let search = serde_json::to_value(&fixture.ctx.config().search).unwrap();
+    assert_eq!(search["gather"]["enabled"], false);
+    assert_eq!(search["gather"]["max_nodes"], 7);
+}
+
+#[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
     let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60}}"#, None);
     write(

@@ -6359,6 +6359,7 @@ mod route_tests {
                     registration();
                 }
                 let call_context = ToolCallContext {
+                    search_context: None,
                     project_root: root.as_path().into(),
                     session_id: Some(session.into()),
                     request_id: "standard-edit".into(),
@@ -6794,6 +6795,7 @@ mod route_tests {
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
                 format_context: Default::default(),
                 tool_call_context: ToolCallContext {
+                    search_context: None,
                     project_root: identity.project_root.clone(),
                     session_id: Some(identity.session.clone()),
                     request_id: "tool-policy-dispatch".into(),
@@ -7197,6 +7199,163 @@ mod route_tests {
             panic!("expected tool call")
         };
         assert_eq!(call.name, "status");
+    }
+
+    #[test]
+    fn gather_context_legacy_decoding_caps_and_redacts_the_carrier() {
+        let RouteRequest::ToolCall(call) = decode_legacy_route_request(json!({
+            "name": "search", "arguments": {"query": "q", "search_context": "forged"},
+            "search_context": "trace-marker",
+        }))
+        .unwrap() else {
+            panic!("expected tool call")
+        };
+        assert_eq!(
+            call.search_context.as_ref().unwrap().as_str(),
+            "trace-marker"
+        );
+        assert!(!format!("{call:?}").contains("trace-marker"));
+        for value in [
+            json!(null),
+            json!(42),
+            json!(true),
+            json!(["trace-marker"]),
+            json!({"trace-marker": true}),
+        ] {
+            let RouteRequest::ToolCall(call) =
+                decode_legacy_route_request(json!({"name": "search", "search_context": value}))
+                    .unwrap()
+            else {
+                panic!("expected tool call")
+            };
+            assert!(call.search_context.is_none());
+        }
+        let RouteRequest::ToolCall(absent) =
+            decode_legacy_route_request(json!({"name": "search"})).unwrap()
+        else {
+            panic!("expected tool call")
+        };
+        assert!(absent.search_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn gather_context_subc_preparation_preserves_the_envelope() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for role in [RouteRole::Legacy, RouteRole::ToolProviderV1] {
+            let (_dir, root) = test_support::test_root("gather-carrier");
+            let mut identity = test_support::route_identity(&root, "gather-session");
+            Arc::get_mut(&mut identity.0).unwrap().role = role;
+            let ctx = test_support::test_ctx();
+            let reply = exchange_with_actor(
+                json!({"name": "search", "preset": "head", "arguments": {"query": "how is config loaded", "search_context": "forged"}, "search_context": "trace-marker"}),
+                identity,
+                ctx,
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, _| {
+                    assert_eq!(request.command, "semantic_search");
+                    assert_eq!(request.params["search_context"], "trace-marker");
+                    Response::success(request.id, json!({}))
+                },
+            ).await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["isError"], false, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_context_subc_trust_controls_host_context() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for role in [RouteRole::Legacy, RouteRole::ToolProviderV1] {
+            for trust in [BindTrust::FirstParty, BindTrust::Untrusted] {
+                let (_dir, root) = test_support::test_root("gather-trust");
+                let mut identity =
+                    test_support::route_identity_with_trust(&root, "gather-trust", trust);
+                Arc::get_mut(&mut identity.0).unwrap().role = role;
+                LAST_DISPATCH.lock().unwrap().take();
+                let reply = exchange_with_actor(
+                    json!({"name": "search", "preset": "head", "arguments": {"query": "how is config loaded", "search_context": "forged"}, "search_context": "trace-marker"}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        *LAST_DISPATCH.lock().unwrap() = Some(json!({"command": request.command, "params": request.params}));
+                        Response::success(request.id, json!({}))
+                    },
+                ).await;
+                assert_eq!(reply.header.ty, FrameType::Response);
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(body["isError"], false, "{body}");
+                let dispatched = LAST_DISPATCH
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("search dispatch");
+                assert_eq!(dispatched["command"], "semantic_search");
+                let expected = match trust {
+                    BindTrust::FirstParty => Some("trace-marker"),
+                    BindTrust::Untrusted => None,
+                };
+                assert_eq!(
+                    dispatched["params"]
+                        .get("search_context")
+                        .and_then(Value::as_str),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_context_plain_job_clone_keeps_host_context() {
+        let (_dir, root) = test_support::test_root("gather-clone");
+        let identity = test_support::route_identity(&root, "gather-clone");
+        let ctx = test_support::test_ctx();
+        let mut run = PlainToolRun {
+            bare_name: "search".into(),
+            arguments: json!({"query": "how is config loaded", "search_context": "forged"}),
+            format_context: Default::default(),
+            tool_call_context: ToolCallContext {
+                search_context: Some(crate::search_context::SearchContext::new("trace-marker")),
+                project_root: identity.project_root.clone(),
+                session_id: Some(identity.session.clone()),
+                request_id: "gather-clone".into(),
+                diagnostics_on_edit: false,
+                preview: false,
+                edit_slot_survives: None,
+                report_registration_downgrade: false,
+                standard_edit_grammar: false,
+                disabled_tools: None,
+                worker_session: false,
+                host_tool_names: None,
+            },
+            dispatch: |request, _| {
+                Response::success(request.id, json!({"received": request.params}))
+            },
+            bind_trust: identity.trust,
+            request_id: "gather-clone".into(),
+            ledger_key: None,
+            io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+            approved_io_window: Some(Duration::from_secs(30)),
+            reply_deadline: Instant::now() + Duration::from_secs(30),
+            identity,
+        };
+        let (done, completion) = oneshot::channel();
+        let job = run.job(
+            crate::access_policy::AskRoute::Consent {
+                once: vec![],
+                launch: access_grants::launch_key(&run.identity, "head"),
+            },
+            PhaseTrace::new(Instant::now()),
+            done,
+        );
+        run.tool_call_context.search_context = None;
+        run.arguments = json!({"query": "changed after clone"});
+        let response = job(&ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["received"]["search_context"], "trace-marker");
+        assert_eq!(response.data["received"]["query"], "how is config loaded");
+        completion.await.unwrap();
     }
 
     #[test]

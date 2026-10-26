@@ -1458,6 +1458,7 @@ fn run(
 ) -> ToolCallResult {
     let format = crate::subc_format::FormatContext::from_tool_call(tool, &args, root);
     let call = ToolCallContext {
+        search_context: None,
         project_root: root.to_path_buf(),
         session_id: Some("tool-result-audit".into()),
         request_id: "tool-result-audit".into(),

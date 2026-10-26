@@ -203,12 +203,39 @@ const RerankConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
 });
 
+const GatherConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  decision: z
+    .object({
+      backend: z.enum(["endpoint", "decisions"]).optional(),
+      endpoint: z.string().trim().min(1).optional(),
+      model: z.string().trim().min(1).optional(),
+      api_key_env: z.string().trim().min(1).optional(),
+      threshold: z.number().gt(0).lt(1).optional(),
+    })
+    .transform((decision) => definedEntries(decision))
+    .optional(),
+  max_rounds: z.number().int().positive().optional(),
+  max_nodes: z.number().int().positive().optional(),
+  max_frontier: z.number().int().positive().optional(),
+  decision_timeout_ms: z.number().int().positive().optional(),
+  deadline_ms: z.number().int().positive().optional(),
+  max_output_bytes: z.number().int().positive().optional(),
+});
+
+/** Only an explicit `enabled: true` lets the host read message parts. */
+export function gatherEnabled(config: AftConfig): boolean {
+  return config.search?.gather?.enabled === true;
+}
+
 const SearchConfigSchema = z.object({
   /** Optional cross-encoder reranking of aft_search results. Default off. */
   rerank: RerankConfigSchema.optional(),
+  gather: GatherConfigSchema.optional(),
 });
 
 type RerankConfig = z.infer<typeof RerankConfigSchema>;
+type GatherConfig = z.infer<typeof GatherConfigSchema>;
 
 const LspExtensionSchema = z
   .string()
@@ -811,6 +838,26 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const override = config.harnesses?.[ACTIVE_HARNESS];
   if (override === undefined) return base as AftConfigFields;
   const merged = { ...base, ...override } as AftConfigFields;
+  merged.search = mergeTrustedSearchConfig(base.search, override.search);
+  if (!trusted) {
+    const stripped = [
+      ...(base.search?.gather?.enabled === false
+        ? projectGatherStrippedKeys(override.search?.gather).filter(
+            (key) => key === "search.gather.enabled",
+          )
+        : []),
+      ...(base.search?.rerank?.backend === "off"
+        ? projectRerankStrippedKeys(override.search?.rerank).filter(
+            (key) => key === "search.rerank.backend",
+          )
+        : []),
+    ];
+    if (stripped.length > 0)
+      warn(
+        `Ignoring ${stripped.join(", ")} from project harness config (security: project disables cannot be reversed)`,
+      );
+    merged.search = mergeProjectSearchConfig(merged.search, base.search);
+  }
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
   // A harness block's `bash.env` merges names into the file's base map
@@ -1036,7 +1083,16 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
-  if (rerank !== undefined) overrides.search = { rerank };
+  const gather = definedEntries({
+    ...config.search?.gather,
+    decision: definedEntries(config.search?.gather?.decision),
+  });
+  if (rerank !== undefined || gather !== undefined) {
+    overrides.search = {
+      ...(rerank !== undefined ? { rerank } : {}),
+      ...(gather !== undefined ? { gather } : {}),
+    };
+  }
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
@@ -2018,6 +2074,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push(`disabled_tools.${tool}`);
   }
   stripped.push(...projectRerankStrippedKeys(override.search?.rerank));
+  stripped.push(...projectGatherStrippedKeys(override.search?.gather));
   return stripped;
 }
 
@@ -2033,13 +2090,68 @@ function projectRerankStrippedKeys(rerank: RerankConfig | undefined): string[] {
   return stripped;
 }
 
-/** A project may set `search.rerank.backend: "off"` and nothing else. */
+/**
+ * The decision endpoint receives conversation text and uses the user's credentials.
+ * A project may disable collection, but it must not select an endpoint or increase the request budget.
+ */
+function projectGatherStrippedKeys(gather: GatherConfig | undefined): string[] {
+  if (gather === undefined) return [];
+  const stripped: string[] = [];
+  if (gather.enabled !== undefined && gather.enabled !== false)
+    stripped.push("search.gather.enabled");
+  for (const key of [
+    "max_rounds",
+    "max_nodes",
+    "max_frontier",
+    "decision_timeout_ms",
+    "deadline_ms",
+    "max_output_bytes",
+  ] as const) {
+    if (gather[key] !== undefined) stripped.push(`search.gather.${key}`);
+  }
+  for (const key of ["backend", "endpoint", "model", "api_key_env", "threshold"] as const) {
+    if (gather.decision?.[key] !== undefined) stripped.push(`search.gather.decision.${key}`);
+  }
+  return stripped;
+}
+
 function mergeProjectSearchConfig(
   base: AftConfig["search"],
   project: AftConfig["search"],
 ): AftConfig["search"] {
-  if (project?.rerank?.backend !== "off") return base;
-  return { ...base, rerank: { ...base?.rerank, backend: "off" } };
+  let search = base;
+  if (project?.rerank?.backend === "off")
+    search = { ...search, rerank: { ...search?.rerank, backend: "off" } };
+  if (project?.gather?.enabled === false)
+    search = { ...search, gather: { ...search?.gather, enabled: false } };
+  return search;
+}
+
+function mergeTrustedSearchConfig(
+  base: AftConfig["search"],
+  override: AftConfig["search"],
+): AftConfig["search"] {
+  if (override === undefined) return base;
+  return {
+    ...base,
+    ...(override.rerank !== undefined ? { rerank: override.rerank } : {}),
+    ...(override.gather !== undefined
+      ? {
+          gather: {
+            ...base?.gather,
+            ...definedEntries(override.gather),
+            ...(override.gather.decision !== undefined
+              ? {
+                  decision: {
+                    ...base?.gather?.decision,
+                    ...definedEntries(override.gather.decision),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 /** A copy of `value` without its undefined entries, or undefined when none are left. */
@@ -2128,7 +2240,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.
     semantic,
-    // Same for search: only the project-safe rerank disable is merged.
+    // Project search values must not enable external requests.
     search,
     ...(bridge !== undefined ? { bridge } : {}),
     ...(indexes !== undefined ? { indexes } : {}),

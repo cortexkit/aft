@@ -155,6 +155,7 @@ fn settings_default_to_off_and_clamp_depth_and_timeout() {
             timeout_ms: Some(1),
             ..RerankConfig::default()
         }),
+        ..SearchConfig::default()
     });
     assert_eq!(settings.top_n, MAX_TOP_N);
     assert_eq!(settings.timeout, Duration::from_millis(MIN_TIMEOUT_MS));
@@ -164,6 +165,7 @@ fn settings_default_to_off_and_clamp_depth_and_timeout() {
             top_n: Some(0),
             ..RerankConfig::default()
         }),
+        ..SearchConfig::default()
     });
     assert_eq!(settings.top_n, 1);
     assert_eq!(settings.timeout, Duration::from_millis(MAX_TIMEOUT_MS));
@@ -1025,6 +1027,7 @@ fn invalid_backend_configuration_fails_build_with_a_reason() {
         cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(rerank),
+            ..SearchConfig::default()
         },
         semantic: Default::default(),
         under_subc: false,
@@ -1069,6 +1072,7 @@ fn onnx_inputs(model: Option<&str>) -> slot::BuildInputs {
                 model: model.map(str::to_string),
                 ..RerankConfig::default()
             }),
+            ..SearchConfig::default()
         },
         semantic: Default::default(),
         under_subc: false,
@@ -1142,6 +1146,7 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
                         backend: Some(backend),
                         ..RerankConfig::default()
                     }),
+                    ..SearchConfig::default()
                 },
                 semantic: Default::default(),
                 under_subc,
@@ -1774,6 +1779,7 @@ fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
                 endpoint: Some(format!("tei+{endpoint}")),
                 ..Default::default()
             }),
+            ..SearchConfig::default()
         },
         semantic: Default::default(),
         under_subc: false,
@@ -1836,6 +1842,7 @@ fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
                 model: Some("reranker".into()),
                 ..Default::default()
             }),
+            ..SearchConfig::default()
         },
         semantic: synapse::tests::config(path),
         under_subc: true,

@@ -674,6 +674,7 @@ async fn read_tool_allows_on(
             disabled_tools: None,
             worker_session: false,
             host_tool_names: None,
+            search_context: None,
         },
         dispatch: read_dispatch,
         bind_trust: identity.trust,

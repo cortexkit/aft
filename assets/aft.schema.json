@@ -708,6 +708,73 @@
     "search": {
       "type": "object",
       "properties": {
+        "gather": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable bounded context collection for aft_search. A project config may only set false."
+            },
+            "decision": {
+              "type": "object",
+              "properties": {
+                "backend": {
+                  "type": "string",
+                  "enum": [
+                    "endpoint"
+                  ]
+                },
+                "endpoint": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "model": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "api_key_env": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false,
+              "description": "Decision service settings. User config only. An endpoint alone does not enable collection."
+            },
+            "max_rounds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3
+            },
+            "max_nodes": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 12
+            },
+            "max_frontier": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 40
+            },
+            "decision_timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3000
+            },
+            "deadline_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 8000
+            },
+            "max_output_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 12288
+            }
+          },
+          "additionalProperties": false,
+          "description": "Bounded context collection. All settings except a project disable require user config."
+        },
         "rerank": {
           "type": "object",
           "properties": {
@@ -1577,6 +1644,73 @@
           "search": {
             "type": "object",
             "properties": {
+              "gather": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable bounded context collection for aft_search. A project config may only set false."
+                  },
+                  "decision": {
+                    "type": "object",
+                    "properties": {
+                      "backend": {
+                        "type": "string",
+                        "enum": [
+                          "endpoint"
+                        ]
+                      },
+                      "endpoint": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "api_key_env": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "additionalProperties": false,
+                    "description": "Decision service settings. User config only. An endpoint alone does not enable collection."
+                  },
+                  "max_rounds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 3
+                  },
+                  "max_nodes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 12
+                  },
+                  "max_frontier": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 40
+                  },
+                  "decision_timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 3000
+                  },
+                  "deadline_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 8000
+                  },
+                  "max_output_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 12288
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Bounded context collection. All settings except a project disable require user config."
+              },
               "rerank": {
                 "type": "object",
                 "properties": {

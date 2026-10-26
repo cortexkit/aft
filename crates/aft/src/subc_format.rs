@@ -2368,6 +2368,16 @@ fn format_search(data: &Value) -> String {
     } else {
         extra_honesty_note(data)
     };
+    let gather_notice =
+        data.get("gather_notice").and_then(Value::as_str) == Some("gather: skipped output_budget");
+    let note = if gather_notice {
+        Some(match note {
+            Some(note) => format!("gather: skipped output_budget\n{note}"),
+            None => "gather: skipped output_budget".to_owned(),
+        })
+    } else {
+        note
+    };
 
     let base = if let Some(text) = data
         .get("text")
@@ -2384,7 +2394,12 @@ fn format_search(data: &Value) -> String {
             None => "No results.".to_string(),
         }
     } else {
-        semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string())
+        let fallback = semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string());
+        if gather_notice {
+            format!("{fallback}\ngather: skipped output_budget")
+        } else {
+            fallback
+        }
     };
 
     if let Some(env) = envelope {

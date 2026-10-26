@@ -1082,6 +1082,7 @@ mod tests {
         let format_context =
             crate::subc_format::FormatContext::from_tool_call("search", &args, session_root);
         let tool_ctx = ToolCallContext {
+            search_context: None,
             project_root: session_root.to_path_buf(),
             session_id: Some("external-render".to_string()),
             request_id: "external-render".to_string(),

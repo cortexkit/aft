@@ -4428,6 +4428,65 @@ pub(super) async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaem
     session
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn gather_bind_route(
+    stream: &mut tokio::net::TcpStream,
+    root: &std::path::Path,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    harness: &str,
+    session: &str,
+) {
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        stream,
+        channel,
+        epoch,
+        corr,
+        root,
+        harness,
+        session,
+        Some(if harness.starts_with("mcp:") {
+            Principal::Unverified
+        } else {
+            Principal::Direct
+        }),
+        json!({"views":{"enabled":false}}),
+    )
+    .await;
+    expect_route_bind_ack(stream, corr).await;
+}
+
+pub(super) async fn gather_search_frame(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    context: Option<&str>,
+) -> Value {
+    let mut body = json!({"name":"search", "arguments":{"query":"how is application config loaded", "topK":5}});
+    if let Some(context) = context {
+        body["search_context"] = json!(context);
+    }
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+    let frame = read_frame_timeout(stream, "gather search response").await;
+    assert_eq!(frame.header.channel, channel);
+    assert_eq!(frame.header.corr, corr);
+    tool_result_body(&frame)
+}
+
 async fn bind_route1(stream: &mut tokio::net::TcpStream, root1: &std::path::Path) {
     send_route_bind(stream, 1, 10, root1).await;
     expect_route_bind_ack(stream, 10).await;

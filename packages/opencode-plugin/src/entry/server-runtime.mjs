@@ -129,6 +129,7 @@ async function bootLocation(context, location, dependencies) {
   const toolContext = {
     pool,
     client: context,
+    readSearchMessageV2: (input) => context.session.message.get(input),
     config,
     hashlineEffective: openCodeHashlineEffective(config),
     // The engine's reply text names AFT's command and patch tools ("Prefer

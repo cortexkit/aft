@@ -56,6 +56,7 @@ import {
   type RootGeneration,
 } from "./lifecycle-registry.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
+import { capSearchContext } from "./search-context.js";
 import type {
   AftProjectTransport,
   AftTransportOptions,
@@ -1396,6 +1397,12 @@ class SubcTransport implements AftProjectTransport {
     this.assertCurrent();
     const { preview, timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
+    if (
+      (name === "search" || name === "aft_search") &&
+      typeof options?.searchContext === "string"
+    ) {
+      body.search_context = capSearchContext(options.searchContext);
+    }
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
@@ -1442,9 +1449,13 @@ class SubcTransport implements AftProjectTransport {
     const {
       [WORKER_SESSION_FIELD]: workerSession,
       [HOST_TOOL_NAMES_FIELD]: hostToolNames,
+      search_context: searchContext,
       ...args
     } = params;
     const body: Record<string, unknown> = { name: command, arguments: args };
+    if (command === "semantic_search" && typeof searchContext === "string") {
+      body.search_context = capSearchContext(searchContext);
+    }
     if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
     if (hostToolNames !== undefined) body[HOST_TOOL_NAMES_FIELD] = hostToolNames;
     body[PRESET_FIELD] = callPresetFor(workerSession === true);

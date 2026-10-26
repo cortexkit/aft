@@ -9,6 +9,7 @@ pub mod extensions;
 pub(crate) mod external_disk_check;
 mod external_exact;
 mod external_pattern;
+pub(crate) mod gather;
 pub mod generation_token;
 pub mod lexical_lane;
 pub mod memo;
@@ -793,6 +794,17 @@ fn handle_semantic_search_with_disk_fallback(
 ) -> Response {
     use extensions::{RawQuery, Root, Token};
 
+    let mut sanitized_request = req.clone();
+    let context = crate::search_context::SearchContext::from_request_field(
+        sanitized_request
+            .params
+            .as_object_mut()
+            .and_then(|params| params.remove("search_context"))
+            .as_ref(),
+    )
+    .unwrap_or_default();
+    let req = &sanitized_request;
+
     let page_request = match paging::parse_public_page_request(&req.params) {
         Ok(request) => request,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
@@ -927,7 +939,7 @@ fn handle_semantic_search_with_disk_fallback(
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
     if let Some((pattern_text, compiled)) = pattern {
-        return handle_pattern_request(
+        let mut response = handle_pattern_request(
             req,
             ctx,
             page_request,
@@ -937,6 +949,14 @@ fn handle_semantic_search_with_disk_fallback(
             &compiled,
             external_root.as_deref(),
         );
+        gather::attach(
+            req,
+            ctx,
+            &mut response,
+            external_root.as_deref().unwrap_or(&project_root),
+            context.as_ref(),
+        );
+        return response;
     }
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
@@ -1046,6 +1066,13 @@ fn handle_semantic_search_with_disk_fallback(
         if external_root.is_none() {
             SearchLaneStatus::observe_current(ctx).attach_labels(&mut response, ctx);
         }
+        gather::attach(
+            req,
+            ctx,
+            &mut response,
+            external_root.as_deref().unwrap_or(&project_root),
+            context.as_ref(),
+        );
     }
     response
 }

@@ -13,6 +13,7 @@ import {
 import type { Logger, LogMeta } from "./logger.js";
 import { withPathPrepended } from "./path-env.js";
 import { type BgCompletion, isTerminalBashStatus, type StatusCompression } from "./protocol.js";
+import { capSearchContext } from "./search-context.js";
 import type {
   AftProjectTransport,
   ToolCallArguments,
@@ -995,6 +996,13 @@ export class BinaryBridge implements AftProjectTransport {
     params: Record<string, unknown> = {},
     options?: SendOptions,
   ): Promise<Record<string, unknown>> {
+    if (command !== "tool_call") {
+      const { search_context: searchContext, ...args } = params;
+      params = args;
+      if (command === "semantic_search" && typeof searchContext === "string") {
+        params.search_context = capSearchContext(searchContext);
+      }
+    }
     this.activeSendCalls += 1;
     this.syncEventLoopHold();
     try {
@@ -1094,7 +1102,10 @@ export class BinaryBridge implements AftProjectTransport {
       params.edit_slot_survives = editSlotSurvives;
       this.logHashlineRegistrationCarrier("tool_call", sessionId, editSlotSurvives);
     }
-    const { preview, workerSession, hostToolNames, ...sendOptions } = options ?? {};
+    const { preview, workerSession, hostToolNames, searchContext, ...sendOptions } = options ?? {};
+    if ((name === "search" || name === "aft_search") && typeof searchContext === "string") {
+      params.search_context = capSearchContext(searchContext);
+    }
     if (preview === true) params.preview = true;
     if (workerSession === true) params[WORKER_SESSION_FIELD] = true;
     if (hostToolNames) params[HOST_TOOL_NAMES_FIELD] = hostToolNames;
@@ -1260,6 +1271,7 @@ export class BinaryBridge implements AftProjectTransport {
         for (const key of [
           "session_id",
           "lsp_hints",
+          "search_context",
           WORKER_SESSION_FIELD,
           HOST_TOOL_NAMES_FIELD,
         ] as const) {

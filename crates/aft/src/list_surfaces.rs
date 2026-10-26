@@ -354,6 +354,62 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    // The scanner does not recognize pub(super) or pub(in ...) declarations.
+    // Some item keys name a prior function; each location names the actual cut.
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/decision.rs",
+        enclosing_item: "validate_ids",
+        location_or_primitive: "deterministic_decision .take(remaining_nodes)",
+        reason: "deterministic_decision selects internal keep and expand IDs within the remaining node budget, not a search result page; the related-code header and footer disclose considered and kept node counts",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/endpoint.rs",
+        enclosing_item: "decide",
+        location_or_primitive: "body lines .take(DEFAULT_BODY_LINE_BUDGET), docs .take(3)",
+        reason: "decide bounds source excerpts in the internal decision prompt, not an agent response list",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/endpoint.rs",
+        enclosing_item: "http_error",
+        location_or_primitive: "post_json response .take(RESPONSE_LIMIT + 1)",
+        reason: "post_json reads at most one byte past the internal response limit and refuses oversized responses for both decision backends, not an agent response list",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/decisions.rs",
+        enclosing_item: "decide",
+        location_or_primitive: "body lines .take(DEFAULT_BODY_LINE_BUDGET), docs .take(3)",
+        reason: "decide bounds source excerpts in the internal decisions request, not an agent response list; each candidate keeps its path and line for a full source read",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/graph.rs",
+        enclosing_item: "code_path",
+        location_or_primitive: "resolve_seeds_for_request .take(MAX_SEEDS)",
+        reason: "resolve_seeds_for_request bounds the initial code seeds for internal graph traversal after path and test filtering; it does not shorten the search result page, and the related-code header and footer report only considered and kept nodes",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/graph.rs",
+        enclosing_item: "render_cached",
+        location_or_primitive: "documentation excerpt .take(3)",
+        reason: "render_cached retains a three-line documentation excerpt for one symbol, not a list of result nodes; the symbol path and line remain available for a full source read",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/graph.rs",
+        enclosing_item: "query_neighbors",
+        location_or_primitive: "locations.truncate(MAX_FRONTIER)",
+        reason: "query_neighbors bounds internal graph candidates after location deduplication, not an agent-visible neighbor list; the related-code counts describe considered nodes, not an exhaustive graph census",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/render.rs",
+        enclosing_item: "append",
+        location_or_primitive: "append_walk .take(MAX_NODES)",
+        reason: "append_walk adds supplementary inline code context, not a paginated search result list; its header and footer disclose shown and considered node counts, graph gaps, and the stop reason, and a body cut has an explicit marker",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/gather/walk.rs",
+        enclosing_item: "record_failure",
+        location_or_primitive: "walk_with_neighbors frontier.truncate(settings.max_frontier)",
+        reason: "walk_with_neighbors bounds the internal next-round decision frontier, not fallback records or a search result page; the related-code counts cover considered and kept nodes rather than all possible graph candidates",
+    },
     ExclusionEntry {
         file: "commands/read.rs",
         enclosing_item: "fit_github_images, process_image_fitting",

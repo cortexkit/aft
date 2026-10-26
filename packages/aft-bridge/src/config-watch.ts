@@ -117,6 +117,7 @@ export function aftLiveConfigKeys<C>(
     pathKey<C>("configure_warnings_delivery"),
     pathKey<C>("restrict_to_project_root"),
     pathKey<C>("revision_reads"),
+    pathKey<C>("search.gather"),
     pathKey<C>("inspect.diagnostics_timeout_ms"),
     pathKey<C>("inspect.tier2_idle_minutes"),
     pathKey<C>("lsp.idle_minutes"),

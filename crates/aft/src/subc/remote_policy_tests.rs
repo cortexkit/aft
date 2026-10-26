@@ -44,6 +44,7 @@ fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Res
     let format =
         crate::subc_format::FormatContext::from_tool_call(name, &args, &route.project_root);
     let tool_ctx = ToolCallContext {
+        search_context: None,
         project_root: route.project_root.clone(),
         session_id: Some(route.session.clone()),
         request_id: "confine-vector".into(),
