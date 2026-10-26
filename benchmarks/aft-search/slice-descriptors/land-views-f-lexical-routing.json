@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs"
+  ],
+  "slices": [
+    "views-f-lexical-routing"
+  ],
+  "note": "Views-on lexical acquisition projects verified v3 payloads into the existing read-only query engine. Views are default-off, so the benchmark runs the views-off path, whose acquisition, scoring, fusion, admission and paging are unchanged; ranked rows must remain byte-identical to the committed reference."
+}
