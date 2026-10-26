@@ -266,6 +266,10 @@ impl V3Ledger {
 
     /// The process's connection to the ledger. Without `create`, a missing
     /// ledger is `None`; with it, the caller must be inside a v3 publication.
+    ///
+    /// The `open_connections` lock is held from before the open until the
+    /// connection is registered, the same lock [`read_rows`] holds across a
+    /// copy of the ledger's files, so an open never overlaps such a copy.
     fn connection(&self, create: bool) -> V3Result<Option<SharedConnection>> {
         let mut open = lock(open_connections());
         open.retain(|_, connection| connection.strong_count() > 0);
@@ -482,21 +486,48 @@ impl V3Ledger {
 /// a WAL a killed importer left behind. A copy taken while another process
 /// writes can only be older or unreadable, and rows only move towards
 /// completion, so neither makes an import look more complete than it is.
+///
+/// The copy opens and closes descriptors on the ledger's files, and closing
+/// any descriptor on a SQLite file drops every POSIX lock this process holds
+/// on it. So the lookup and the whole copy run under the `open_connections`
+/// lock, which every ledger open in this process takes before it opens and
+/// keeps until it has registered its connection: an open and a copy can
+/// never overlap, and a copy only runs while this process has no connection
+/// to the ledger.
 pub fn read_rows(storage: &Path, family: &str) -> V3Result<Option<Vec<V3ImportRow>>> {
     let ledger = V3Ledger::new(storage, family)?;
-    if let Some(shared) = lock(open_connections())
-        .get(&ledger.path)
-        .and_then(Weak::upgrade)
-    {
+    let mut open = lock(open_connections());
+    open.retain(|_, connection| connection.strong_count() > 0);
+    if let Some(shared) = open.get(&ledger.path).and_then(Weak::upgrade) {
+        drop(open);
         return read_all(&lock(&shared)).map(Some);
     }
     if !ledger.path.is_file() {
         return Ok(None);
     }
-    read_sqlite_copy(&ledger.path, |connection| {
+    let rows = read_sqlite_copy(&ledger.path, |connection| {
         check_format(connection)?;
         read_all(connection).map(Some)
-    })
+    });
+    drop(open);
+    rows
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: called on the copying thread at named points of
+    /// [`read_sqlite_copy`], so a test can hold a copy part-way through.
+    static COPY_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&'static str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn copy_hook(stage: &'static str) {
+    COPY_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
 }
 
 /// Runs `body` on a private copy of the SQLite database at `path` (and its
@@ -505,8 +536,10 @@ pub fn read_rows(storage: &Path, family: &str) -> V3Result<Option<Vec<V3ImportRo
 /// files beside it; reading a copy writes nothing under the storage root.
 /// Copying opens and closes a descriptor on the file, which drops POSIX locks
 /// this process holds on it, so callers use it only for databases this
-/// process has no SQLite connection to (as [`read_rows`] ensures for the
-/// ledger, and as holds for the `aft cache prune-legacy` command).
+/// process has no SQLite connection to and cannot open one during the copy
+/// (as [`read_rows`] ensures for the ledger by holding `open_connections`,
+/// and as holds for the `aft cache prune-legacy` command, which opens no v3
+/// registry connection).
 pub(crate) fn read_sqlite_copy<T>(
     path: &Path,
     body: impl FnOnce(&rusqlite::Connection) -> V3Result<T>,
@@ -524,6 +557,8 @@ pub(crate) fn read_sqlite_copy<T>(
         crate::private_storage::create_dir_all(&copy_dir)?;
         let copy = copy_dir.join(name);
         crate::private_storage::copy(path, &copy)?;
+        #[cfg(test)]
+        copy_hook("database-copied");
         let mut wal_name = name.to_os_string();
         wal_name.push("-wal");
         match crate::private_storage::copy(path.with_file_name(&wal_name), copy_dir.join(&wal_name))
@@ -538,6 +573,8 @@ pub(crate) fn read_sqlite_copy<T>(
         result
     })();
     let _ = fs::remove_dir_all(&copy_dir);
+    #[cfg(test)]
+    copy_hook("finished");
     result
 }
 

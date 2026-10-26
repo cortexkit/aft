@@ -332,7 +332,30 @@ fn imported_trigram_rows_equal_a_cold_build_and_read_no_checkout_file() {
         },
     )
     .unwrap();
-    assert!(entries.len() >= 3, "{} entries", entries.len());
+    // Exactly the files a cold build indexes are imported: every checkout
+    // file whose trigram extraction is indexed (the binary file is not), and
+    // no other path.
+    let imported = entries
+        .iter()
+        .map(|entry| crate::views::segment_store::rel_path_to_os(&entry.rel_path).unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    let eligible = sources
+        .iter()
+        .filter(|(_, bytes)| {
+            TrigramPayload::extract(bytes, &POLICY).flag
+                == crate::views::segment_store::TrigramFlag::Indexed
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(imported, eligible);
+    assert_eq!(
+        eligible,
+        ["notes/readme.md", "src/alpha.rs", "src/beta.rs"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    );
+    assert_eq!(entries.len(), imported.len(), "a path was imported twice");
     let outcome = register_staged(
         &storage,
         FAMILY,

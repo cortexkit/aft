@@ -343,6 +343,76 @@ fn a_live_claim_is_single_flight_and_an_abandoned_one_is_taken_over() {
     assert_eq!(row_of(&storage, LegacyArtifact::Trigram).attempt, 2);
 }
 
+/// A ledger read that has to copy the ledger's files holds descriptors on
+/// them; closing those would drop the POSIX locks of any connection this
+/// process had open. The copy is held part-way through: it then holds the
+/// lock every ledger open takes, and an open attempted meanwhile completes
+/// only after the copy has finished.
+#[test]
+fn a_ledger_open_waits_for_an_in_flight_copy_of_its_files() {
+    use std::sync::mpsc;
+    let _serial = v3::serial_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let root = checkout(dir.path());
+    let storage = dir.path().join("storage");
+    legacy_trigram(&storage, &root);
+    run_v3_import(&request(&storage, &root, None), None).unwrap();
+    let ledger = V3Ledger::new(&storage, FAMILY).unwrap();
+    assert!(ledger.path.is_file());
+    // The import's connection is closed (its last handle dropped), so the
+    // next read has to copy the files.
+    assert!(lock(open_connections())
+        .get(&ledger.path)
+        .and_then(Weak::upgrade)
+        .is_none());
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader = {
+        let storage = storage.clone();
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            COPY_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |stage| match stage {
+                    "database-copied" => {
+                        paused_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    "finished" => lock(&log).push("copy-finished"),
+                    _ => {}
+                }));
+            });
+            read_rows(&storage, FAMILY).unwrap().unwrap().len()
+        })
+    };
+    paused_rx.recv().unwrap();
+    // The copy is in flight and holds the lock every ledger open takes first.
+    assert!(matches!(
+        open_connections().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    let (attempting_tx, attempting_rx) = mpsc::channel();
+    let opener = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            let connection = ledger.connection(false).unwrap().unwrap();
+            lock(&log).push("opened");
+            drop(connection);
+        })
+    };
+    attempting_rx.recv().unwrap();
+    assert!(
+        lock(&log).is_empty(),
+        "nothing finished while the copy is held"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(reader.join().unwrap(), 1, "the copy read the trigram row");
+    opener.join().unwrap();
+    assert_eq!(*lock(&log), vec!["copy-finished", "opened"]);
+}
+
 #[test]
 fn a_ledger_from_a_newer_build_is_refused_by_name() {
     let _serial = v3::serial_for_test();
@@ -355,8 +425,9 @@ fn a_ledger_from_a_newer_build_is_refused_by_name() {
         .unwrap()
         .path()
         .to_path_buf();
-    // Close this process's shared connection before editing the file.
-    lock(open_connections()).clear();
+    // Forget this process's ledger handle (its connection is already closed)
+    // so the next read opens the edited file.
+    lock(open_connections()).remove(&path);
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection
         .execute("UPDATE format_meta SET format_version = 2", [])

@@ -61,7 +61,17 @@ fn a_compatible_symbol_import_needs_no_parse_and_serves_lookups() {
     let root = checkout(dir.path());
     let storage = dir.path().join("storage");
     let files = legacy_symbols(&storage, &root);
-    assert!(files.len() >= 3, "{} parsed files", files.len());
+    // Every checkout file the parser has a language for, and only those.
+    assert_eq!(
+        files
+            .iter()
+            .map(|(relative, _, _)| relative.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["notes/readme.md", "src/alpha.rs", "src/beta.rs"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect()
+    );
     let legacy = snapshot_tree(&storage);
 
     let parses = cached_parser_parses();
