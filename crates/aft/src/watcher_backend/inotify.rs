@@ -757,6 +757,9 @@ fn register_initial_tree(
             }
         }
     }
+    if !installed.contains(root) {
+        return Err(notify::Error::path_not_found().add_path(root.to_path_buf()));
+    }
     Ok(installed)
 }
 
@@ -896,6 +899,19 @@ pub(super) mod tests {
             );
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn initial_subscription_cannot_certify_a_root_lost_before_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let result =
+            register_initial_tree(&boundary, &Arc::new(RwLock::new(None)), &[], &mut |_| {
+                Ok(true)
+            });
+        assert!(result.is_err());
     }
 
     #[test]
