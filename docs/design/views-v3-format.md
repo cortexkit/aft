@@ -565,7 +565,9 @@ CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   overrides is not a base. The identity digest (tag
   `aft/views-v3/base-identity/1`) covers family, all producers, the ignore
   fingerprint, the platform family, `head_tree:none` and the membership
-  digest. The base scope is `base-m1-<identity hex>`.
+  digest. The base scope is `base-m1-<identity hex>`. A second, tree-keyed
+  base kind (`base-t1-`) is defined in *Tree-keyed bases and blob receipts*
+  below; a scope is never relabelled from one kind to the other.
 - **Authentication.** Every consumer resolves a base by pin-then-verify and
   recomputes both digests from the pinned manifest; a `BaseHeader` is
   checked against that result, never trusted. `bound_generation` is
@@ -653,6 +655,7 @@ contract is [views-slice4-opening.md](views-slice4-opening.md).
 | 4 | Plane-row sweep over `F/{semantic,callgraph,trigram}.sqlite`; progress at `retention/cursors/v3-plane-rows/<family>.json` | Store 1/1; cursor 1; registry 2/2 for sweep coordination | Implement in `gc/family.rs` and `storage_retention.rs`. Mark the composed depth-one closure, including overrides, then delete only unmarked eligible rows under the epoch/lease protocol. Bound the producing iterator and deadline; resume rather than treating a partial scan as complete. Include later registered planes when they exist. |
 | 4 | `DiskBudget` wiring in `crates/aft/src/views/eviction.rs`, using `F/members.sqlite` reservations/accounting and the existing namespace inventory | Registry 2/2; no separate budget file or new config format | Preserve allocated-byte charging, the 2 GiB family target, 4 GiB hard/namespace limits and max(4 GiB, 5%) device floor. Refuse with the named storage gap and no legacy fallback. |
 | 4v | `M/stat-evidence-<generation>.sqlite` | Stat-evidence 1/1, registry floor 3 | Generation-paired path/root/file identity, size/times, stable content digest, proven Git OID if any, observation-time conversion-policy digest and per-plane keys. No stat-cache or current-policy-only proof. |
+| 4v | `M/tree-proof.sqlite` in a `base-t1-` member | Tree proof 1/1, registry floor 3 | Full-index tree descriptor proven from the coherent index and counted `rev-parse HEAD^{tree}`, plus one byte-bound Git-blob receipt per base member. Never a header string or a stat-cache tuple. See *Tree-keyed bases and blob receipts*. |
 | 4v | `F/members.sqlite`: `view_tokens` rows | `views_v3_registry` 3/3 | Single-use advisory token bound to identity at first consumption, with expiry and consume state. Stored in daemon storage, never the checkout. Stat evidence and tokens do not replace freshness validation. |
 | 5 | `M/donor-<generation>-<fingerprint>.seal.json` beside `M/donor-<generation>-<fingerprint>.sqlite` | Donor seal 1, registry floor 4 | Atomically publish fingerprint, size and `journal_mode=DELETE` only after the detached donor is checkpointed and synced and has no WAL/SHM. A published manifest names only a completed seal. Never copy/clone a live SQLite file set. |
 | 6a | `F/symbol.sqlite` | `views_v3_store` 1/1, new-store layout 2; store floor 1 | The v3 symbol plane uses the same immutable `payload`/`payload_digest` contract and reservation protocol. No in-place legacy conversion. Implemented; see *Import ledger and symbol plane*. |
@@ -715,6 +718,113 @@ and member retention remain unchanged.
 Slice 4's binder must honour the `evicting` contract above: when it finds its
 member in `evicting`, it never uses that view directory, and either treats the
 member as absent and publishes a fresh one or waits for the eviction to finish.
+
+#### Tree-keyed bases and blob receipts
+
+Source: `git_index_reader.rs` (tree computation and blob object IDs),
+`views/base_refs.rs` (identity), `views/tree_base.rs` (builder),
+`views/verification.rs` (proof file and bind-time checks).
+
+**Identity.** A base manifest whose header carries `head_tree` is a
+tree-keyed base; one without it keeps the membership identity above,
+unchanged. A tree-keyed manifest has only regular entries, each with a
+`git_oid`, and no `base` header, tombstones or overrides. Its tree-membership
+digest is BLAKE3 over the length-prefixed tag
+`aft/views-v3/base-tree-membership/1`, the entry count, then per path (in path
+order) the path bytes, kind byte 1, mode, content hash, size,
+resolution-input flag and the `git_oid` text. Every OID and the tree are
+lowercase hex of one length (40 for SHA-1, 64 for SHA-256). The identity digest
+(tag `aft/views-v3/base-identity-tree/1`) covers family, all producers, the
+ignore fingerprint, the platform family, the object format name (`sha1` or
+`sha256`), `head_tree:<hex>` and the tree-membership digest. The scope is
+`base-t1-<identity hex>`. The membership digest still refuses any manifest
+with `head_tree` or a `git_oid`, and membership resolution still requires the
+`base-m1-` prefix.
+
+The identity only names the tree a base claims. Header fields never prove it.
+Trust needs the proof file below and a live check against Git at bind time.
+Without both, a tree-keyed base is treated like a membership base: every path
+takes the full check.
+
+**Older readers.** A tree-keyed base is published only after the registry floor
+is raised to 3, so readers that support at most registry 2 refuse the domain.
+A registry-3 reader without this section refuses the scope: membership
+resolution rejects the `base-t1-` prefix, and `membership_digest` rejects the
+manifest. Such a reader never authenticates a tree-keyed base as
+membership-keyed. Its sweep records the base's edges as `base_corrupt` (strict
+rebuild for those workers) and can then reclaim the base as unreferenced. That
+costs a rebuild in a mixed-version fleet; it does not change any answer.
+
+**Builder.** The claim owner reads a coherent index snapshot. It computes the
+full index tree in Git's object format and compares it with a counted
+`git rev-parse HEAD^{tree}`. The computation refuses unmerged stages,
+assume-valid, skip-worktree and intent-to-add entries, and duplicate paths. It
+also refuses file/directory conflicts, empty, `.` or `..` components, any
+component equal to `.git` (ASCII case-insensitive), and modes other than
+100644, 100755, 120000 and 160000. Split and sparse indexes were already
+refused by the reader. Every member is a walker-admitted path with a stage-0
+regular index entry. It is read with the same native stat before and after
+the read. The bytes are hashed as BLAKE3 content and as Git's
+`blob <length>\0<bytes>` object. The blob OID must equal the index entry's. On
+unix the executable bit must agree with the index mode. A failure of any check
+for any member means no tree-keyed base: the bind builds a membership base as
+before. The conversion policy must be reusable (see *Stat evidence*). The
+receipt pairs the policy digest captured for this build with that read, never
+with an older index tuple.
+
+**Proof file `M/tree-proof.sqlite`.** One per tree-keyed base member. The
+base's identity and membership never change across readiness successors, so
+one proof serves every generation of the scope. It is written once by the
+claim owner, after the member is registered and the registry floor is 3, and
+before the first publication. After that it is never rewritten.
+`application_id=0x41465454`, `PRAGMA user_version=1`, `journal_mode=DELETE`:
+
+```sql
+CREATE TABLE proof_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL,
+ base_scope TEXT NOT NULL, identity_digest TEXT NOT NULL, membership_digest TEXT NOT NULL,
+ object_format TEXT NOT NULL, head_tree TEXT NOT NULL, root BLOB NOT NULL,
+ policy TEXT NOT NULL, receipts_digest TEXT NOT NULL);
+CREATE TABLE blob_receipts(path BLOB PRIMARY KEY, record BLOB NOT NULL);
+```
+
+Format/schema are 1/1. `root` is the versioned JSON root identity used by stat
+evidence. A receipt record is versioned JSON (`version: 1`): mode, size,
+content digest, Git blob OID, the native stat observed around the read,
+observation time (rounded down to the second), policy digest and delivery
+sequence. `receipts_digest` is BLAKE3 over the tag `aft/views-v3/tree-receipts/1`,
+the receipt count, then each path and its record bytes, length-prefixed and in
+path order.
+
+Staging is `M/.tree-proof.sqlite.tmp.<nonce>`. It is synced, renamed into place
+and followed by a directory sync. A failed writer removes its own staging. A
+crash can leave one staging file, which stays until the member is reclaimed.
+The generation sweep does not match either name. Both are member files, so
+the existing per-member accounting counts them, and whole-base reclaim removes
+them. A reader reads the proof only while it holds the authenticated base's
+exact-generation read marker.
+
+**Bind-time check.** A worker whose durable generation names a `base-t1-` base
+resolves that base (pin-then-verify) and reads the proof. The bind refuses the
+proof unless all of these hold:
+
+- the file's application ID, version and format/schema are as above;
+- `receipts_digest` matches the stored receipts;
+- scope, identity and membership digests equal the authenticated base;
+- head tree and object format equal the base manifest;
+- the root identity and policy digest equal the current bind guard, and the
+  current policy is reusable;
+- every base member has exactly one receipt, and each receipt's mode, size,
+  content and OID equal its manifest entry.
+
+Git must then agree now. The guard's counted `rev-parse HEAD^{tree}` must name
+the proof's tree. A coherent index read now must compute that same tree. Each
+receipt's path must have a stage-0 index entry with no exception flag, the
+same mode and the receipt's OID. A receipt that passes is only a candidate.
+The stat-evidence reuse rules still decide each path: equal native stat and
+file identity, mtime before the observation second, no watcher delivery for
+the path, matching disk state, and ready, present plane keys. Any failed check
+means that path, or with a refused proof every path, takes the full check.
 
 ## Import ledger and symbol plane
 
