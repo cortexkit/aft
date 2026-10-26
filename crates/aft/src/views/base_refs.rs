@@ -708,7 +708,7 @@ pub fn publish_worker_with(
 
 /// Publishes with ownership serialization around final validation and the CAS.
 /// `publish_cas` may decline without calling its operation, but may call it only
-/// once. Artifact construction and admission happen before this short fence.
+/// once. Artifact construction and admission happen before this fence.
 pub fn publish_worker_guarded(
     request: WorkerPublication<'_>,
     observer: Option<&dyn DurabilityObserver>,

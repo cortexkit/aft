@@ -1676,13 +1676,72 @@ pub(crate) struct ReconcileWork {
     pub attachments: usize,
 }
 
+/// Why this driver cannot own and complete a fresh base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FreshBootstrapRefusal {
+    NonLexicalPlane(FamilyPlane),
+    MissingLexicalPlane,
+    LexicalProducerMismatch,
+}
+
+impl std::fmt::Display for FreshBootstrapRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonLexicalPlane(plane) => write!(
+                f,
+                "fresh_bootstrap_nonlexical_plane: {} requires its base completion coordinator",
+                plane.as_str()
+            ),
+            Self::MissingLexicalPlane => f.write_str("fresh_bootstrap_missing_lexical_plane"),
+            Self::LexicalProducerMismatch => {
+                f.write_str("fresh_bootstrap_lexical_producer_mismatch")
+            }
+        }
+    }
+}
+impl std::error::Error for FreshBootstrapRefusal {}
+
 impl CheckoutDriver {
+    /// Pure eligibility check for callers choosing between new and existing
+    /// runtime paths. The bind hook reports the same refusal through PlaneError.
+    pub fn fresh_bootstrap_policy(
+        &self,
+    ) -> Result<crate::blob_store::v2::TrigramPolicy, FreshBootstrapRefusal> {
+        if let Some(plane) = self
+            .planes
+            .iter()
+            .map(|plane| plane.plane())
+            .find(|plane| *plane != FamilyPlane::Trigram)
+        {
+            return Err(FreshBootstrapRefusal::NonLexicalPlane(plane));
+        }
+        if self.producers.semantic.is_some() {
+            return Err(FreshBootstrapRefusal::NonLexicalPlane(
+                FamilyPlane::Semantic,
+            ));
+        }
+        if self.producers.callgraph != super::semantic_runtime::UNREGISTERED_PRODUCER {
+            return Err(FreshBootstrapRefusal::NonLexicalPlane(
+                FamilyPlane::Callgraph,
+            ));
+        }
+        let policy = self
+            .planes
+            .iter()
+            .find_map(|plane| plane.bootstrap_policy())
+            .ok_or(FreshBootstrapRefusal::MissingLexicalPlane)?;
+        if self.producers.trigram != policy.fingerprint_hex() {
+            return Err(FreshBootstrapRefusal::LexicalProducerMismatch);
+        }
+        Ok(policy)
+    }
     fn stable_read(
         &self,
         path: &RelPath,
         absolute: &std::path::Path,
         recorded_ns: u128,
         first_seq: u64,
+        first_stat: Option<ObservedStat>,
     ) -> Result<StableRead, PlaneError> {
         for attempt in 0..3 {
             let seq = if attempt == 0 {
@@ -1693,7 +1752,11 @@ impl CheckoutDriver {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .seq
             };
-            let before = self.source_stat(absolute, recorded_ns)?;
+            let before = if attempt == 0 {
+                first_stat.clone()
+            } else {
+                self.source_stat(absolute, recorded_ns)?
+            };
             let bytes = super::assembly::read_working_tree_file(absolute)
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
             #[cfg(test)]
@@ -1742,6 +1805,8 @@ impl CheckoutDriver {
     /// A fresh checkout bootstraps a lexical-ready v3 base and publishes a v3
     /// worker over it; it never falls back to legacy storage. Installation is
     /// left to the caller and still validates the cut's epoch and bundle identity.
+    /// Fresh bases are lexical-only until nonlexical completion can be scheduled;
+    /// already-built bases can be verified for any registered plane.
     pub fn verified_bind(
         &self,
         access: &ViewAccess,
@@ -1752,6 +1817,15 @@ impl CheckoutDriver {
             return Err(SiblingLoader::error(
                 "verified_bind requires a v3-only registration",
             ));
+        }
+        let bootstrap = base.base_header().is_none();
+        if bootstrap {
+            self.fresh_bootstrap_policy()
+                .map_err(|reason| SiblingLoader::error(reason.to_string()))?;
+        } else {
+            base.ensure_producers(&self.producers).map_err(|error| {
+                SiblingLoader::stage_error(LoaderStage::ProducerValidation, error.to_string())
+            })?;
         }
         if let Some(token) = self
             .advisory_token
@@ -1774,7 +1848,6 @@ impl CheckoutDriver {
                 now,
             );
         }
-        let bootstrap = base.base_header().is_none();
         self.v3_reconcile
             .store(true, std::sync::atomic::Ordering::Release);
         let base = if bootstrap {
@@ -1832,17 +1905,8 @@ impl CheckoutDriver {
         seed: Arc<ComposedGeneration>,
     ) -> Result<Arc<ComposedGeneration>, PlaneError> {
         let policy = self
-            .planes
-            .iter()
-            .find_map(|plane| plane.bootstrap_policy())
-            .ok_or_else(|| {
-                SiblingLoader::error("v3 bootstrap requires a registered lexical plane")
-            })?;
-        if self.producers.trigram != policy.fingerprint_hex() {
-            return Err(SiblingLoader::error(
-                "v3 bootstrap lexical producer mismatch",
-            ));
-        }
+            .fresh_bootstrap_policy()
+            .map_err(|reason| SiblingLoader::error(reason.to_string()))?;
         let (checkout, _) = SiblingLoader::reconciled_snapshot(self, access, seed)?;
         if checkout.pending_intent().next().is_some() {
             return Err(SiblingLoader::error(
@@ -2496,7 +2560,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 }
             }
             let (bytes, stat_evidence) =
-                match self.stable_read(&path, &absolute, recorded_ns, delivery_seq)? {
+                match self.stable_read(&path, &absolute, recorded_ns, delivery_seq, before)? {
                     StableRead::Absent => continue,
                     StableRead::Bytes(bytes, evidence) => (bytes, evidence),
                     StableRead::Pending => {
@@ -4619,10 +4683,14 @@ impl CompositePlane for CallgraphBridge {
                         "cached callgraph row disappeared before protection".into(),
                     ));
                 }
-                if let Some(super::manifest_v2::EntryV2::Regular { planes, .. }) =
-                    delta.get_mut(path)
+                if let Some(super::manifest_v2::EntryV2::Regular {
+                    planes,
+                    resolution_input,
+                    ..
+                }) = delta.get_mut(path)
                 {
                     planes.callgraph = Some(super::readiness::PlaneState::ready(&cached.0));
+                    *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
                 }
                 continue;
             }
@@ -5367,6 +5435,9 @@ impl CompositePlane for TrigramBridge {
         delta: &mut super::manifest_v2::ManifestV2,
         live: &mut crate::pins::LivePin,
     ) -> Result<(), PlaneError> {
+        if delta.header().producers.trigram != self.policy.fingerprint_hex() {
+            return Err(SiblingLoader::error("trigram producer mismatch"));
+        }
         let mut keys = Vec::new();
         let mut payloads = Vec::new();
         for (path, entry) in delta.entries() {
@@ -5808,6 +5879,112 @@ mod checkout_kind_tests {
 mod v3_bootstrap_tests {
     use super::*;
 
+    struct NamedPlane(FamilyPlane);
+    impl CompositePlane for NamedPlane {
+        fn plane(&self) -> FamilyPlane {
+            self.0
+        }
+        fn applies_to(&self, _: &RelPath) -> bool {
+            false
+        }
+        fn attachment(
+            &self,
+            _: &RelPath,
+            _: &[u8],
+        ) -> Result<super::super::snapshot::PlaneAttachment, PlaneError> {
+            panic!("unsupported bootstrap must not extract")
+        }
+        fn materialize(
+            &self,
+            _: &super::super::registry::ViewRegistration,
+            _: &str,
+            _: &Snapshot,
+            _: &BTreeMap<RelPath, LiveEntry>,
+            _: &mut super::super::manifest_v2::ManifestV2,
+            _: &mut crate::pins::LivePin,
+            _: bool,
+        ) -> Result<(), PlaneError> {
+            panic!("unsupported bootstrap must not materialize")
+        }
+        fn finish_generation(
+            &self,
+            _: &super::super::registry::ViewRegistration,
+            _: &str,
+            _: &str,
+        ) -> Result<(), PlaneError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fresh_nonlexical_bootstrap_has_a_typed_refusal_and_takes_no_claim() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for plane in [FamilyPlane::Semantic, FamilyPlane::Callgraph] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("file.rs"), b"fn untouched() {}\n").unwrap();
+            let policy = crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            };
+            let driver = CheckoutDriver::new_v3(
+                storage.path(),
+                "family",
+                "worker",
+                root.path(),
+                Producers {
+                    trigram: policy.fingerprint_hex(),
+                    semantic: (plane == FamilyPlane::Semantic).then(|| "model".into()),
+                    callgraph: if plane == FamilyPlane::Callgraph {
+                        super::super::callgraph::PRODUCER.into()
+                    } else {
+                        "unregistered".into()
+                    },
+                },
+                Arc::new(ConfiguredMembershipWalker),
+                vec![
+                    Arc::new(TrigramBridge::new(storage.path().to_owned(), policy)),
+                    Arc::new(NamedPlane(plane)),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                driver.fresh_bootstrap_policy(),
+                Err(FreshBootstrapRefusal::NonLexicalPlane(plane))
+            );
+            let error = driver
+                .verified_bind(
+                    &driver.access(),
+                    driver.installed_snapshot().generation().clone(),
+                )
+                .unwrap_err();
+            assert!(error.reason.contains("fresh_bootstrap_nonlexical_plane"));
+            let work = driver.take_reconcile_work();
+            assert_eq!((work.walks, work.reads), (0, 0));
+            let registry =
+                crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family")
+                    .unwrap();
+            assert_eq!(
+                registry
+                    .read(
+                        |c| Ok(c.query_row("SELECT COUNT(*) FROM base_builds", [], |r| r
+                            .get::<_, u64>(0))?)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                registry
+                    .read(|c| Ok(c.query_row(
+                        "SELECT COUNT(*) FROM members WHERE kind='base'",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )?))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     fn trigram_driver(root: &std::path::Path, storage: &std::path::Path) -> CheckoutDriver {
         let policy = crate::blob_store::v2::TrigramPolicy {
             max_file_size: 1 << 20,
@@ -5979,7 +6156,125 @@ mod v3_bootstrap_tests {
             let work = driver.take_reconcile_work();
             assert_eq!(work.reads, 1);
             assert_eq!(work.attachments, expected_extractions);
+            let mut header = driver.installed_snapshot().generation().header().clone();
+            header.producers.trigram = "wrong-producer".into();
+            let mut delta =
+                super::super::manifest_v2::ManifestV2::new_v3(header, None, Default::default());
+            let bridge = TrigramBridge::new(storage.path().to_owned(), policy);
+            let mut pin =
+                crate::pins::LivePin::create_v3(storage.path(), family, "worker").unwrap();
+            assert!(bridge
+                .materialize_v3(
+                    &driver.owner,
+                    &driver.owner.v3_route(),
+                    "unused",
+                    driver.installed_snapshot().generation(),
+                    &BTreeMap::new(),
+                    &mut delta,
+                    &mut pin
+                )
+                .is_err());
         }
+    }
+
+    #[test]
+    fn cached_callgraph_configuration_keeps_resolution_input_metadata() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let owner = super::super::registry::ViewRegistration::register_v3(
+            storage.path(),
+            "family",
+            "worker",
+            root.path(),
+        )
+        .unwrap();
+        let bridge = CallgraphBridge::default();
+        let path = RelPath::new(b"package.json".to_vec()).unwrap();
+        let bytes = b"{\"name\":\"cached-configuration\"}";
+        let content = crate::blob_store::v2::ContentHash::of(bytes);
+        let attachment = bridge.attachment(&path, bytes).unwrap();
+        let attachment = attachment
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap();
+        let key = attachment.key;
+        crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
+            p.put(
+                &key,
+                &attachment.blob.to_bytes().unwrap(),
+                FamilyPlane::Callgraph.payload_schema(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let header = super::super::manifest_v2::ManifestHeader {
+            producers: Producers {
+                trigram: "unused".into(),
+                semantic: None,
+                callgraph: super::super::callgraph::PRODUCER.into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        };
+        let mut base_manifest =
+            super::super::manifest_v2::ManifestV2::new_v3(header.clone(), None, Default::default());
+        base_manifest
+            .insert(
+                RelPath::new(b"base.rs".to_vec()).unwrap(),
+                super::super::manifest_v2::EntryV2::regular(
+                    crate::blob_store::v2::ContentHash::of(b"base"),
+                    4,
+                    super::super::manifest_v2::EntryPlanes {
+                        callgraph: Some(super::super::readiness::PlaneState::pending(
+                            "base graph pending",
+                        )),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let identity = super::super::base_refs::BaseIdentity::of("family", &base_manifest).unwrap();
+        let base = Arc::new(ComposedGeneration::new("base", base_manifest, None));
+        let mut delta = super::super::manifest_v2::ManifestV2::new_v3(
+            header,
+            Some(identity.header("base")),
+            Default::default(),
+        );
+        delta
+            .insert(
+                path.clone(),
+                super::super::manifest_v2::EntryV2::regular(
+                    content,
+                    bytes.len() as u64,
+                    Default::default(),
+                ),
+            )
+            .unwrap();
+        let mut entry = LiveEntry::new(super::super::snapshot::DiskState::of_bytes(bytes), 0);
+        entry.attachments.insert(
+            FamilyPlane::Callgraph,
+            bridge.cached_attachment(content, key),
+        );
+        let mut pin = crate::pins::LivePin::create_v3(storage.path(), "family", "worker").unwrap();
+        bridge
+            .materialize_v3(
+                &owner,
+                &owner.v3_route(),
+                "private",
+                &base,
+                &BTreeMap::from([(path.clone(), entry)]),
+                &mut delta,
+                &mut pin,
+            )
+            .unwrap();
+        assert!(matches!(
+            delta.get(&path),
+            Some(super::super::manifest_v2::EntryV2::Regular {
+                resolution_input: true,
+                ..
+            })
+        ));
     }
 
     fn legacy_inventory(storage: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
