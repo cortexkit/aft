@@ -18,6 +18,10 @@ use super::RelPath;
 #[path = "first_load/overflow_recovery_tests.rs"]
 mod overflow_recovery_tests;
 
+#[cfg(test)]
+#[path = "first_load/publication_fence_tests.rs"]
+mod publication_fence_tests;
+
 /// A complete strict content walk under the checkout's current ignore rules.
 /// The revision must change for every delivered edit, write intent, watcher gap,
 /// or membership change; a partial walk must return an error, not this value.
@@ -1782,7 +1786,7 @@ impl CheckoutDriver {
         if !bootstrap {
             return Ok((snapshot, revision));
         }
-        let own = self.build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING)?;
+        let own = self.build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING);
         if self
             .planes
             .iter()
@@ -1799,6 +1803,7 @@ impl CheckoutDriver {
                     .map_err(|e| SiblingLoader::error(e.to_string()))?;
             }
         }
+        let own = own?;
         let mut delta = LiveDelta::from_snapshot(&snapshot);
         let draft = super::snapshot::derive_successor(
             &delta.cut(),
@@ -3078,7 +3083,12 @@ impl CheckoutDriver {
                 .flatten(),
         };
         let planes = &self.planes;
-        let outcome = super::base_refs::publish_worker_with(
+        let fence = self
+            .publish_fence
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let outcome = super::base_refs::publish_worker_guarded(
             super::base_refs::WorkerPublication {
                 storage: &storage,
                 family: &family,
@@ -3123,6 +3133,29 @@ impl CheckoutDriver {
                 }
                 self.validate_cut(access, snapshot, 0)
                     .map_err(|error| super::base_refs::BaseRefError::Unavailable(error.reason))
+            },
+            &mut |commit| {
+                let mut actual = None;
+                let mut publish = || {
+                    let _transition = self
+                        .publication_transition
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    actual =
+                        Some(commit().map_err(|error| SiblingLoader::error(error.to_string()))?);
+                    Ok(())
+                };
+                match &fence {
+                    Some(fence) => fence.publish(&mut publish),
+                    None => publish(),
+                }
+                .map_err(|error| super::base_refs::BaseRefError::Unavailable(error.reason))?;
+                drop(publish);
+                actual.ok_or_else(|| {
+                    super::base_refs::BaseRefError::Unavailable(
+                        "publication fence did not invoke CAS".into(),
+                    )
+                })
             },
         );
         drop(live);

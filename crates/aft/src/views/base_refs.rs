@@ -697,6 +697,25 @@ pub fn publish_worker_with(
     before_cas: &mut dyn FnMut(&str) -> Result<()>,
     final_validate: &mut dyn FnMut() -> Result<()>,
 ) -> Result<WorkerOutcome> {
+    publish_worker_guarded(
+        request,
+        observer,
+        before_cas,
+        final_validate,
+        &mut |commit| commit(),
+    )
+}
+
+/// Publishes with ownership serialization around final validation and the CAS.
+/// `publish_cas` may decline without calling its operation, but may call it only
+/// once. Artifact construction and admission happen before this short fence.
+pub fn publish_worker_guarded(
+    request: WorkerPublication<'_>,
+    observer: Option<&dyn DurabilityObserver>,
+    before_cas: &mut dyn FnMut(&str) -> Result<()>,
+    final_validate: &mut dyn FnMut() -> Result<()>,
+    publish_cas: &mut dyn FnMut(&mut dyn FnMut() -> Result<PublishV2>) -> Result<PublishV2>,
+) -> Result<WorkerOutcome> {
     let WorkerPublication {
         storage,
         family,
@@ -850,16 +869,39 @@ pub fn publish_worker_with(
     if let Err(error) = verified {
         return Err(abort(error, marker));
     }
-    if let Err(error) = final_validate() {
-        return Err(abort(error, marker));
-    }
 
     // (4) The CAS. From here on the reference may be durable.
-    let outcome = worker_store.commit_v2(prepared, observer);
+    let mut prepared = Some(prepared);
+    let mut invoked = false;
+    let mut cas_started = false;
+    let outcome = publish_cas(&mut || {
+        if invoked {
+            return Err(BaseRefError::Unavailable(
+                "publication fence invoked CAS twice".into(),
+            ));
+        }
+        invoked = true;
+        final_validate()?;
+        cas_started = true;
+        worker_store
+            .commit_v2(
+                prepared.take().expect("prepared CAS consumed once"),
+                observer,
+            )
+            .map_err(BaseRefError::from)
+    });
+    if !cas_started {
+        return Err(abort(
+            outcome.err().unwrap_or_else(|| {
+                BaseRefError::Unavailable("publication fence did not invoke CAS".into())
+            }),
+            marker,
+        ));
+    }
     #[cfg(test)]
     let outcome =
         match AFTER_WORKER_CAS.with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook())) {
-            Some(error) => Err(super::ViewError::Io(error)),
+            Some(error) => Err(error.into()),
             None => outcome,
         };
     let landed = match outcome {
