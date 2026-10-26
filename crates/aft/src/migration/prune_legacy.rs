@@ -1,12 +1,15 @@
 //! `aft cache prune-legacy`: the only path that deletes a legacy (pre-view)
-//! artifact set.
+//! artifact set (`index`, `semantic`, `callgraph`, `artifact-owners` and
+//! `symbols` directories of one key).
 //!
 //! Nothing deletes legacy sets automatically: not startup, not a sweep, not
 //! maintenance. The operator runs this command, which is a dry run unless
 //! `--yes` is given. It lists each legacy set as a whole with its bytes and
-//! prunes a set only when the set's import into per-checkout views completed
-//! and the retention window (14 days) has passed since, so an offline
-//! rollback to the previous binary keeps its caches in between.
+//! prunes a set only when the set's import into per-checkout views (v2) or
+//! into the v3 stores completed and the retention window (14 days) has
+//! passed since, so an offline rollback to the previous binary keeps its
+//! caches in between. A set that a running v3 import or a v3 base build may
+//! still read is kept whatever its ledgers say.
 //!
 //! The process census is a guard against a mistake, not process exclusion:
 //!
@@ -49,14 +52,17 @@ pub enum LegacyKind {
     Semantic,
     Callgraph,
     ArtifactOwners,
+    /// `symbols/<key>`: the parsed-symbol cache, which the v3 importer reads.
+    Symbols,
 }
 
 impl LegacyKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Index,
         Self::Semantic,
         Self::Callgraph,
         Self::ArtifactOwners,
+        Self::Symbols,
     ];
 
     /// The legacy root under the storage directory.
@@ -66,6 +72,7 @@ impl LegacyKind {
             Self::Semantic => "semantic",
             Self::Callgraph => "callgraph",
             Self::ArtifactOwners => "artifact-owners",
+            Self::Symbols => "symbols",
         }
     }
 
@@ -100,6 +107,10 @@ pub enum Eligibility {
     LedgerUnreadable(String),
     /// The set could not be inventoried completely; it is never moved.
     InventoryIncomplete(String),
+    /// Something may still read the set as an import source, whatever its
+    /// ledgers say: a running v3 import holds a claim on it, or a v3 base of
+    /// the family of the same name is being built.
+    PinnedSource(String),
 }
 
 impl Eligibility {
@@ -120,6 +131,9 @@ impl Eligibility {
             ),
             Self::LedgerUnreadable(reason) => format!("kept: import ledger unreadable: {reason}"),
             Self::InventoryIncomplete(reason) => format!("kept: inventory incomplete: {reason}"),
+            Self::PinnedSource(reason) => {
+                format!("kept: still pinned as an import source: {reason}")
+            }
         }
     }
 }
@@ -156,7 +170,7 @@ pub struct Inventory {
 
 /// Size of a directory tree without following symlinks. The walk stops at
 /// `limit` entries; `complete` is false when it did.
-fn tree_size(path: &Path, limit: usize) -> io::Result<(u64, u64, bool)> {
+pub(crate) fn tree_size(path: &Path, limit: usize) -> io::Result<(u64, u64, bool)> {
     let mut bytes = 0_u64;
     let mut entries = 0_u64;
     let mut stack = vec![path.to_path_buf()];
@@ -220,14 +234,103 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// Decides eligibility from the key's import ledger, read without writing.
+/// Whether something may still read a legacy set as an import source.
+enum SourcePin {
+    Free,
+    Pinned(String),
+    Uncertain(String),
+}
+
+/// Consults the v3 import ledger and the v3 base-build claims (the
+/// base-reference protocol of `views::base_refs`) of the family named like
+/// the legacy key, reading both without writing. A finished import does not
+/// free a set that a live import or a live base build may still read.
+fn source_pin(storage: &Path, key: &str) -> SourcePin {
+    match super::v3_ledger::legacy_key_status(storage, key) {
+        Ok(Some(status)) if status.live_claim => {
+            return SourcePin::Pinned("a running v3 import holds a claim on it".to_owned())
+        }
+        Ok(_) => {}
+        Err(error) => return SourcePin::Uncertain(error.to_string()),
+    }
+    if crate::blob_store::v2::validate_family(key).is_err() {
+        return SourcePin::Free;
+    }
+    let Ok(registry) =
+        crate::blob_store::v3::family_dir(storage, key).map(|family| family.join("members.sqlite"))
+    else {
+        return SourcePin::Free;
+    };
+    if !registry.is_file() {
+        return SourcePin::Free;
+    }
+    // Read a private copy: even a read-only open of the live registry can
+    // leave WAL sidecars beside it, and this command's dry run writes nothing.
+    let building = super::v3_ledger::read_sqlite_copy(&registry, |connection| {
+        if !crate::views::base_refs::has_base_refs(connection)? {
+            return Ok(None);
+        }
+        let mut statement = connection.prepare(
+            "SELECT base_scope, owner_pid, owner_start FROM base_builds WHERE state='building'",
+        )?;
+        let claims = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::pins::PinOwner {
+                        pid: row.get(1)?,
+                        start_time: row.get(2)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(claims
+            .into_iter()
+            .find(|(_, owner)| crate::pins::owner_is_live(owner))
+            .map(|(scope, _)| scope))
+    });
+    match building {
+        Ok(Some(scope)) => SourcePin::Pinned(format!("v3 base {scope} is being built")),
+        Ok(None) => SourcePin::Free,
+        Err(error) => SourcePin::Uncertain(format!("v3 registry unreadable: {error}")),
+    }
+}
+
+/// Decides eligibility from the key's import ledgers (the v2 per-checkout
+/// ledger and the v3 ledger), read without writing. Every ledger that has
+/// rows for the key must be complete; the retention window runs from the
+/// latest completion; and nothing may still pin the set as a source.
 fn eligibility(storage: &Path, key: &str, now: SystemTime) -> Eligibility {
-    let status = match ImportLedger::read_status(storage, key) {
-        Ok(Some(status)) => status,
-        Ok(None) => return Eligibility::NotImported,
+    match source_pin(storage, key) {
+        SourcePin::Free => {}
+        SourcePin::Pinned(reason) => return Eligibility::PinnedSource(reason),
+        SourcePin::Uncertain(reason) => return Eligibility::LedgerUnreadable(reason),
+    }
+    let v2 = match ImportLedger::read_status(storage, key) {
+        Ok(status) => status,
         Err(error) => return Eligibility::LedgerUnreadable(error.to_string()),
     };
-    let (true, Some(completed_ms)) = (status.complete, status.completed_ms) else {
+    let v3 = match super::v3_ledger::legacy_key_status(storage, key) {
+        Ok(status) => status,
+        Err(error) => return Eligibility::LedgerUnreadable(error.to_string()),
+    };
+    if v2.is_none() && v3.is_none() {
+        return Eligibility::NotImported;
+    }
+    let mut completions = Vec::new();
+    if let Some(status) = v2 {
+        match (status.complete, status.completed_ms) {
+            (true, Some(completed_ms)) => completions.push(completed_ms),
+            _ => return Eligibility::ImportIncomplete,
+        }
+    }
+    if let Some(status) = v3 {
+        match (status.incomplete, status.completed_ms) {
+            (false, Some(completed_ms)) => completions.push(completed_ms),
+            _ => return Eligibility::ImportIncomplete,
+        }
+    }
+    let Some(completed_ms) = completions.into_iter().max() else {
         return Eligibility::ImportIncomplete;
     };
     let retention_ms = LEGACY_RETENTION.as_millis() as u64;
@@ -761,6 +864,7 @@ pub fn prune_legacy(
     writeln!(out)?;
     let inventory = inventory(storage, options.now)?;
     write_inventory(out, storage, &inventory)?;
+    write_retained(out, storage)?;
 
     if let Some(reasons) = census_refusal(census) {
         writeln!(out, "Refusing: the storage root may be in use.")?;
@@ -929,6 +1033,54 @@ fn write_inventory(out: &mut dyn Write, storage: &Path, inventory: &Inventory) -
                 ""
             } else {
                 " (partial count)"
+            }
+        )?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Lists the legacy data this command never removes (v1 views and blob
+/// families, v2 family stores), so the operator sees what stays for rollback
+/// and which families v3 already holds. Symbol caches are part of the legacy
+/// sets above and are pruned with them.
+fn write_retained(out: &mut dyn Write, storage: &Path) -> io::Result<()> {
+    let items = match crate::storage_retention::retained_legacy_inventory(storage) {
+        Ok(items) => items
+            .into_iter()
+            .filter(|item| item.kind != crate::storage_retention::RetainedKind::SymbolCache)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            writeln!(out, "Retained legacy data could not be listed: {error}")?;
+            writeln!(out)?;
+            return Ok(());
+        }
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "Retained legacy data (never removed by this command):")?;
+    for item in &items {
+        let mut notes = Vec::new();
+        if item.copied_into_v3 {
+            notes.push("v3 family present".to_owned());
+        }
+        if let Some(reason) = &item.pinned {
+            notes.push(format!("pinned: {reason}"));
+        }
+        writeln!(
+            out,
+            "  {}  {}  {}{}",
+            item.kind.describe(),
+            item.path
+                .strip_prefix(storage)
+                .unwrap_or(&item.path)
+                .display(),
+            human_bytes(item.bytes),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", notes.join("; "))
             }
         )?;
     }

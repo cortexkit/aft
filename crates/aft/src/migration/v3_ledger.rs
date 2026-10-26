@@ -493,28 +493,49 @@ pub fn read_rows(storage: &Path, family: &str) -> V3Result<Option<Vec<V3ImportRo
     if !ledger.path.is_file() {
         return Ok(None);
     }
+    read_sqlite_copy(&ledger.path, |connection| {
+        check_format(connection)?;
+        read_all(connection).map(Some)
+    })
+}
+
+/// Runs `body` on a private copy of the SQLite database at `path` (and its
+/// WAL, if any), taken in a temporary directory outside the storage root.
+/// Even a read-only open of a WAL database can create or recover sidecar
+/// files beside it; reading a copy writes nothing under the storage root.
+/// Copying opens and closes a descriptor on the file, which drops POSIX locks
+/// this process holds on it, so callers use it only for databases this
+/// process has no SQLite connection to (as [`read_rows`] ensures for the
+/// ledger, and as holds for the `aft cache prune-legacy` command).
+pub(crate) fn read_sqlite_copy<T>(
+    path: &Path,
+    body: impl FnOnce(&rusqlite::Connection) -> V3Result<T>,
+) -> V3Result<T> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| V3ImportError::Corrupt(format!("{} names no file", path.display())))?;
     let copy_dir = std::env::temp_dir().join(format!(
-        "aft-v3-ledger-read-{}-{}",
+        "aft-v3-sqlite-read-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let result = (|| {
         crate::private_storage::create_dir_all(&copy_dir)?;
-        let copy = copy_dir.join(LEDGER_FILE);
-        crate::private_storage::copy(&ledger.path, &copy)?;
-        let wal = ledger.path.with_file_name(format!("{LEDGER_FILE}-wal"));
-        match crate::private_storage::copy(&wal, copy.with_file_name(format!("{LEDGER_FILE}-wal")))
+        let copy = copy_dir.join(name);
+        crate::private_storage::copy(path, &copy)?;
+        let mut wal_name = name.to_os_string();
+        wal_name.push("-wal");
+        match crate::private_storage::copy(path.with_file_name(&wal_name), copy_dir.join(&wal_name))
         {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         let connection = TrackedConnection::open(&copy, STORE)?;
-        check_format(&connection)?;
-        let rows = read_all(&connection)?;
+        let result = body(&connection);
         drop(connection);
-        Ok(Some(rows))
+        result
     })();
     let _ = fs::remove_dir_all(&copy_dir);
     result
@@ -945,3 +966,28 @@ pub fn run_v3_import(
 #[cfg(test)]
 #[path = "v3_ledger_tests.rs"]
 mod tests;
+
+/// Keeps a test's claim live until it is dropped.
+#[cfg(test)]
+pub(crate) struct HeldClaim(#[allow(dead_code)] ActiveClaim);
+
+/// Test seam: claims a row of `legacy_key` in `family`'s ledger for an owner
+/// this process keeps live until the returned guard drops, as a running
+/// import would.
+#[cfg(test)]
+pub(crate) fn hold_claim_for_test(storage: &Path, family: &str, legacy_key: &str) -> HeldClaim {
+    let owner = ClaimOwner::new();
+    let active = ActiveClaim::register(&owner);
+    let key = RowKey {
+        legacy_key: legacy_key.to_owned(),
+        artifact: LegacyArtifact::Trigram,
+        producer: "held-for-test".to_owned(),
+        plane: FamilyPlane::Trigram,
+    };
+    let claimed = V3Ledger::new(storage, family)
+        .unwrap()
+        .claim(&key, &owner)
+        .unwrap();
+    assert!(matches!(claimed, Claim::Owned(_)));
+    HeldClaim(active)
+}

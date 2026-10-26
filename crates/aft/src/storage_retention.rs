@@ -2279,6 +2279,144 @@ fn protected(cache: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Whether a due legacy cache must stay because a v3 import is reading it.
+///
+/// The v3 importer reads `index/<key>`, `semantic/<key>` and `symbols/<key>`
+/// while it holds a claim in the family's import ledger
+/// (`migration::v3_ledger`). Retiring such a set would pull the source out
+/// from under that import, so a live claim protects it, and a ledger that
+/// cannot be read is uncertainty and protects it too. A finished, abandoned
+/// or absent import leaves the binding-age rules alone.
+fn legacy_import_source_pinned(storage: &StoragePaths, cache: &Path, key: &str) -> bool {
+    let domain = cache
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if !matches!(domain, Some("index" | "semantic" | "symbols")) {
+        return false;
+    }
+    match crate::migration::v3_ledger::legacy_key_status(&storage.artifacts, key) {
+        Ok(Some(status)) => status.live_claim,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// One kind of legacy (pre-v3) data that stays on disk for an offline
+/// rollback to the previous binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RetainedKind {
+    /// `symbols/<key>`: a parsed-symbol cache, a source of the v3 symbol import.
+    SymbolCache,
+    /// `views/<scope>`: a v1 view, whose generations name v1 blob rows.
+    V1View,
+    /// `blobs/<family>`: v1 blob stores, the copy-on-first-use donors of v3.
+    V1BlobFamily,
+    /// `blobs/v2/<family>`: v2 family stores, also copy-on-first-use donors.
+    V2FamilyStore,
+}
+
+impl RetainedKind {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::SymbolCache => "symbol cache",
+            Self::V1View => "v1 view",
+            Self::V1BlobFamily => "v1 blob family",
+            Self::V2FamilyStore => "v2 family store",
+        }
+    }
+}
+
+/// One retained legacy item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedItem {
+    pub kind: RetainedKind,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// The v3 family of the same name exists, so rows of this item may have
+    /// been copied into v3 (a copy never removes or changes its source).
+    pub copied_into_v3: bool,
+    /// Why the item is protected right now (a live import claim, live pins
+    /// or readers), or `None`. A protected item is never retired.
+    pub pinned: Option<String>,
+}
+
+/// Upper bound on items listed per retained kind.
+const RETAINED_ITEMS_PER_KIND: usize = 10_000;
+
+/// Lists the legacy data this build keeps but never writes: symbol caches,
+/// v1 views and blob families, and v2 family stores, with whether v3 holds
+/// a family of the same name and whether something protects them now. It
+/// reads directory listings, sizes, ledgers and pin files only; it writes
+/// nothing under the storage root.
+pub fn retained_legacy_inventory(storage: &Path) -> io::Result<Vec<RetainedItem>> {
+    let paths = StoragePaths::same(storage);
+    let v3_family = |name: &str| storage.join("blobs/v3").join(name).is_dir();
+    let mut items = Vec::new();
+    for (kind, parent) in [
+        (RetainedKind::SymbolCache, storage.join("symbols")),
+        (RetainedKind::V1View, storage.join("views")),
+        (RetainedKind::V1BlobFamily, storage.join("blobs")),
+        (RetainedKind::V2FamilyStore, storage.join("blobs/v2")),
+    ] {
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut names = Vec::new();
+        for entry in entries.take(RETAINED_ITEMS_PER_KIND) {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let listed = match kind {
+                RetainedKind::SymbolCache => {
+                    crate::migration::per_checkout::validate_legacy_key(&name).is_ok()
+                }
+                RetainedKind::V1View | RetainedKind::V1BlobFamily => key_valid(&name),
+                RetainedKind::V2FamilyStore => {
+                    crate::blob_store::v2::validate_family(&name).is_ok()
+                }
+            };
+            if listed {
+                names.push(name);
+            }
+        }
+        names.sort();
+        for name in names {
+            let path = parent.join(&name);
+            let bytes = crate::migration::prune_legacy::tree_size(&path, TREE_ENTRIES)
+                .map(|(bytes, _, _)| bytes)
+                .unwrap_or(0);
+            let pinned = match kind {
+                RetainedKind::SymbolCache => legacy_import_source_pinned(&paths, &path, &name)
+                    .then(|| "a v3 import is reading it".to_owned()),
+                RetainedKind::V1View => match protected(&path) {
+                    Ok(true) => Some("live pins or readers".to_owned()),
+                    Ok(false) => None,
+                    Err(error) => Some(format!("pins unreadable: {error}")),
+                },
+                // Their rows are protected one by one: a copier pins each
+                // source row before reading it, and the v1/v2 sweeps honour
+                // those pins. Nothing protects the store as a whole.
+                RetainedKind::V1BlobFamily | RetainedKind::V2FamilyStore => None,
+            };
+            items.push(RetainedItem {
+                kind,
+                copied_into_v3: v3_family(&name),
+                path,
+                bytes,
+                pinned,
+            });
+        }
+    }
+    Ok(items)
+}
+
 fn owner_has_residency_marker(
     storage: &StoragePaths,
     owner: &crate::artifact_owner::ArtifactOwnerManifest,
@@ -3478,6 +3616,7 @@ impl PreparedDue {
             || crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key)
             || owners.protect(storage, key, current.contains_key(key))?
             || protected(&cache)?
+            || legacy_import_source_pinned(storage, &cache, key)
         {
             report.skipped_protected += 1;
             return Ok(());
@@ -3948,6 +4087,7 @@ fn candidate_inner(
         report,
     )? || crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key)
         || protected(&cache)?
+        || legacy_import_source_pinned(storage, &cache, key)
     {
         report.skipped_protected += 1;
         return Ok(());
@@ -9215,6 +9355,93 @@ mod storage_retention_tests {
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert!(path.exists());
         assert!(report.skipped_protected > 0);
+    }
+
+    #[test]
+    fn retention_due_legacy_cache_keeps_a_live_v3_import_source() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(&root).unwrap();
+        let path = cache(temp.path(), "index", &scope);
+        // The v3 importer of this key's family holds a live claim: it may be
+        // reading `index/<scope>` right now.
+        let held = crate::migration::v3_ledger::hold_claim_for_test(temp.path(), &scope, &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert!(path.join("payload.bin").exists());
+        assert!(report.skipped_protected > 0, "{report:?}");
+        // Once the import is gone the binding-age rule applies again.
+        drop(held);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn retained_legacy_inventory_lists_every_kind_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path();
+        for (path, bytes) in [
+            ("symbols/0123456789abcdef/symbols.bin", &b"symbols"[..]),
+            ("views/0123456789abcdef/manifest.json", b"view"),
+            ("views/v2/scope/manifest.json", b"v2 view"),
+            ("blobs/fedcba9876543210/semantic.sqlite", b"v1 blobs"),
+            ("blobs/v2/family/semantic.sqlite", b"v2 blobs"),
+            ("blobs/v3/family/members.sqlite", b"v3 registry"),
+        ] {
+            let path = storage.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let pins = storage.join("views/0123456789abcdef/pins");
+        fs::create_dir_all(&pins).unwrap();
+        let _pin =
+            crate::pins::QueryPin::acquire(&storage.join("views/0123456789abcdef"), "g").unwrap();
+        let snapshot = crate::migration::v3_import::tests::snapshot_tree;
+        let before = snapshot(storage);
+        let items = retained_legacy_inventory(storage).unwrap();
+        let summary = items
+            .iter()
+            .map(|item| {
+                (
+                    item.kind,
+                    item.path.strip_prefix(storage).unwrap().to_path_buf(),
+                    item.copied_into_v3,
+                    item.pinned.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    RetainedKind::SymbolCache,
+                    PathBuf::from("symbols/0123456789abcdef"),
+                    false,
+                    false
+                ),
+                (
+                    RetainedKind::V1View,
+                    PathBuf::from("views/0123456789abcdef"),
+                    false,
+                    true
+                ),
+                (
+                    RetainedKind::V1BlobFamily,
+                    PathBuf::from("blobs/fedcba9876543210"),
+                    false,
+                    false
+                ),
+                (
+                    RetainedKind::V2FamilyStore,
+                    PathBuf::from("blobs/v2/family"),
+                    true,
+                    false
+                ),
+            ]
+        );
+        assert!(items.iter().all(|item| item.bytes > 0));
+        assert_eq!(snapshot(storage), before);
     }
 
     #[test]
