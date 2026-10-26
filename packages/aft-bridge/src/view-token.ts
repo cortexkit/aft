@@ -31,5 +31,5 @@ export async function mintViewToken(
   ) {
     throw new Error("Invalid advisory view token response");
   }
-  return value as unknown as ViewToken;
+  return { token: value.token, expires_ms: value.expires_ms, advisory: true };
 }
