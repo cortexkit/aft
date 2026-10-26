@@ -114,30 +114,18 @@ impl ProjectWatcher {
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
-        let walked_directories = exclusion_state
-            .boundary()
-            .map_or_else(BTreeMap::new, |boundary| {
-                collect_watch_directories(boundary, &matcher, &exclusion_paths)
-            });
         counters.set_backend_exclusions(
             observed_generation.unwrap_or(0),
             exclusion_paths.clone(),
             watcher_exclusion_paths(&plan.dropped),
         );
-        let mut installed = BTreeSet::new();
-        for directory in desired_watch_directories(
-            walked_directories,
-            &BTreeSet::new(),
-            &matcher,
-            &exclusion_paths,
-            &root,
-        ) {
-            if watch_directory(&mut watcher, &directory, &mut watch, &counters)? {
-                installed.insert(directory.clone());
-            } else if directory == root {
-                return Err(notify::Error::path_not_found().add_path(root));
-            }
-        }
+        let boundary = exclusion_state
+            .boundary()
+            .ok_or_else(|| notify::Error::path_not_found().add_path(root.clone()))?;
+        let installed =
+            register_initial_tree(boundary, &matcher, &exclusion_paths, &mut |directory| {
+                watch_directory(&mut watcher, directory, &mut watch, &counters)
+            })?;
         let mut watched_directories = installed;
         let git_directory = root.join(".git");
         let mut git_watched = watched_directories.contains(&git_directory);
@@ -734,6 +722,42 @@ impl DirectoryIdentity {
     }
 }
 
+/// Arm each parent before listing it. Children created during registration
+/// are then either enumerated or reported on the already armed parent stream.
+fn register_initial_tree(
+    boundary: &crate::watcher_filter::WatcherWalkBoundary,
+    matcher: &SharedGitignore,
+    exclusions: &[PathBuf],
+    watch: &mut dyn FnMut(&Path) -> notify::Result<bool>,
+) -> notify::Result<BTreeSet<PathBuf>> {
+    let root = boundary.root();
+    let mut stack = vec![root.to_path_buf()];
+    let mut installed = BTreeSet::new();
+    while let Some(directory) = stack.pop() {
+        if exclusions
+            .iter()
+            .any(|excluded| directory.starts_with(excluded))
+            || watcher_directory_is_ignored_by_matcher(matcher, &directory, root)
+            || !boundary.allows_directory(&directory)
+        {
+            continue;
+        }
+        if !watch(&directory)? {
+            return Err(notify::Error::path_not_found().add_path(directory));
+        }
+        installed.insert(directory.clone());
+        for entry in
+            crate::watcher_filter::exclusion_read_dir(&directory).map_err(notify::Error::io)?
+        {
+            let entry = entry.map_err(notify::Error::io)?;
+            if entry.file_type().map_err(notify::Error::io)?.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(installed)
+}
+
 fn collect_watch_directories(
     boundary: &crate::watcher_filter::WatcherWalkBoundary,
     matcher: &SharedGitignore,
@@ -812,6 +836,66 @@ fn desired_watch_directories(
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn initial_subscription_arms_parent_before_listing_new_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+        let mut order = Vec::new();
+        let installed = register_initial_tree(
+            &boundary,
+            &Arc::new(RwLock::new(None)),
+            &[],
+            &mut |directory| {
+                order.push(directory.to_path_buf());
+                if directory == root {
+                    std::fs::create_dir(root.join("during")).unwrap();
+                }
+                if directory == root.join("during") {
+                    std::fs::create_dir(directory.join("nested")).unwrap();
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            order,
+            vec![
+                root.clone(),
+                root.join("during"),
+                root.join("during/nested")
+            ]
+        );
+        assert_eq!(installed.len(), 3);
+    }
+
+    #[test]
+    fn initial_subscription_refuses_a_missing_watch_or_incomplete_listing() {
+        for remove_after_watch in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            std::fs::create_dir(root.join("child")).unwrap();
+            let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+            let result = register_initial_tree(
+                &boundary,
+                &Arc::new(RwLock::new(None)),
+                &[],
+                &mut |directory| {
+                    if directory == root {
+                        return Ok(true);
+                    }
+                    if remove_after_watch {
+                        std::fs::remove_dir(directory).unwrap();
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
     #[test]
     fn watcher_cookie_inotify_recovery_precedes_root_cookie_without_command_tracking() {
         let temp = tempfile::tempdir().unwrap();
