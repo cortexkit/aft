@@ -15368,6 +15368,8 @@ mod tests {
             let request = RawRequest {
                 id: format!("lexical-views-{command}"),
                 command: command.into(),
+                lsp_hints: None,
+                session_id: None,
                 params,
             };
             let run = |ctx: &AppContext| match command {
@@ -15445,8 +15447,10 @@ mod tests {
             ),
             before
         );
-        let cache =
-            resolve_cache_dir_with_key(&ctx.memoized_artifact_cache_key(&root), Some(&storage));
+        let cache = crate::search_index::resolve_cache_dir_with_key(
+            &ctx.memoized_artifact_cache_key(&root),
+            Some(&storage),
+        );
         // The owner fixture already wrote a cache. A routed checkout must not
         // replace it with its own content, even after refresh and shutdown.
         let owner_cache = std::fs::read(cache.join("cache.bin")).unwrap();
@@ -15500,6 +15504,113 @@ mod tests {
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         lexical_views_assert_public_parity(&ctx, &root);
+    }
+
+    #[test]
+    fn lexical_views_public_acquisition_failure_never_uses_legacy_index() {
+        struct Refused;
+        impl crate::views::trigram::LexicalSnapshotSource for Refused {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                Err("lexical source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(root.join("visible.ts"), "needle\n").unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        ctx.install_lexical_source_for_test(Arc::new(Refused));
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::empty_ready_for_root(&root));
+        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(
+            !grep.success && grep.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            grep.data
+        );
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("needle"),
+            &ctx,
+        );
+        assert!(
+            !search.success && search.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            search.data
+        );
+        let glob = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts"}),
+            },
+            &ctx,
+        );
+        assert!(
+            glob.success && glob.data["text"].as_str().unwrap().contains("visible.ts"),
+            "{:?}",
+            glob.data
+        );
+        assert_eq!(glob.data["fallback"], "filesystem");
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+    }
+
+    #[test]
+    fn lexical_views_public_search_pins_one_snapshot_for_all_lexical_lanes() {
+        struct Counted {
+            source: Arc<crate::views::trigram::BaseBuilderTestSource>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::trigram::LexicalSnapshotSource for Counted {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                crate::views::trigram::LexicalSnapshotSource::acquire(self.source.as_ref())
+            }
+            fn record_change(&self, path: &Path) {
+                crate::views::trigram::LexicalSnapshotSource::record_change(
+                    self.source.as_ref(),
+                    path,
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let source = lexical_views_test_source(&ctx);
+        let counted = Arc::new(Counted {
+            source,
+            calls: Default::default(),
+        });
+        ctx.install_lexical_source_for_test(counted.clone());
+        let response = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("OLDER_COMMIT_TOKEN"),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response.data);
+        assert!(!response.data["results"].as_array().unwrap().is_empty());
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.lexical_view_route_counts(), [0, 0, 1]);
     }
 
     #[test]

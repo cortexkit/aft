@@ -283,6 +283,11 @@ impl LexicalSnapshotSource for BaseBuilderTestSource {
             None,
         )
         .map_err(|error| error.to_string())?;
+        let composed = composed.with_v3_route(super::snapshot::V3Route {
+            storage: self.storage.clone(),
+            family: self.family.clone(),
+            scope: "lexical-test-worker".into(),
+        });
         let snapshot = super::snapshot::LiveDelta::new(Arc::new(composed)).snapshot();
         snapshots.insert(key, (snapshot.clone(), claim));
         Ok(snapshot)
@@ -1348,6 +1353,64 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
 
 #[cfg(test)]
 mod tests {
+    struct FixedSource(Snapshot);
+    impl LexicalSnapshotSource for FixedSource {
+        fn acquire(&self) -> Result<Snapshot, String> {
+            Ok(self.0.clone())
+        }
+        fn record_change(&self, _: &Path) {}
+    }
+
+    #[test]
+    fn lexical_views_projection_refuses_uncertain_or_wrong_policy_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "needle\n").unwrap();
+        let policy = TrigramPolicy {
+            max_file_size: 1024,
+        };
+        let source = BaseBuilderTestSource::new(&root, &storage, "lexical-guards", policy);
+        let snapshot = source.acquire().unwrap();
+        let make_view = |snapshot, policy| {
+            LexicalView::with_source(
+                root.clone(),
+                crate::root_cache::StoragePaths::same(&storage),
+                "lexical-guards".into(),
+                policy,
+                Arc::new(FixedSource(snapshot)),
+            )
+        };
+        for state in [
+            WatcherState::Overflowed,
+            WatcherState::Stopped,
+            WatcherState::Reconciling,
+        ] {
+            let mut delta = super::super::snapshot::LiveDelta::new(snapshot.generation().clone());
+            delta.set_watcher(state);
+            assert!(make_view(delta.snapshot(), policy)
+                .snapshot()
+                .unwrap_err()
+                .contains("unverified writes"));
+        }
+        let mut delta = super::super::snapshot::LiveDelta::new(snapshot.generation().clone());
+        delta.record_intent(RelPath::new(b"a.rs".to_vec()).unwrap());
+        assert!(make_view(delta.snapshot(), policy)
+            .snapshot()
+            .unwrap_err()
+            .contains("unverified writes"));
+        assert!(make_view(
+            snapshot,
+            TrigramPolicy {
+                max_file_size: 1025
+            }
+        )
+        .snapshot()
+        .unwrap_err()
+        .contains("not ready"));
+    }
+
     #[test]
     fn lexical_views_projection_matches_legacy_masks_ranks_and_membership() {
         let temp = tempfile::tempdir().unwrap();
