@@ -1,0 +1,15 @@
+{
+  "slice_class": "ranking",
+  "kind": "paging",
+  "targeted_mechanism": "none",
+  "fixtures": [
+    "views::trigram::tests::lexical_views_projection_matches_legacy_masks_ranks_and_membership",
+    "lexical_views_public"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs"
+  ],
+  "note": "Views-on lexical acquisition projects verified v3 payloads into the existing read-only query engine. Views-off acquisition, scoring, fusion, admission and paging rules are unchanged. Parity rows, including rank order, must remain byte-identical; this descriptor does not waive any quality difference. Platform measurements and the release-binary quality replay are deferred to the views measurement step."
+}

@@ -294,6 +294,8 @@ thread_local! {
 thread_local! {
     static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -384,6 +386,8 @@ pub struct ConfigPinGuard {
 impl Drop for ConfigPinGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key {
+            LEXICAL_QUERY_SNAPSHOTS
+                .with(|snapshots| snapshots.borrow_mut().retain(|(id, _)| *id != key));
             CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
                 outcomes
                     .borrow_mut()
@@ -4549,6 +4553,8 @@ pub struct AppContext {
     #[cfg(test)]
     view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
     checkout_driver: crate::views::first_load::InstalledDriver,
+    lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
+    lexical_routes: [AtomicU64; 3],
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
     /// Wall-clock milliseconds at which the completion drain should next
@@ -5396,6 +5402,8 @@ impl AppContext {
             #[cfg(test)]
             view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
+            lexical_view: parking_lot::Mutex::new(None),
+            lexical_routes: Default::default(),
             checkout_semantic: Arc::default(),
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
@@ -10512,6 +10520,9 @@ impl AppContext {
 
     pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
         self.reset_view_publication_retry();
+        if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_change(path);
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_absolute_change(path);
         }
@@ -11921,6 +11932,85 @@ impl AppContext {
         &self.search_index
     }
 
+    pub(crate) fn lexical_views_enabled(&self) -> bool {
+        let config = self.config();
+        config.views.enabled
+            && config.indexes.trigram
+            && config.project_root.is_some()
+            && self.heavy_root_work_allowed()
+            && self.cache_unavailable_reason().is_none()
+    }
+
+    pub(crate) fn lexical_view_is_ready(&self) -> bool {
+        self.lexical_view
+            .lock()
+            .as_ref()
+            .is_some_and(|view| view.is_ready())
+    }
+
+    /// With views enabled, lexical queries use the checkout-local view rather
+    /// than the legacy SearchIndex cache. The separate lexical driver keeps
+    /// lexical service independent of semantic models.
+    pub(crate) fn lexical_view_snapshot(
+        &self,
+        tool: &str,
+    ) -> Option<Result<crate::search_index::SearchIndexSnapshot, String>> {
+        if !self.lexical_views_enabled() {
+            return None;
+        }
+        if let Some(snapshot) = LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
+            snapshots
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == self.config_pin_key())
+                .map(|(_, snapshot)| snapshot.clone())
+        }) {
+            return Some(snapshot);
+        }
+        let config = self.config();
+        let root = self.canonical_cache_root();
+        let storage = self.storage_paths();
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: config.search_index_max_file_size,
+        };
+        let family = self.memoized_artifact_cache_key(&root);
+        let view = {
+            let mut slot = self.lexical_view.lock();
+            if !slot
+                .as_ref()
+                .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+            {
+                match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
+                    Ok(view) => *slot = Some(Arc::new(view)),
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+            slot.as_ref().unwrap().clone()
+        };
+        let result = view.snapshot();
+        if pinned_config_for(self.config_pin_key()).is_some() {
+            LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
+                snapshots
+                    .borrow_mut()
+                    .push((self.config_pin_key(), result.clone()))
+            });
+        }
+        if result.is_ok() && tool != "bind" {
+            let index = match tool {
+                "grep" => 0,
+                "glob" => 1,
+                _ => 2,
+            };
+            self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
+    /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
+    pub fn lexical_view_route_counts(&self) -> [u64; 3] {
+        std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
+    }
+
     pub(crate) fn search_exact_memo(
         &self,
     ) -> Arc<crate::commands::semantic_search::memo::ExactMemoStore> {
@@ -12364,6 +12454,9 @@ impl AppContext {
     }
 
     fn search_index_shutdown_outcome(&self) -> SearchIndexShutdownOutcome {
+        if self.config().views.enabled {
+            return SearchIndexShutdownOutcome::Skipped;
+        }
         use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
         if self.cache_unavailable_reason().is_some() {
             return Failed("cache root is unavailable");

@@ -4808,7 +4808,7 @@ fn handle_configure_inner(
             &canonical_cache_root,
         ));
     ctx.begin_configure_ack_phase("index_loading_state");
-    let search_index = ctx.config().indexes.trigram;
+    let search_index = ctx.config().indexes.trigram && !ctx.config().views.enabled;
     let semantic_search = ctx.config().indexes.semantic;
     let mut search_index_cache_reused = false;
 
@@ -5219,7 +5219,7 @@ fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
-    let search_enabled = config.indexes.trigram;
+    let search_enabled = config.indexes.trigram && !config.views.enabled;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
     let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
@@ -5355,6 +5355,9 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
 /// dropped. Without the overlay, a read-only root serves the shared snapshot
 /// as-is.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if ctx.config().views.enabled {
+        return false;
+    }
     if ctx.canonical_cache_root_opt().is_none() || !ctx.search_index_query_reload_allowed() {
         return false;
     }
@@ -5607,6 +5610,9 @@ fn schedule_artifact_loads_admitted(
     load_semantic: bool,
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
+    // With views enabled, skip both loading another checkout's SearchIndex
+    // cache and building a new legacy search cache.
+    let load_search = load_search && !ctx.config().views.enabled;
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
         *ctx.semantic_index_status()

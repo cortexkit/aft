@@ -590,7 +590,14 @@ fn glob_root(
     }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
-    let indexed_snapshot = {
+    let view_snapshot = (search_scope.use_index && !ignored_target)
+        .then(|| ctx.lexical_view_snapshot("glob"))
+        .flatten();
+    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
+        // Failed view acquisition uses the bounded current-tree walk, never a
+        // borrowed legacy snapshot that may describe another checkout.
+        snapshot.ok()
+    } else {
         let search_index = ctx
             .search_index()
             .read()

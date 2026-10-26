@@ -742,6 +742,61 @@ impl SearchIndex {
 }
 
 impl SearchIndexSnapshot {
+    pub(crate) fn content_generation(&self) -> String {
+        let mut digest = blake3::Hasher::new();
+        digest.update(&self.max_file_size.to_be_bytes());
+        for file in self.files.iter() {
+            let path = file.path.as_os_str().as_encoded_bytes();
+            digest.update(&(path.len() as u64).to_be_bytes());
+            digest.update(path);
+            digest.update(file.content_hash.as_bytes());
+        }
+        digest.finalize().to_hex().to_string()
+    }
+
+    /// Reuses the query engine over already verified, in-memory posting rows.
+    /// This is a read projection, not a mutable index: it has no cache file or
+    /// persistence path. Missing postings require direct verification by grep.
+    pub(crate) fn from_verified_rows(
+        root: &Path,
+        max_file_size: u64,
+        rows: impl IntoIterator<Item = (FileEntry, Option<Vec<(u32, u8, u8)>>)>,
+    ) -> Self {
+        let mut files = Vec::new();
+        let mut paths = HashMap::new();
+        let mut counts = Vec::new();
+        let mut unindexed = HashSet::new();
+        let mut delta = DeltaState::default();
+        for (file, records) in rows {
+            let id = u32::try_from(files.len()).expect("view file id exceeds u32");
+            paths.insert(file.path.clone(), id);
+            files.push(file);
+            counts.push(records.as_ref().map_or(0, |records| records.len() as u32));
+            if let Some(records) = records {
+                for (trigram, next_mask, loc_mask) in records {
+                    delta.postings.entry(trigram).or_default().push(Posting {
+                        file_id: id,
+                        next_mask,
+                        loc_mask,
+                    });
+                }
+            } else {
+                unindexed.insert(id);
+            }
+        }
+        Self {
+            base: None,
+            delta: Arc::new(delta),
+            files: Arc::new(files),
+            path_to_id: Arc::new(paths),
+            ready: true,
+            project_root: root.to_path_buf(),
+            max_file_size,
+            file_trigram_count: Arc::new(counts),
+            unindexed_files: Arc::new(unindexed),
+        }
+    }
+
     pub(crate) fn file_modified(&self, path: &Path) -> Option<SystemTime> {
         self.path_to_id
             .get(path)

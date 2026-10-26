@@ -836,7 +836,20 @@ fn execute_root_profiled(
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
     let mut snapshot_timed_out = false;
-    let indexed_snapshot =
+    let view_snapshot = (root.use_index && !ignored_target)
+        .then(|| ctx.lexical_view_snapshot("grep"))
+        .flatten();
+    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
+        match snapshot {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                return (
+                    failed_index_grep(std::io::Error::other(error)),
+                    GrepExecutionPhaseTimings::default(),
+                )
+            }
+        }
+    } else {
         match try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Some(search_index) => match search_index.as_ref() {
                 Some(index) if index.ready && root.use_index && !ignored_target => {
@@ -848,7 +861,8 @@ fn execute_root_profiled(
                 snapshot_timed_out = true;
                 None
             }
-        };
+        }
+    };
     let snapshot_acquire = snapshot_started.elapsed();
     let mut index_lacks_scope = ignored_target;
     if let Some(snapshot) = indexed_snapshot {

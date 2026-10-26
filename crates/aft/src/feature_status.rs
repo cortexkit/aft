@@ -271,6 +271,13 @@ pub fn storage_refusal(
 // index is being replaced or updated, which reports as building.
 
 fn observe_trigram(ctx: &AppContext) -> IndexObservation {
+    if ctx.lexical_views_enabled() {
+        return if ctx.lexical_view_is_ready() {
+            IndexObservation::ready()
+        } else {
+            IndexObservation::building()
+        };
+    }
     let resident = match ctx.search_index().try_read() {
         Ok(guard) => guard.as_ref().map(|index| index.ready),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {

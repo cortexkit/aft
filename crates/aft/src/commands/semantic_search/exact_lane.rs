@@ -521,7 +521,36 @@ impl ExactLane {
         fallback_options: Option<&FallbackExactOptions>,
         scope: &ExactEvidenceScope,
     ) -> Result<ServeOutcome, MemoError> {
-        let is_ready = index.is_some_and(SearchIndex::is_ready);
+        let snapshot = index
+            .filter(|index| index.is_ready())
+            .map(SearchIndex::snapshot);
+        self.search_scoped_snapshot(
+            snapshot.as_ref(),
+            project_root,
+            snapshot_generation,
+            query,
+            include_tests,
+            offset,
+            top_k,
+            fallback_options,
+            scope,
+        )
+    }
+
+    /// Accepts a read projection without requiring a mutable legacy index.
+    pub(crate) fn search_scoped_snapshot(
+        &self,
+        snapshot: Option<&crate::search_index::SearchIndexSnapshot>,
+        project_root: &Path,
+        snapshot_generation: GenerationToken,
+        query: &str,
+        include_tests: bool,
+        offset: usize,
+        top_k: usize,
+        fallback_options: Option<&FallbackExactOptions>,
+        scope: &ExactEvidenceScope,
+    ) -> Result<ServeOutcome, MemoError> {
+        let is_ready = snapshot.is_some();
         // Index loading can finish without changing snapshot_generation. Give
         // fallback results a separate memo key so they cannot be reused once
         // the full index is ready.
@@ -538,9 +567,8 @@ impl ExactLane {
 
         self.memo.get_or_verify(&key, offset, top_k, || {
             if is_ready {
-                let snapshot = index.unwrap().snapshot();
                 Ok(self.execute_ready_mode_scoped(
-                    &snapshot,
+                    snapshot.unwrap(),
                     project_root,
                     query,
                     include_tests,

@@ -1,7 +1,7 @@
 //! Opt-in trigram views: shared segment, generation overlay, and live delta.
 //!
-//! No adapter is registered in `contracts::process_hooks` by this module;
-//! existing search commands keep using `SearchIndex` by default.
+//! Public lexical queries select a checkout-local v3 reader only with views on.
+//! Views off retains the legacy `SearchIndex` route.
 //!
 //! Runtime call sequence: obtain current bytes with `live_delta::strict_walk`,
 //! project those entries into the complete v2 manifest, call `materialize`
@@ -25,6 +25,196 @@ use super::live_delta::{strict_walk, Attachment};
 use super::segment_store::{rel_path_to_os, SegmentReader, TrigramFlag, TrigramPayload};
 use super::snapshot::{DiskState, Snapshot, Source, WatcherState};
 use super::RelPath;
+
+/// Checkout-local lexical authority, independent of the semantic worker's
+/// lifetime and model availability. Queries serialize reconciliation so an
+/// installed membership and its payloads always come from the same snapshot.
+pub(crate) struct LexicalView {
+    pub(crate) root: PathBuf,
+    storage: crate::root_cache::StoragePaths,
+    family: String,
+    policy: TrigramPolicy,
+    driver: Arc<super::first_load::CheckoutDriver>,
+    loader: super::first_load::SiblingLoader,
+    access: super::contracts::ViewAccess,
+    query: std::sync::Mutex<()>,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+impl LexicalView {
+    pub(crate) fn matches(
+        &self,
+        root: &Path,
+        storage: &crate::root_cache::StoragePaths,
+        family: &str,
+        policy: TrigramPolicy,
+    ) -> bool {
+        self.root == root
+            && self.storage == *storage
+            && self.family == family
+            && self.policy == policy
+    }
+
+    pub(crate) fn new(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: TrigramPolicy,
+    ) -> Result<Self, String> {
+        let registry = super::registry::FamilyRegistry::open(&storage.artifacts, &family)
+            .map_err(|error| error.to_string())?;
+        let owner = registry
+            .register_view_with_storage(
+                &storage.durable,
+                &crate::path_identity::project_scope_key(&root),
+                &root,
+            )
+            .map_err(|error| error.to_string())?;
+        let bridge = Arc::new(super::first_load::TrigramBridge::new(
+            storage.artifacts.clone(),
+            policy,
+        ));
+        let adapter: Arc<dyn super::contracts::PlaneAdapter> = bridge.adapter.clone();
+        let driver = Arc::new(
+            super::first_load::CheckoutDriver::new(
+                owner.clone(),
+                super::manifest_v2::Producers {
+                    trigram: policy.fingerprint_hex(),
+                    semantic: None,
+                    callgraph: super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
+                },
+                None,
+                Arc::new(super::first_load::ConfiguredMembershipWalker),
+                vec![bridge],
+            )
+            .with_adapters(vec![adapter.clone()]),
+        );
+        driver.register_write_intent();
+        Ok(Self {
+            root,
+            storage,
+            family,
+            policy,
+            loader: super::first_load::SiblingLoader::new(driver.clone(), vec![adapter]),
+            driver,
+            access: super::contracts::ViewAccess::Owner(owner),
+            query: std::sync::Mutex::new(()),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn record_change(&self, path: &Path) {
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.driver.record_absolute_change(path);
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Keep acquisition separate from the read projection so a source that
+    /// verifies a saved generation can supply the same query snapshot.
+    fn acquire(&self) -> Result<Snapshot, String> {
+        use super::contracts::PlaneLoader;
+        self.loader
+            .load(&self.access)
+            .map(|outcome| outcome.snapshot)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+        let result = self.project();
+        self.ready
+            .store(result.is_ok(), std::sync::atomic::Ordering::Release);
+        result
+    }
+
+    fn project(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+        use super::segment_store::PayloadSource;
+        let _query = self
+            .query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.acquire()?;
+        if snapshot.pending_intent().next().is_some() || snapshot.watcher() != WatcherState::Healthy
+        {
+            return Err("lexical view has unverified writes".into());
+        }
+        let source = crate::blob_store::v3::PlaneReader::open_existing(
+            &self.storage.artifacts,
+            &self.family,
+            FamilyPlane::Trigram,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut rows = Vec::new();
+        for (path, disk) in snapshot.membership() {
+            let DiskState::Present { content, size } = disk else {
+                continue;
+            };
+            let absolute = self
+                .root
+                .join(rel_path_to_os(&path).map_err(|error| error.to_string())?);
+            let key = crate::blob_store::v2::TrigramKey {
+                content,
+                policy: self.policy,
+            }
+            .family_key();
+            let payload = match snapshot.source(&path) {
+                Source::Live(entry) => entry
+                    .attachments
+                    .get(&FamilyPlane::Trigram)
+                    .and_then(|value| value.downcast_ref::<Attachment>())
+                    .filter(|attachment| {
+                        attachment.content == content
+                            && attachment.policy == self.policy.fingerprint()
+                    })
+                    .map(|attachment| attachment.payload.clone()),
+                _ => None,
+            };
+            let payload = match payload {
+                Some(payload) => payload,
+                None => {
+                    if snapshot.plane_readiness(&path, FamilyPlane::Trigram)
+                        != Some(&super::readiness::PlaneState::ready(&key))
+                    {
+                        return Err(format!("lexical payload not ready: {}", absolute.display()));
+                    }
+                    let bytes = source
+                        .payload(&key)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            format!("lexical payload missing: {}", absolute.display())
+                        })?;
+                    TrigramPayload::decode(&bytes).map_err(|error| error.to_string())?
+                }
+            };
+            let metadata = fs::metadata(&absolute).map_err(|error| error.to_string())?;
+            rows.push((
+                crate::search_index::FileEntry {
+                    path: absolute,
+                    size,
+                    modified: metadata.modified().map_err(|error| error.to_string())?,
+                    content_hash: blake3::Hash::from_bytes(*content.as_bytes()),
+                },
+                (payload.flag == TrigramFlag::Indexed).then(|| {
+                    payload
+                        .records
+                        .into_iter()
+                        .map(|record| (record.trigram, record.next_mask, record.loc_mask))
+                        .collect()
+                }),
+            ));
+        }
+        Ok(
+            crate::search_index::SearchIndexSnapshot::from_verified_rows(
+                &self.root,
+                self.policy.max_file_size,
+                rows,
+            ),
+        )
+    }
+}
 
 /// Generation-local replacements and tombstones relative to the shared segment.
 /// Missing payloads are gaps, not empty postings.
@@ -1083,6 +1273,79 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lexical_views_projection_matches_legacy_masks_ranks_and_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "fn needle_alpha() {}\nneedle beta\n").unwrap();
+        fs::write(root.join("src/b.rs"), "fn needle_beta() {}\n").unwrap();
+        fs::write(root.join("binary.dat"), [0, 1, 2, 3]).unwrap();
+        fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(root.join("ignored.rs"), "needle ignored\n").unwrap();
+        let policy = TrigramPolicy {
+            max_file_size: 1024 * 1024,
+        };
+        let view = LexicalView::new(
+            root.clone(),
+            crate::root_cache::StoragePaths::same(&storage),
+            "lexical-parity".into(),
+            policy,
+        )
+        .unwrap();
+        let projected = view.snapshot().unwrap();
+        let legacy =
+            crate::search_index::SearchIndex::build_with_limit_serial(&root, policy.max_file_size)
+                .snapshot();
+        assert_eq!(projected.glob("**/*", &root), legacy.glob("**/*", &root));
+        for pattern in [
+            "needle",
+            "needle_(alpha|beta)",
+            "n.e.*beta",
+            "^fn",
+            "NEEDLE",
+            "a",
+        ] {
+            for insensitive in [false, true] {
+                assert_eq!(
+                    projected
+                        .grep(pattern, !insensitive, &[], &[], &root, 100)
+                        .unwrap()
+                        .matches,
+                    legacy
+                        .grep(pattern, !insensitive, &[], &[], &root, 100)
+                        .unwrap()
+                        .matches,
+                    "{pattern} insensitive={insensitive}"
+                );
+            }
+        }
+        for query in ["needle", "needle alpha", "beta", "absent"] {
+            let trigrams = crate::search_index::query_trigrams_from_tokens(
+                &query.split_whitespace().collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                projected
+                    .lexical_rank_at_depth(&trigrams, None, 20)
+                    .unwrap()
+                    .files,
+                legacy
+                    .lexical_rank_at_depth(&trigrams, None, 20)
+                    .unwrap()
+                    .files
+            );
+        }
+        assert!(view
+            .driver
+            .installed_snapshot()
+            .generation()
+            .v3_route()
+            .is_some());
+        assert!(!storage.join("blobs/v2").exists());
+        assert!(!storage.join("views/v3").exists());
+    }
+
     #[test]
     fn unrepresentable_query_gap_keeps_the_exact_relative_bytes() {
         let path = RelPath::new(b"a-\xff.rs".to_vec()).unwrap();

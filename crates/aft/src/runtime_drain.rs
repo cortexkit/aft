@@ -814,6 +814,10 @@ pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
 }
 
 pub fn drain_search_index_events(ctx: &AppContext) {
+    if ctx.config().views.enabled {
+        ctx.retire_search_index_rx("lexical views replace the legacy search loader");
+        return;
+    }
     let (latest, disconnected, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx
             .search_index_rx()
@@ -2378,6 +2382,9 @@ fn spawn_search_corpus_refresh_admitted(
     config: Arc<aft::config::Config>,
     generation: u64,
 ) {
+    if config.views.enabled || ctx.config().views.enabled {
+        return;
+    }
     {
         let mut search_index = ctx
             .search_index()
@@ -2533,7 +2540,7 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
             }
         }
 
-        if config.indexes.trigram && !ctx.shared_artifacts_read_only() {
+        if config.indexes.trigram && !config.views.enabled && !ctx.shared_artifacts_read_only() {
             spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
             status_changed = true;
             aft::slog_info!("{}", search_refresh_started_log(reason));
@@ -2923,6 +2930,9 @@ fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyP
 }
 
 fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
+    if ctx.config().views.enabled {
+        return;
+    }
     let max_file_size = ctx
         .search_index()
         .read()
@@ -3118,6 +3128,9 @@ impl Drop for FileMutationGuard<'_> {
 /// read-after-write ordering. Preparation reads at most the index's file-size
 /// limit, just as it does for a watcher update.
 pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
+    if ctx.config().views.enabled {
+        return;
+    }
     if !ctx.heavy_root_work_allowed()
         || (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
     {
