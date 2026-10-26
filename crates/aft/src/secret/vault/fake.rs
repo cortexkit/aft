@@ -1,4 +1,4 @@
-//! The fake vault tests script (V5).
+//! The fake vault tests script.
 //!
 //! Compiled only under `cfg(test)` or the `secret-test-fake` feature, which no
 //! release profile enables (`scripts/check-secret-test-fake.sh` checks that in
@@ -50,7 +50,7 @@ impl std::fmt::Debug for FakeVaultState {
     }
 }
 
-/// The test-only vault (V5).
+/// The test-only vault.
 #[derive(Debug, Clone)]
 pub struct FakeVault {
     state: Arc<Mutex<FakeVaultState>>,

@@ -1,4 +1,4 @@
-//! One daemon-stamped scope, as the vault and the audit record name it (V2).
+//! One daemon-stamped scope, as the vault and the audit record name it.
 //!
 //! A [`SecretScope`] is stamped by the daemon onto a route. It is never built
 //! from a tool argument or a session id, and a background command keeps the one
@@ -63,7 +63,7 @@ impl SecretScope {
         &self.reference
     }
 
-    /// The authorization scope of an audit record (A1).
+    /// The authorization scope of an audit record.
     pub fn to_scope_ref(&self) -> ScopeRef {
         ScopeRef {
             owner: self.owner.clone(),

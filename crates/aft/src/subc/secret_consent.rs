@@ -1,4 +1,4 @@
-//! V2/V3: the secret vault seam as the subc dispatch path sees it.
+//! The secret vault seam as the subc dispatch path sees it.
 //!
 //! This module is where a stamped route becomes an eligibility answer. It
 //! reads the daemon's [`RouteIdentity`], so it lives beside the rest of the
@@ -144,7 +144,7 @@ fn bound_codemode(
     ))
 }
 
-/// A V3 launch outcome that may end the call with `access_pending`, carrying
+/// A launch outcome that may end the call with `access_pending`, carrying
 /// the ask it needs answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PendingSecretConsent {
@@ -157,7 +157,7 @@ pub(super) struct PendingSecretConsent {
 }
 
 /// File the consent a `FileConsent` outcome asks for, under the call's
-/// authorization scope (V3).
+/// authorization scope.
 ///
 /// A filing failure ends the call with `access_unavailable`; a filed ask ends
 /// it with `access_pending` and the label's own message, so no child, job or
@@ -188,7 +188,7 @@ pub(super) fn file_secret_consent(
     }
 }
 
-/// Settle a pending secret ask the call left behind (V3).
+/// Settle a pending secret ask the call left behind.
 pub(super) fn withdraw_secret_consent(pending: &PendingSecretConsent) {
     let _ = withhold_consent(&pending.request);
 }

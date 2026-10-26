@@ -1,4 +1,4 @@
-//! V3: the secret consent entry point AFT's own tools dispatch to.
+//! The secret consent entry point AFT's own tools dispatch to.
 //!
 //! A secret consent is not a filesystem permission. It is filed for every
 //! eligible scope, including a bound codemode call, and it carries the vault's
@@ -17,15 +17,15 @@ use crate::secret::SecretScope;
 
 /// The consent kind a secret ask files under.
 ///
-/// SUBC has not confirmed this name yet (the campaign's open question); the
+/// SUBC has not confirmed this name yet; the
 /// adapter is the one place it is spelled, so the confirmation changes one
 /// constant, not every call site.
 pub const SECRET_CONSENT_KIND: &str = "secret_use";
 
-/// What the consent adapter is asked to file for one label (V3).
+/// What the consent adapter is asked to file for one label.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretConsentRequest {
-    /// The authorization scope the ask is filed under (V2).
+    /// The authorization scope the ask is filed under.
     pub scope: SecretScope,
     /// The label the vault is waiting on.
     pub label: String,
@@ -46,7 +46,7 @@ impl std::fmt::Debug for SecretConsentRequest {
     }
 }
 
-/// What happened to a filed secret consent (V3).
+/// What happened to a filed secret consent.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
     /// Cingulate answered. Whatever it said, the caller must resolve again;
@@ -113,10 +113,10 @@ fn transport() -> Option<std::sync::Arc<dyn SecretConsentTransport>> {
         .clone()
 }
 
-/// File `request` and report what happened (V3).
+/// File `request` and report what happened.
 ///
 /// The caller has already decided the asking call is eligible, so the scope in
-/// `request` is the one the daemon stamped (V2).
+/// `request` is the one the daemon stamped.
 pub fn file_consent(request: &SecretConsentRequest) -> ConsentOutcome {
     match transport() {
         Some(transport) => transport.file(request),
@@ -126,7 +126,7 @@ pub fn file_consent(request: &SecretConsentRequest) -> ConsentOutcome {
     }
 }
 
-/// Settle a pending secret ask (V3).
+/// Settle a pending secret ask.
 pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
     match transport() {
         Some(transport) => transport.withhold(request),
@@ -136,7 +136,7 @@ pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
     }
 }
 
-/// The `consent.request` parameter shape a secret ask carries (V3).
+/// The `consent.request` parameter shape a secret ask carries.
 ///
 /// It is built here, not by the filesystem `request_params`, because a secret
 /// ask has no path and names a vault request instead. The shape follows the

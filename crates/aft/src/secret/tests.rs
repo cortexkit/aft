@@ -1,4 +1,4 @@
-//! V1/V3/V5 seam tests: the production vault, the outcome table, the material
+//! Seam tests: the production vault, the outcome table, the material
 //! buffer, the fake, and the consent adapter's request shape.
 
 use super::*;
@@ -30,7 +30,7 @@ fn rule(label: &str) -> secret_rules::location::LabelRule {
 }
 
 // ---------------------------------------------------------------------------
-// V5: production stays fail-closed.
+// Production stays fail-closed.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -59,7 +59,7 @@ fn an_unavailable_resolution_ends_the_launch_with_secrets_unavailable() {
 }
 
 // ---------------------------------------------------------------------------
-// V3: the outcome table.
+// The outcome table.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -165,7 +165,7 @@ fn a_material_lapse_refuses_without_filing_a_consent() {
 }
 
 // ---------------------------------------------------------------------------
-// V1/V5: the fake and the material buffer.
+// The fake and the material buffer.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -210,7 +210,7 @@ fn material_prints_its_length_and_never_its_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// A2: the fake collects audit records.
+// The fake collects audit records.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -239,7 +239,7 @@ fn the_fake_collects_audit_records_in_order() {
 }
 
 // ---------------------------------------------------------------------------
-// V3: the consent adapter's request shape.
+// The consent adapter's request shape.
 // ---------------------------------------------------------------------------
 
 #[test]

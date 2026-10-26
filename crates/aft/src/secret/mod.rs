@@ -1,11 +1,11 @@
-//! The secret vault seam (V1, V2, V5) and its consent adapter (V3).
+//! The secret vault seam and its consent adapter.
 //!
 //! [`SecretVault`] is the only way AFT asks for a label's rule or key bytes:
 //! `resolve` says whether and where a label may be used, `material` releases the
 //! bytes for one request, and `audit` collects one record per decided label.
 //! [`wire`] holds the `secret.use` contract's request and reply shapes (v1 §15);
 //! production wires [`UnavailableVault`], which resolves nothing because the
-//! live vault is not deployed and AFT holds no use grant yet (V5). The fake
+//! live vault is not deployed and AFT holds no use grant yet. The fake
 //! lives behind `cfg(test)` or the `secret-test-fake` feature, which no release
 //! profile enables.
 //!

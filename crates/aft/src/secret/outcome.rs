@@ -1,33 +1,33 @@
-//! V3: the launch outcome for one label, and the first-failing-label rule.
+//! The launch outcome for one label, and the first-failing-label rule.
 //!
 //! Each outcome maps to one reply code (or to "proceed"), and with several
 //! labels the first failing one decides: no child, no job and no proxy start
 //! while any label is pending or refused.
 //!
 //! The codes this module names are the ones the bash and fetch launch paths
-//! already return for a held or refused call, plus two of the campaign's own.
+//! already return for a held or refused call, plus two of its own.
 
 use super::eligibility::Ineligibility;
 use super::vault::{MaterialError, Resolution};
 
 /// The reply code for a launch refused because its scope is not eligible
-/// (V2). It outranks every vault answer, because an ineligible call never
+/// . It outranks every vault answer, because an ineligible call never
 /// reaches the vault at all.
 pub const SECRET_REFUSED: &str = "secret_refused";
 /// The reply code for a label the vault cannot resolve, including every
-/// production `resolve` until the vault ships (V5).
+/// production `resolve` until the vault ships.
 pub const SECRETS_UNAVAILABLE: &str = "secrets_unavailable";
 /// The reply code for a call held on a secret consent the user has not
-/// answered yet (V3). It carries its own message, below.
+/// answered yet. It carries its own message, below.
 pub const SECRET_ACCESS_PENDING: &str = "access_pending";
-/// The reply code for a secret consent that could not be filed (V3).
+/// The reply code for a secret consent that could not be filed.
 pub const SECRET_ACCESS_UNAVAILABLE: &str = "access_unavailable";
 
 /// The held call's message, one constant because every agent-visible sentence
-/// is reviewed as one string (V3).
+/// is reviewed as one string.
 pub const SECRET_ACCESS_PENDING_MESSAGE: &str = "Waiting for approval to use a secret. The request has gone to the user. End your turn now; you will be resumed with the answer, and then you should run this same call again.";
 
-/// What a launch does for one label (V3).
+/// What a launch does for one label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LabelOutcome {
     /// The rule may be followed; substitute at the declared location.
@@ -79,7 +79,7 @@ pub fn refuse(code: &'static str, label: &str, detail: &str) -> LabelOutcome {
     LabelOutcome::Refuse { code, message }
 }
 
-/// Refuse a call whose scope is not eligible (V2): `secret_refused`, naming the
+/// Refuse a call whose scope is not eligible : `secret_refused`, naming the
 /// label, with no `resolve` call.
 pub fn refuse_ineligible(label: &str, reason: Ineligibility) -> LabelOutcome {
     let detail = match reason {
@@ -97,7 +97,7 @@ pub fn refuse_ineligible(label: &str, reason: Ineligibility) -> LabelOutcome {
     refuse(SECRET_REFUSED, label, detail)
 }
 
-/// The outcome for one `resolve` answer (V3).
+/// The outcome for one `resolve` answer.
 pub fn outcome_for(label: &str, resolution: &Resolution) -> LabelOutcome {
     match resolution {
         Resolution::Granted { .. } => LabelOutcome::Proceed,
@@ -115,7 +115,7 @@ pub fn outcome_for(label: &str, resolution: &Resolution) -> LabelOutcome {
 }
 
 /// The outcome after Cingulate answered but the vault still has not granted
-/// (V3). Cingulate's answer alone never grants: the caller resolves again, and
+/// . Cingulate's answer alone never grants: the caller resolves again, and
 /// this is what a second pending or refused answer leaves.
 pub fn outcome_for_second_resolve(label: &str, resolution: &Resolution) -> LabelOutcome {
     match resolution {
@@ -132,7 +132,7 @@ pub fn outcome_for_second_resolve(label: &str, resolution: &Resolution) -> Label
     }
 }
 
-/// The outcome for a `material` call that failed at request time (V3).
+/// The outcome for a `material` call that failed at request time.
 ///
 /// A lapsed grant is a refusal with no consent filed, because the proxy is
 /// already live and a fresh consent would not make this request legal.
@@ -148,7 +148,7 @@ pub fn outcome_for_material(label: &str, error: &MaterialError) -> LabelOutcome 
     }
 }
 
-/// The first failing outcome across every scanned label, in scan order (V3).
+/// The first failing outcome across every scanned label, in scan order.
 ///
 /// `None` means every label may proceed. A pending label is a failure like any
 /// other: the call is held, and no child starts.

@@ -1,9 +1,9 @@
-//! V2 scope-table and V3 consent-flow tests, through the subc dispatch path.
+//! The scope-table and consent-flow tests, through the subc dispatch path.
 //!
 //! Each case builds the route identity the daemon would bind and asks the seam
 //! the same questions a bash launch or a fetch call asks it: is this call
 //! eligible, under which two scopes, and what does a vault answer do to the
-//! launch. The vault is the test-only fake (V5).
+//! launch. The vault is the test-only fake.
 
 use super::*;
 use crate::secret::{
@@ -137,7 +137,7 @@ fn bound(head: &RouteIdentity, run_stamp: ScopeStamp) -> RouteIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// V2: the three eligible forms.
+// The three eligible forms.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -192,7 +192,7 @@ fn form_three_is_a_bound_codemode_call_with_the_heads_authorization_and_the_runs
 }
 
 // ---------------------------------------------------------------------------
-// V2: every ineligible form, all answered with `secret_refused` and no
+// Every ineligible form, all answered with `secret_refused` and no
 // `resolve`.
 // ---------------------------------------------------------------------------
 
@@ -342,7 +342,7 @@ fn every_ineligible_form_refuses_with_secret_refused_and_never_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// V3: outcomes through the seam.
+// Outcomes through the seam.
 // ---------------------------------------------------------------------------
 
 struct RecordingTransport {
@@ -516,7 +516,7 @@ fn the_production_vault_ends_an_eligible_launch_with_secrets_unavailable() {
 
 #[test]
 fn with_several_labels_no_part_starts_while_any_label_is_pending_or_refused() {
-    // V3: the launch either starts whole or not at all. A covered label past
+    // The launch either starts whole or not at all. A covered label past
     // the pending one does not change that: the proxy must never begin with a
     // subset of the set it scanned.
     let outcomes = [

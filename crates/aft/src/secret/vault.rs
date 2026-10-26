@@ -1,4 +1,4 @@
-//! V1/V5: the vault seam AFT asks for a label's rule and key material.
+//! The vault seam: the one way AFT asks for a label's rule and key material.
 //!
 //! AFT never reads a key itself. The vault maps a label to a rule in a
 //! `secret.use` reply ([`crate::secret::wire`]), hands over the bytes for one
@@ -11,7 +11,7 @@
 //!
 //! The live vault is not deployed and AFT holds no `secret.use` grant yet, so
 //! production wires [`UnavailableVault`], which resolves nothing and releases
-//! nothing (V5). [`SubcSecretVault`] is the real client, built and tested
+//! nothing. [`SubcSecretVault`] is the real client, built and tested
 //! against the contract's golden examples; it becomes the production stand-in's
 //! replacement once the daemon can carry the call. The fake for tests compiles
 //! only under `cfg(test)` or the `secret-test-fake` feature, which no release
@@ -51,7 +51,7 @@ impl Material {
         self.0.len()
     }
 
-    /// Whether the material is empty, which no admissible key is (P3).
+    /// Whether the material is empty, which no admissible key is.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -73,7 +73,7 @@ impl std::fmt::Debug for Material {
 
 /// Overwrite a byte buffer with zeros, in a way the compiler may not drop as
 /// dead. AFT reaches this through material buffers, whose contents must not
-/// outlive their one request (V4).
+/// outlive their one request.
 pub fn zeroize(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
         // SAFETY: `byte` is a valid, aligned pointer to one initialized `u8`,
@@ -84,7 +84,7 @@ pub fn zeroize(bytes: &mut [u8]) {
     std::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
-/// What the vault says about one label (V1, V3).
+/// What the vault says about one label.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Resolution {
     /// A rule to follow and the grant that allows material for it.
@@ -104,11 +104,11 @@ pub enum Resolution {
         reason: String,
     },
     /// No vault answers. Production answers this until the vault ships and AFT
-    /// holds a grant (V5), which keeps the seam fail-closed.
+    /// holds a grant, which keeps the seam fail-closed.
     Unavailable,
 }
 
-/// Why `material` handed out no bytes (V1, V3).
+/// Why `material` handed out no bytes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MaterialError {
     /// The grant lapsed: its expiry passed, it was revoked, or its scope ended.
@@ -125,7 +125,7 @@ pub enum MaterialError {
     },
 }
 
-/// Why `audit` did not take a record (A1).
+/// Why `audit` did not take a record.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AuditError {
     /// The record failed its key or scope check; the detail names the field,
@@ -141,7 +141,7 @@ pub enum AuditError {
     },
 }
 
-/// V1: the three calls AFT makes on the vault.
+/// The three calls AFT makes on the vault.
 ///
 /// Both scopes are [`crate::secret::SecretScope`] values the daemon stamped,
 /// never tool arguments or session ids.
@@ -159,12 +159,12 @@ pub trait SecretVault: Send + Sync {
         grant_id: &str,
     ) -> Result<Material, MaterialError>;
 
-    /// A2: hand one record to the vault's audit sink.
+    /// Hand one record to the vault's audit sink.
     fn audit(&self, record: &AuditRecordV1) -> Result<(), AuditError>;
 }
 
 /// The vault production uses while the live vault is undeployed and AFT holds
-/// no `secret.use` grant (V5).
+/// no `secret.use` grant.
 ///
 /// Every resolution is `Unavailable` and `material` refuses, so nothing is ever
 /// substituted without a real grant, whatever the configuration says. No config
@@ -338,7 +338,7 @@ impl SecretVault for SubcSecretVault {
     }
 }
 
-/// Map a result error onto a resolution (V3's outcome table).
+/// Map a result error onto a resolution (the outcome table).
 fn resolution_for_error(error: &VaultError) -> Resolution {
     match error.code.as_str() {
         "not_found" | "invalid_params" => Resolution::Denied {
@@ -358,7 +358,7 @@ fn error_for_material(error: &VaultError) -> MaterialError {
     }
 }
 
-/// V5: the fake vault, compiled only for tests or an explicitly feature-enabled
+/// The fake vault, compiled only for tests or an explicitly feature-enabled
 /// build.
 #[cfg(any(test, feature = "secret-test-fake"))]
 pub(crate) mod fake;

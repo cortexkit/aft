@@ -1,18 +1,18 @@
-//! V2: which stamped call may ask the vault for a label, and under which two
+//! Which stamped call may ask the vault for a label, and under which two
 //! scopes.
 //!
 //! A call is eligible in exactly three forms, and every other call is
 //! ineligible and never reaches `resolve`:
 //!
 //! 1. **Direct Head**: a Classic call whose route carries the head agent's own
-//!    stamp. Authorization and lifetime scopes are both that stamp.
+//! stamp. Authorization and lifetime scopes are both that stamp.
 //! 2. **Direct Worker**: the same for a worker's stamp. Both scopes are the
 //!    worker's own `(owner, Worker, ref, epoch)`, so a worker's grant never
 //!    covers its head or a sibling.
 //! 3. **Bound codemode**: a Codemode call that `codemode::admit`/`resolve_owner`
-//!    already bound to a live head route. The lifetime scope is the run's
-//!    Ephemeral stamp, and the authorization scope is the head route's, so the
-//!    program cannot outlive its own lifetime.
+//! already bound to a live head route. The lifetime scope is the run's
+//! Ephemeral stamp, and the authorization scope is the head route's, so the
+//! program cannot outlive its own lifetime.
 //!
 //! Ineligible: no stamp, a standalone call, a plugin-only route, another
 //! owner, a flow-read scope, and any Ephemeral stamp on a non-codemode identity
@@ -26,7 +26,7 @@
 use crate::secret::SecretScope;
 use subc_protocol::scope::ScopeKind;
 
-/// The two scopes one eligible call asks the vault under (V2).
+/// The two scopes one eligible call asks the vault under.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CallScopes {
     /// The authorization scope: passed to `resolve` and `material`, and the
@@ -46,7 +46,7 @@ impl std::fmt::Debug for CallScopes {
     }
 }
 
-/// Which of the three eligible forms a call took (V2).
+/// Which of the three eligible forms a call took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EligibilityForm {
     /// Form 1: a head agent's own Classic call.
@@ -57,7 +57,7 @@ pub enum EligibilityForm {
     BoundCodemode,
 }
 
-/// Why a call may not ask the vault (V2). Every variant maps to
+/// Why a call may not ask the vault. Every variant maps to
 /// `secret_refused`, and to no `resolve` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligibility {
@@ -84,7 +84,7 @@ pub enum Ineligibility {
 }
 
 impl Ineligibility {
-    /// The refusal code a launch ends with for this reason (V3).
+    /// The refusal code a launch ends with for this reason.
     pub fn code(&self) -> &'static str {
         "secret_refused"
     }
