@@ -1625,8 +1625,8 @@ pub fn consume_view_token(
         Err(_) => return Ok(TokenUse::IdentityMismatch),
     };
     let identities = match (
-        super::verification::NativeStat::read(&root),
-        super::verification::NativeStat::read(&directory),
+        super::verification::NativeStat::strict_read(&root),
+        super::verification::NativeStat::strict_read(&directory),
     ) {
         (Ok(root), Ok(gitdir)) => (root.identity, (directory, gitdir.identity)),
         _ => return Ok(TokenUse::IdentityMismatch),
@@ -1981,6 +1981,65 @@ mod tests {
 mod view_token_tests {
     use super::*;
     const TREE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn view_token_upgrade_preserves_existing_registry_two_members_and_sessions() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        super::super::base_refs::with_base_barrier(storage.path(), "family", |tx| {
+            super::super::base_refs::register_view_in(
+                tx,
+                storage.path(),
+                "family",
+                "before",
+                root.path(),
+            )?;
+            tx.execute(
+                "INSERT INTO view_sessions VALUES('before-session','before',123,456,789)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let reader =
+            crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family").unwrap();
+        assert_eq!(
+            reader
+                .read(|c| Ok(c
+                    .query_row("SELECT format_version FROM format_meta", [], |r| r
+                        .get::<_, u32>(0))?))
+                .unwrap(),
+            2
+        );
+        mint_view_token(
+            storage.path(),
+            "family",
+            &root.path().join("future"),
+            TREE,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .read(|c| Ok(c
+                    .query_row("SELECT format_version FROM format_meta", [], |r| r
+                        .get::<_, u32>(0))?))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            reader
+                .read(|c| Ok(c.query_row(
+                    "SELECT COUNT(*) FROM members WHERE scope='before'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )?))
+                .unwrap(),
+            1
+        );
+        assert_eq!(reader.read(|c| Ok(c.query_row("SELECT owner_pid,owner_start,opened_at_ms FROM view_sessions WHERE session_id='before-session'", [], |r| Ok((r.get::<_, u32>(0)?,r.get::<_, u32>(1)?,r.get::<_, u32>(2)?)))?)).unwrap(), (123,456,789));
+    }
 
     #[test]
     fn view_token_mints_before_root_exists_and_binds_both_identities_once() {

@@ -685,6 +685,15 @@ when its generation, root, policy, file identity, timestamps and racy checks
 all agree. Missing, corrupt or future evidence means reading source again.
 Evidence does not upgrade membership-keyed bases to tree-keyed identities.
 
+Policy capture uses counted `git config --list --show-origin -z` **and**
+`git var GIT_ATTR_SYSTEM` / `git var GIT_ATTR_GLOBAL`, rather than guessing
+an installation prefix for attribute sources. This supersedes the earlier
+config-only query wording in the views design. Every successful spawn,
+including an unsupported-variable exit, contributes to `git_subprocesses`
+in the process work counters. Either source query failing disables stat reuse
+and takes strict reconciliation. Measurements of these additional queries
+belong to the later performance gate.
+
 The registry-version increments above are serial handoffs, not permission for
 an earlier slice to write a later owner's rows. Owners implement and test their
 assigned schema and encoding before publishing any such bytes. Registration

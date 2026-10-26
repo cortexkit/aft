@@ -10,6 +10,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::RelPath;
+
+#[cfg(test)]
+thread_local! {
+    static ATTRIBUTE_SOURCES: std::cell::RefCell<Option<[PathBuf; 2]>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct AttributeSourcesGuard(Option<[PathBuf; 2]>);
+#[cfg(test)]
+impl Drop for AttributeSourcesGuard {
+    fn drop(&mut self) {
+        ATTRIBUTE_SOURCES.with(|paths| *paths.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn known_attribute_sources_for_test(root: &Path) -> AttributeSourcesGuard {
+    let sources = [
+        root.join("absent-system-attributes"),
+        root.join("absent-global-attributes"),
+    ];
+    assert!(sources.iter().all(|p| !p.exists()));
+    AttributeSourcesGuard(ATTRIBUTE_SOURCES.with(|paths| paths.replace(Some(sources))))
+}
 use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -24,6 +46,11 @@ pub(crate) enum FileIdentity {
         id: [u8; 16],
         creation: i64,
     },
+    StrictOnly {
+        volume: u64,
+        index: u64,
+        birth: Option<u128>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -33,6 +60,7 @@ pub(crate) struct NativeStat {
     pub modified_ns: i128,
     pub changed_ns: i128,
     pub mode: u32,
+    pub reuse_supported: bool,
 }
 
 impl NativeStat {
@@ -55,6 +83,7 @@ impl NativeStat {
                 modified_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
                 changed_ns: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
                 mode: m.mode(),
+                reuse_supported: local_precise_filesystem(path),
             })
         }
         #[cfg(windows)]
@@ -71,7 +100,69 @@ impl NativeStat {
         }
     }
     pub fn reusable(&self, current: &Self, observed_ns: u128) -> bool {
-        self == current && self.modified_ns >= 0 && (self.modified_ns as u128) < observed_ns
+        self.reuse_supported
+            && self == current
+            && self.modified_ns >= 0
+            && (self.modified_ns as u128) < observed_ns
+    }
+
+    pub fn strict_read(path: &Path) -> io::Result<Self> {
+        match Self::read(path) {
+            Ok(stat) => Ok(stat),
+            Err(error) => {
+                let (metadata, identity) = crate::file_identity::symlink_metadata(path)?;
+                let crate::file_identity::FileIdentity::Known { volume, index } = identity else {
+                    return Err(error);
+                };
+                Ok(Self {
+                    identity: FileIdentity::StrictOnly {
+                        volume,
+                        index,
+                        birth: metadata
+                            .created()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos()),
+                    },
+                    size: metadata.len(),
+                    modified_ns: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map_or(-1, |d| d.as_nanos() as i128),
+                    changed_ns: -1,
+                    mode: 0,
+                    reuse_supported: false,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn local_precise_filesystem(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            stat.f_type as u64,
+            0xef53 | 0x9123683e | 0x58465342 | 0x794c7630 | 0x01021994 | 0x2fc12fc1
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_bytes() == b"apfs"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
     }
 }
 
@@ -144,6 +235,7 @@ fn windows_stat(path: &Path) -> io::Result<NativeStat> {
         modified_ns: unix_ns(basic.LastWriteTime),
         changed_ns: unix_ns(basic.ChangeTime),
         mode: basic.FileAttributes,
+        reuse_supported: true,
     })
 }
 
@@ -199,15 +291,71 @@ fn metadata_source(path: &Path, hash: &mut blake3::Hasher) -> io::Result<()> {
 
 impl Policy {
     pub fn capture(root: &Path, metadata: &[PathBuf]) -> io::Result<Self> {
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"aft/views-v3/conversion-policy/1");
         let queries =
             crate::git_index_reader::GitQueries::new(root.to_path_buf(), Duration::from_secs(2));
-        let output = queries.config();
+        #[cfg(test)]
+        if let Some(paths) = ATTRIBUTE_SOURCES.with(|paths| paths.borrow().clone()) {
+            #[cfg(unix)]
+            use std::os::unix::process::ExitStatusExt;
+            #[cfg(windows)]
+            use std::os::windows::process::ExitStatusExt;
+            return Self::capture_sources(
+                root,
+                metadata,
+                queries.config(),
+                paths.map(|path| {
+                    Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: path.as_os_str().as_encoded_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    })
+                }),
+            );
+        }
+        Self::capture_sources(
+            root,
+            metadata,
+            queries.config(),
+            [
+                queries.attribute_source(false),
+                queries.attribute_source(true),
+            ],
+        )
+    }
+
+    fn capture_sources(
+        root: &Path,
+        metadata: &[PathBuf],
+        output: io::Result<std::process::Output>,
+        sources: [io::Result<std::process::Output>; 2],
+    ) -> io::Result<Self> {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"aft/views-v3/conversion-policy/1");
         let mut reusable = output.as_ref().is_ok_and(|output| output.status.success());
         hash.update(&[u8::from(reusable)]);
         let config = output.map(|output| output.stdout).unwrap_or_default();
         hash.update(&config);
+        for output in sources {
+            match output {
+                Ok(output) if output.status.success() => {
+                    let bytes = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+                    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+                    if bytes.is_empty() || bytes.contains(&b'\n') {
+                        reusable = false;
+                        continue;
+                    }
+                    let path = path_from_bytes(bytes)?;
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        root.join(path)
+                    };
+                    metadata_source(&path, &mut hash)?;
+                    reusable &= !path.exists();
+                }
+                _ => reusable = false,
+            }
+        }
         // Config --show-origin records include targets and worktree config.
         // Hash their bytes as well as the effective values, including empty files.
         for item in config.split(|b| *b == 0) {
@@ -229,9 +377,28 @@ impl Policy {
             {
                 reusable = false;
             }
-            if let Some(path) = item.strip_prefix(b"core.attributesfile\n") {
-                metadata_source(&path_from_bytes(path)?, &mut hash)?;
-                reusable = false;
+            for (key, conversion) in [
+                (b"core.attributesfile\n".as_slice(), true),
+                (b"core.excludesfile\n".as_slice(), false),
+            ] {
+                if let Some(path) = item.strip_prefix(key) {
+                    let path = path_from_bytes(path)?;
+                    let path =
+                        if let Some(suffix) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
+                            std::env::var_os("HOME")
+                                .or_else(|| std::env::var_os("USERPROFILE"))
+                                .map(|home| PathBuf::from(home).join(suffix))
+                                .ok_or_else(|| {
+                                    io::Error::other("cannot resolve Git policy home directory")
+                                })?
+                        } else if path.is_absolute() {
+                            path
+                        } else {
+                            root.join(path)
+                        };
+                    metadata_source(&path, &mut hash)?;
+                    reusable &= !conversion;
+                }
             }
         }
         for path in metadata {
@@ -246,16 +413,6 @@ impl Policy {
                 reusable = false;
             }
         }
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            for relative in [".gitattributes", ".config/git/attributes"] {
-                let path = PathBuf::from(&home).join(relative);
-                metadata_source(&path, &mut hash)?;
-                reusable &= !path.exists();
-            }
-        }
-        let system = Path::new("/etc/gitattributes");
-        metadata_source(system, &mut hash)?;
-        reusable &= !system.exists();
         Ok(Self {
             digest: hash.finalize().to_hex().to_string(),
             reusable,
@@ -289,7 +446,7 @@ pub(crate) fn now_ns() -> u128 {
 /// Enumerate policy inputs with metadata only. Source files are never opened.
 pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
     fn walk(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-        for name in [".gitattributes", ".gitignore", ".ignore"] {
+        for name in [".gitattributes", ".gitignore", ".ignore", ".aftignore"] {
             out.push(root.join(name));
         }
         for entry in fs::read_dir(root)? {
@@ -324,6 +481,22 @@ pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
     if let Some(gitdir) = gitdir {
         paths.push(gitdir.join("info/attributes"));
         paths.push(gitdir.join("info/exclude"));
+        let common_marker = gitdir.join("commondir");
+        match fs::read(&common_marker) {
+            Ok(bytes) => {
+                let common = path_from_bytes(bytes.trim_ascii())?;
+                let common = if common.is_absolute() {
+                    common
+                } else {
+                    gitdir.join(common)
+                };
+                paths.push(common.join("info/attributes"));
+                paths.push(common.join("info/exclude"));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        paths.push(common_marker);
     }
     paths.sort();
     Ok(paths)
@@ -365,10 +538,10 @@ impl BindGuard {
             Some(inputs) => inputs.to_vec(),
             None => policy_inputs(root)?,
         };
-        let policy = Policy::capture(root, &inputs)?;
-        let root_identity = NativeStat::read(root)?.identity;
+        let mut policy = Policy::capture(root, &inputs)?;
+        let root_identity = NativeStat::strict_read(root)?.identity;
         let directory = match gitdir(root) {
-            Ok(path) => Some((path.clone(), NativeStat::read(&path)?.identity)),
+            Ok(path) => Some((path.clone(), NativeStat::strict_read(&path)?.identity)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
@@ -384,14 +557,40 @@ impl BindGuard {
                 head_tree = Some(head.stdout);
             }
             let path = directory.join("index");
-            match NativeStat::read(&path) {
+            match NativeStat::strict_read(&path) {
                 Ok(before) => {
                     let bytes = fs::read(&path)?;
-                    let after = NativeStat::read(&path)?;
+                    let after = NativeStat::strict_read(&path)?;
                     if before != after {
                         return Err(io::Error::other("Git index changed during verification"));
                     }
                     index = Some((before, *blake3::hash(&bytes).as_bytes()));
+                    let format = if head_tree
+                        .as_ref()
+                        .is_some_and(|tree| tree.trim_ascii().len() == 64)
+                    {
+                        crate::git_index_reader::ObjectFormat::Sha256
+                    } else {
+                        crate::git_index_reader::ObjectFormat::Sha1
+                    };
+                    match crate::git_index_reader::read_index(&path, format, Default::default()) {
+                        crate::git_index_reader::IndexRead::Snapshot(snapshot) => {
+                            let mut digest = blake3::Hasher::new();
+                            digest.update(policy.digest.as_bytes());
+                            for entry in snapshot.entries.iter().filter(|entry| {
+                                entry.path.rsplit(|b| *b == b'/').next() == Some(b".gitattributes")
+                            }) {
+                                policy.reusable = false;
+                                digest.update(&(entry.path.len() as u64).to_le_bytes());
+                                digest.update(&entry.path);
+                                digest.update(&entry.oid);
+                            }
+                            policy.digest = digest.finalize().to_hex().to_string();
+                        }
+                        crate::git_index_reader::IndexRead::Strict(_) => {
+                            policy.reusable = false;
+                        }
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -540,6 +739,75 @@ pub(crate) fn read_evidence(
 mod tests {
     use super::*;
 
+    fn success(bytes: &[u8]) -> io::Result<std::process::Output> {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: bytes.to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn conversion_or_unknown_attribute_sources_disable_stat_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = || {
+            [
+                success(
+                    root.path()
+                        .join("system-attributes")
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                ),
+                success(
+                    root.path()
+                        .join("global-attributes")
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                ),
+            ]
+        };
+        assert!(
+            Policy::capture_sources(root.path(), &[], success(b""), sources())
+                .unwrap()
+                .reusable
+        );
+        for config in [
+            b"core.autocrlf\ntrue\0".as_slice(),
+            b"core.eol\ncrlf\0",
+            b"filter.custom.clean\ncustom-driver\0",
+        ] {
+            assert!(
+                !Policy::capture_sources(root.path(), &[], success(config), sources())
+                    .unwrap()
+                    .reusable
+            );
+        }
+        assert!(
+            !Policy::capture_sources(
+                root.path(),
+                &[],
+                success(b""),
+                [
+                    Err(io::Error::other("unsupported Git source query")),
+                    success(b"unused")
+                ]
+            )
+            .unwrap()
+            .reusable
+        );
+        let attribute = root.path().join(".gitattributes");
+        fs::write(&attribute, b"*.rs text\n").unwrap();
+        assert!(
+            !Policy::capture_sources(root.path(), &[attribute], success(b""), sources())
+                .unwrap()
+                .reusable
+        );
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .current_dir(root)
@@ -551,6 +819,60 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn failed_config_disables_reuse_but_still_hashes_known_policy_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(".gitattributes");
+        fs::write(&source, b"*.rs text\n").unwrap();
+        let capture = || {
+            Policy::capture_sources(
+                root.path(),
+                std::slice::from_ref(&source),
+                Err(io::Error::other("config unavailable")),
+                [
+                    Err(io::Error::other("unknown system attributes")),
+                    Err(io::Error::other("unknown global attributes")),
+                ],
+            )
+            .unwrap()
+        };
+        let before = capture();
+        assert!(!before.reusable);
+        fs::write(&source, b"*.rs filter=custom\n").unwrap();
+        let after = capture();
+        assert!(!after.reusable);
+        assert_ne!(before.digest, after.digest);
+    }
+
+    #[test]
+    fn final_policy_digest_covers_git_stat_settings_and_include_targets() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        for (key, value) in [
+            ("core.autocrlf", "true"),
+            ("core.eol", "crlf"),
+            ("core.symlinks", "false"),
+            ("core.ignorecase", "true"),
+            ("core.checkStat", "minimal"),
+            ("core.trustctime", "false"),
+            ("core.fileMode", "false"),
+        ] {
+            let before = BindGuard::capture(root.path(), None).unwrap();
+            git(root.path(), &["config", key, value]);
+            assert!(before.validate(root.path()).is_err(), "{key}");
+        }
+        let external = tempfile::tempdir().unwrap();
+        let include = external.path().join("included.config");
+        fs::write(&include, b"[core]\n eol = lf\n").unwrap();
+        git(
+            root.path(),
+            &["config", "include.path", include.to_str().unwrap()],
+        );
+        let before = BindGuard::capture(root.path(), None).unwrap();
+        fs::write(&include, b"[core]\n eol = crlf\n").unwrap();
+        assert!(before.validate(root.path()).is_err());
     }
 
     #[test]
@@ -619,6 +941,9 @@ mod tests {
         let db = rusqlite::Connection::open(evidence_path(&route.member_dir(), "g-one")).unwrap();
         db.pragma_update(None, "user_version", 2).unwrap();
         assert!(read_evidence(&route.member_dir(), "g-one", &guard).is_none());
+        db.pragma_update(None, "user_version", 1).unwrap();
+        db.pragma_update(None, "application_id", 0x1234).unwrap();
+        assert!(read_evidence(&route.member_dir(), "g-one", &guard).is_none());
     }
 
     #[test]
@@ -631,6 +956,9 @@ mod tests {
         assert!(!stat.reusable(&stat, observed));
         assert!(stat.reusable(&stat, observed + 1));
         let mut changed = stat.clone();
+        changed.reuse_supported = false;
+        assert!(!changed.reusable(&changed, observed + 1));
+        changed = stat.clone();
         changed.changed_ns += 1;
         assert!(!stat.reusable(&changed, observed + 1));
         changed = stat.clone();

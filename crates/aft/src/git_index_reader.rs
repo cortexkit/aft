@@ -1,8 +1,7 @@
 //! Read-only Git index snapshots and counted, deadline-bound Git metadata queries.
 //!
-//! Nothing in production routes through this module yet. A snapshot records only
-//! the index bytes observed, not proof that worktree bytes are clean. Callers must
-//! verify worktree content independently.
+//! A snapshot records the index bytes observed, not proof that working-tree bytes
+//! are clean. Callers must verify working-tree content independently.
 
 use crate::file_identity::FileIdentity;
 use sha1::Digest;
@@ -549,6 +548,21 @@ impl GitQueries {
     pub fn config(&self) -> io::Result<Output> {
         self.run(&["config", "--list", "--show-origin", "-z"], Vec::new())
     }
+    /// Ask Git for its compiled/default attribute path rather than guessing an
+    /// installation prefix. Older Git versions may refuse this variable.
+    pub fn attribute_source(&self, global: bool) -> io::Result<Output> {
+        self.run(
+            &[
+                "var",
+                if global {
+                    "GIT_ATTR_GLOBAL"
+                } else {
+                    "GIT_ATTR_SYSTEM"
+                },
+            ],
+            Vec::new(),
+        )
+    }
 
     fn run(&self, args: &[&str], input: Vec<u8>) -> io::Result<Output> {
         let mut command = Command::new("git");
@@ -583,6 +597,9 @@ fn pump(
         .stderr(Stdio::piped())
         .spawn()?;
     spawned.fetch_add(1, Ordering::Relaxed);
+    crate::views::io::WORK
+        .git_subprocesses
+        .fetch_add(1, Ordering::Relaxed);
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
@@ -1287,4 +1304,21 @@ mod tests {
     fn pump_sleep_child() {
         thread::sleep(Duration::from_secs(60));
     }
+}
+#[test]
+fn attribute_source_queries_count_both_spawns_even_on_unsupported_git() {
+    let root = tempfile::tempdir().unwrap();
+    let queries = GitQueries::new(root.path().to_owned(), Duration::from_secs(2));
+    let before = crate::views::io::WORK
+        .git_subprocesses
+        .load(Ordering::Relaxed);
+    queries.attribute_source(false).unwrap();
+    queries.attribute_source(true).unwrap();
+    assert_eq!(queries.spawned(), 2);
+    assert!(
+        crate::views::io::WORK
+            .git_subprocesses
+            .load(Ordering::Relaxed)
+            >= before + 2
+    );
 }

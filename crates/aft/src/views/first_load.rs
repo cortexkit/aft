@@ -978,7 +978,7 @@ mod tests {
         drop(generation);
     }
 
-    fn inventory(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn legacy_inventory(storage: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         fn visit(
             root: &std::path::Path,
             dir: &std::path::Path,
@@ -1364,9 +1364,9 @@ pub struct InstalledBundle {
     own_installed: bool,
 }
 
-/// In-memory evidence that a previous source read still describes this file.
-/// No stamps survive a restart. Platforms without a kernel change time and
-/// file identity keep reading bytes instead of trusting mtime alone.
+/// Evidence that a previous source read still describes this file. V3 stores
+/// stable observations with their published generation. Missing change-time
+/// or file-identity support means reading bytes instead of trusting mtime alone.
 #[derive(Clone)]
 struct ObservedStat {
     stamp: crate::watcher::FileStamp,
@@ -1971,6 +1971,7 @@ impl CheckoutDriver {
     }
 
     pub fn installed_bundle(&self) -> Arc<InstalledBundle> {
+        self.check_subscription();
         self.installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2332,6 +2333,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 .as_ref()
                 .zip(previous.guard.as_ref())
                 .is_some_and(|(now, old)| now.root == old.root && now.policy == old.policy)
+            && guard.as_ref().is_some_and(|guard| guard.policy.reusable)
             && !policy_or_directory;
         let changed_files = if continuous {
             self.walker.changed_files(self.owner.root(), &candidates)?
@@ -3172,6 +3174,7 @@ impl QueryState for CheckoutDriver {
         access: &ViewAccess,
         plane: FamilyPlane,
     ) -> (Snapshot, Vec<std::path::PathBuf>) {
+        self.check_subscription();
         let installed = self
             .installed
             .lock()
@@ -5369,6 +5372,28 @@ impl CompositePlane for TrigramBridge {
 }
 
 impl CheckoutDriver {
+    fn check_subscription(&self) {
+        let stale = {
+            let installed = self
+                .installed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            installed.snapshot.watcher() == super::snapshot::WatcherState::Healthy
+                && installed
+                    .snapshot
+                    .install_cut()
+                    .and_then(|cut| cut.verification.as_ref())
+                    .and_then(|guard| guard.subscription)
+                    .is_some_and(|expected| {
+                        crate::watcher_backend::subscription::current(self.owner.root())
+                            != Some(expected)
+                    })
+        };
+        if stale {
+            self.record_watcher_overflow();
+        }
+    }
+
     fn source_stat(
         &self,
         path: &std::path::Path,
@@ -5381,7 +5406,7 @@ impl CheckoutDriver {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let mut stat = ObservedStat::new(&metadata, recorded_ns);
-                stat.native = super::verification::NativeStat::read(path).ok();
+                stat.native = super::verification::NativeStat::strict_read(path).ok();
                 Ok(Some(stat))
             }
             Ok(_) => Ok(None),
@@ -5406,6 +5431,7 @@ impl CheckoutDriver {
     /// The snapshot last installed for this checkout, without computing the
     /// per-plane gaps `installed_state` reports.
     pub fn installed_snapshot(&self) -> Snapshot {
+        self.check_subscription();
         self.installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5735,12 +5761,152 @@ mod checkout_kind_tests {
 mod v3_bootstrap_tests {
     use super::*;
 
+    fn trigram_driver(root: &std::path::Path, storage: &std::path::Path) -> CheckoutDriver {
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let plane = Arc::new(TrigramBridge::new(storage.to_owned(), policy));
+        CheckoutDriver::new_v3(
+            storage,
+            "family",
+            "worker",
+            root,
+            Producers {
+                trigram: policy.fingerprint_hex(),
+                semantic: None,
+                callgraph: "unregistered".into(),
+            },
+            Arc::new(ConfiguredMembershipWalker),
+            vec![plane.clone()],
+        )
+        .unwrap()
+        .with_adapters(vec![plane.adapter.clone()])
+    }
+
+    #[test]
+    fn continuous_refresh_reads_only_reported_paths_and_gaps_or_policy_edits_walk() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        for name in ["file.rs", "other.rs"] {
+            std::fs::write(root.path().join(name), b"fn before() {}\n").unwrap();
+        }
+        let subscription = crate::watcher_backend::subscription::start(
+            &std::fs::canonicalize(root.path()).unwrap(),
+        );
+        let driver = trigram_driver(root.path(), storage.path());
+        let access = driver.access();
+        let (first, revision) = driver
+            .verified_bind(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &first, revision).unwrap();
+        driver.take_reconcile_work();
+        std::fs::write(root.path().join("file.rs"), b"fn edited() {}\n").unwrap();
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        let (changed, revision) = driver
+            .verified_bind(&access, first.generation().clone())
+            .unwrap();
+        let work = driver.take_reconcile_work();
+        assert_eq!(work.walks, 0);
+        assert_eq!(work.reads, 1);
+        assert!(work.stats <= 3);
+        driver.install(&access, &changed, revision).unwrap();
+        assert!(!driver.installed_snapshot().needs_reconcile());
+        driver.record_watcher_overflow();
+        let (reconciled, revision) = driver
+            .verified_bind(&access, changed.generation().clone())
+            .unwrap();
+        assert_eq!(driver.take_reconcile_work().walks, 1);
+        driver.install(&access, &reconciled, revision).unwrap();
+        std::fs::write(root.path().join(".gitignore"), b"other.rs\n").unwrap();
+        driver.record_change(RelPath::new(b".gitignore".to_vec()).unwrap());
+        let (ignored, revision) = driver
+            .verified_bind(&access, reconciled.generation().clone())
+            .unwrap();
+        assert_eq!(driver.take_reconcile_work().walks, 1);
+        assert_eq!(
+            ignored.disk_state(&RelPath::new(b"other.rs".to_vec()).unwrap()),
+            super::super::snapshot::DiskState::Absent
+        );
+        driver.install(&access, &ignored, revision).unwrap();
+        drop(subscription);
+        assert!(driver.installed_snapshot().needs_reconcile());
+        assert_eq!(
+            driver.installed_snapshot().watcher(),
+            super::super::snapshot::WatcherState::Overflowed
+        );
+    }
+
+    #[test]
+    fn v3_lazy_attachments_probe_the_actual_producer_key_before_extraction() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let bytes = b"pub fn cached() -> u32 { 42 }\n";
+        std::fs::write(root.path().join("file.rs"), bytes).unwrap();
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        let content = crate::blob_store::v2::ContentHash::of(bytes);
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let graph = CallgraphBridge::default();
+        let attachment = graph.attachment(&path, bytes).unwrap();
+        let extracted = attachment
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap();
+        assert_eq!(graph.key(&path, content), Some(extracted.key));
+        let trigram_key = crate::blob_store::v2::TrigramKey { content, policy }.family_key();
+        let trigram = super::super::segment_store::TrigramPayload::extract(bytes, &policy).encode();
+        let graph_payload = extracted.blob.to_bytes().unwrap();
+        crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
+            p.put(
+                &trigram_key,
+                &trigram,
+                FamilyPlane::Trigram.payload_schema(),
+            )?;
+            p.put(
+                &extracted.key,
+                &graph_payload,
+                FamilyPlane::Callgraph.payload_schema(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        for (family, expected_extractions) in [("family", 0), ("miss", 2)] {
+            let driver = CheckoutDriver::new_v3(
+                storage.path(),
+                family,
+                "worker",
+                root.path(),
+                Producers {
+                    trigram: policy.fingerprint_hex(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                Arc::new(ConfiguredMembershipWalker),
+                vec![
+                    Arc::new(TrigramBridge::new(storage.path().to_owned(), policy)),
+                    Arc::new(CallgraphBridge::default()),
+                ],
+            )
+            .unwrap();
+            driver.reconcile(&driver.access()).unwrap();
+            let work = driver.take_reconcile_work();
+            assert_eq!(work.reads, 1);
+            assert_eq!(work.attachments, expected_extractions);
+        }
+    }
+
     fn inventory(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         fn visit(
             base: &std::path::Path,
             path: &std::path::Path,
             files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
         ) {
+            if path == base.join("v3") {
+                return;
+            }
             if !path.exists() {
                 return;
             }
@@ -5757,7 +5923,8 @@ mod v3_bootstrap_tests {
             }
         }
         let mut files = BTreeMap::new();
-        visit(root, root, &mut files);
+        let root = storage.join("blobs");
+        visit(&root, &root, &mut files);
         files
     }
 
@@ -5766,6 +5933,7 @@ mod v3_bootstrap_tests {
         let _serial = crate::blob_store::v3::serial_for_test();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
         let source = b"fn fresh_checkout() { let marker = 42; }\n";
         std::fs::write(root.path().join("file.rs"), source).unwrap();
         std::fs::File::open(root.path().join("file.rs"))
@@ -5781,7 +5949,7 @@ mod v3_bootstrap_tests {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join("untouched"), b"legacy sentinel").unwrap();
         }
-        let before = (inventory(&legacy_v1), inventory(&legacy_v2));
+        let before = legacy_inventory(storage.path());
         let policy = crate::blob_store::v2::TrigramPolicy {
             max_file_size: 1 << 20,
         };
@@ -5798,12 +5966,13 @@ mod v3_bootstrap_tests {
             root.path(),
             producers.clone(),
             Arc::new(ConfiguredMembershipWalker),
-            vec![plane],
+            vec![plane.clone()],
         )
-        .unwrap();
+        .unwrap()
+        .with_adapters(vec![plane.adapter.clone()]);
         let access = driver.access();
         assert!(driver.owner.open_store(FamilyPlane::Trigram).is_err());
-        assert_eq!((inventory(&legacy_v1), inventory(&legacy_v2)), before);
+        assert_eq!(legacy_inventory(storage.path()), before);
         let empty = driver.installed_snapshot().generation().clone();
         let (snapshot, revision) = driver.verified_bind(&access, empty).unwrap();
         assert!(snapshot.generation().base_header().is_some());
@@ -5820,6 +5989,10 @@ mod v3_bootstrap_tests {
         ));
         driver.install(&access, &snapshot, revision).unwrap();
         assert!(!driver.installed_snapshot().needs_reconcile());
+        assert!(driver
+            .installed_state(&access, FamilyPlane::Trigram)
+            .1
+            .is_empty());
         let route = driver.owner.v3_route();
         let store = super::super::ViewStore::existing_dir(route.member_dir()).unwrap();
         let generation = store.current_generation_read_only().unwrap().unwrap();
@@ -5832,7 +6005,7 @@ mod v3_bootstrap_tests {
         assert!(
             super::super::verification::evidence_path(&route.member_dir(), &generation).exists()
         );
-        assert_eq!((inventory(&legacy_v1), inventory(&legacy_v2)), before);
+        assert_eq!(legacy_inventory(storage.path()), before);
         let ledger =
             crate::blob_store::v3::LedgerReader::open_existing(storage.path(), "family").unwrap();
         assert_eq!(
@@ -5876,6 +6049,65 @@ mod v3_bootstrap_tests {
             work.reads, 0,
             "generation-paired evidence avoids rereading stable source"
         );
-        assert_eq!((inventory(&legacy_v1), inventory(&legacy_v2)), before);
+        let other_content = crate::blob_store::v2::ContentHash::of(b"other bytes");
+        let other_key = crate::blob_store::v2::TrigramKey {
+            content: other_content,
+            policy,
+        }
+        .family_key();
+        let other_payload =
+            super::super::segment_store::TrigramPayload::extract(b"other bytes", &policy).encode();
+        crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
+            p.put(
+                &other_key,
+                &other_payload,
+                FamilyPlane::Trigram.payload_schema(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let evidence = rusqlite::Connection::open(super::super::verification::evidence_path(
+            &route.member_dir(),
+            &generation,
+        ))
+        .unwrap();
+        let bytes: Vec<u8> = evidence
+            .query_row(
+                "SELECT record FROM stat_evidence WHERE path=?1",
+                [path.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut record: super::super::verification::Evidence =
+            serde_json::from_slice(&bytes).unwrap();
+        record.keys.insert("Trigram".into(), other_key.to_hex());
+        evidence
+            .execute(
+                "UPDATE stat_evidence SET record=?1 WHERE path=?2",
+                rusqlite::params![serde_json::to_vec(&record).unwrap(), path.as_bytes()],
+            )
+            .unwrap();
+        drop(evidence);
+        let third = trigram_driver(root.path(), storage.path());
+        let base = super::super::base_refs::open_foreign_v3(
+            storage.path(),
+            "family",
+            "worker",
+            &third.producers,
+        )
+        .unwrap()
+        .unwrap();
+        third.set_view_token("forged-advisory-token".into());
+        let (checked, _) = third.verified_bind(&third.access(), base).unwrap();
+        assert_eq!(
+            third.take_reconcile_work().reads,
+            1,
+            "an existing but unrelated key is not stat provenance, even with a token"
+        );
+        assert_eq!(
+            checked.disk_state(&path),
+            super::super::snapshot::DiskState::of_bytes(source)
+        );
+        assert_eq!(legacy_inventory(storage.path()), before);
     }
 }
