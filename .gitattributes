@@ -39,3 +39,7 @@ crates/aft/src/exec_remote/fixtures/reports/** -text
 # rewrite them into CRLF. The whole directory is covered so that template
 # files added beside the vectors are byte-pinned without another rule.
 crates/aft/tests/fixtures/rich_ui/** -text
+# Secret-approval and Cingulate secret_use vectors are pinned by the owners'
+# sha256 sums of their exact published bytes; Windows autocrlf would rewrite
+# them as CRLF on checkout and break the pins.
+crates/aft/tests/fixtures/secret/** -text
