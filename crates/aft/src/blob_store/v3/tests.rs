@@ -859,15 +859,15 @@ fn newer_format_keeps_artifact_refusal_and_malformed_file_reports_found_zero() {
     let root = tempdir().unwrap();
     seed(root.path(), A);
     let path = db(root.path(), A);
+    let future = REGISTRY_VERIFICATION_VERSION + 1;
     Connection::open(&path)
         .unwrap()
-        // Registry 2 is the base-reference protocol this build reads; the
-        // first newer version is 3.
-        .execute("UPDATE format_meta SET format_version=3", [])
+        // Keep testing a future registry, not drift within a supported version.
+        .execute("UPDATE format_meta SET format_version=?1", [future])
         .unwrap();
     match LedgerReader::open_existing(root.path(), A).err().unwrap() {
         Error::Incompatible(error) => {
-            assert_eq!(error.found, 3);
+            assert_eq!(error.found, u64::from(future));
             assert_eq!(error.source, persisted_format::RefusalSource::Artifact);
         }
         error => panic!("{error}"),
