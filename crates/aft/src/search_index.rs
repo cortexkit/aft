@@ -3194,6 +3194,7 @@ impl SearchIndex {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuild_or_refresh_with_strategy(
         root: &Path,
         max_file_size: u64,

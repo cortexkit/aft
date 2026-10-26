@@ -15316,22 +15316,6 @@ mod tests {
         oracle
     }
 
-    fn lexical_views_test_source(
-        ctx: &AppContext,
-    ) -> Arc<crate::views::trigram::BaseBuilderTestSource> {
-        let root = ctx.canonical_cache_root();
-        let source = crate::views::trigram::BaseBuilderTestSource::new(
-            &root,
-            &ctx.storage_paths().artifacts,
-            &ctx.memoized_artifact_cache_key(&root),
-            crate::blob_store::v2::TrigramPolicy {
-                max_file_size: ctx.config().search_index_max_file_size,
-            },
-        );
-        ctx.install_lexical_source_for_test(source.clone());
-        source
-    }
-
     fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
         let oracle = lexical_views_oracle(root);
         for (command, params, field) in [
@@ -15403,8 +15387,13 @@ mod tests {
 
     fn lexical_views_public_checkout(kind: OlderCheckoutKind) {
         let temp = tempfile::tempdir().unwrap();
-        let (_owner, root, storage) = older_checkout_beside_live_owner(temp.path(), kind);
+        let (owner, root, storage) = older_checkout_beside_live_owner(temp.path(), kind);
         let root = std::fs::canonicalize(root).unwrap();
+        let cache = crate::search_index::resolve_cache_dir_with_key(
+            &owner.memoized_artifact_cache_key(&owner.canonical_cache_root()),
+            Some(&storage),
+        );
+        let owner_cache = std::fs::read(cache.join("cache.bin")).unwrap();
         let builds = crate::write_ledger::register(
             crate::write_ledger::Domain::SearchIndexBuild,
             root.display().to_string(),
@@ -15420,7 +15409,6 @@ mod tests {
         let ctx = test_context();
         let bound = handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx);
         assert!(bound.success, "{:?}", bound.data);
-        let source = lexical_views_test_source(&ctx);
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         lexical_views_assert_public_parity(&ctx, &root);
@@ -15434,12 +15422,27 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "new.ts\n").unwrap();
         ctx.record_checkout_watcher_change(&root.join("shared.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
+        let stamp = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(root.join("shared.ts")).unwrap(),
+        );
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 5;\nneedle alpha\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(root.join("shared.ts"), stamp).unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
         std::fs::remove_file(root.join("shared.ts")).unwrap();
         std::fs::write(root.join(".gitignore"), "").unwrap();
         lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::rename(root.join("new.ts"), root.join("moved.ts")).unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        ctx.record_checkout_watcher_overflow();
+        std::fs::write(root.join("moved.ts"), "needle alpha after overflow\n").unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
 
         crate::runtime_drain::spawn_search_corpus_refresh(&ctx, root.clone(), ctx.config());
-        crate::runtime_drain::refresh_search_index_after_write(&ctx, &root.join("new.ts"));
+        crate::runtime_drain::refresh_search_index_after_write(&ctx, &root.join("moved.ts"));
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         ctx.flush_search_index_on_graceful_shutdown();
         assert_eq!(
@@ -15449,13 +15452,10 @@ mod tests {
             ),
             before
         );
-        let cache = crate::search_index::resolve_cache_dir_with_key(
-            &ctx.memoized_artifact_cache_key(&root),
-            Some(&storage),
-        );
         // The owner fixture already wrote a cache. A routed checkout must not
         // replace it with its own content, even after refresh and shutdown.
-        let owner_cache = std::fs::read(cache.join("cache.bin")).unwrap();
+        assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
+        assert!(!storage.join("blobs/v2").exists());
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
         drop(ctx);
@@ -15464,7 +15464,6 @@ mod tests {
             handle_configure_for_test(&configure_lexical_views(&root, &storage), &restarted)
                 .success
         );
-        restarted.install_lexical_source_for_test(source);
         lexical_views_assert_public_parity(&restarted, &root);
         assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
     }
@@ -15498,7 +15497,6 @@ mod tests {
         )
         .unwrap();
         assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
-        let _source = lexical_views_test_source(&ctx);
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
         tx.send(stale).unwrap();
@@ -15506,6 +15504,7 @@ mod tests {
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         lexical_views_assert_public_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
     }
 
     #[test]
@@ -15568,7 +15567,7 @@ mod tests {
     #[test]
     fn lexical_views_public_search_pins_one_snapshot_for_all_lexical_lanes() {
         struct Counted {
-            source: Arc<crate::views::trigram::BaseBuilderTestSource>,
+            source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
             calls: std::sync::atomic::AtomicUsize,
         }
         impl crate::views::trigram::LexicalSnapshotSource for Counted {
@@ -15599,7 +15598,7 @@ mod tests {
             )
             .success
         );
-        let source = lexical_views_test_source(&ctx);
+        let source = ctx.lexical_source_for_test();
         let counted = Arc::new(Counted {
             source,
             calls: Default::default(),
@@ -15624,7 +15623,6 @@ mod tests {
         let root = PathBuf::from(root);
         let ctx = test_context();
         assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
-        let _source = lexical_views_test_source(&ctx);
         lexical_views_assert_public_parity(&ctx, &root);
         println!("LEXICAL_VIEW_PUBLISHED");
         use std::io::{Read, Write};
@@ -15679,7 +15677,6 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
-        let _source = lexical_views_test_source(&ctx);
         lexical_views_assert_public_parity(&ctx, &root);
     }
 

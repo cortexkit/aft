@@ -8994,6 +8994,9 @@ impl AppContext {
         });
         self.reconcile_rerank_backend(&next);
         self.arm_view_disk_limits(next.views.enabled);
+        if !next.views.enabled || project_root_changed {
+            self.lexical_view.lock().take();
+        }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
@@ -10541,6 +10544,9 @@ impl AppContext {
 
     pub(crate) fn record_checkout_watcher_overflow(&self) {
         self.reset_view_publication_retry();
+        if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_overflow();
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_watcher_overflow();
         }
@@ -10549,6 +10555,9 @@ impl AppContext {
 
     pub(crate) fn record_checkout_watcher_cookie(&self, path: &Path) {
         self.record_checkout_pending_watcher_gap();
+        if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_cookie(path);
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_watcher_cookie(path);
         }
@@ -11963,6 +11972,13 @@ impl AppContext {
     }
 
     #[cfg(test)]
+    pub(crate) fn lexical_source_for_test(
+        &self,
+    ) -> Arc<dyn crate::views::trigram::LexicalSnapshotSource> {
+        self.lexical_view.lock().as_ref().unwrap().source_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_lexical_source_for_test(
         &self,
         source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
@@ -12020,6 +12036,7 @@ impl AppContext {
             }
             slot.as_ref().unwrap().clone()
         };
+        self.record_checkout_pending_watcher_gap();
         let result = view.snapshot();
         if pinned_config_for(self.config_pin_key()).is_some() {
             LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {

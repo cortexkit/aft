@@ -3,8 +3,9 @@
 //! Public lexical queries select a checkout-local v3 reader only with views on.
 //! Views off retains the legacy `SearchIndex` route.
 //!
-//! Runtime call sequence: obtain current bytes with `live_delta::strict_walk`,
-//! project those entries into the complete v2 manifest, call `materialize`
+//! `LexicalView` acquires v3 snapshots through `CheckoutDriver::verified_bind`.
+//! The lower-level segment API also supports v2 fixtures: obtain current bytes
+//! with `live_delta::strict_walk`, project a complete v2 manifest, call `materialize`
 //! while keeping its returned pin alive, materialize the other planes, and
 //! publish with the core generation CAS. Open the verified pinned generation
 //! with `TrigramAdapter::open_generation`. Supply `TrigramDriver` with a
@@ -44,6 +45,63 @@ pub(crate) struct LexicalView {
 pub(crate) trait LexicalSnapshotSource: Send + Sync {
     fn acquire(&self) -> Result<Snapshot, String>;
     fn record_change(&self, path: &Path);
+    fn record_overflow(&self) {}
+    fn record_cookie(&self, _: &Path) {}
+}
+
+struct CheckoutLexicalSource {
+    driver: Arc<super::first_load::CheckoutDriver>,
+    access: super::contracts::ViewAccess,
+    storage: PathBuf,
+    family: String,
+    scope: String,
+    producers: super::manifest_v2::Producers,
+}
+
+impl LexicalSnapshotSource for CheckoutLexicalSource {
+    fn acquire(&self) -> Result<Snapshot, String> {
+        use super::first_load::FirstLoadDriver;
+        let installed = self.driver.installed_snapshot();
+        let seed = if installed.generation().name() == "empty" {
+            match super::base_refs::open_foreign_v3(
+                &self.storage,
+                &self.family,
+                &self.scope,
+                &self.producers,
+            ) {
+                Ok(Some(generation)) => generation,
+                Ok(None) => installed.generation().clone(),
+                Err(error) => {
+                    crate::slog_debug!(
+                        "lexical v3 seed unavailable; reconciling current tree: {}",
+                        error
+                    );
+                    installed.generation().clone()
+                }
+            }
+        } else {
+            installed.generation().clone()
+        };
+        let (snapshot, revision) = self
+            .driver
+            .verified_bind(&self.access, seed)
+            .map_err(|error| error.to_string())?;
+        self.driver
+            .install(&self.access, &snapshot, revision)
+            .map_err(|error| error.to_string())?;
+        Ok(self.driver.installed_snapshot())
+    }
+
+    fn record_change(&self, path: &Path) {
+        self.driver.record_absolute_change(path);
+    }
+
+    fn record_overflow(&self) {
+        self.driver.record_watcher_overflow();
+    }
+    fn record_cookie(&self, path: &Path) {
+        self.driver.record_watcher_cookie(path);
+    }
 }
 
 impl LexicalView {
@@ -61,17 +119,47 @@ impl LexicalView {
     }
 
     pub(crate) fn new(
-        _root: PathBuf,
-        _storage: crate::root_cache::StoragePaths,
-        _family: String,
-        _policy: TrigramPolicy,
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: TrigramPolicy,
     ) -> Result<Self, String> {
-        // A legacy registration would write blobs/v2 even before loading. Until
-        // a v3-only source is available, refuse rather than silently creating it.
-        Err("v3-only lexical snapshot source unavailable".into())
+        let scope = crate::path_identity::project_scope_key(&root);
+        let producers = super::manifest_v2::Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: None,
+            callgraph: super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
+        };
+        let bridge = Arc::new(super::first_load::TrigramBridge::new(
+            storage.artifacts.clone(),
+            policy,
+        ));
+        let adapter: Arc<dyn super::contracts::PlaneAdapter> = bridge.adapter.clone();
+        let driver = Arc::new(
+            super::first_load::CheckoutDriver::new_v3(
+                &storage.artifacts,
+                &family,
+                &scope,
+                &root,
+                producers.clone(),
+                Arc::new(super::first_load::ConfiguredMembershipWalker),
+                vec![bridge],
+            )
+            .map_err(|error| error.to_string())?
+            .with_adapters(vec![adapter]),
+        );
+        driver.register_write_intent();
+        let source = Arc::new(CheckoutLexicalSource {
+            access: driver.access(),
+            driver,
+            storage: storage.artifacts.clone(),
+            family: family.clone(),
+            scope,
+            producers,
+        });
+        Ok(Self::with_source(root, storage, family, policy, source))
     }
 
-    #[cfg(test)]
     pub(crate) fn with_source(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
@@ -96,8 +184,23 @@ impl LexicalView {
         self.source.record_change(path);
     }
 
+    pub(crate) fn record_overflow(&self) {
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.source.record_overflow();
+    }
+
+    pub(crate) fn record_cookie(&self, path: &Path) {
+        self.source.record_cookie(path);
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_for_test(&self) -> Arc<dyn LexicalSnapshotSource> {
+        self.source.clone()
     }
 
     /// Keep acquisition separate from the read projection so a source that
