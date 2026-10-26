@@ -33,9 +33,11 @@ fn publish(view: &ViewStore, tag: &str) -> String {
     let manifest = manifest(tag);
     let generation = GenerationName::for_manifest(&manifest).unwrap();
     let previous = view.current_generation_read_only().unwrap();
+    let prepared = view
+        .prepare_v2(&generation, previous.as_deref(), &manifest, None)
+        .unwrap();
     assert_eq!(
-        view.publish_v2(&generation, previous.as_deref(), &manifest, None)
-            .unwrap(),
+        view.commit_v2(prepared, None).unwrap(),
         PublishV2::Published
     );
     wait_for_generation_sweep_for_test(view.view_dir());
