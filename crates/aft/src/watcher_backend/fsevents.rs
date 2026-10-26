@@ -1878,6 +1878,7 @@ mod tests {
                 Ok(
                     WatcherDispatchEvent::Paths(_)
                     | WatcherDispatchEvent::ContentOnlyPaths(_)
+                    | WatcherDispatchEvent::CookieObserved(_)
                     | WatcherDispatchEvent::IgnoreRulesChanged { .. }
                     | WatcherDispatchEvent::RootDeleted,
                 ) => {}

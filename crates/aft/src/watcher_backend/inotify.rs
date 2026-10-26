@@ -335,12 +335,11 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
-                            if counters.bash_changes.get().is_some()
-                                && event
-                                    .paths
-                                    .iter()
-                                    .any(|path| super::flush::is_marker_path(path))
-                            {
+                            if event.paths.iter().any(|path| {
+                                super::cookie::is_cookie_path(path)
+                                    || (counters.bash_changes.get().is_some()
+                                        && super::flush::is_marker_path(path))
+                            }) {
                                 // New-directory recovery waits briefly for duplicate kernel
                                 // events. Publish its files before the ordered marker too.
                                 if !new_directory_files.files.is_empty()
@@ -813,6 +812,47 @@ fn desired_watch_directories(
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn watcher_cookie_inotify_recovery_precedes_root_cookie_without_command_tracking() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let tree = staging.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("source.rs"), b"already populated").unwrap();
+        let counters = crate::context::watcher_counters_for_root(&root);
+        assert!(counters.bash_changes.get().is_none());
+        let (tx, rx) = mpsc::channel();
+        let _watcher = ProjectWatcher::create(
+            root.clone(),
+            vec![],
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        std::fs::rename(&tree, root.join("tree")).unwrap();
+        let cookie = root.join(".aft-cookie-123-nonce");
+        std::fs::write(&cookie, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut recovered = false;
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .unwrap();
+            assert!(!event.need_rescan());
+            recovered |= event.paths.contains(&root.join("tree/source.rs"));
+            if event.paths.contains(&cookie) {
+                assert!(
+                    recovered,
+                    "cookie overtook recovered new-directory membership"
+                );
+                break;
+            }
+        }
+    }
+
     use std::sync::{Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 

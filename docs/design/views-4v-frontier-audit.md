@@ -43,11 +43,14 @@ before acknowledging the exact registered cookie. A rescan must enter the
 driver as `WatcherState::Overflowed` and invalidate an in-flight installation;
 a subsequent ordinary path must not reset that state to Healthy. A cookie held
 in a backlog whose paths are discarded must be discarded too (timeout, not a
-false successful frontier). This provides an ordered **delivery acknowledgment**,
+false successful frontier). Drops coalesced during a legacy rescan also set a
+pending driver-gap signal, consumed at drain entry and before a cookie ack;
+legacy rescan work coalescing must not hide a gap from a newly installed driver.
+This provides an ordered **delivery acknowledgment**,
 not ready publication: the bind owner must still establish E0, reject any gap,
 replay through the acknowledged cut, and revalidate before publication.
 
-The planned additive implementation includes regression tests named
+The additive implementation includes regression tests named
 `watcher_cookie_delayed_delivery_past_read_inotify`,
 `watcher_cookie_delayed_delivery_past_read_fsevents`, and
 `watcher_cookie_delayed_delivery_past_read_windows`, using a backend-delivery shim

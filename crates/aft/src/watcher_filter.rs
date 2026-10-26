@@ -180,6 +180,8 @@ pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),
     /// Every path had only explicit data modifications, never topology events.
     ContentOnlyPaths(Vec<PathBuf>),
+    /// Ordered control; preceding changes must enter the driver before its ack.
+    CookieObserved(PathBuf),
     RescanRequired(RescanReason),
     IgnoreRulesChanged {
         paths: Vec<PathBuf>,
@@ -285,7 +287,9 @@ pub fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
 pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
     // Operating-system metadata files (a Finder `.DS_Store` rewrite, say) are
     // never indexed by the project walks, so their events carry no change.
-    if crate::project_content::is_excluded_event(path) {
+    if crate::watcher_backend::cookie::is_cookie_path(path)
+        || crate::project_content::is_excluded_event(path)
+    {
         return true;
     }
     watcher_path_has_infra_component(path)
@@ -2403,10 +2407,11 @@ impl WatcherFilterThread {
             }
 
             match raw_rx.recv_timeout(self.next_recv_timeout()) {
-                Ok(Ok(event)) => {
+                Ok(Ok(mut event)) => {
                     #[cfg(feature = "test-timing-hooks")]
                     hold_watcher_intake_for_test(&self.shutdown);
                     self.config.counters.note_raw_event();
+                    let cookies = self.take_cookie_paths(&mut event);
                     if self.config.counters.bash_changes.get().is_some()
                         && self.config.counters.bash_flush.observe(&event)
                     {
@@ -2460,6 +2465,14 @@ impl WatcherFilterThread {
                             return;
                         }
                     }
+                    for cookie in cookies {
+                        if !self.flush_pending()
+                            || self.send_dispatch(WatcherDispatchEvent::CookieObserved(cookie))
+                                == Dispatch::Closed
+                        {
+                            return;
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
                     if let Some(journal) = self.config.counters.bash_changes.get() {
@@ -2484,6 +2497,33 @@ impl WatcherFilterThread {
                 }
             }
         }
+    }
+
+    fn take_cookie_paths(&self, event: &mut notify::Event) -> Vec<PathBuf> {
+        let acknowledge =
+            !event.need_rescan() && matches!(event.kind, notify::EventKind::Create(_));
+        let mut cookies = Vec::new();
+        event.paths.retain(|path| {
+            if !crate::watcher_backend::cookie::is_cookie_path(path) {
+                return true;
+            }
+            // Only root cookies are controls. Do not unlink a similarly named
+            // file in an auxiliary watch or a nested directory.
+            if path.parent() == Some(self.config.project_root.as_path()) {
+                let removed = std::fs::remove_file(path).or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                });
+                if acknowledge && removed.is_ok() {
+                    cookies.push(path.clone());
+                }
+            }
+            false
+        });
+        cookies
     }
 
     fn project_root_was_deleted(&mut self, now: Instant) -> bool {
@@ -2705,6 +2745,7 @@ impl WatcherFilterThread {
                 .strip_prefix(&self.config.project_root)
                 .is_ok_and(watcher_path_is_high_churn_infra)
                 || crate::os_metadata::is_os_metadata_path(&path)
+                || crate::watcher_backend::cookie::is_cookie_path(&path)
             {
                 continue;
             }
@@ -2981,10 +3022,19 @@ impl WatcherFilterThread {
             WatcherDispatchEvent::Paths(paths) => self.hold_paths(paths, false),
             WatcherDispatchEvent::ContentOnlyPaths(paths) => self.hold_paths(paths, true),
             WatcherDispatchEvent::RescanRequired(reason) => {
-                self.backlog.retain(|held| !is_path_batch(held));
+                // Losing the paths before a held cookie also loses its proof.
+                self.backlog.retain(|held| {
+                    !is_path_batch(held) && !matches!(held, WatcherDispatchEvent::CookieObserved(_))
+                });
                 if !rescan_held {
                     self.backlog
                         .push_back(WatcherDispatchEvent::RescanRequired(reason));
+                }
+            }
+            WatcherDispatchEvent::CookieObserved(path) => {
+                if !rescan_held {
+                    self.backlog
+                        .push_back(WatcherDispatchEvent::CookieObserved(path));
                 }
             }
             WatcherDispatchEvent::IgnoreRulesChanged { paths } => match self.backlog.back_mut() {
@@ -3036,7 +3086,9 @@ impl WatcherFilterThread {
             // logged and counted like an operating-system event overflow. A
             // rescan already running is told to run again instead.
             let during_rescan = self.log_overflow(RescanReason::BufferOverflow);
-            self.backlog.retain(|held| !is_path_batch(held));
+            self.backlog.retain(|held| {
+                !is_path_batch(held) && !matches!(held, WatcherDispatchEvent::CookieObserved(_))
+            });
             if !during_rescan {
                 self.backlog.push_back(WatcherDispatchEvent::RescanRequired(
                     RescanReason::BufferOverflow,
@@ -3149,6 +3201,116 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watcher_cookie_bypasses_ignore_and_flushes_mixed_paths_before_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source.rs");
+        let cookie = root.join(".aft-cookie-123-nonce");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&cookie, b"").unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        builder.add_line(None, ".aft-cookie-*").unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let (tx, rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.clone(), None),
+            matcher,
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::clone(&shutdown),
+        );
+        let worker = thread::spawn(move || filter.run(raw_rx));
+        raw_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(source.clone())
+            .add_path(cookie.clone())))
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::Paths(vec![source])
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::CookieObserved(cookie.clone())
+        );
+        assert!(!cookie.exists());
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_cookie_unlinks_on_overflow_but_only_create_can_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (filter, _rx, _) = filter_with_full_dispatch_channel(&root);
+        let cookie = root.join(".aft-cookie-123-nonce");
+        for kind in [
+            notify::EventKind::Remove(notify::event::RemoveKind::File),
+            notify::EventKind::Any,
+        ] {
+            std::fs::write(&cookie, b"").unwrap();
+            let mut event = notify::Event::new(kind).add_path(cookie.clone());
+            assert!(filter.take_cookie_paths(&mut event).is_empty());
+            assert!(event.paths.is_empty());
+            assert!(!cookie.exists());
+        }
+        std::fs::write(&cookie, b"").unwrap();
+        let mut event =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(cookie.clone())
+                .set_flag(notify::event::Flag::Rescan);
+        assert!(filter.take_cookie_paths(&mut event).is_empty());
+        assert!(event.need_rescan());
+        assert!(!cookie.exists());
+        let nested = root.join("nested/.aft-cookie-123-nonce");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"not a root control").unwrap();
+        let mut event =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(nested.clone());
+        assert!(filter.take_cookie_paths(&mut event).is_empty());
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn watcher_cookie_backlog_preserves_barriers_and_drops_them_with_lost_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (mut filter, _rx, _) = filter_with_full_dispatch_channel(&root);
+        filter.send_dispatch(WatcherDispatchEvent::Paths(vec![root.join("a.rs")]));
+        filter.send_dispatch(WatcherDispatchEvent::CookieObserved(
+            root.join(".aft-cookie-1-nonce"),
+        ));
+        filter.send_dispatch(WatcherDispatchEvent::Paths(vec![root.join("b.rs")]));
+        assert_eq!(
+            filter.backlog.len(),
+            3,
+            "paths must not merge across the cookie"
+        );
+        filter.send_dispatch(WatcherDispatchEvent::RescanRequired(
+            RescanReason::BufferOverflow,
+        ));
+        assert_eq!(filter.backlog.len(), 1);
+        assert!(matches!(
+            filter.backlog.front(),
+            Some(WatcherDispatchEvent::RescanRequired(_))
+        ));
+        filter.send_dispatch(WatcherDispatchEvent::CookieObserved(
+            root.join(".aft-cookie-1-next"),
+        ));
+        assert_eq!(
+            filter.backlog.len(),
+            1,
+            "a held rescan cannot certify a cookie"
+        );
+    }
+
     #[test]
     fn issue645_nested_git_and_local_manifests_get_kernel_exclusions() {
         use super::*;

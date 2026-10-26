@@ -221,7 +221,7 @@ impl FlushControl {
         if event.need_rescan() {
             return false;
         }
-        let marker_event = event.paths.iter().any(|path| is_marker_path(path));
+        let marker_event = event.paths.iter().any(|path| is_flush_marker_path(path));
         if !marker_event {
             return false;
         }
@@ -243,6 +243,12 @@ impl FlushControl {
 }
 
 pub(crate) fn is_marker_path(path: &Path) -> bool {
+    // Corpus admission excludes both protocols, but command-report intake must
+    // not consume a views cookie before it reaches the driver's ordered queue.
+    super::cookie::is_cookie_path(path) || is_flush_marker_path(path)
+}
+
+fn is_flush_marker_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };

@@ -3695,6 +3695,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     {
         return outcome;
     }
+    ctx.record_checkout_pending_watcher_gap();
     let mut state = match ctx.watcher_drain_slice().lock().take() {
         Some(state) if state.configure_generation == configure_generation => state,
         // Lifecycle-only generation change (transient unbind + equivalent
@@ -3754,6 +3755,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    ctx.record_checkout_watcher_overflow();
                     state.view_publication_reason.events |=
                         crate::views::publication_reason::Reason::RESCAN;
                     state.view_publication_full = true;
@@ -3775,6 +3777,20 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.phase = WatcherDrainPhase::Collect;
                     state.semantic_refresh_paths.clear();
                     state.scheduler_changed_path_count = 0;
+                }
+                Ok(WatcherDispatchEvent::CookieObserved(path)) => {
+                    dispatch_events_received += 1;
+                    // Earlier batches may still await sliced Tier-2 work. Record
+                    // their intents now so the cookie cannot overtake them.
+                    for pending in &state.pending_paths {
+                        ctx.record_checkout_watcher_change(pending);
+                    }
+                    if let WatcherDrainPhase::Apply { paths, .. } = &state.phase {
+                        for pending in paths {
+                            ctx.record_checkout_watcher_change(pending);
+                        }
+                    }
+                    ctx.record_checkout_watcher_cookie(&path);
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     state.view_publication_reason.events |=

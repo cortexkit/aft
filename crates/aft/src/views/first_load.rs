@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::blob_store::v2::FamilyPlane;
+pub use crate::watcher_backend::cookie::{CookieObservation, CookieTicket};
 
 use super::contracts::{LoaderStage, PlaneError, ViewAccess};
 use super::manifest_v2::Producers;
@@ -1483,6 +1484,7 @@ pub struct CheckoutDriver {
     // without holding query locks during I/O or plane-reader retirement.
     publication_transition: std::sync::Mutex<()>,
     retry: std::sync::atomic::AtomicBool,
+    watcher_cookies: crate::watcher_backend::cookie::CookieBarrier,
     #[cfg(test)]
     work: std::sync::Mutex<ReconcileWork>,
 }
@@ -1553,6 +1555,7 @@ impl CheckoutDriver {
             adapters: Vec::new(),
             publish_fence: std::sync::RwLock::new(None),
             observed: Default::default(),
+            watcher_cookies: Default::default(),
             installed: std::sync::Mutex::new(Arc::new(InstalledBundle {
                 seq: 0,
                 composed,
@@ -1615,6 +1618,8 @@ impl CheckoutDriver {
         delta.record_intent(path);
         // Membership is unchanged, so are the ignore rules it was walked under.
         delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
+        // A known path cannot repair an earlier stream-wide delivery gap.
+        delta.set_watcher(installed.snapshot.watcher());
         installed.snapshot = delta
             .snapshot()
             .with_readers(installed.readers.clone())
@@ -1625,6 +1630,47 @@ impl CheckoutDriver {
                 version: delta.version(),
                 intent_version: delta.snapshot().intent_version(),
             });
+    }
+
+    /// Invalidates stale builds and indexed membership until strict reconciliation.
+    pub fn record_watcher_overflow(&self) {
+        let mut installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        installed.revision += 1;
+        let mut delta =
+            super::snapshot::LiveDelta::new(Arc::clone(installed.snapshot.generation()));
+        for (path, entry) in installed.snapshot.live_entries() {
+            delta.apply(path.clone(), entry.clone());
+        }
+        for path in installed.snapshot.pending_intent() {
+            delta.record_intent(path.clone());
+        }
+        delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
+        delta.set_watcher(super::snapshot::WatcherState::Overflowed);
+        installed.snapshot = delta.snapshot();
+    }
+
+    /// Creates an exclusive root cookie. This does not enable verified bind;
+    /// the caller must establish subscription coverage and reject delivery gaps.
+    pub fn begin_watcher_cookie(&self) -> std::io::Result<CookieTicket> {
+        self.watcher_cookies.begin(self.owner.root())
+    }
+
+    /// Called only after preceding dispatch paths have entered the driver.
+    pub(crate) fn record_watcher_cookie(&self, path: &std::path::Path) {
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.watcher_cookies.observe(
+            path,
+            CookieObservation {
+                revision: installed.revision,
+                watcher: installed.snapshot.watcher(),
+            },
+        );
     }
 
     fn check_owner(&self, access: &ViewAccess) -> Result<(), PlaneError> {

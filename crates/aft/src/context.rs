@@ -1720,6 +1720,9 @@ pub(crate) struct WatcherCounters {
     pub(crate) bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
     pub(crate) bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,
+    /// Legacy rescan work coalesces repeated drops, but a newly installed views
+    /// snapshot must still learn that delivery was lost during that work.
+    checkout_watcher_gap_pending: AtomicBool,
     fsevents_stream_creations_total: AtomicU64,
     raw_events_total: AtomicU64,
     raw_events_since_last_rescan: AtomicU64,
@@ -1891,6 +1894,8 @@ impl WatcherCounters {
                 .is_ok()
             {
                 self.overflows_during_rescan.fetch_add(1, Ordering::Relaxed);
+                self.checkout_watcher_gap_pending
+                    .store(true, Ordering::Release);
                 return true;
             }
         }
@@ -10513,6 +10518,31 @@ impl AppContext {
         // The driver only records the change; the semantic view resolves it
         // on its worker after the quiet window.
         self.checkout_semantic.wake();
+    }
+
+    pub(crate) fn record_checkout_watcher_overflow(&self) {
+        self.reset_view_publication_retry();
+        if let Some(driver) = self.checkout_driver.get() {
+            driver.record_watcher_overflow();
+        }
+        self.checkout_semantic.wake();
+    }
+
+    pub(crate) fn record_checkout_watcher_cookie(&self, path: &Path) {
+        self.record_checkout_pending_watcher_gap();
+        if let Some(driver) = self.checkout_driver.get() {
+            driver.record_watcher_cookie(path);
+        }
+    }
+
+    pub(crate) fn record_checkout_pending_watcher_gap(&self) {
+        if self
+            .watcher_counters()
+            .checkout_watcher_gap_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            self.record_checkout_watcher_overflow();
+        }
     }
 
     pub(crate) fn view_publication_retry(
