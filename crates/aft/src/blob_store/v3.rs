@@ -42,7 +42,15 @@ mod replay;
 pub use copy::{copy_on_first_use, CopyOutcome, CopySource, SWEEP_LEASE_WAIT};
 
 const META: &str = "CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, layout_tag INTEGER NOT NULL, schema_text TEXT NOT NULL);";
-const REGISTRY_SCHEMA: &str = "
+/// Registry format/schema version of the base-reference protocol
+/// (`views_v3_registry` 2/2 in docs/design/views-v3-format.md). A version-1
+/// registry is upgraded in place, by the exact-predecessor migration in
+/// [`RegistryWriter::upgrade_to_base_refs`], only by a writer that raised the
+/// registry reader floor to 2 first.
+pub const REGISTRY_BASE_REFS_VERSION: u32 = 2;
+macro_rules! registry_v1_schema {
+    () => {
+        "
 CREATE TABLE members (
  scope TEXT NOT NULL PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('view','base')),
  root BLOB, view_dir TEXT NOT NULL, registered_at_ms INTEGER NOT NULL,
@@ -57,7 +65,34 @@ CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT,
  charge_bytes INTEGER NOT NULL CHECK(charge_bytes>=0), completed_seq INTEGER);
 CREATE TABLE accounting (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  measured_bytes INTEGER NOT NULL, watermark INTEGER NOT NULL);
-";
+"
+    };
+}
+macro_rules! base_refs_schema {
+    () => {
+        "CREATE TABLE base_refs (worker_scope TEXT NOT NULL, base_scope TEXT NOT NULL, nonce TEXT NOT NULL,
+ membership_digest TEXT NOT NULL, worker_generation TEXT,
+ state TEXT NOT NULL CHECK(state IN ('intent','orphaned','published')),
+ owner_pid INTEGER NOT NULL, owner_start INTEGER NOT NULL, updated_epoch INTEGER NOT NULL,
+ PRIMARY KEY(worker_scope, base_scope, nonce));
+CREATE INDEX base_refs_by_base ON base_refs(base_scope);
+CREATE TABLE base_builds (base_scope TEXT NOT NULL PRIMARY KEY,
+ owner_pid INTEGER NOT NULL, owner_start INTEGER NOT NULL, owner_token TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt>=1),
+ state TEXT NOT NULL CHECK(state IN ('building','serving')), heartbeat_at_ms INTEGER NOT NULL);
+CREATE TABLE strict_rebuild (worker_scope TEXT NOT NULL, worker_generation TEXT NOT NULL,
+ reason TEXT NOT NULL, recorded_epoch INTEGER NOT NULL, PRIMARY KEY(worker_scope, worker_generation));
+CREATE TABLE base_sweeps (base_scope TEXT NOT NULL PRIMARY KEY,
+ unreferenced_sweeps INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ gc_epoch INTEGER NOT NULL, lease_pid INTEGER, lease_start INTEGER, reconcile_cursor TEXT,
+ dangling_base_edges INTEGER NOT NULL DEFAULT 0, live_base_cap_hits INTEGER NOT NULL DEFAULT 0);
+"
+    };
+}
+const REGISTRY_SCHEMA: &str = registry_v1_schema!();
+const BASE_REFS_SCHEMA: &str = base_refs_schema!();
+const REGISTRY_SCHEMA_V2: &str = concat!(registry_v1_schema!(), base_refs_schema!());
 const PLANE_SCHEMA: &str = "
 CREATE TABLE store_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), plane TEXT NOT NULL, gc_epoch INTEGER NOT NULL);
 CREATE TABLE blob_payloads (full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key)=32),
@@ -185,7 +220,39 @@ fn probe_free_space(path: &Path) -> Option<(u64, u64)> {
         (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64),
     ))
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn probe_free_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    // As on unix: probe the nearest existing ancestor without creating it.
+    let mut existing = path;
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+    }
+    let wide: Vec<u16> = existing
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and the three out-pointers name live
+    // u64 locals for the duration of the call.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    // `available` honours per-user quotas, like statvfs's f_bavail.
+    (ok != 0).then_some((available, total))
+}
+#[cfg(not(any(unix, windows)))]
 fn probe_free_space(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -407,7 +474,13 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|_| incompatible(kind, path, version, IncompatibleReason::SchemaDrift))?;
-    let Some(compiled_schema) = kind.schema_for(layout) else {
+    let compiled_schema = match (kind, version, schema) {
+        // A registry of the base-reference protocol carries its own exact
+        // text; any other version/schema pair falls through to the drift check.
+        (Kind::Registry, 2, 2) if layout == 0 => Some(REGISTRY_SCHEMA_V2),
+        _ => kind.schema_for(layout),
+    };
+    let Some(compiled_schema) = compiled_schema else {
         return Err(incompatible(
             kind,
             path,
@@ -418,8 +491,18 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(META)?;
     expected.execute_batch(compiled_schema)?;
-    if version != u64::from(FORMAT_VERSION)
-        || schema != SCHEMA_VERSION
+    let known_version = match kind {
+        Kind::Registry => {
+            (version, schema) == (u64::from(FORMAT_VERSION), SCHEMA_VERSION)
+                || (version, schema)
+                    == (
+                        u64::from(REGISTRY_BASE_REFS_VERSION),
+                        REGISTRY_BASE_REFS_VERSION,
+                    )
+        }
+        Kind::Plane(_) => version == u64::from(FORMAT_VERSION) && schema == SCHEMA_VERSION,
+    };
+    if !known_version
         || text != format!("{META}{compiled_schema}")
         || schema_rows(c).ok() != Some(schema_rows(&expected)?)
         || !initialization::has_seed(c, kind)
@@ -544,6 +627,24 @@ impl LedgerReader {
     }
     pub fn accounting(&self) -> Result<Accounting> {
         accounting(&**self.database.connection()?)
+    }
+    /// The member row of `scope` as `(kind, state, view_dir)`, read without
+    /// any lock or barrier. Pin-then-verify readers use it before and after
+    /// taking their marker.
+    pub fn member(&self, scope: &str) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .database
+            .connection()?
+            .query_row(
+                "SELECT kind,state,view_dir FROM members WHERE scope=?1",
+                [scope],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+    /// Runs a read-only query on the ledger connection.
+    pub fn read<T>(&self, body: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        body(&**self.database.connection()?)
     }
     fn reservation_owners(&self) -> Result<(u64, bool)> {
         let connection = self.database.connection()?;
@@ -748,6 +849,78 @@ impl<'a> RegistryWriter<'a> {
     }
     pub fn accounting(&self) -> Result<Accounting> {
         accounting(&**self.connection()?)
+    }
+    /// An existing registry for barrier-only work (base references, build
+    /// claims, sweeps). It takes no covering measurement: nothing it does
+    /// changes the namespace inventory, and admission still measures through
+    /// [`Self::reserve`].
+    pub fn open_for_barrier(
+        storage: &Path,
+        family: &str,
+        lock: &'a ReservationLock,
+    ) -> Result<Self> {
+        Self::open_unmeasured(storage, family, lock, false)
+    }
+    pub fn storage(&self) -> &Path {
+        &self.lock.storage
+    }
+    pub fn family(&self) -> Result<&str> {
+        self.dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or(Error::InvalidIdentity)
+    }
+    pub fn family_dir(&self) -> &Path {
+        &self.dir
+    }
+    /// The registry's format version: 1 before the base-reference upgrade,
+    /// [`REGISTRY_BASE_REFS_VERSION`] after it.
+    pub fn registry_version(&self) -> Result<u32> {
+        Ok(self.connection()?.query_row(
+            "SELECT format_version FROM format_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    /// Exact-predecessor migration from registry 1/1 to 2/2: adds the
+    /// base-reference tables in one barrier transaction and rewrites
+    /// `format_meta`. The caller must already have raised the registry reader
+    /// floor to 2. A registry already at 2/2 is left alone; any other state is
+    /// schema drift.
+    pub fn upgrade_to_base_refs(&mut self) -> Result<()> {
+        let path = self.dir.join("members.sqlite");
+        self.with_barrier(|tx| {
+            let (version, schema, text): (u32, u32, String) = tx.query_row(
+                "SELECT format_version,schema_version,schema_text FROM format_meta WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if (version, schema) == (REGISTRY_BASE_REFS_VERSION, REGISTRY_BASE_REFS_VERSION)
+                && text == format!("{META}{REGISTRY_SCHEMA_V2}")
+            {
+                return Ok(());
+            }
+            if (version, schema) != (FORMAT_VERSION, SCHEMA_VERSION)
+                || text != format!("{META}{REGISTRY_SCHEMA}")
+            {
+                return Err(incompatible(
+                    Kind::Registry,
+                    &path,
+                    u64::from(version),
+                    IncompatibleReason::SchemaDrift,
+                ));
+            }
+            tx.execute_batch(BASE_REFS_SCHEMA)?;
+            tx.execute(
+                "INSERT INTO sweep_state(singleton,gc_epoch) VALUES(1,1)",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE format_meta SET format_version=?1,schema_version=?1,schema_text=?2 WHERE singleton=1",
+                params![REGISTRY_BASE_REFS_VERSION, format!("{META}{REGISTRY_SCHEMA_V2}")],
+            )?;
+            Ok(())
+        })
     }
     fn connection(&self) -> Result<connections::Guard<'_>> {
         self.database.connection()
@@ -1054,6 +1227,157 @@ pub fn publish_locked<T>(
     })
     .map_err(|e| Error::Io(std::io::Error::other(e)))?
 }
+/// Per-visit progress of the v3 plane-row sweep: for each plane, the last
+/// key (hex) the previous bounded visit examined.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlaneRowCursor {
+    pub format_version: u32,
+    pub after: std::collections::BTreeMap<String, String>,
+}
+
+/// What one bounded plane-row visit did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaneRowSweep {
+    pub examined: u64,
+    pub deleted: u64,
+    /// Every plane was scanned to its end in this visit.
+    pub complete: bool,
+}
+
+impl RegistryWriter<'_> {
+    /// Deletes plane rows of this family that no marked generation, pin or
+    /// protected reader names, under the storage-root lock this writer holds.
+    /// Every v3 plane write happens inside a publication that holds the same
+    /// lock, so no row can be put or touched between the caller's marking and
+    /// this deletion. Rows with `ref_epoch >= epoch` are never deleted, and
+    /// every plane's `gc_epoch` is raised to `epoch` first, so a row written by
+    /// a later publication carries an epoch this sweep cannot delete.
+    ///
+    /// The scan stops after `limit` examined rows or at `deadline` and resumes
+    /// from `cursor` on the next visit; reaching a bound never counts as having
+    /// seen the remaining rows.
+    pub fn sweep_plane_rows(
+        &mut self,
+        epoch: i64,
+        marked: &std::collections::HashSet<[u8; 32]>,
+        cursor: &mut PlaneRowCursor,
+        limit: u64,
+        deadline: Option<Instant>,
+    ) -> Result<PlaneRowSweep> {
+        self.lock.verify(&self.lock.storage)?;
+        cursor.format_version = 1;
+        let mut report = PlaneRowSweep {
+            complete: true,
+            ..PlaneRowSweep::default()
+        };
+        for plane in FamilyPlane::ALL {
+            let path = self.dir.join(format!("{}.sqlite", plane.as_str()));
+            if !path.try_exists()? {
+                cursor.after.remove(plane.as_str());
+                continue;
+            }
+            let database = connections::shared(&path, Kind::Plane(plane), false, false)?;
+            let mut c = database.connection()?;
+            {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE store_meta SET gc_epoch=?1 WHERE singleton=1 AND gc_epoch<?1",
+                    [epoch],
+                )?;
+                tx.commit()?;
+            }
+            let layout = plane_layout(&c)?;
+            let (select, delete) = if layout == 1 {
+                (
+                    "SELECT full_key FROM blob_payloads WHERE ref_epoch<?1 AND full_key>?2 ORDER BY full_key LIMIT 64",
+                    "DELETE FROM blob_payloads WHERE full_key=?1 AND ref_epoch<?2",
+                )
+            } else {
+                (
+                    "SELECT p.full_key FROM blob_payloads p JOIN blob_liveness l ON l.blob_id=p.id WHERE l.ref_epoch<?1 AND p.full_key>?2 ORDER BY p.full_key LIMIT 64",
+                    "DELETE FROM blob_payloads WHERE full_key=?1 AND id IN (SELECT blob_id FROM blob_liveness WHERE ref_epoch<?2)",
+                )
+            };
+            let mut after = cursor
+                .after
+                .get(plane.as_str())
+                .and_then(|hex| super::v2::parse_hex32(hex))
+                .map(|key| key.to_vec())
+                .unwrap_or_default();
+            loop {
+                if report.examined >= limit || deadline.is_some_and(|d| Instant::now() >= d) {
+                    report.complete = false;
+                    break;
+                }
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let keys: Vec<Vec<u8>> = tx
+                    .prepare(select)?
+                    .query_map(params![epoch, after], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                if keys.is_empty() {
+                    tx.commit()?;
+                    after.clear();
+                    break;
+                }
+                for key in &keys {
+                    report.examined += 1;
+                    let protected = <[u8; 32]>::try_from(key.as_slice())
+                        .map_or(true, |key| marked.contains(&key));
+                    if !protected {
+                        report.deleted += tx.execute(delete, params![key, epoch])? as u64;
+                    }
+                }
+                tx.commit()?;
+                after = keys.last().cloned().unwrap_or_default();
+            }
+            if after.is_empty() {
+                cursor.after.remove(plane.as_str());
+            } else {
+                cursor
+                    .after
+                    .insert(plane.as_str().to_owned(), super::v2::to_hex(&after));
+            }
+            if !report.complete {
+                break;
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// Opens (creating when absent) the family registry for the base-reference
+/// protocol and upgrades it to registry 2/2. The registry floor is raised to
+/// 2 before any byte of the new schema exists, and the store floor to 1,
+/// through the combined v3 floor boundary every v3 writer uses.
+#[doc(hidden)]
+pub fn open_base_refs_registry<'a>(
+    storage: &Path,
+    family: &str,
+    lock: &'a ReservationLock,
+    observer: Option<&dyn DurabilityObserver>,
+) -> Result<RegistryWriter<'a>> {
+    family_dir(storage, family)?;
+    lock.verify(storage)?;
+    crate::reader_floor::publish_v3_with_floor(
+        storage,
+        REGISTRY_BASE_REFS_VERSION,
+        FORMAT_VERSION,
+        || {
+            observe(observer, DurabilityStep::V3FloorRaised);
+            let exists = family_dir(storage, family)?
+                .join("members.sqlite")
+                .try_exists()?;
+            let mut registry = if exists {
+                RegistryWriter::open_for_barrier(storage, family, lock)?
+            } else {
+                RegistryWriter::open(storage, family, lock, true)?
+            };
+            registry.upgrade_to_base_refs()?;
+            Ok(registry)
+        },
+    )
+    .map_err(|e| Error::Io(std::io::Error::other(e)))?
+}
 fn publish_under_lock<T>(
     storage: &Path,
     family: &str,
@@ -1311,6 +1635,14 @@ impl PlaneReader {
         })
         .transpose()
     }
+}
+
+/// Serializes tests that depend on the process-wide free-space override and
+/// sets it to unlimited, so admission in other modules' tests never races the
+/// refusal cases in `tests`.
+#[cfg(test)]
+pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+    tests::serial()
 }
 
 #[cfg(test)]

@@ -785,12 +785,14 @@ pub(crate) mod tests {
     #[test]
     fn v3_registration_is_advertised_but_not_prepared() {
         let formats = persisted_format::formats_json();
-        for name in ["views_v3_registry", "views_v3_store"] {
-            assert_eq!(formats["stores"][name], 1, "{name}");
+        // The registry reads the base-reference protocol (2/2); plane stores
+        // keep format 1. Neither appears in the startup baseline floor.
+        for (name, version) in [("views_v3_registry", 2), ("views_v3_store", 1)] {
+            assert_eq!(formats["stores"][name], version, "{name}");
             let store = PersistedStore::from_name(name).expect("registered store");
             assert!(PersistedStore::ALL.contains(&store));
-            assert_eq!(store.supported(), 1);
-            assert_eq!(store.written(), 1);
+            assert_eq!(store.supported(), version);
+            assert_eq!(store.written(), version);
         }
         let root = tempfile::tempdir().unwrap();
         assert!(prepare_uncached(root.path()).is_empty());
