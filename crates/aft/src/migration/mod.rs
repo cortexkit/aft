@@ -15,6 +15,7 @@
 
 pub mod per_checkout;
 pub mod prune_legacy;
+pub mod v3_import;
 
 use std::collections::BTreeMap;
 use std::fmt;
