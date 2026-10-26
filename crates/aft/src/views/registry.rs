@@ -1073,6 +1073,16 @@ impl ViewRegistration {
     }
 
     /// The view's own pointer and manifests in `views/v2/<scope>`.
+    /// This checkout's member in the v3 namespace: the same family and scope
+    /// under `blobs/v3/<family>/views/<scope>`.
+    pub fn v3_route(&self) -> super::snapshot::V3Route {
+        super::snapshot::V3Route {
+            storage: self.registry().storage().to_path_buf(),
+            family: self.family().to_owned(),
+            scope: self.scope().to_owned(),
+        }
+    }
+
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
         let view = super::ViewStore::open_dir(self.view_dir.clone())?
             .with_sweep_registry(self.registry.clone());

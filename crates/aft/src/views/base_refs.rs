@@ -312,12 +312,24 @@ impl AuthenticatedBase {
     }
     /// The base side of a composed generation. It owns the marker, so the base
     /// generation stays protected for as long as any bundle holds it.
-    pub fn into_generation(self) -> Arc<ComposedGeneration> {
-        Arc::new(ComposedGeneration::new(
-            self.generation,
-            self.manifest,
-            Some(Residency::Marker(self.marker)),
-        ))
+    pub fn into_generation(self, storage: &Path, family: &str) -> Arc<ComposedGeneration> {
+        let route = route(storage, family, &self.identity.scope);
+        Arc::new(
+            ComposedGeneration::new(
+                self.generation,
+                self.manifest,
+                Some(Residency::Marker(self.marker)),
+            )
+            .with_v3_route(route),
+        )
+    }
+}
+
+pub(crate) fn route(storage: &Path, family: &str, scope: &str) -> super::snapshot::V3Route {
+    super::snapshot::V3Route {
+        storage: storage.to_path_buf(),
+        family: family.to_owned(),
+        scope: scope.to_owned(),
     }
 }
 
@@ -668,6 +680,19 @@ pub fn publish_worker(
     request: WorkerPublication<'_>,
     observer: Option<&dyn DurabilityObserver>,
 ) -> Result<WorkerOutcome> {
+    publish_worker_with(request, observer, &mut |_| Ok(()))
+}
+
+/// [`publish_worker`] with a step that runs once the final generation name is
+/// known (after the delta is rebound to the authenticated base header and
+/// its manifest is durable) and before the pointer CAS. Plane finishers
+/// rename private derived files to that name here. An error aborts the job
+/// like a failed verify.
+pub fn publish_worker_with(
+    request: WorkerPublication<'_>,
+    observer: Option<&dyn DurabilityObserver>,
+    before_cas: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<WorkerOutcome> {
     let WorkerPublication {
         storage,
         family,
@@ -758,7 +783,7 @@ pub fn publish_worker(
     if let Err(error) = delta.set_base_header(header.clone()) {
         return Err(abort(error.into(), marker));
     }
-    let base_generation = authenticated.into_generation();
+    let base_generation = authenticated.into_generation(storage, family);
     let worker_store = match ViewStore::open_dir(worker_dir.clone()) {
         Ok(store) => store,
         Err(error) => return Err(abort(error.into(), marker)),
@@ -772,6 +797,9 @@ pub fn publish_worker(
         Ok(prepared) => prepared,
         Err(error) => return Err(abort(error.into(), marker)),
     };
+    if let Err(error) = before_cas(&generation) {
+        return Err(abort(error, marker));
+    }
     // The bundle's own marker on the new worker generation exists before the
     // CAS, so the generation is protected from the moment it is published.
     let worker_marker = match ReadMarker::create(&worker_dir, &generation) {
@@ -784,7 +812,7 @@ pub fn publish_worker(
         base_generation,
         Some(Residency::Marker(worker_marker)),
     ) {
-        Ok(composed) => Arc::new(composed),
+        Ok(composed) => Arc::new(composed.with_v3_route(route(storage, family, worker_scope))),
         Err(error) => return Err(abort(error.into(), marker)),
     };
 
@@ -931,11 +959,10 @@ pub fn open_foreign_v3(
         let manifest = store.load_manifest_v2(&generation)?;
         manifest.ensure_producers(producers)?;
         let Some(header) = manifest.base_header().cloned() else {
-            return Ok(Some(Arc::new(ComposedGeneration::new(
-                generation,
-                manifest,
-                Some(Residency::Marker(marker)),
-            ))));
+            return Ok(Some(Arc::new(
+                ComposedGeneration::new(generation, manifest, Some(Residency::Marker(marker)))
+                    .with_v3_route(route(storage, family, scope)),
+            )));
         };
         let base = match resolve_base(storage, family, &header.scope)
             .and_then(|base| base.check_header(&header).map(|()| base))
@@ -947,12 +974,15 @@ pub fn open_foreign_v3(
             }
             Err(error) => return Err(error),
         };
-        return Ok(Some(Arc::new(ComposedGeneration::compose(
-            generation,
-            manifest,
-            base.into_generation(),
-            Some(Residency::Marker(marker)),
-        )?)));
+        return Ok(Some(Arc::new(
+            ComposedGeneration::compose(
+                generation,
+                manifest,
+                base.into_generation(storage, family),
+                Some(Residency::Marker(marker)),
+            )?
+            .with_v3_route(route(storage, family, scope)),
+        )));
     }
     Err(last.unwrap_or_else(|| {
         BaseRefError::Unavailable(format!("{scope} moved during {RESOLVE_ATTEMPTS} attempts"))

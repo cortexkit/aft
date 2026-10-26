@@ -1257,6 +1257,41 @@ pub trait CompositePlane: Send + Sync {
         staging: &str,
         published: &str,
     ) -> Result<(), PlaneError>;
+
+    /// Materializes this plane for a v3 worker generation whose `delta`
+    /// composes over `base`: rows go to the family's v3 plane stores and
+    /// derived files to `route.member_dir()` under `staging`. Every new key
+    /// is listed in `live`, the owner's v3 live pin, before it is put or
+    /// touched. Only the delta's entries are this checkout's work; inherited
+    /// base entries belong to the base's builder.
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_v3(
+        &self,
+        owner: &super::registry::ViewRegistration,
+        route: &super::snapshot::V3Route,
+        staging: &str,
+        base: &Arc<ComposedGeneration>,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+        delta: &mut super::manifest_v2::ManifestV2,
+        live: &mut crate::pins::LivePin,
+    ) -> Result<(), PlaneError> {
+        let _ = (owner, route, staging, base, observed, delta, live);
+        Err(PlaneError {
+            plane: Some(self.plane()),
+            reason: "this plane has no v3 materialization".into(),
+        })
+    }
+
+    /// [`Self::finish_generation`] for a v3 member directory.
+    fn finish_generation_v3(
+        &self,
+        route: &super::snapshot::V3Route,
+        staging: &str,
+        published: &str,
+    ) -> Result<(), PlaneError> {
+        let _ = (route, staging, published);
+        Ok(())
+    }
 }
 
 /// Supplies the same full membership as the configured lexical walker. Runtime
@@ -3308,6 +3343,148 @@ impl CompositePlane for CallgraphBridge {
         super::sync_directory(owner.view_dir()).map_err(|e| error(e.into()))?;
         Ok(())
     }
+    fn materialize_v3(
+        &self,
+        _owner: &super::registry::ViewRegistration,
+        route: &super::snapshot::V3Route,
+        staging: &str,
+        base: &Arc<ComposedGeneration>,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+        delta: &mut super::manifest_v2::ManifestV2,
+        live: &mut crate::pins::LivePin,
+    ) -> Result<(), PlaneError> {
+        let error = |reason: String| PlaneError {
+            plane: Some(FamilyPlane::Callgraph),
+            reason,
+        };
+        let mut attachments = Vec::new();
+        for (path, entry) in observed {
+            if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
+                continue;
+            }
+            // Only the delta's own entries; inherited base entries are the
+            // base's work, and their keys are the base's.
+            if delta.get(path).is_none()
+                || super::snapshot::DiskState::in_generation(delta, path) != entry.disk
+            {
+                continue;
+            }
+            let attachment = entry
+                .attachments
+                .get(&FamilyPlane::Callgraph)
+                .and_then(|value| value.downcast_ref::<super::callgraph::CallgraphAttachment>())
+                .ok_or_else(|| error(format!("{path:?}: callgraph attachment missing")))?;
+            attachments.push((path.clone(), attachment.clone()));
+        }
+        live.protect(&attachments.iter().map(|(_, a)| a.key).collect::<Vec<_>>())
+            .map_err(|e| error(e.to_string()))?;
+        let mut payloads = Vec::new();
+        for (path, attachment) in &attachments {
+            payloads.push((
+                path.clone(),
+                attachment.key,
+                attachment
+                    .blob
+                    .to_bytes()
+                    .map_err(|e| error(e.to_string()))?,
+            ));
+        }
+        if !payloads.is_empty() {
+            let request = payloads
+                .iter()
+                .map(|(_, _, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+                .saturating_mul(2)
+                .saturating_add(1 << 20);
+            let schema = FamilyPlane::Callgraph.payload_schema();
+            crate::blob_store::v3::publish(&route.storage, &route.family, request, None, |p| {
+                for (_, key, bytes) in &payloads {
+                    p.put(key, bytes, schema)?;
+                }
+                Ok(())
+            })
+            .map_err(|e| error(e.to_string()))?;
+        }
+        for (path, key, _) in &payloads {
+            if let Some(super::manifest_v2::EntryV2::Regular {
+                planes,
+                resolution_input,
+                ..
+            }) = delta.get_mut(path)
+            {
+                planes.callgraph = Some(super::readiness::PlaneState::ready(key));
+                *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+            }
+        }
+        // The derived graph covers the composed generation. While the base's
+        // graph is still pending the projection refuses, and the worker's
+        // graph stays building until a later publication; nothing is copied.
+        let composed = ComposedGeneration::compose(staging, delta.clone(), base.clone(), None)
+            .map_err(|e| error(e.to_string()))?;
+        if super::callgraph::project_manifest(&composed).is_err() {
+            return Ok(());
+        }
+        let reader = super::callgraph::V3BlobReader(
+            crate::blob_store::v3::PlaneReader::open_existing(
+                &route.storage,
+                &route.family,
+                FamilyPlane::Callgraph,
+            )
+            .map_err(|e| error(e.to_string()))?,
+        );
+        let dir = route.member_dir();
+        // Open (and so initialize and recover) the member's view store before
+        // writing a private derived file into it: first-open recovery removes
+        // derived files no generation owns. The caller protects `staging` with
+        // an assembly pin, as on the v2 path.
+        super::ViewStore::open_dir(dir.clone()).map_err(|e| error(e.to_string()))?;
+        let database =
+            super::resolve_derived_path(&dir, staging).map_err(|e| error(e.to_string()))?;
+        super::callgraph::materialize(&database, &composed, &reader)
+    }
+    fn finish_generation_v3(
+        &self,
+        route: &super::snapshot::V3Route,
+        staging: &str,
+        published: &str,
+    ) -> Result<(), PlaneError> {
+        let error = |e: super::ViewError| PlaneError {
+            plane: Some(FamilyPlane::Callgraph),
+            reason: e.to_string(),
+        };
+        let dir = route.member_dir();
+        let staging_path = super::resolve_derived_path(&dir, staging).map_err(error)?;
+        if !staging_path.exists() {
+            // The graph was not built for this generation (base graph pending).
+            return Ok(());
+        }
+        let (busy, frames, checkpointed) = super::sqlite_full_sync_checkpoint(
+            &staging_path,
+            "first_load::CallgraphBridge::finish_generation_v3",
+        )
+        .map_err(error)?;
+        if busy != 0 || (frames >= 0 && checkpointed != frames) {
+            return Err(PlaneError {
+                plane: Some(FamilyPlane::Callgraph),
+                reason: "private callgraph checkpoint incomplete".into(),
+            });
+        }
+        let published_path = super::resolve_derived_path(&dir, published).map_err(error)?;
+        if staging_path != published_path {
+            if crate::db::file_identity::open_connections(&staging_path) != 0
+                || published_path.exists()
+            {
+                return Err(PlaneError {
+                    plane: Some(FamilyPlane::Callgraph),
+                    reason: "private callgraph install would replace a live database".into(),
+                });
+            }
+            crate::db::file_identity::guard_replacement(&staging_path, "v3 derived rename");
+            std::fs::rename(&staging_path, &published_path).map_err(|e| error(e.into()))?;
+        }
+        super::sync_directory(&dir).map_err(|e| error(e.into()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3892,6 +4069,26 @@ impl CompositePlane for TrigramBridge {
         _: &str,
     ) -> Result<(), PlaneError> {
         Ok(())
+    }
+    fn materialize_v3(
+        &self,
+        owner: &super::registry::ViewRegistration,
+        route: &super::snapshot::V3Route,
+        _: &str,
+        _: &Arc<ComposedGeneration>,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+        delta: &mut super::manifest_v2::ManifestV2,
+        live: &mut crate::pins::LivePin,
+    ) -> Result<(), PlaneError> {
+        super::trigram::materialize_v3_observed(
+            &route.storage,
+            &route.family,
+            owner.root(),
+            delta,
+            observed,
+            live,
+            self.policy,
+        )
     }
 }
 

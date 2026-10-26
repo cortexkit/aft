@@ -1552,6 +1552,40 @@ impl Publication<'_, '_> {
     pub fn put(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<()> {
         self.put_row(key, payload, payload_schema).map(|_| ())
     }
+    /// Inserts the row, or touches an equal existing one. `true` means the
+    /// row was inserted by this call.
+    pub fn put_or_touch(
+        &mut self,
+        key: &FamilyKey,
+        payload: &[u8],
+        payload_schema: u32,
+    ) -> Result<bool> {
+        self.put_row(key, payload, payload_schema)
+    }
+    /// Stamps the plane's current `gc_epoch` on each existing row of `keys`
+    /// and returns the keys that have no row. Never inserts, and never creates
+    /// a plane store. The caller protects every key (a pin or live pin) before
+    /// touching it, so a sweep either marks it or sees the new epoch.
+    pub fn touch(&mut self, keys: &[FamilyKey]) -> Result<Vec<FamilyKey>> {
+        let mut missing = Vec::new();
+        for key in keys {
+            let Some(mut c) = self.plane_with(key.plane(), false)? else {
+                missing.push(*key);
+                continue;
+            };
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let sql = if plane_layout(&tx)? == 1 {
+                "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1"
+            } else {
+                "UPDATE blob_liveness SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1)"
+            };
+            if tx.execute(sql, [key.as_bytes().as_slice()])? == 0 {
+                missing.push(*key);
+            }
+            tx.commit()?;
+        }
+        Ok(missing)
+    }
     /// Inserts the row, or touches an equal existing one. `true` means inserted.
     fn put_row(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<bool> {
         let mut c = self.plane(key.plane())?;
@@ -1660,6 +1694,15 @@ impl PlaneReader {
                 true,
             )?,
         })
+    }
+    /// True when the store holds a row for `key`. A presence probe through
+    /// the key index: the payload is not read.
+    pub fn contains(&self, key: &FamilyKey) -> Result<bool> {
+        Ok(self.database.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blob_payloads WHERE full_key=?1)",
+            [key.as_bytes().as_slice()],
+            |r| r.get(0),
+        )?)
     }
     pub fn get(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self

@@ -89,7 +89,26 @@ pub struct ComposedGeneration {
     delta: Arc<ManifestV2>,
     base: Option<Arc<ComposedGeneration>>,
     overrides: BTreeMap<RelPath, EntryV2>,
+    route: Option<V3Route>,
     _residency: Option<Residency>,
+}
+
+/// Where a v3 generation's artifacts live: plane rows in
+/// `blobs/v3/<family>/<plane>.sqlite`, and its manifest, pointer and derived
+/// files in the member directory `blobs/v3/<family>/views/<scope>`. A
+/// generation without a route is a v2 generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V3Route {
+    pub storage: std::path::PathBuf,
+    pub family: String,
+    pub scope: String,
+}
+
+impl V3Route {
+    pub fn member_dir(&self) -> std::path::PathBuf {
+        crate::blob_store::v3::view_dir(&self.storage, &self.family, &self.scope)
+            .unwrap_or_else(|_| self.storage.join("blobs/v3/invalid"))
+    }
 }
 
 /// Compatibility name for callers that open a flat generation. Both names
@@ -111,6 +130,7 @@ impl ComposedGeneration {
             delta: Arc::new(manifest),
             base: None,
             overrides: BTreeMap::new(),
+            route: None,
             _residency: residency,
         }
     }
@@ -159,8 +179,20 @@ impl ComposedGeneration {
             delta: Arc::new(delta),
             base: Some(base),
             overrides,
+            route: None,
             _residency: residency,
         })
+    }
+
+    /// Marks this generation as stored in the v3 namespace at `route`.
+    pub fn with_v3_route(mut self, route: V3Route) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// The v3 location of this generation, or `None` for a v2 generation.
+    pub fn v3_route(&self) -> Option<&V3Route> {
+        self.route.as_ref()
     }
 
     pub fn name(&self) -> &str {

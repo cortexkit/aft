@@ -130,6 +130,18 @@ pub fn publish_base(
     manifest: &ManifestV2,
     observer: Option<&dyn DurabilityObserver>,
 ) -> Result<BasePublication> {
+    publish_base_with(storage, family, manifest, observer, &mut |_, _| Ok(()))
+}
+
+/// [`publish_base`] with a step that runs after the new manifest is durable
+/// under its private name and before the pointer CAS.
+fn publish_base_with(
+    storage: &Path,
+    family: &str,
+    manifest: &ManifestV2,
+    observer: Option<&dyn DurabilityObserver>,
+    before_cas: &mut dyn FnMut(&ViewStore, &str) -> Result<()>,
+) -> Result<BasePublication> {
     let identity = BaseIdentity::of(family, manifest)?;
     let (dir, registered) = with_base_barrier(storage, family, |tx| {
         register_base_in(tx, storage, family, &identity.scope)
@@ -148,6 +160,9 @@ pub fn publish_base(
     }
     let name = GenerationName::for_manifest(manifest)?;
     let prepared = store.prepare_v2(&name, current.as_deref(), manifest, observer)?;
+    // The private manifest is pinned by `prepared`; derived artifacts named
+    // after it are built before the pointer can name it.
+    before_cas(&store, &name.to_string())?;
     match store.commit_v2(prepared, observer)? {
         PublishV2::Published => {
             if current.is_some() {
@@ -360,6 +375,50 @@ impl BuildClaim {
             self.attempt, self.token
         )
     }
+    /// Builds the base's derived call graph for `generation` once every
+    /// callgraph member of `manifest` is ready, as
+    /// `derived-<generation>-a<attempt>-<owner_token>.sqlite` with a
+    /// `derived-<generation>.ref` naming it, so a takeover never reuses a
+    /// dead attempt's file. While any member is pending nothing is built.
+    fn build_derived(
+        &self,
+        store: &ViewStore,
+        generation: &str,
+        manifest: &ManifestV2,
+    ) -> Result<()> {
+        let composed = super::snapshot::ComposedGeneration::new(generation, manifest.clone(), None);
+        if super::callgraph::project_manifest(&composed).is_err() {
+            return Ok(());
+        }
+        let owner = format!("{generation}-a{}-{}", self.attempt, self.token);
+        // `derived_name` is `derived-<owner>.sqlite`: the name the
+        // reference file below resolves to.
+        let database = store.view_dir().join(self.derived_name(generation));
+        let reader = super::callgraph::V3BlobReader(v3::PlaneReader::open_existing(
+            &self.storage,
+            &self.family,
+            FamilyPlane::Callgraph,
+        )?);
+        super::callgraph::materialize(&database, &composed, &reader)
+            .map_err(|error| BaseRefError::Io(std::io::Error::other(error.reason)))?;
+        let (busy, frames, checkpointed) =
+            super::sqlite_full_sync_checkpoint(&database, "base_builder::build_derived")?;
+        if busy != 0 || (frames >= 0 && checkpointed != frames) {
+            return Err(BaseRefError::Io(std::io::Error::other(
+                "base derived graph checkpoint incomplete",
+            )));
+        }
+        let reference = store.view_dir().join(format!("derived-{generation}.ref"));
+        let temporary = store
+            .view_dir()
+            .join(format!(".derived-{generation}.ref.tmp"));
+        std::fs::write(&temporary, owner.as_bytes())?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::rename(&temporary, &reference)?;
+        super::sync_directory(store.view_dir())?;
+        Ok(())
+    }
+
     /// Deletes the staging directories of a dead attempt. Called only after
     /// the claim CAS confirmed that attempt's owner dead.
     fn remove_dead_staging(&self, attempt: i64, token: &str) -> Result<()> {
@@ -677,7 +736,15 @@ pub fn publish_successor(
     let mut next = base.manifest().clone();
     drop(base);
     update(&mut next);
-    match publish_base(&claim.storage, &claim.family, &next, observer)? {
+    let mut build_graph =
+        |store: &ViewStore, generation: &str| claim.build_derived(store, generation, &next);
+    match publish_base_with(
+        &claim.storage,
+        &claim.family,
+        &next,
+        observer,
+        &mut build_graph,
+    )? {
         BasePublication::Published { generation, .. } => Ok(generation),
         BasePublication::Lost { current } => Err(BaseRefError::Unavailable(format!(
             "the base pointer moved to {current:?}"

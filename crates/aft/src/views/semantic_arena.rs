@@ -346,6 +346,43 @@ impl Drop for ArenaClaim {
     }
 }
 
+/// Where admitted runs are read from: the v2 family store, or a v3 plane
+/// store. Verified-run markers are a v2 deletion-epoch optimization; a source
+/// without them returns `None` and its runs simply do not seed the chunk index.
+pub(crate) trait RunSource {
+    fn run_payload(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>, String>;
+    fn markers_at_deletion_epoch(
+        &self,
+        keys: &mut dyn FnMut(&DeletionEpoch) -> Vec<FamilyKey>,
+    ) -> Option<(DeletionEpoch, std::collections::HashSet<FamilyKey>)>;
+}
+
+impl RunSource for FamilyStoreReader {
+    fn run_payload(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>, String> {
+        self.get(key).map_err(|error| error.to_string())
+    }
+    fn markers_at_deletion_epoch(
+        &self,
+        keys: &mut dyn FnMut(&DeletionEpoch) -> Vec<FamilyKey>,
+    ) -> Option<(DeletionEpoch, std::collections::HashSet<FamilyKey>)> {
+        self.contains_many_at_deletion_epoch(|epoch| keys(epoch))
+            .ok()
+            .flatten()
+    }
+}
+
+impl RunSource for crate::blob_store::v3::PlaneReader {
+    fn run_payload(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>, String> {
+        self.get(key).map_err(|error| error.to_string())
+    }
+    fn markers_at_deletion_epoch(
+        &self,
+        _keys: &mut dyn FnMut(&DeletionEpoch) -> Vec<FamilyKey>,
+    ) -> Option<(DeletionEpoch, std::collections::HashSet<FamilyKey>)> {
+        None
+    }
+}
+
 impl SemanticArena {
     #[cfg(test)]
     pub(crate) fn set_chunk_shortcut(&self, enabled: bool) {
@@ -419,7 +456,7 @@ impl SemanticArena {
     /// chunk index; see [`Self::seed_verified_runs`].
     pub(crate) fn load(
         &self,
-        store: &FamilyStoreReader,
+        store: &dyn RunSource,
         key: &FamilyKey,
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
@@ -437,7 +474,7 @@ impl SemanticArena {
     /// afterwards.
     pub(crate) fn load_deferring_seed(
         &self,
-        store: &FamilyStoreReader,
+        store: &dyn RunSource,
         key: &FamilyKey,
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
@@ -448,7 +485,7 @@ impl SemanticArena {
             return Ok(Some(run));
         }
         self.store_reads.fetch_add(1, Ordering::Relaxed);
-        let Some(payload) = store.get(key).map_err(|error| error.to_string())? else {
+        let Some(payload) = store.run_payload(key)? else {
             return Ok(None);
         };
         self.decodes.fetch_add(1, Ordering::Relaxed);
@@ -512,7 +549,7 @@ impl SemanticArena {
     /// [`MAX_CHUNK_KEYS`] keys, the remaining vectors stay unindexed.
     pub(crate) fn seed_verified_runs(
         &self,
-        store: &FamilyStoreReader,
+        store: &dyn RunSource,
         seeds: Vec<RunSeed>,
         naming: &dyn ChunkNaming,
     ) {
@@ -523,7 +560,7 @@ impl SemanticArena {
         if seeds.is_empty() {
             return;
         }
-        let Ok(Some((epoch, present))) = store.contains_many_at_deletion_epoch(|epoch| {
+        let Some((epoch, present)) = store.markers_at_deletion_epoch(&mut |epoch| {
             seeds
                 .iter()
                 .map(|seed| naming.verified_run_marker(&seed.payload_digest, epoch))

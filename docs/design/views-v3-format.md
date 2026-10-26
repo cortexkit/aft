@@ -580,8 +580,18 @@ CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   base after two consecutive unreferenced sweeps. The plane-row sweep keeps
   its resume position at `retention/cursors/v3-plane-rows/<family>.json`
   (format 1) when the retention collector runs it.
-- **Segments.** v3 generations carry no trigram segment yet: v3 has no
-  segment rows or segment collection, so readers build from payloads.
+- **Segments.** v3 generations carry no trigram segment: v3 has no segment
+  rows, files or segment collection. A reader assembles the base
+  generation's segment in memory from the base's stored trigram payloads
+  (once per base generation per process) and loads the worker's changed
+  entries as the usual overlay. No new on-disk rows were added for this.
+- **Derived graphs.** A base's derived call graph is
+  `M/derived-<generation>-a<attempt>-<owner_token>.sqlite`, named by the
+  existing `M/derived-<generation>.ref` owner-reference file, and is built
+  only once every callgraph member of that generation is ready. A worker's
+  derived graph covers its composed generation and lives in its own member
+  directory under the usual `derived-<generation>.sqlite` name; while the
+  base's graph is pending the worker has none.
 
 ## Deferred implementation register
 

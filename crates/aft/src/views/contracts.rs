@@ -233,6 +233,26 @@ impl ViewAccess {
     }
 }
 
+/// Where a generation's plane artifacts are read and written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageRoute {
+    /// The v2 family store and the registration's v2 view directory.
+    V2,
+    /// The v3 plane stores and the v3 member directory of the route's scope.
+    V3(super::snapshot::V3Route),
+}
+
+impl ViewAccess {
+    /// The storage of `generation`: a generation opened or published in the
+    /// v3 namespace carries its route; every other generation is v2.
+    pub fn route(&self, generation: &ComposedGeneration) -> StorageRoute {
+        generation
+            .v3_route()
+            .cloned()
+            .map_or(StorageRoute::V2, StorageRoute::V3)
+    }
+}
+
 /// An error from an index plane or loader orchestration, carried into existing
 /// incomplete/named-gap reporting, never turned into an empty success.
 #[derive(Clone, Debug, Eq, PartialEq)]

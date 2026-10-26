@@ -68,6 +68,8 @@ pub mod trigram;
 mod dispatch_parity_probe;
 #[cfg(test)]
 mod per_checkout_core_tests;
+#[cfg(test)]
+mod v3_plane_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;

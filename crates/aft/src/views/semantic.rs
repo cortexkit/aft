@@ -33,9 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::blob_store::v2::{
-    ContentHash, FamilyKey, FamilyPlane, FamilyStore, FamilyStoreReader, PutOrTouch,
-};
+use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane, FamilyStore, PutOrTouch};
 use crate::blob_store::{FullKey, SemanticKey, SEMANTIC_PRODUCER_VERSION};
 use crate::refresh::{FailureClass, FailureTracker, PreparedWork};
 use crate::semantic_index::{
@@ -339,8 +337,184 @@ fn decode_chunk_vector(payload: &[u8], identity: &str, text: &str) -> Option<Vec
     )
 }
 
+/// Where a fill reads and writes semantic rows: the owner's v2 family store,
+/// or the family's v3 semantic plane store for a generation published in the
+/// v3 namespace. A v3 write goes through one v3 publication (reservation,
+/// closure flush, ledger commit) per call.
+pub(crate) enum SemanticStore {
+    V2(FamilyStore),
+    V3(super::snapshot::V3Route),
+}
+
+/// A v3 source with no semantic store yet: every read misses.
+struct NoRuns;
+impl super::semantic_arena::RunSource for NoRuns {
+    fn run_payload(&self, _: &FamilyKey) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    fn markers_at_deletion_epoch(
+        &self,
+        _: &mut dyn FnMut(&crate::blob_store::v2::DeletionEpoch) -> Vec<FamilyKey>,
+    ) -> Option<(crate::blob_store::v2::DeletionEpoch, HashSet<FamilyKey>)> {
+        None
+    }
+}
+
+fn v3_store_error(error: crate::blob_store::v3::Error) -> crate::blob_store::v2::StoreError {
+    crate::blob_store::v2::StoreError::Io(std::io::Error::other(error.to_string()))
+}
+
+impl SemanticStore {
+    fn for_generation(
+        owner: &ViewRegistration,
+        generation: &ComposedGeneration,
+    ) -> Result<Self, PlaneError> {
+        match generation.v3_route() {
+            Some(route) => Ok(Self::V3(route.clone())),
+            None => owner
+                .open_store(FamilyPlane::Semantic)
+                .map(Self::V2)
+                .map_err(|error| plane_error(error.to_string())),
+        }
+    }
+
+    fn is_v3(&self) -> bool {
+        matches!(self, Self::V3(_))
+    }
+
+    fn v3_reader(
+        route: &super::snapshot::V3Route,
+    ) -> Result<Option<crate::blob_store::v3::PlaneReader>, crate::blob_store::v2::StoreError> {
+        let path =
+            crate::blob_store::v3::plane_path(&route.storage, &route.family, FamilyPlane::Semantic)
+                .map_err(v3_store_error)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        crate::blob_store::v3::PlaneReader::open_existing(
+            &route.storage,
+            &route.family,
+            FamilyPlane::Semantic,
+        )
+        .map(Some)
+        .map_err(v3_store_error)
+    }
+
+    fn get(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>, crate::blob_store::v2::StoreError> {
+        match self {
+            Self::V2(store) => store.get(key),
+            Self::V3(route) => match Self::v3_reader(route)? {
+                Some(reader) => reader.get(key).map_err(v3_store_error),
+                None => Ok(None),
+            },
+        }
+    }
+
+    fn reader(&self) -> Box<dyn super::semantic_arena::RunSource> {
+        match self {
+            Self::V2(store) => Box::new(store.reader()),
+            Self::V3(route) => match Self::v3_reader(route) {
+                Ok(Some(reader)) => Box::new(reader),
+                _ => Box::new(NoRuns),
+            },
+        }
+    }
+
+    fn put_or_touch(
+        &self,
+        key: &FamilyKey,
+        payload: &[u8],
+    ) -> Result<PutOrTouch, crate::blob_store::v2::StoreError> {
+        match self {
+            Self::V2(store) => store.put_or_touch(key, payload),
+            Self::V3(route) => {
+                let request = (payload.len() as u64)
+                    .saturating_mul(2)
+                    .saturating_add(1 << 20);
+                let inserted = crate::blob_store::v3::publish(
+                    &route.storage,
+                    &route.family,
+                    request,
+                    None,
+                    |publication| {
+                        publication.put_or_touch(
+                            key,
+                            payload,
+                            FamilyPlane::Semantic.payload_schema(),
+                        )
+                    },
+                )
+                .map_err(|error| match error {
+                    crate::blob_store::v3::Error::Refused("payload_mismatch") => {
+                        crate::blob_store::v2::StoreError::ConflictingPayload(*key)
+                    }
+                    other => v3_store_error(other),
+                })?;
+                Ok(if inserted {
+                    PutOrTouch::Inserted { ref_epoch: 0 }
+                } else {
+                    PutOrTouch::Reused { ref_epoch: 0 }
+                })
+            }
+        }
+    }
+
+    /// Verified-run markers are a v2 deletion-epoch optimization; v3 stores
+    /// none, which only costs later loads their chunk-row reads.
+    fn put_at_deletion_epoch(
+        &self,
+        build: impl FnOnce(&crate::blob_store::v2::DeletionEpoch) -> Option<(FamilyKey, Vec<u8>)>,
+    ) -> Result<Option<PutOrTouch>, crate::blob_store::v2::StoreError> {
+        match self {
+            Self::V2(store) => store.put_at_deletion_epoch(build),
+            Self::V3(_) => Ok(None),
+        }
+    }
+
+    fn deletion_epoch(
+        &self,
+    ) -> Result<Option<crate::blob_store::v2::DeletionEpoch>, crate::blob_store::v2::StoreError>
+    {
+        match self {
+            Self::V2(store) => store.deletion_epoch(),
+            Self::V3(_) => Ok(None),
+        }
+    }
+
+    fn touch(
+        &self,
+        keys: &[FamilyKey],
+    ) -> Result<crate::blob_store::v2::TouchReport, crate::blob_store::v2::StoreError> {
+        match self {
+            Self::V2(store) => store.touch(keys),
+            Self::V3(route) => {
+                if Self::v3_reader(route)?.is_none() {
+                    return Ok(crate::blob_store::v2::TouchReport {
+                        missing: keys.to_vec(),
+                        ..Default::default()
+                    });
+                }
+                let request = (keys.len() as u64).saturating_mul(64 * 1024).max(1 << 20);
+                let missing = crate::blob_store::v3::publish(
+                    &route.storage,
+                    &route.family,
+                    request,
+                    None,
+                    |publication| publication.touch(keys),
+                )
+                .map_err(v3_store_error)?;
+                Ok(crate::blob_store::v2::TouchReport {
+                    touched: keys.len() - missing.len(),
+                    missing,
+                    ref_epoch: 0,
+                })
+            }
+        }
+    }
+}
+
 fn load_chunk(
-    store: &FamilyStore,
+    store: &SemanticStore,
     arena: &super::semantic_arena::SemanticArena,
     key: &FamilyKey,
     identity: &str,
@@ -506,6 +680,10 @@ struct ViewState {
     failed: BTreeMap<(RelPath, ContentHash), String>,
     tracker: FailureTracker,
     live: Option<Arc<Mutex<crate::pins::LivePin>>>,
+    /// The live pin in the v3 member directory, for fills of a generation
+    /// published in the v3 namespace. Its keys are kept until the process
+    /// ends: post-fold trimming covers only the v2 pin so far.
+    live_v3: Option<Arc<Mutex<crate::pins::LivePin>>>,
     active_fills: usize,
     cache: Option<(CacheKey, Arc<SemanticIndex>)>,
 }
@@ -738,14 +916,122 @@ impl SemanticPlane {
             .cloned()
     }
 
-    fn store_reader(access: &ViewAccess) -> Result<Option<FamilyStoreReader>, PlaneError> {
+    /// Records semantic readiness for `manifest`'s entries; see
+    /// [`super::first_load::CompositePlane::materialize`].
+    fn materialize_with(
+        &self,
+        owner: &ViewRegistration,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+        manifest: &mut ManifestV2,
+        live: &mut crate::pins::LivePin,
+        store: &SemanticStore,
+    ) -> Result<(), PlaneError> {
+        let id = self.producer.id();
+        if manifest.header().producers.semantic.as_deref() != Some(id.as_str()) {
+            return Err(plane_error("semantic producer mismatch"));
+        }
+        let view = self.view(&ViewAccess::Owner(owner.clone()));
+        let state = lock(&view);
+        let mut candidates = Vec::new();
+        for (path, entry) in manifest.entries_mut() {
+            let EntryV2::Regular {
+                content, planes, ..
+            } = entry
+            else {
+                continue;
+            };
+            if !applies_to(path) {
+                planes.semantic = None;
+                continue;
+            }
+            // A completed small-cap repair replaces the old Ready file-run key.
+            let repaired = self.producer.caps.total_chars < EmbedTextCaps::default().total_chars
+                && state
+                    .fill
+                    .get(path, content, FamilyPlane::Semantic)
+                    .is_some();
+            if matches!(planes.semantic, Some(PlaneState::Ready { .. })) && !repaired {
+                continue;
+            }
+            let stored = observed
+                .get(path)
+                .and_then(|entry| entry.attachments.get(&FamilyPlane::Semantic))
+                .and_then(|value| value.downcast_ref::<SemanticAttachment>())
+                .filter(|attachment| attachment.content == *content && attachment.producer == id)
+                .map(|attachment| attachment.key);
+            let key = match state.fill.get(path, content, FamilyPlane::Semantic) {
+                Some(key) => Some(*key),
+                None => match stored {
+                    Some(key) => store
+                        .get(&key)
+                        .map_err(|error| plane_error(error.to_string()))?
+                        .is_some()
+                        .then_some(key),
+                    None => None,
+                },
+            };
+            if let Some(key) = key {
+                candidates.push((path.clone(), key));
+            }
+            if let Some(reason) = state.failed.get(&(path.clone(), *content)) {
+                planes.semantic = Some(PlaneState::Failed {
+                    reason: reason.clone(),
+                    producer: id.clone(),
+                });
+                continue;
+            }
+            if !matches!(&planes.semantic, Some(PlaneState::Failed { producer, .. }) if *producer == id)
+            {
+                planes.semantic = Some(PlaneState::pending("awaiting semantic fill"));
+            }
+        }
+        if !candidates.is_empty() {
+            // Pin all candidates before the touch transaction. Missing rows
+            // remain pending/failed: GC may have won before protection landed.
+            let keys = candidates.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+            live.protect(&keys)
+                .map_err(|error| plane_error(error.to_string()))?;
+            let missing = store
+                .touch(&keys)
+                .map_err(|error| plane_error(error.to_string()))?
+                .missing
+                .into_iter()
+                .collect::<HashSet<_>>();
+            for (path, key) in candidates {
+                if !missing.contains(&key) {
+                    if let Some(EntryV2::Regular { planes, .. }) = manifest.get_mut(&path) {
+                        planes.semantic = Some(PlaneState::ready(&key));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn store_reader(
+        access: &ViewAccess,
+        generation: &ComposedGeneration,
+    ) -> Result<Option<Box<dyn super::semantic_arena::RunSource>>, PlaneError> {
+        if let super::contracts::StorageRoute::V3(route) = access.route(generation) {
+            return SemanticStore::v3_reader(&route)
+                .map(|reader| {
+                    reader
+                        .map(|reader| Box::new(reader) as Box<dyn super::semantic_arena::RunSource>)
+                })
+                .map_err(|error| plane_error(error.to_string()));
+        }
         match access {
             ViewAccess::Owner(owner) => owner
                 .open_store(FamilyPlane::Semantic)
-                .map(|store| Some(store.reader()))
+                .map(|store| {
+                    Some(Box::new(store.reader()) as Box<dyn super::semantic_arena::RunSource>)
+                })
                 .map_err(|error| plane_error(error.to_string())),
             ViewAccess::Reader { registration, .. } => registration
                 .open_store(FamilyPlane::Semantic)
+                .map(|store| {
+                    store.map(|store| Box::new(store) as Box<dyn super::semantic_arena::RunSource>)
+                })
                 .map_err(|error| plane_error(error.to_string())),
         }
     }
@@ -767,7 +1053,7 @@ impl SemanticPlane {
         let mut legacy_summaries = BTreeSet::new();
         if compatible {
             let arena = self.arena(access.family());
-            let store = Self::store_reader(access)?;
+            let store = Self::store_reader(access, generation)?;
             // Markers of every run loaded here are probed together afterwards.
             let mut seeds = Vec::new();
             for (path, entry) in manifest.entries() {
@@ -786,7 +1072,7 @@ impl SemanticPlane {
                         ) {
                             (Some(bytes), Some(store), Some(relative)) => arena
                                 .load_deferring_seed(
-                                    store,
+                                    store.as_ref(),
                                     &FamilyKey::new(FamilyPlane::Semantic, bytes),
                                     &relative,
                                     &self.producer.payload(),
@@ -818,7 +1104,7 @@ impl SemanticPlane {
                 }
             }
             if let Some(store) = store.as_ref() {
-                arena.seed_verified_runs(store, seeds, &self.producer);
+                arena.seed_verified_runs(store.as_ref(), seeds, &self.producer);
             }
         }
         Ok(Resident {
@@ -1014,15 +1300,32 @@ impl SemanticPlane {
         // The view's state is locked only for short bookkeeping steps, never
         // across file reads, model calls or store writes, so queries and
         // publication of this checkout proceed while it fills.
-        let needs_pin = lock(&view).live.is_none();
+        let v3 = snapshot.generation().v3_route().cloned();
+        let needs_pin = {
+            let state = lock(&view);
+            if v3.is_some() {
+                state.live_v3.is_none()
+            } else {
+                state.live.is_none()
+            }
+        };
         if needs_pin {
-            let pin = Arc::new(Mutex::new(
-                crate::pins::LivePin::create(owner)
-                    .map_err(|error| plane_error(error.to_string()))?,
-            ));
+            let pin = match &v3 {
+                Some(route) => {
+                    crate::pins::LivePin::create_v3(&route.storage, &route.family, &route.scope)
+                }
+                None => crate::pins::LivePin::create(owner),
+            }
+            .map_err(|error| plane_error(error.to_string()))?;
+            let pin = Arc::new(Mutex::new(pin));
             let mut state = lock(&view);
-            if state.live.is_none() {
-                state.live = Some(pin.clone());
+            let slot = if v3.is_some() {
+                &mut state.live_v3
+            } else {
+                &mut state.live
+            };
+            if slot.is_none() {
+                *slot = Some(pin.clone());
             }
             drop(state);
             drop(pin);
@@ -1105,9 +1408,7 @@ impl SemanticPlane {
 
         let lookup_started = Instant::now();
         let arena = self.arena(owner.family());
-        let store = owner
-            .open_store(FamilyPlane::Semantic)
-            .map_err(|error| plane_error(error.to_string()))?;
+        let store = SemanticStore::for_generation(owner, snapshot.generation())?;
         let payload_producer = self.producer.payload();
         let mut ready = Vec::new();
         let mut claimed = Vec::new();
@@ -1123,7 +1424,7 @@ impl SemanticPlane {
                 ready.push((item.clone(), key, run));
             } else if let Some(run) = arena
                 .load(
-                    &store.reader(),
+                    &*store.reader(),
                     &key,
                     relative,
                     &payload_producer,
@@ -1146,7 +1447,7 @@ impl SemanticPlane {
                     ready.push((item.clone(), key, run));
                 } else if let Some(run) = arena
                     .load(
-                        &store.reader(),
+                        &*store.reader(),
                         &key,
                         relative,
                         &payload_producer,
@@ -1234,7 +1535,7 @@ impl SemanticPlane {
             )
             .collect::<Vec<_>>();
         let store_started = Instant::now();
-        protect(&view, &keys)?;
+        protect(&view, &keys, store.is_v3())?;
         report.timing.store_write += store_started.elapsed();
         let mut pending = to_embed.into_iter().zip(chunks).peekable();
         while pending.peek().is_some() {
@@ -1388,7 +1689,7 @@ impl SemanticPlane {
                                 }
                                 if let Some(run) = arena
                                     .load(
-                                        &store.reader(),
+                                        &*store.reader(),
                                         &key,
                                         &relative,
                                         &payload_producer,
@@ -1466,7 +1767,7 @@ impl SemanticPlane {
                 Some(run) => Some(run),
                 None => arena
                     .load(
-                        &store.reader(),
+                        &*store.reader(),
                         &key,
                         &relative,
                         &payload_producer,
@@ -1518,7 +1819,7 @@ impl SemanticPlane {
     fn embed_chunks<F>(
         &self,
         arena: &super::semantic_arena::SemanticArena,
-        store: &FamilyStore,
+        store: &SemanticStore,
         texts: Vec<String>,
         embed: &mut F,
         report: &mut FillReport,
@@ -1662,7 +1963,7 @@ fn chunk_store_error(error: crate::blob_store::v2::StoreError, report: &mut Fill
 
 fn admit_ready(
     view: &Mutex<ViewState>,
-    store: &FamilyStore,
+    store: &SemanticStore,
     ready: Vec<(
         WorkItem,
         FamilyKey,
@@ -1676,7 +1977,7 @@ fn admit_ready(
         return Ok(());
     }
     let keys = ready.iter().map(|(_, key, _)| *key).collect::<Vec<_>>();
-    protect(view, &keys)?;
+    protect(view, &keys, store.is_v3())?;
     // GC may have won before the live-pin write. Do not admit a missing row.
     let swept = store
         .touch(&keys)
@@ -1712,11 +2013,11 @@ fn admit_ready(
     Ok(())
 }
 
-fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey]) -> Result<(), PlaneError> {
-    let pin = lock(view)
-        .live
-        .clone()
-        .ok_or_else(|| plane_error("semantic fill has no live pin"))?;
+fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey], v3: bool) -> Result<(), PlaneError> {
+    let state = lock(view);
+    let pin = if v3 { &state.live_v3 } else { &state.live }.clone();
+    drop(state);
+    let pin = pin.ok_or_else(|| plane_error("semantic fill has no live pin"))?;
     let result = lock(&pin)
         .protect(keys)
         .map_err(|error| plane_error(error.to_string()));
@@ -2216,6 +2517,7 @@ impl PlaneAdapter for SemanticPlane {
                         failed,
                         tracker: std::mem::take(&mut state.tracker),
                         live: pin.clone(),
+                        live_v3: state.live_v3.clone(),
                         active_fills: 0,
                         cache: None,
                     }));
@@ -2344,88 +2646,33 @@ impl super::first_load::CompositePlane for SemanticPlane {
         live: &mut crate::pins::LivePin,
         _seed_derived: bool,
     ) -> Result<(), PlaneError> {
-        let id = self.producer.id();
-        if manifest.header().producers.semantic.as_deref() != Some(id.as_str()) {
-            return Err(plane_error("semantic producer mismatch"));
-        }
         let store = owner
             .open_store(FamilyPlane::Semantic)
+            .map(SemanticStore::V2)
             .map_err(|error| plane_error(error.to_string()))?;
-        let view = self.view(&ViewAccess::Owner(owner.clone()));
-        let state = lock(&view);
-        let mut candidates = Vec::new();
-        for (path, entry) in manifest.entries_mut() {
-            let EntryV2::Regular {
-                content, planes, ..
-            } = entry
-            else {
-                continue;
-            };
-            if !applies_to(path) {
-                planes.semantic = None;
-                continue;
-            }
-            // A completed small-cap repair replaces the old Ready file-run key.
-            let repaired = self.producer.caps.total_chars < EmbedTextCaps::default().total_chars
-                && state
-                    .fill
-                    .get(path, content, FamilyPlane::Semantic)
-                    .is_some();
-            if matches!(planes.semantic, Some(PlaneState::Ready { .. })) && !repaired {
-                continue;
-            }
-            let stored = observed
-                .get(path)
-                .and_then(|entry| entry.attachments.get(&FamilyPlane::Semantic))
-                .and_then(|value| value.downcast_ref::<SemanticAttachment>())
-                .filter(|attachment| attachment.content == *content && attachment.producer == id)
-                .map(|attachment| attachment.key);
-            let key = match state.fill.get(path, content, FamilyPlane::Semantic) {
-                Some(key) => Some(*key),
-                None => match stored {
-                    Some(key) => store
-                        .contains(&key)
-                        .map_err(|error| plane_error(error.to_string()))?
-                        .then_some(key),
-                    None => None,
-                },
-            };
-            if let Some(key) = key {
-                candidates.push((path.clone(), key));
-            }
-            if let Some(reason) = state.failed.get(&(path.clone(), *content)) {
-                planes.semantic = Some(PlaneState::Failed {
-                    reason: reason.clone(),
-                    producer: id.clone(),
-                });
-                continue;
-            }
-            if !matches!(&planes.semantic, Some(PlaneState::Failed { producer, .. }) if *producer == id)
-            {
-                planes.semantic = Some(PlaneState::pending("awaiting semantic fill"));
-            }
-        }
-        if !candidates.is_empty() {
-            // Pin all candidates before the touch transaction. Missing rows
-            // remain pending/failed: GC may have won before protection landed.
-            let keys = candidates.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-            live.protect(&keys)
-                .map_err(|error| plane_error(error.to_string()))?;
-            let missing = store
-                .touch(&keys)
-                .map_err(|error| plane_error(error.to_string()))?
-                .missing
-                .into_iter()
-                .collect::<HashSet<_>>();
-            for (path, key) in candidates {
-                if !missing.contains(&key) {
-                    if let Some(EntryV2::Regular { planes, .. }) = manifest.get_mut(&path) {
-                        planes.semantic = Some(PlaneState::ready(&key));
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.materialize_with(owner, observed, manifest, live, &store)
+    }
+
+    /// The v3 counterpart: the same readiness rules, with presence checks and
+    /// touches against the family's v3 semantic store. Only the delta's own
+    /// entries are materialized; inherited base entries belong to the base.
+    fn materialize_v3(
+        &self,
+        owner: &ViewRegistration,
+        route: &super::snapshot::V3Route,
+        _staging: &str,
+        _base: &Arc<ComposedGeneration>,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+        delta: &mut ManifestV2,
+        live: &mut crate::pins::LivePin,
+    ) -> Result<(), PlaneError> {
+        self.materialize_with(
+            owner,
+            observed,
+            delta,
+            live,
+            &SemanticStore::V3(route.clone()),
+        )
     }
 
     fn finish_generation(
@@ -2553,7 +2800,7 @@ mod tests {
                 crate::pins::LivePin::create(&checkout.owner).unwrap(),
             )));
         }
-        protect(&view, &[key]).unwrap();
+        protect(&view, &[key], false).unwrap();
         let mut manifest =
             super::super::manifest_v2::ManifestV2::new(snapshot.generation().header().clone());
         manifest
@@ -2600,7 +2847,7 @@ mod tests {
         let key = plane
             .producer
             .key(b"pending bytes", &RelPath::new(b"new.rs".to_vec()).unwrap());
-        protect(&view, &[key]).unwrap();
+        protect(&view, &[key], false).unwrap();
         let path = live_pin_path(&view);
         plane
             .generation_published(&checkout.access, snapshot.generation(), &|| {
@@ -3820,7 +4067,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let plane = new_plane(storage.path(), "model-a");
         let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
-        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        let store = SemanticStore::V2(checkout.owner.open_store(FamilyPlane::Semantic).unwrap());
         let producer = plane.semantic_producer();
         let identity = producer.chunk_identity();
         let text = "file:src/a.rs\nfn compact_vector()";
@@ -3908,7 +4155,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let plane = new_plane(storage.path(), "model-a");
         let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
-        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        let store = SemanticStore::V2(checkout.owner.open_store(FamilyPlane::Semantic).unwrap());
         let producer = plane.semantic_producer();
         let text = "file:src/a.rs\nfn correct()";
         let key = producer.chunk_key(text);
@@ -4722,5 +4969,46 @@ mod tests {
             }
         );
         assert_eq!(plane.readiness(&b.access, &shared), unfilled);
+    }
+}
+
+#[cfg(test)]
+mod v3_store_tests {
+    use super::*;
+
+    #[test]
+    fn a_v3_semantic_store_puts_touches_and_admits_runs_without_the_v2_store() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let store = SemanticStore::V3(super::super::snapshot::V3Route {
+            storage: storage.path().to_path_buf(),
+            family: "00112233445566ff".into(),
+            scope: "worker".into(),
+        });
+        let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+        assert_eq!(store.get(&key).unwrap(), None);
+        assert_eq!(store.touch(&[key]).unwrap().missing, vec![key]);
+        assert!(matches!(
+            store.put_or_touch(&key, b"run").unwrap(),
+            PutOrTouch::Inserted { .. }
+        ));
+        assert!(matches!(
+            store.put_or_touch(&key, b"run").unwrap(),
+            PutOrTouch::Reused { .. }
+        ));
+        assert!(matches!(
+            store.put_or_touch(&key, b"another run"),
+            Err(crate::blob_store::v2::StoreError::ConflictingPayload(conflict)) if conflict == key
+        ));
+        assert_eq!(store.get(&key).unwrap(), Some(b"run".to_vec()));
+        assert!(store.touch(&[key]).unwrap().missing.is_empty());
+        // Verified-run markers are a v2 optimization; v3 writes none.
+        assert!(store.put_at_deletion_epoch(|_| None).unwrap().is_none());
+        assert!(store.deletion_epoch().unwrap().is_none());
+        assert_eq!(
+            store.reader().run_payload(&key).unwrap(),
+            Some(b"run".to_vec())
+        );
+        assert!(!storage.path().join("blobs/v2").exists());
     }
 }

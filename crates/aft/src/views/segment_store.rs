@@ -353,6 +353,13 @@ impl PayloadSource for FamilyStoreReader {
     }
 }
 
+impl PayloadSource for crate::blob_store::v3::PlaneReader {
+    fn payload(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get(key)
+            .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))
+    }
+}
+
 /// Builds a segment from stored payloads only; no checkout bytes are read.
 pub fn build_from_blobs(
     source: &dyn PayloadSource,

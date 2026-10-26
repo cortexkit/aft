@@ -738,6 +738,67 @@ pub fn materialize_v3(
             TrigramPayload::extract(source, &policy).encode(),
         ));
     }
+    put_v3_payloads(storage, family, manifest, payloads, live)
+}
+
+/// [`materialize_v3`] for a worker delta: each regular entry's payload comes
+/// from its strict-reconcile attachment when that attachment names the same
+/// content, otherwise from a fresh read of the checkout that must hash to the
+/// entry's content.
+pub fn materialize_v3_observed(
+    storage: &Path,
+    family: &str,
+    root: &Path,
+    manifest: &mut super::manifest_v2::ManifestV2,
+    observed: &BTreeMap<RelPath, super::snapshot::LiveEntry>,
+    live: &mut crate::pins::LivePin,
+    policy: TrigramPolicy,
+) -> Result<(), super::contracts::PlaneError> {
+    if manifest.header().producers.trigram != policy.fingerprint_hex() {
+        return Err(plane_error("trigram producer mismatch"));
+    }
+    let mut payloads = Vec::new();
+    for (path, entry) in manifest.entries() {
+        let super::manifest_v2::EntryV2::Regular { content, size, .. } = entry else {
+            continue;
+        };
+        let attachment = observed
+            .get(path)
+            .and_then(|entry| entry.attachments.get(&FamilyPlane::Trigram))
+            .and_then(|value| value.downcast_ref::<Attachment>())
+            .filter(|value| value.content == *content && value.policy == policy.fingerprint());
+        let payload = match attachment {
+            Some(attachment) => attachment.payload.clone(),
+            None => {
+                let relative = rel_path_to_os(path).map_err(|e| plane_error(e.to_string()))?;
+                let bytes =
+                    fs::read(root.join(relative)).map_err(|e| plane_error(e.to_string()))?;
+                if ContentHash::of(&bytes) != *content || bytes.len() as u64 != *size {
+                    return Err(plane_error("source changed during trigram construction"));
+                }
+                TrigramPayload::extract(&bytes, &policy)
+            }
+        };
+        let key = crate::blob_store::v2::TrigramKey {
+            content: *content,
+            policy,
+        }
+        .family_key();
+        payloads.push((path.clone(), key, payload.encode()));
+    }
+    put_v3_payloads(storage, family, manifest, payloads, live)
+}
+
+fn put_v3_payloads(
+    storage: &Path,
+    family: &str,
+    manifest: &mut super::manifest_v2::ManifestV2,
+    payloads: Vec<(RelPath, crate::blob_store::v2::FamilyKey, Vec<u8>)>,
+    live: &mut crate::pins::LivePin,
+) -> Result<(), super::contracts::PlaneError> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
     // Protect every key before the first put, as the v2 materializer does.
     live.protect(&payloads.iter().map(|(_, key, _)| *key).collect::<Vec<_>>())
         .map_err(|e| plane_error(e.to_string()))?;
@@ -805,6 +866,9 @@ impl TrigramAdapter {
         access: &super::contracts::ViewAccess,
         snapshot: &Snapshot,
     ) -> Result<GenerationIndex, super::contracts::PlaneError> {
+        if let super::contracts::StorageRoute::V3(route) = access.route(snapshot.generation()) {
+            return self.open_v3_index(&route, snapshot);
+        }
         let id = snapshot
             .generation()
             .segment_id()
@@ -861,6 +925,91 @@ impl TrigramAdapter {
                 GenerationIndex::open(segment, snapshot, self.policy, &store).map_err(plane_error)
             }
         }
+    }
+}
+
+impl TrigramAdapter {
+    /// A v3 generation has no segment file: v3 keeps no segment rows, so the
+    /// base's segment is assembled in memory from the base's stored payloads
+    /// (one build per base generation, shared through the segment cache), and
+    /// the worker's changed entries load as the usual overlay. Missing or
+    /// not-ready payloads stay direct-scan gaps, as on the v2 path.
+    fn open_v3_index(
+        &self,
+        route: &super::snapshot::V3Route,
+        snapshot: &Snapshot,
+    ) -> Result<GenerationIndex, super::contracts::PlaneError> {
+        let generation = snapshot.generation();
+        if !generation.segment_ids().is_empty() {
+            return Err(plane_error("a v3 generation names a trigram segment"));
+        }
+        let source = crate::blob_store::v3::PlaneReader::open_existing(
+            &route.storage,
+            &route.family,
+            FamilyPlane::Trigram,
+        )
+        .map_err(|e| plane_error(e.to_string()))?;
+        let base = generation
+            .base()
+            .map_or(generation.as_ref(), |base| base.as_ref());
+        let base_scope = base
+            .v3_route()
+            .map_or(route.scope.as_str(), |base| base.scope.as_str());
+        let segment_key = (
+            format!("v3:{}", route.family),
+            *blake3::hash(format!("{base_scope}\0{}", base.name()).as_bytes()).as_bytes(),
+        );
+        let cached = {
+            let mut segments = self.segments.lock().unwrap_or_else(|e| e.into_inner());
+            segments.retain(|_, segment| segment.strong_count() != 0);
+            segments
+                .get(&segment_key)
+                .and_then(|segment| segment.upgrade())
+        };
+        let segment = match cached {
+            Some(segment) => segment,
+            None => {
+                let members: Vec<_> = base
+                    .entries()
+                    .filter_map(|(path, entry)| {
+                        let content = entry.content()?;
+                        let key = crate::blob_store::v2::TrigramKey {
+                            content,
+                            policy: self.policy,
+                        }
+                        .family_key();
+                        (base.plane_readiness(path, FamilyPlane::Trigram)
+                            == Some(&super::readiness::PlaneState::ready(&key)))
+                        .then(|| super::segment_store::SegmentMember {
+                            rel_path: path.clone(),
+                            content,
+                            size: match entry {
+                                super::manifest_v2::EntryV2::Regular { size, .. } => *size,
+                                _ => 0,
+                            },
+                        })
+                    })
+                    .collect();
+                let bytes = super::segment_store::build_from_blobs(&source, &members, &self.policy)
+                    .map_err(|e| plane_error(e.to_string()))?;
+                let reader = Arc::new(
+                    SegmentReader::from_bytes(&bytes.bytes)
+                        .map_err(|e| plane_error(e.to_string()))?,
+                );
+                let mut segments = self.segments.lock().unwrap_or_else(|e| e.into_inner());
+                match segments
+                    .get(&segment_key)
+                    .and_then(|segment| segment.upgrade())
+                {
+                    Some(existing) => existing,
+                    None => {
+                        segments.insert(segment_key, Arc::downgrade(&reader));
+                        reader
+                    }
+                }
+            }
+        };
+        GenerationIndex::open(segment, snapshot, self.policy, &source).map_err(plane_error)
     }
 }
 

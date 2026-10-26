@@ -90,6 +90,18 @@ impl ManifestBlobReader for BlobReader {
     }
 }
 
+/// Reads callgraph blobs from the family's v3 callgraph plane store.
+pub struct V3BlobReader(pub crate::blob_store::v3::PlaneReader);
+impl ManifestBlobReader for V3BlobReader {
+    fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
+        let bytes = parse_hex32(key)
+            .ok_or_else(|| ManifestJoinError::InvalidBlob("invalid callgraph key".into()))?;
+        self.0
+            .get(&FamilyKey::new(FamilyPlane::Callgraph, bytes))
+            .map_err(|e| ManifestJoinError::InvalidBlob(e.to_string()))
+    }
+}
+
 /// Project membership and compatible ready keys, not checkout paths/configuration.
 /// Missing/failed callgraph members refuse construction rather than falsely ready.
 pub fn project_manifest(
@@ -147,6 +159,38 @@ pub fn materialize(
         .map_err(error)
 }
 
+/// The checkout root recorded for a v3 member, read without any lock.
+fn v3_member_root(route: &super::snapshot::V3Route) -> Result<PathBuf, PlaneError> {
+    use rusqlite::OptionalExtension;
+    let root: Option<Option<Vec<u8>>> =
+        crate::blob_store::v3::LedgerReader::open_existing(&route.storage, &route.family)
+            .and_then(|ledger| {
+                ledger.read(|c| {
+                    Ok(c.query_row(
+                        "SELECT root FROM members WHERE scope=?1",
+                        [&route.scope],
+                        |r| r.get(0),
+                    )
+                    .optional()?)
+                })
+            })
+            .map_err(error)?;
+    let bytes = root
+        .flatten()
+        .ok_or_else(|| error("v3 member root cannot be bound"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|_| error("v3 member root is not UTF-8"))
+    }
+}
+
 /// Holding a reader keeps exactly its generation pinned, including after a swap.
 pub struct PinnedReader {
     pub store: Arc<ReadonlyCallGraphStore>,
@@ -201,12 +245,26 @@ impl PlaneAdapter for CallgraphPlane {
         generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError> {
         queryable_manifest(generation)?;
-        let (root, dir): (PathBuf, PathBuf) = match access {
-            ViewAccess::Owner(view) => (view.root().to_path_buf(), view.view_dir().to_path_buf()),
-            ViewAccess::Reader {
-                registration,
-                scope,
-            } => {
+        let route = access.route(generation);
+        let (root, dir): (PathBuf, PathBuf) = match (access, route) {
+            // A v3 generation's derived graph lives in its v3 member
+            // directory; the checkout root binds rendering as on v2.
+            (ViewAccess::Owner(view), super::contracts::StorageRoute::V3(route)) => {
+                (view.root().to_path_buf(), route.member_dir())
+            }
+            (ViewAccess::Reader { .. }, super::contracts::StorageRoute::V3(route)) => {
+                (v3_member_root(&route)?, route.member_dir())
+            }
+            (ViewAccess::Owner(view), _) => {
+                (view.root().to_path_buf(), view.view_dir().to_path_buf())
+            }
+            (
+                ViewAccess::Reader {
+                    registration,
+                    scope,
+                },
+                _,
+            ) => {
                 let member = registration
                     .members()
                     .map_err(error)?
