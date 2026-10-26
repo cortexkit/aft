@@ -320,6 +320,7 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
         | LangId::Json
         | LangId::Yaml
         | LangId::Toml
+        | LangId::SystemVerilog
         | LangId::Pascal => return None,
     };
     Some(spec)

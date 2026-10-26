@@ -602,7 +602,9 @@
           "metal",
           "pascal",
           "r",
-          "objc"
+          "objc",
+          "systemverilog",
+          "verilog"
         ]
       },
       "paths": {
@@ -630,7 +632,7 @@
       "pattern",
       "lang"
     ],
-    "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'"
+    "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'"
   },
   "ast_replace": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -658,7 +660,9 @@
           "metal",
           "pascal",
           "r",
-          "objc"
+          "objc",
+          "systemverilog",
+          "verilog"
         ]
       },
       "paths": {

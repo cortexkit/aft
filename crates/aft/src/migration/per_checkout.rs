@@ -1195,6 +1195,9 @@ fn stored_kind(kind: &crate::symbols::SymbolKind) -> u8 {
         SymbolKind::Heading => 8,
         SymbolKind::FileSummary => 9,
         SymbolKind::Kernel => 10,
+        SymbolKind::Module => 11,
+        SymbolKind::Package => 12,
+        SymbolKind::Task => 13,
     }
 }
 

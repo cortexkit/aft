@@ -10221,6 +10221,9 @@ fn build_embed_text_with_lines_and_caps(
     let kind_label = match &symbol.kind {
         SymbolKind::Function => "function",
         SymbolKind::Kernel => "kernel",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",
@@ -10541,7 +10544,11 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "gradle"
                 | "m"
                 | "mm"
-                | "toml",
+                | "toml"
+                | "sv"
+                | "svh"
+                | "v"
+                | "vh",
         )
     )
 }
@@ -11485,6 +11492,9 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
         SymbolKind::Heading => 8,
         SymbolKind::FileSummary => 9,
         SymbolKind::Kernel => 10,
+        SymbolKind::Module => 11,
+        SymbolKind::Package => 12,
+        SymbolKind::Task => 13,
     }
 }
 
@@ -11501,6 +11511,9 @@ fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
         8 => SymbolKind::Heading,
         9 => SymbolKind::FileSummary,
         10 => SymbolKind::Kernel,
+        11 => SymbolKind::Module,
+        12 => SymbolKind::Package,
+        13 => SymbolKind::Task,
         _ => return Err(format!("invalid semantic symbol kind: {v}")),
     })
 }
@@ -16217,6 +16230,43 @@ Connection: close
             .expect("host function chunk");
         assert_eq!((host.start_line, host.end_line), (9, 11));
         assert!(host.snippet.contains("transform<<<grid, block>>>(data)"));
+    }
+
+    #[test]
+    fn systemverilog_chunks_use_written_package_and_routine_boundaries() {
+        let root = Path::new("/project");
+        let source = include_str!("../tests/fixtures/systemverilog/types_pkg.sv");
+        let chunks = collect_file_chunks_from_source(
+            root,
+            &root.join("types_pkg.sv"),
+            crate::parser::LangId::SystemVerilog,
+            source,
+        )
+        .unwrap();
+        let package = chunks
+            .iter()
+            .find(|chunk| chunk.name == "types_pkg" && chunk.kind == SymbolKind::Package)
+            .expect("package chunk");
+        assert_eq!(package.kind, SymbolKind::Package);
+        let function = chunks
+            .iter()
+            .find(|chunk| chunk.name == "increment")
+            .expect("function chunk");
+        assert!(function.snippet.contains("return value + 1'b1"));
+        assert!(!function.snippet.contains("task automatic report"));
+        let task = chunks
+            .iter()
+            .find(|chunk| chunk.name == "report")
+            .expect("task chunk");
+        assert_eq!(task.kind, SymbolKind::Task);
+        for ext in ["sv", "svh", "v", "vh"] {
+            assert!(is_semantic_indexed_extension(
+                &root.join(format!("source.{ext}"))
+            ));
+        }
+        for kind in [SymbolKind::Module, SymbolKind::Package, SymbolKind::Task] {
+            assert_eq!(u8_to_symbol_kind(symbol_kind_to_u8(&kind)).unwrap(), kind);
+        }
     }
 
     #[test]

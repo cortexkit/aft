@@ -2168,6 +2168,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::SystemVerilog => "systemverilog",
     }
 }
 
@@ -2361,7 +2362,8 @@ fn formatter_candidates_with_pyproject(
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -2439,7 +2441,8 @@ fn checker_candidates(
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }

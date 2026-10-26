@@ -1276,6 +1276,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::SystemVerilog => "systemverilog",
     }
 }
 

@@ -135,6 +135,7 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-solidity",
  "tree-sitter-swift",
+ "tree-sitter-systemverilog",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-vue-next",
@@ -4461,6 +4462,16 @@ name = "tree-sitter-swift"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2688c06564afa397313e0db17d140a73e2c6a47f3884794614246167c9dd5dfd"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-systemverilog"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d9f02d7fd20691acb5edf44a782f0b9fa278d9987befb1ae597c768707b95e6"
 dependencies = [
  "cc",
  "tree-sitter-language",

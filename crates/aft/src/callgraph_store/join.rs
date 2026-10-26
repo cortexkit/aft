@@ -586,6 +586,7 @@ fn language_id(language: &str) -> Option<LangId> {
         "groovy" => LangId::Groovy,
         "objc" => LangId::ObjC,
         "toml" => LangId::Toml,
+        "systemverilog" => LangId::SystemVerilog,
         _ => return None,
     })
 }
@@ -829,6 +830,9 @@ fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
         SymbolKind::Kernel => "kernel",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",

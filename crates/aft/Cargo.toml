@@ -127,6 +127,7 @@ tree-sitter-solidity = "1.2"
 tree-sitter-vue = { package = "tree-sitter-vue-next", version = "0.1" }
 tree-sitter-json = "0.24"
 tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7.0" }
+tree-sitter-systemverilog = "0.4.1"
 tree-sitter-scala = "0.26"
 tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"

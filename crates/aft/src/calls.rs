@@ -67,7 +67,8 @@ pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => &[],
+        | LangId::Toml
+        | LangId::SystemVerilog => &[],
     }
 }
 

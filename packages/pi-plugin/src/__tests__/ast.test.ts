@@ -8,6 +8,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { registerAstTools } from "../tools/ast.js";
 import {
   executeTool,
@@ -28,6 +30,26 @@ afterAll(() => {
 });
 
 describe("AST tool adapters", () => {
+  test("SystemVerilog schemas accept both names and preserve HDL replacements", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "preview" }));
+    registerAstTools(api, makePluginContext(bridge), { astSearch: true, astReplace: true });
+    const search = tools.get("ast_grep_search")!;
+    const replace = tools.get("ast_grep_replace")!;
+    for (const lang of ["systemverilog", "verilog"]) {
+      const args = {
+        pattern: '$display("value=%d", $VALUE)',
+        rewrite: '$display("next=%d", $VALUE)',
+        lang,
+        dryRun: true,
+      };
+      expect(Value.Check(search.parameters as TSchema, { pattern: args.pattern, lang })).toBe(true);
+      expect(Value.Check(replace.parameters as TSchema, args)).toBe(true);
+      await executeTool(replace, args, makeExtContext(projectRoot));
+      expect(calls.at(-1)?.params).toMatchObject({ name: "ast_replace", arguments: args });
+    }
+  });
+
   test("ast_grep_search forwards agent-facing contextLines and preserves globs", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "Found 0 matches" }));

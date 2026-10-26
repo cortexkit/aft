@@ -822,6 +822,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::SystemVerilog => "systemverilog",
     }
 }
 
@@ -1060,7 +1061,8 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1183,7 +1185,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1426,6 +1429,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Groovy => "aft-tool-detection.groovy",
         LangId::ObjC => "aft-tool-detection.m",
         LangId::Toml => "aft-tool-detection.toml",
+        LangId::SystemVerilog => "aft-tool-detection.sv",
     };
     project_root.join(filename)
 }

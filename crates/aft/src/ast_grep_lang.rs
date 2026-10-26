@@ -43,6 +43,7 @@ pub enum AstGrepLang {
     R,
     Groovy,
     ObjC,
+    SystemVerilog,
 }
 
 #[derive(Clone, Debug)]
@@ -125,11 +126,15 @@ impl AstGrepLang {
             "r" => Some(Self::R),
             "groovy" => Some(Self::Groovy),
             "objc" | "objective-c" | "objectivec" | "obj-c" => Some(Self::ObjC),
+            "systemverilog" | "sv" | "verilog" => Some(Self::SystemVerilog),
             _ => None,
         }
     }
 
     pub(crate) fn compile_pattern(&self, pattern: &str) -> Result<Pattern, PatternError> {
+        if *self == Self::SystemVerilog {
+            return systemverilog_pattern(pattern);
+        }
         if matches!(self, Self::Pascal) {
             if pascal_pattern_is_declaration(pattern) {
                 return Pattern::try_new(pattern, self.clone());
@@ -182,6 +187,7 @@ impl AstGrepLang {
             Self::R => &["R", "r"],
             Self::Groovy => &["groovy", "gvy", "gy", "gsh", "gradle"],
             Self::ObjC => &["m", "mm"],
+            Self::SystemVerilog => &["sv", "svh", "v", "vh"],
         }
     }
 
@@ -212,6 +218,61 @@ fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
         node = node.child(0).expect("single child exists");
     }
     Ok(node.kind().into_owned())
+}
+
+fn systemverilog_pattern(pattern: &str) -> Result<Pattern, PatternError> {
+    let lang = AstGrepLang::SystemVerilog;
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Err(PatternError::NoContent(
+            "empty SystemVerilog pattern".into(),
+        ));
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_systemverilog::LANGUAGE.into())
+        .map_err(|e| PatternError::NoContent(e.to_string()))?;
+    for (prefix, suffix) in [
+        ("", ""),
+        ("module __aft;\n", "\nendmodule"),
+        ("module __aft; initial begin\n", "\nend endmodule"),
+        ("module __aft; initial begin\n", ";\nend endmodule"),
+    ] {
+        let context = format!("{prefix}{pattern}{suffix}");
+        let processed = lang.pre_process_pattern(&context);
+        let Some(tree) = parser.parse(processed.as_ref(), None) else {
+            continue;
+        };
+        if tree.root_node().has_error() {
+            continue;
+        }
+        if prefix.is_empty() {
+            return Pattern::try_new(pattern, lang);
+        }
+        let start = prefix.len();
+        let end = start + lang.pre_process_pattern(pattern).len();
+        let mut cursor = tree.walk();
+        loop {
+            let node = cursor.node();
+            if node.is_named() && node.start_byte() == start && node.end_byte() == end {
+                return Pattern::contextual(&context, node.kind(), lang);
+            }
+            if !cursor.goto_first_child() {
+                break;
+            }
+            while !(cursor.node().start_byte() <= start && end <= cursor.node().end_byte()) {
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+            if !(cursor.node().start_byte() <= start && end <= cursor.node().end_byte()) {
+                break;
+            }
+        }
+    }
+    Err(PatternError::NoContent(
+        "SystemVerilog pattern must be a complete declaration, statement, or expression".into(),
+    ))
 }
 
 fn pascal_pattern_is_declaration(pattern: &str) -> bool {
@@ -324,7 +385,28 @@ impl Language for AstGrepLang {
     /// character. We replace `$` with the expando char (`µ`) in meta-variable
     /// positions so tree-sitter can parse the pattern as valid code.
     fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        if *self == Self::SystemVerilog {
+            return Cow::Owned(crate::systemverilog::preprocess_pattern(query));
+        }
         pre_process_pattern_with_expando(query, self.expando_char())
+    }
+
+    fn extract_meta_var(&self, source: &str) -> Option<ast_grep_core::meta_var::MetaVariable> {
+        let expanded = if *self == Self::SystemVerilog {
+            let suffix = source.strip_prefix("__aft_meta_")?;
+            let (count, name) = suffix.split_once('_')?;
+            let count = count
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1..=3).contains(n))?;
+            format!("{}{}", "µ".repeat(count), name)
+        } else {
+            if !source.starts_with(self.expando_char()) {
+                return None;
+            }
+            source.replace(self.expando_char(), "µ")
+        };
+        PhpPatternLang::Full.extract_meta_var(&expanded)
     }
 
     fn expando_char(&self) -> char {
@@ -392,6 +474,7 @@ impl LanguageExt for AstGrepLang {
             Self::R => tree_sitter_r::LANGUAGE.into(),
             Self::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
             Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
+            Self::SystemVerilog => tree_sitter_systemverilog::LANGUAGE.into(),
         }
     }
 }
@@ -399,6 +482,46 @@ impl LanguageExt for AstGrepLang {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemverilog_patterns_bind_calls_declarations_and_variadic_arguments() {
+        let lang = AstGrepLang::SystemVerilog;
+        let source = "module top; initial begin $display(\"$NAME\", value); _REAL(value); send(value, other); end endmodule";
+        let grep = lang.ast_grep(source);
+        let pattern = lang.compile_pattern("send($FIRST, $SECOND)").unwrap();
+        let found = grep.root().find(&pattern).unwrap();
+        assert_eq!(found.get_env().get_match("FIRST").unwrap().text(), "value");
+        assert_eq!(
+            grep.root()
+                .replace_all(&pattern, "deliver($SECOND, $FIRST)")
+                .len(),
+            1
+        );
+        assert_eq!(
+            grep.root()
+                .find_all(lang.compile_pattern("send($$$ARGS)").unwrap())
+                .count(),
+            1
+        );
+        assert_eq!(
+            grep.root()
+                .find_all(lang.compile_pattern("_REAL($ARG)").unwrap())
+                .count(),
+            1
+        );
+        assert_eq!(
+            grep.root()
+                .find_all(lang.compile_pattern("$display(\"$NAME\", $ARG)").unwrap())
+                .count(),
+            1
+        );
+        assert!(lang.compile_pattern("module $NAME; initial begin $display(\"$NAME\", $A); _REAL($B); send($C, $D); end endmodule").is_ok());
+        assert!(lang.compile_pattern("module broken(").is_err());
+        assert!(lang.compile_pattern("").is_err());
+        for alias in ["systemverilog", "verilog", "sv"] {
+            assert_eq!(AstGrepLang::from_str(alias), Some(lang.clone()));
+        }
+    }
     use ast_grep_core::tree_sitter::LanguageExt;
 
     #[test]

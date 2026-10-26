@@ -1150,6 +1150,9 @@ fn symbol_kind_from_label(label: &str) -> Option<SymbolKind> {
     match label {
         "function" => Some(SymbolKind::Function),
         "kernel" => Some(SymbolKind::Kernel),
+        "module" => Some(SymbolKind::Module),
+        "package" => Some(SymbolKind::Package),
+        "task" => Some(SymbolKind::Task),
         "class" => Some(SymbolKind::Class),
         "method" => Some(SymbolKind::Method),
         "struct" => Some(SymbolKind::Struct),

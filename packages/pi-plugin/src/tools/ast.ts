@@ -1,6 +1,6 @@
 /**
  * ast_grep_search + ast_grep_replace — AST-aware pattern search/rewrite.
- * 11 languages: typescript, tsx, javascript, python, rust, go, CUDA, Metal, pascal, R, Objective-C.
+ * 12 languages: typescript, tsx, javascript, python, rust, go, CUDA, Metal, pascal, R, Objective-C, SystemVerilog.
  */
 
 import { coerceBoolean } from "@cortexkit/aft-bridge";
@@ -52,6 +52,8 @@ const AstLang = StringEnum(
     "pascal",
     "r",
     "objc",
+    "systemverilog",
+    "verilog",
   ] as const,
   {
     description: "Target language",

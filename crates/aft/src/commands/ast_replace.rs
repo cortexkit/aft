@@ -169,7 +169,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 format!(
-                    "ast_replace: unsupported language '{}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc",
+                    "ast_replace: unsupported language '{}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc, systemverilog, verilog",
                     lang_str
                 ),
             );
