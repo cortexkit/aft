@@ -5781,16 +5781,6 @@ fn current_view_projection_result(
     result
 }
 
-/// The reader Tier-2 dead-code projection uses for `project_root`'s published
-/// view, for tests that compare it with an independent build.
-#[cfg(test)]
-pub(crate) fn current_view_projection_store_for_test(
-    project_root: &Path,
-    config: &crate::config::Config,
-) -> Option<(ReadonlyCallGraphStore, String)> {
-    current_view_projection_store(project_root, Path::new(""), config, &[])
-}
-
 fn build_view_callgraph_snapshot(
     job: &InspectJob,
     projection_cache: Option<&InspectManager>,
