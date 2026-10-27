@@ -326,6 +326,50 @@ fn a_file_whose_bytes_no_longer_match_its_receipt_takes_the_full_check() {
 }
 
 #[test]
+fn the_tree_proof_names_the_first_check_a_checkout_fails() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let route = crate::views::snapshot::V3Route {
+        storage: storage.path().to_owned(),
+        family: FAMILY.into(),
+        scope: WORKER.into(),
+    };
+    let paths: Vec<RelPath> = FILES.iter().map(|(name, _)| rel(name)).collect();
+    let producers = producers();
+    let outcome = |root: &Path| {
+        let input = super::TreeBaseInput {
+            route: &route,
+            root,
+            paths: &paths,
+            policy: policy(),
+            producers: &producers,
+            ignore_fingerprint: None,
+        };
+        let guard = crate::views::verification::BindGuard::capture(root, None).unwrap();
+        super::prove(&input, &guard).map(|proven| proven.receipts.len())
+    };
+    let plain = checkout(false);
+    let _plain_attributes = known_attribute_sources_for_test(plain.path());
+    assert_eq!(outcome(plain.path()), Err("no_head_tree"));
+    let root = checkout(true);
+    let _attributes = known_attribute_sources_for_test(root.path());
+    assert_eq!(outcome(root.path()), Ok(FILES.len()));
+    git(
+        root.path(),
+        &["update-index", "--assume-unchanged", "lib.rs"],
+    );
+    assert_eq!(outcome(root.path()), Err("index_tree_refused"));
+    git(
+        root.path(),
+        &["update-index", "--no-assume-unchanged", "lib.rs"],
+    );
+    write_old(&root.path().join("lib.rs"), b"pub fn edited() {}\n");
+    assert_eq!(outcome(root.path()), Err("member_differs_from_index_blob"));
+    git(root.path(), &["add", "lib.rs"]);
+    assert_eq!(outcome(root.path()), Err("index_tree_differs_from_head"));
+}
+
+#[test]
 fn a_tree_proof_round_trips_and_refuses_another_application() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();

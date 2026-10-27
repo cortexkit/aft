@@ -48,21 +48,31 @@ struct ProvenMembers {
     format: ObjectFormat,
 }
 
-/// Reads and proves the members, or `None` when any check fails.
-fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Option<ProvenMembers> {
+/// Why a fresh checkout gets no tree-keyed base.
+pub(crate) type NoTreeProof = &'static str;
+
+/// Reads and proves the members, or names the first check that failed.
+fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Result<ProvenMembers, NoTreeProof> {
     if !guard.policy.reusable {
-        return None;
+        return Err("conversion_policy_not_reusable");
     }
-    let head_tree = std::str::from_utf8(guard.head_tree.as_deref()?.trim_ascii()).ok()?;
-    let format = ObjectFormat::from_hex_len(head_tree.len())?;
-    let index_path = guard.gitdir.as_ref()?.0.join("index");
+    let head_tree = guard
+        .head_tree
+        .as_deref()
+        .and_then(|tree| std::str::from_utf8(tree.trim_ascii()).ok())
+        .ok_or("no_head_tree")?;
+    let format = ObjectFormat::from_hex_len(head_tree.len()).ok_or("unknown_object_format")?;
+    let index_path = guard.gitdir.as_ref().ok_or("no_gitdir")?.0.join("index");
     let IndexRead::Snapshot(snapshot) = read_index(&index_path, format, Default::default()) else {
-        return None;
+        return Err("index_not_coherent");
     };
-    if NativeStat::strict_read(&index_path).ok()? != guard.index.as_ref()?.0
-        || to_hex(&index_tree(&snapshot).ok()?) != head_tree
+    if NativeStat::strict_read(&index_path).ok().as_ref()
+        != guard.index.as_ref().map(|(stat, _)| stat)
     {
-        return None;
+        return Err("index_changed_since_guard");
+    }
+    if to_hex(&index_tree(&snapshot).map_err(|_| "index_tree_refused")?) != head_tree {
+        return Err("index_tree_differs_from_head");
     }
     let index: BTreeMap<&[u8], _> = snapshot
         .entries
@@ -89,24 +99,28 @@ fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Option<ProvenMembers> 
         }
         let absolute = input
             .root
-            .join(super::segment_store::rel_path_to_os(path).ok()?);
+            .join(super::segment_store::rel_path_to_os(path).map_err(|_| "unrepresentable_path")?);
         let observed_ns = super::verification::now_ns();
-        let before = NativeStat::read(&absolute).ok()?;
-        if !std::fs::symlink_metadata(&absolute).ok()?.is_file() {
-            return None;
+        let unreadable = |_| "member_unreadable";
+        let before = NativeStat::read(&absolute).map_err(unreadable)?;
+        if !std::fs::symlink_metadata(&absolute)
+            .map_err(unreadable)?
+            .is_file()
+        {
+            return Err("member_not_a_regular_file");
         }
-        let source = std::fs::read(&absolute).ok()?;
-        let after = NativeStat::read(&absolute).ok()?;
+        let source = std::fs::read(&absolute).map_err(unreadable)?;
+        let after = NativeStat::read(&absolute).map_err(unreadable)?;
         if before != after || before.size != source.len() as u64 {
-            return None;
+            return Err("member_changed_during_read");
         }
         let oid = format.blob_oid(&source);
         if oid != entry.oid {
-            return None;
+            return Err("member_differs_from_index_blob");
         }
         #[cfg(unix)]
         if (before.mode & 0o111 != 0) != (entry.stat.mode == 0o100755) {
-            return None;
+            return Err("member_mode_differs_from_index");
         }
         let content = crate::blob_store::v2::ContentHash::of(&source);
         let planes = EntryPlanes {
@@ -131,7 +145,7 @@ fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Option<ProvenMembers> 
                     planes,
                 },
             )
-            .ok()?;
+            .map_err(|_| "invalid_manifest_entry")?;
         receipts.insert(
             path.clone(),
             BlobReceipt {
@@ -148,7 +162,10 @@ fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Option<ProvenMembers> 
         );
         bytes.insert(path.clone(), source);
     }
-    (!manifest.is_empty()).then_some(ProvenMembers {
+    if manifest.is_empty() {
+        return Err("no_tracked_members");
+    }
+    Ok(ProvenMembers {
         manifest,
         bytes,
         receipts,
@@ -166,7 +183,7 @@ pub(crate) fn bootstrap(
     claim_slot: &Mutex<Option<BuildClaim>>,
 ) -> Option<AuthenticatedBase> {
     let guard = BindGuard::capture(input.root, None).ok()?;
-    let mut proven = prove(&input, &guard)?;
+    let mut proven = prove(&input, &guard).ok()?;
     let route = input.route;
     let identity = BaseIdentity::of(&route.family, &proven.manifest).ok()?;
     if identity.kind() != BaseKind::Tree {
@@ -237,6 +254,17 @@ fn build(
             super::base_builder::register_base_in(tx, storage, family, &identity.scope)
         })
         .map_err(|e| error(&e))?;
+        // A base that is already published keeps its proof unchanged: a
+        // proof is written only before a scope's first publication.
+        if super::ViewStore::existing_dir(dir.clone())
+            .map(|store| store.current_generation_read_only())
+            .transpose()
+            .map_err(|e| error(&e))?
+            .flatten()
+            .is_some()
+        {
+            return Ok(());
+        }
         super::verification::write_tree_proof(
             storage,
             family,
