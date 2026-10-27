@@ -82,11 +82,11 @@ const SearchParams = Type.Object({
 const ReplaceParams = Type.Object({
   pattern: Type.String({
     description:
-      "AST pattern with meta-variables; SystemVerilog/Verilog $[NAME] denotes literal $NAME",
+      "Complete AST pattern with meta-variables. Name variadic captures reused in the rewrite, e.g. send($$$ARGS). SystemVerilog/Verilog $[NAME] denotes literal $NAME",
   }),
   rewrite: Type.String({
     description:
-      "Replacement pattern, can reference $VAR from pattern; SystemVerilog/Verilog $[NAME] denotes literal $NAME",
+      "Replacement pattern, can reference $VAR or named $$$ARGS captured in pattern, e.g. deliver($$$ARGS); anonymous $$$ cannot be expanded. SystemVerilog/Verilog $[NAME] denotes literal $NAME",
   }),
   lang: AstLang,
   paths: Type.Optional(Type.Array(Type.String(), { description: "Paths (default: ['.'])" })),

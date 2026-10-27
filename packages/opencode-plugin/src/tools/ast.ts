@@ -115,6 +115,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     description:
       "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\n" +
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n" +
+      "To reuse a variadic capture, name it in both pattern and rewrite: pattern='send($$$ARGS)', rewrite='deliver($$$ARGS)'. Anonymous $$$ is valid in search patterns but cannot be expanded in rewrites.\n" +
       "For SystemVerilog/Verilog, $[NAME] denotes literal $NAME in patterns and rewrites.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
@@ -122,8 +123,14 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     args: {
       pattern: z
         .string()
-        .describe("AST pattern with meta-variables ($VAR, $$$). Must be complete AST node."),
-      rewrite: z.string().describe("Replacement pattern (can use $VAR from pattern)"),
+        .describe(
+          "Complete AST pattern with meta-variables. Name variadic captures reused in the rewrite, e.g. send($$$ARGS).",
+        ),
+      rewrite: z
+        .string()
+        .describe(
+          "Replacement pattern (can use $VAR or named $$$ARGS captured in pattern; anonymous $$$ cannot be expanded)",
+        ),
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
       globs: z.array(z.string()).optional().describe("Include/exclude globs (prefix ! to exclude)"),

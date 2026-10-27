@@ -9840,7 +9840,9 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V8)
             && total_len.is_some_and(|len| len < HEADER_BYTES_V2)
         {
-            return Err("data too short for semantic index v2/v3/v4/v5/v6/v7 header".to_string());
+            return Err(format!(
+                "data too short for semantic index v{version} header"
+            ));
         }
 
         let dimension = read_u32_stream(&mut reader)? as usize;

@@ -639,6 +639,14 @@ Groovy replacements use the same `lang: "groovy"` path rules as `ast_grep_search
 Meta-variables captured in `pattern` are available in `rewrite`. Returns unified diffs per file
 in dry-run mode, or writes changes with backups when applied.
 
+To reuse a variadic capture, give it the same name in both the pattern and rewrite:
+
+```json
+{ "pattern": "send($$$ARGS)", "rewrite": "deliver($$$ARGS)", "lang": "systemverilog", "dryRun": true }
+```
+
+Anonymous `$$$` is valid in search patterns, but cannot be expanded in rewrite templates.
+
 ---
 
 ### lsp_diagnostics

@@ -639,11 +639,11 @@
     "type": "object",
     "properties": {
       "pattern": {
-        "description": "AST pattern with meta-variables ($VAR, $$$). Must be complete AST node.",
+        "description": "Complete AST pattern with meta-variables. Name variadic captures reused in the rewrite, e.g. send($$$ARGS).",
         "type": "string"
       },
       "rewrite": {
-        "description": "Replacement pattern (can use $VAR from pattern)",
+        "description": "Replacement pattern (can use $VAR or named $$$ARGS captured in pattern; anonymous $$$ cannot be expanded)",
         "type": "string"
       },
       "lang": {
@@ -689,7 +689,7 @@
       "rewrite",
       "lang"
     ],
-    "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nFor SystemVerilog/Verilog, $[NAME] denotes literal $NAME in patterns and rewrites.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements."
+    "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nTo reuse a variadic capture, name it in both pattern and rewrite: pattern='send($$$ARGS)', rewrite='deliver($$$ARGS)'. Anonymous $$$ is valid in search patterns but cannot be expanded in rewrites.\nFor SystemVerilog/Verilog, $[NAME] denotes literal $NAME in patterns and rewrites.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements."
   },
   "delete": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
