@@ -467,6 +467,24 @@ fn refusal_explanation_table_covers_bot_request_codes() {
     assert_eq!(refusal_explanation(json!({"result": {
         "status": "refused", "refusal_code": "agent_repository_conflict", "retry_same_nonce": false,
     }})), "Plexus refused the bot write: agent_repository_conflict. The GitHub target does not match the bound repository. GitHub received a request. The agent must change the request. The same request and nonce cannot succeed; use a new request.");
+    for status in [429, 503] {
+        let code = format!("vendor_rejected{{status: {status}}}");
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": code, "retry_same_nonce": true,
+        }})), format!("Plexus refused the bot write: {code}. GitHub rejected the request. GitHub received a request. No request change is needed for this transient refusal. It is safe to retry the same request and nonce; already-sent steps will be skipped."));
+    }
+    for denial in [
+        "RecipientArgumentInvalid",
+        "ArgumentUndeclared, field: body",
+        "ResourceFilter(MissingRequiredFilter)",
+        "ResourceFilter(ValueNotAllowed)",
+        "ResourceFilter(WriteFiltersAbsent)",
+    ] {
+        let code = format!("pipeline_denied{{gate: G10, denial: {denial}}}");
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": code, "retry_same_nonce": false,
+        }})), format!("Plexus refused the bot write: {code}. A permission or service check stopped the current step. Earlier reads or writes may have reached GitHub. The agent must change the request. The same request and nonce cannot succeed; use a new request."));
+    }
 }
 
 fn ok_envelope(reply: Value) -> Vec<u8> {
