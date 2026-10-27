@@ -1,1 +1,1 @@
-- The gh shim now explains bot-write refusals, what reached GitHub, and whether retrying the same request is safe.
+- The gh shim now explains bot-write refusals, safely retries recoverable failures, and warns when rerunning may repeat a write.

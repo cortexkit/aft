@@ -116,7 +116,7 @@ pub(super) fn relay_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<S
         .map(|entry| entry.module_id.clone())
 }
 
-/// How the shim reacts to a plexus refusal code.
+/// Legacy retry policy for Plexus replies without retry metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodeClass {
     /// Resend with the same nonce after 5 s, then 10 s.
@@ -313,7 +313,7 @@ impl RefusalFacts {
     }
 }
 
-fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts) -> String {
+fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts, budget_ms: Option<u64>) -> String {
     let explanation = REFUSAL_EXPLANATIONS.iter().find(|(name, selector, ..)| {
         *name == code_prefix(code)
             && (selector.is_empty()
@@ -360,28 +360,32 @@ fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts) -> String {
             .collect();
         text.push_str(&format!(" Already-sent write steps: {}.", steps.join(", ")));
     }
-    if let Some((_, _, _, _, actor)) = explanation {
+    let actor = explanation.map(|(_, _, _, _, actor)| *actor);
+    if let Some(actor) = actor {
         text.push_str(match actor {
             RefusalActor::Agent => " The agent must change the request.",
             RefusalActor::Operator => " An operator must fix the setup, grants, or policy.",
-            RefusalActor::Nobody => " No request change is needed for this transient refusal.",
+            RefusalActor::Nobody => "",
         });
     }
-    text.push_str(match facts.retry_same_nonce {
-        Some(true) if code_prefix(code) == "nonce_in_flight" => {
-            " Wait, then retry the same request and nonce; already-sent steps will be skipped."
+    if let Some(budget_ms) = budget_ms {
+        text.push_str(&format!(
+            " The relay's {budget_ms} ms budget cannot fit another retry."
+        ));
+    }
+    text.push_str(match (reach, actor) {
+        (Some(GithubReach::Never), Some(RefusalActor::Nobody)) => " Rerunning the command is safe.",
+        (Some(GithubReach::Never), Some(RefusalActor::Agent | RefusalActor::Operator)) => "",
+        (Some(GithubReach::Maybe | GithubReach::Yes), _) => {
+            " Check GitHub before rerunning; a rerun may repeat the steps that were sent."
         }
-        Some(true) => {
-            " It is safe to retry the same request and nonce; already-sent steps will be skipped."
-        }
-        Some(false) => " The same request and nonce cannot succeed; use a new request.",
-        None => " Retry safety is unknown.",
+        _ => " Check GitHub before rerunning.",
     });
     text
 }
 
 fn plexus_refusal_text(code: &str, facts: &RefusalFacts) -> String {
-    refusal_text("Plexus", code, facts)
+    refusal_text("Plexus", code, facts, None)
 }
 
 fn outcome_undetermined_text(code: &str) -> String {
@@ -406,8 +410,8 @@ pub(super) enum Reply {
         generation: Option<u64>,
         facts: RefusalFacts,
     },
-    /// Module errors historically use the unknown-outcome exit. Keep that
-    /// status while explaining their refusal code and retry metadata.
+    /// If retries do not complete, module refusals keep their historical
+    /// unknown-outcome exit while explaining the refusal itself.
     ModuleRefused {
         code: String,
         facts: RefusalFacts,
@@ -613,10 +617,7 @@ fn daemon_refusal(code: &str, stage: &str, message: &str, facts: &RefusalFacts) 
         // These are AFT's own pre-dispatch gates, not Plexus receipt replies.
         "ticket_unknown" | "untrusted_principal" | "bot_write_requires_scope" | "agent_identity_conflict" => RouteOutcome::RelayRefusal {
             code: code.to_string(),
-            text: refusal_text("AFT", code, &RefusalFacts {
-                retry_same_nonce: facts.retry_same_nonce.or(Some(false)),
-                ..RefusalFacts::default()
-            }),
+            text: refusal_text("AFT", code, facts, None),
         },
         "relay_unavailable" => RouteOutcome::Unavailable(format!(
             "the AFT daemon could not reach {} to relay the bot write, so nothing was sent: {message}",
@@ -636,7 +637,7 @@ fn daemon_refusal(code: &str, stage: &str, message: &str, facts: &RefusalFacts) 
         _ => {
             RouteOutcome::RelayRefusal {
                 code: code.to_string(),
-                text: refusal_text(if stage == "plexus" { "Plexus" } else { "AFT" }, code, facts),
+                text: refusal_text(if stage == "plexus" { "Plexus" } else { "AFT" }, code, facts, None),
             }
         }
     }
@@ -1013,10 +1014,10 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
     }
 }
 
-/// Send one governed request through the relay, retrying only as the plexus
-/// refusal class allows and always with this invocation's single nonce. The
-/// whole exchange shares one budget: attempts and retry sleeps come out of
-/// it, and a retry sleep that would run past it is not taken.
+/// Send one governed request through the relay with one nonce. Explicit retry
+/// metadata controls resends; older replies use the legacy refusal classes.
+/// Attempts and retry sleeps share one budget, so a retry sleep that would run
+/// past the deadline is not taken.
 #[allow(clippy::too_many_arguments)]
 async fn exchange(
     exchange: &Exchange<'_, impl ExchangeIo>,
@@ -1042,12 +1043,23 @@ async fn exchange(
     }
     let mut transient_retries = 0_usize;
     let mut reminted = false;
+    let mut sent_steps = Vec::new();
     loop {
         let bytes = match exchange.send(body).await {
             Ok(bytes) => bytes,
             Err(outcome) => return outcome,
         };
-        let reply = parse_reply(&bytes);
+        let mut reply = parse_reply(&bytes);
+        if let Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } = &mut reply {
+            // An early gate on a later retry may not know which steps an
+            // earlier attempt sent. Keep those steps in the final warning.
+            for step in &facts.legs_sent {
+                if !sent_steps.contains(step) {
+                    sent_steps.push(step.clone());
+                }
+            }
+            facts.legs_sent.clone_from(&sent_steps);
+        }
         let reply_generation = match &reply {
             Reply::Completed { generation, .. } | Reply::Refused { generation, .. } => *generation,
             Reply::Malformed(_) | Reply::ModuleRefused { .. } => None,
@@ -1074,6 +1086,27 @@ async fn exchange(
                     }
                 }
             }
+        }
+        let retry_same_nonce = match &reply {
+            Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } => {
+                facts.retry_same_nonce
+            }
+            _ => None,
+        };
+        let mut retry_budget_ms = None;
+        if retry_same_nonce == Some(true) {
+            if let Some(outcome) = mismatch {
+                return outcome;
+            }
+            // Keep using the final backoff after the first two retries. The
+            // shared deadline, not the legacy attempt cap, bounds explicit retries.
+            let delay = transient_delays[transient_retries.min(transient_delays.len() - 1)];
+            if exchange.io.now() + delay < exchange.deadline() {
+                exchange.io.sleep(delay).await;
+                transient_retries += 1;
+                continue;
+            }
+            retry_budget_ms = Some(exchange.budget_ms());
         }
         match reply {
             Reply::Completed { result, .. } => {
@@ -1102,7 +1135,12 @@ async fn exchange(
                 )));
             }
             Reply::ModuleRefused { code, facts } => {
-                return RouteOutcome::OutcomeUndetermined(plexus_refusal_text(&code, &facts));
+                return RouteOutcome::OutcomeUndetermined(refusal_text(
+                    "Plexus",
+                    &code,
+                    &facts,
+                    retry_budget_ms,
+                ));
             }
             Reply::Refused {
                 code,
@@ -1118,15 +1156,16 @@ async fn exchange(
                     return daemon_refusal(&code, &stage, &message, &facts);
                 }
                 let class = classify_code(&code);
-                match class {
-                    CodeClass::Transient if transient_retries < transient_delays.len() => {
+                match (retry_same_nonce, class) {
+                    (None, CodeClass::Transient) if transient_retries < transient_delays.len() => {
                         let delay = transient_delays[transient_retries];
                         if exchange.io.now() + delay >= exchange.deadline() {
                             return RouteOutcome::RelayRefusal {
-                                text: format!(
-                                    "{} The relay's {} ms budget cannot fit another retry.",
-                                    plexus_refusal_text(&code, &facts),
-                                    exchange.budget_ms()
+                                text: refusal_text(
+                                    "Plexus",
+                                    &code,
+                                    &facts,
+                                    Some(exchange.budget_ms()),
                                 ),
                                 code,
                             };
@@ -1134,15 +1173,18 @@ async fn exchange(
                         exchange.io.sleep(delay).await;
                         transient_retries += 1;
                     }
-                    CodeClass::Remint if !reminted => reminted = true,
-                    CodeClass::OutcomeUnknown => {
-                        return RouteOutcome::OutcomeUndetermined(plexus_refusal_text(
-                            &code, &facts,
+                    (None, CodeClass::Remint) if !reminted => reminted = true,
+                    (_, CodeClass::OutcomeUnknown) => {
+                        return RouteOutcome::OutcomeUndetermined(refusal_text(
+                            "Plexus",
+                            &code,
+                            &facts,
+                            retry_budget_ms,
                         ))
                     }
                     _ => {
                         return RouteOutcome::RelayRefusal {
-                            text: plexus_refusal_text(&code, &facts),
+                            text: refusal_text("Plexus", &code, &facts, retry_budget_ms),
                             code,
                         }
                     }
