@@ -297,6 +297,7 @@ pub(super) struct RefusalFacts {
     retry_same_nonce: Option<bool>,
     legs_sent: Vec<Value>,
     not_sent: bool,
+    detail_message: Option<String>,
 }
 
 impl RefusalFacts {
@@ -309,6 +310,10 @@ impl RefusalFacts {
                 .cloned()
                 .unwrap_or_default(),
             not_sent: refusal.get("transmission").and_then(Value::as_str) == Some("not_sent"),
+            detail_message: refusal
+                .pointer("/detail/message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }
     }
 }
@@ -323,7 +328,13 @@ fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts, budget_ms: Optio
                 }))
     });
     let mut text = format!("{origin} refused the bot write: {code}. ");
-    if let Some((_, _, sentence, _, _)) = explanation {
+    if let Some(message) = facts
+        .detail_message
+        .as_deref()
+        .filter(|_| origin == "Plexus")
+    {
+        text.push_str(message);
+    } else if let Some((_, _, sentence, _, _)) = explanation {
         let mut sentence = sentence.to_string();
         for key in ["claimed_agent", "bound_agent"] {
             sentence = sentence.replace(

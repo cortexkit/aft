@@ -298,6 +298,25 @@ fn refusal_explanation(reply: Value) -> String {
 }
 
 #[test]
+fn refusal_explanation_preserves_plexus_detail_message_verbatim() {
+    let refusal = json!({"status":"refused","refusal_code":"pr_edit_not_own","code":"pr_edit_not_own","detail":{"message":"'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."},"retry_same_nonce":false});
+    assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), "Plexus refused the bot write: pr_edit_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    let mut stack = refusal;
+    stack["refusal_code"] = json!("stack_pr_not_own");
+    stack["code"] = json!("stack_pr_not_own");
+    stack["detail"]["number"] = json!(285);
+    stack["detail"]["author_login"] = json!("contributor");
+    assert_eq!(refusal_explanation(json!({"result": stack})), "Plexus refused the bot write: stack_pr_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
+fn refusal_explanation_bare_pr_edit_not_own_keeps_generic_fallback() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "pr_edit_not_own", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: pr_edit_not_own. The pull request was not opened by this bot. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
 fn refusal_explanation_never_sent_terminal() {
     assert_eq!(refusal_explanation(json!({"result": {
         "status": "refused", "refusal_code": "approval_denied", "retry_same_nonce": false,
