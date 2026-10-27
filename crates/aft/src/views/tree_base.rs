@@ -182,32 +182,39 @@ pub(crate) fn bootstrap(
     input: TreeBaseInput<'_>,
     claim_slot: &Mutex<Option<BuildClaim>>,
 ) -> Option<AuthenticatedBase> {
-    let guard = BindGuard::capture(input.root, None).ok()?;
-    let mut proven = prove(&input, &guard).ok()?;
+    try_bootstrap(input, claim_slot).ok()
+}
+
+/// [`bootstrap`] with the reason a tree-keyed base is unavailable.
+fn try_bootstrap(
+    input: TreeBaseInput<'_>,
+    claim_slot: &Mutex<Option<BuildClaim>>,
+) -> Result<AuthenticatedBase, String> {
+    let guard = BindGuard::capture(input.root, None).map_err(|e| e.to_string())?;
+    let mut proven = prove(&input, &guard)?;
     let route = input.route;
-    let identity = BaseIdentity::of(&route.family, &proven.manifest).ok()?;
-    if identity.kind() != BaseKind::Tree {
-        return None;
-    }
+    let identity = BaseIdentity::of(&route.family, &proven.manifest).map_err(|e| e.to_string())?;
     if let Ok(base) = resolve_base(&route.storage, &route.family, &identity.scope) {
-        return Some(base);
+        return Ok(base);
     }
     let ClaimOutcome::Claimed(claim) =
-        claim_base(&route.storage, &route.family, &identity.scope, None).ok()?
+        claim_base(&route.storage, &route.family, &identity.scope, None)
+            .map_err(|e| e.to_string())?
     else {
-        return None;
+        return Err("tree_base_claim_unavailable".into());
     };
     match build(route, &identity, &guard, &mut proven, input.policy, &claim) {
         Ok(()) => {
-            let base = resolve_base(&route.storage, &route.family, &identity.scope).ok();
+            let base = resolve_base(&route.storage, &route.family, &identity.scope)
+                .map_err(|e| e.to_string());
             *claim_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(claim);
             base
         }
-        Err(_) => {
+        Err(error) => {
             let _ = claim.release();
-            None
+            Err(error)
         }
     }
 }

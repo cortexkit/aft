@@ -354,6 +354,25 @@ fn the_tree_proof_names_the_first_check_a_checkout_fails() {
     let root = checkout(true);
     let _attributes = known_attribute_sources_for_test(root.path());
     assert_eq!(outcome(root.path()), Ok(FILES.len()));
+    let slot = std::sync::Mutex::new(None);
+    let built = super::try_bootstrap(
+        super::TreeBaseInput {
+            route: &route,
+            root: root.path(),
+            paths: &paths,
+            policy: policy(),
+            producers: &producers,
+            ignore_fingerprint: None,
+        },
+        &slot,
+    );
+    assert_eq!(
+        built.as_ref().err(),
+        None,
+        "a clean checkout builds a tree-keyed base"
+    );
+    assert_eq!(built.unwrap().identity().kind(), BaseKind::Tree);
+    slot.lock().unwrap().take().unwrap().release().unwrap();
     git(
         root.path(),
         &["update-index", "--assume-unchanged", "lib.rs"],
