@@ -262,12 +262,11 @@ fn build(
         })
         .map_err(|e| error(&e))?;
         // A base that is already published keeps its proof unchanged: a
-        // proof is written only before a scope's first publication.
-        if super::ViewStore::existing_dir(dir.clone())
-            .map(|store| store.current_generation_read_only())
-            .transpose()
+        // proof is written only before a scope's first publication. Opening
+        // the store also creates the member directory the proof lives in.
+        if super::ViewStore::open_dir(dir.clone())
+            .and_then(|store| store.current_generation())
             .map_err(|e| error(&e))?
-            .flatten()
             .is_some()
         {
             return Ok(());
