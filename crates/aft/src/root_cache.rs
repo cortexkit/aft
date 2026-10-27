@@ -761,6 +761,10 @@ pub struct ReadMarkerMetadata {
     pub pid: u32,
     pub hostname: String,
     pub created_at_ms: u64,
+    /// Per-acquisition identity of a base-reference marker. Ordinary readers
+    /// leave it out, so their files are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 #[derive(Debug)]
@@ -774,10 +778,45 @@ pub struct ReadMarker {
 
 impl ReadMarker {
     pub fn create(cache_dir: &Path, generation_label: &str) -> io::Result<Self> {
+        Self::create_inner(cache_dir, generation_label, None)
+    }
+
+    /// A marker whose file also records `nonce`, so its holder can later
+    /// prove the file at its unique path is still its own acquisition.
+    pub fn create_with_nonce(
+        cache_dir: &Path,
+        generation_label: &str,
+        nonce: &str,
+    ) -> io::Result<Self> {
+        Self::create_inner(cache_dir, generation_label, Some(nonce.to_owned()))
+    }
+
+    /// True when the marker file at this marker's own path still exists and
+    /// carries this marker's metadata, nonce included. A sweep that judged the
+    /// owner dead removes the file, and this then reports `false`.
+    pub fn verify_held(&self) -> io::Result<bool> {
+        use std::io::Read;
+        let mut file = match self.generation.repair_read_file(&self.name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        (&mut file).take(32 * 1024).read_to_end(&mut bytes)?;
+        Ok(serde_json::from_slice::<ReadMarkerMetadata>(&bytes)
+            .is_ok_and(|stored| stored == self.metadata))
+    }
+
+    fn create_inner(
+        cache_dir: &Path,
+        generation_label: &str,
+        nonce: Option<String>,
+    ) -> io::Result<Self> {
         let metadata = ReadMarkerMetadata {
             pid: std::process::id(),
             hostname: current_hostname(),
             created_at_ms: now_ms(),
+            nonce,
         };
         let dir = read_marker_dir(cache_dir, generation_label);
         crate::private_storage::open_dir(cache_dir, &dir)?;
@@ -1559,6 +1598,7 @@ mod tests {
             pid: 0,
             hostname: current_hostname(),
             created_at_ms: now_ms(),
+            nonce: None,
         };
         fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
         write_marker_file(&marker_path, &metadata).unwrap();
@@ -1579,6 +1619,7 @@ mod tests {
             pid,
             hostname: current_hostname(),
             created_at_ms: 1_000,
+            nonce: None,
         };
         fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
         write_marker_file(&marker_path, &metadata).unwrap();
@@ -1600,6 +1641,7 @@ mod tests {
             pid: 123,
             hostname: format!("other-{}", current_hostname()),
             created_at_ms: now_ms(),
+            nonce: None,
         };
         fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
         write_marker_file(&marker_path, &metadata).unwrap();

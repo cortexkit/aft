@@ -179,6 +179,7 @@ fn publication_observes_floor_before_files_and_flush_before_commit() {
                 | DurabilityStep::ManifestParentSynced
                 | DurabilityStep::PointerCas
                 | DurabilityStep::PointerSynced => panic!("v2 boundary in v3 publication"),
+                other => panic!("base-reference boundary {other:?} in a copy publication"),
             }
         }
     }
@@ -685,6 +686,7 @@ fn killed_v3_publishers_recover_at_both_new_boundaries_without_losing_orphans() 
             | DurabilityStep::ManifestParentSynced
             | DurabilityStep::PointerCas
             | DurabilityStep::PointerSynced => panic!("V3_ONLY contains a v2 boundary"),
+            other => panic!("V3_ONLY contains the base-path boundary {other:?}"),
         }
     }
 }
@@ -859,11 +861,13 @@ fn newer_format_keeps_artifact_refusal_and_malformed_file_reports_found_zero() {
     let path = db(root.path(), A);
     Connection::open(&path)
         .unwrap()
-        .execute("UPDATE format_meta SET format_version=2", [])
+        // Registry 2 is the base-reference protocol this build reads; the
+        // first newer version is 3.
+        .execute("UPDATE format_meta SET format_version=3", [])
         .unwrap();
     match LedgerReader::open_existing(root.path(), A).err().unwrap() {
         Error::Incompatible(error) => {
-            assert_eq!(error.found, 2);
+            assert_eq!(error.found, 3);
             assert_eq!(error.source, persisted_format::RefusalSource::Artifact);
         }
         error => panic!("{error}"),

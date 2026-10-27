@@ -51,6 +51,35 @@ impl LivePin {
         })
     }
 
+    /// Creates an empty live pin in the `pins/` of the v3 member `scope`,
+    /// inside the v3 registry barrier: the member must still be registered and
+    /// not `evicting`, so the retention collector's final protection check
+    /// either sees this pin or has already removed the member.
+    pub fn create_v3(storage: &Path, family: &str, scope: &str) -> Result<Self, PinError> {
+        crate::views::base_refs::with_base_barrier(storage, family, |tx| {
+            let state: Option<String> = rusqlite::OptionalExtension::optional(tx.query_row(
+                "SELECT state FROM members WHERE scope=?1",
+                [scope],
+                |r| r.get(0),
+            ))?;
+            if state.is_none() || state.as_deref() == Some(crate::views::registry::STATE_EVICTING) {
+                return Err(crate::views::base_refs::BaseRefError::Unavailable(format!(
+                    "v3 member {scope} is not registered"
+                )));
+            }
+            let view_dir = crate::blob_store::v3::view_dir(storage, family, scope)?;
+            Self::create_in(&view_dir, family.to_owned(), scope.to_owned()).map_err(|error| {
+                crate::views::base_refs::BaseRefError::Io(std::io::Error::other(error.to_string()))
+            })
+        })
+        .map_err(|error| match error {
+            crate::views::base_refs::BaseRefError::Unavailable(_) => {
+                PinError::NotRegistered(scope.to_owned())
+            }
+            other => PinError::Registry(other.to_string()),
+        })
+    }
+
     fn create_in(view_dir: &Path, family: String, view: String) -> Result<Self, PinError> {
         let pid = std::process::id();
         let now = now_ms();
