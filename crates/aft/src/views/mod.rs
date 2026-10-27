@@ -14,6 +14,7 @@ pub mod assembly;
 pub mod base_builder;
 pub mod base_refs;
 pub mod base_sweep;
+pub(crate) mod donor;
 mod generation;
 #[cfg(test)]
 pub(crate) use generation::{

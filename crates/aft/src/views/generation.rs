@@ -845,6 +845,7 @@ impl ViewStore {
                         ".sqlite-wal",
                         ".sqlite-shm",
                         ".sqlite-journal",
+                        ".sqlite-seal",
                         ".ref",
                     ]
                     .iter()
@@ -942,9 +943,15 @@ impl ViewStore {
             let generation = name
                 .strip_prefix("derived-")
                 .and_then(|s| {
-                    [".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
-                        .iter()
-                        .find_map(|suffix| s.strip_suffix(suffix))
+                    [
+                        ".sqlite",
+                        ".sqlite-wal",
+                        ".sqlite-shm",
+                        ".sqlite-journal",
+                        ".sqlite-seal",
+                    ]
+                    .iter()
+                    .find_map(|suffix| s.strip_suffix(suffix))
                 })
                 .or_else(|| {
                     name.strip_prefix("manifest-")
@@ -1143,7 +1150,8 @@ impl ViewStore {
                     continue;
                 }
                 let suffixes = if sqlite {
-                    &["", "-wal", "-shm", "-journal"][..]
+                    // A sealed donor's seal record goes with its database.
+                    &["", "-wal", "-shm", "-journal", super::donor::SEAL_SUFFIX][..]
                 } else {
                     &[""][..]
                 };

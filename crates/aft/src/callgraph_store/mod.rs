@@ -9125,7 +9125,12 @@ impl ReadonlyCallGraphStore {
     ) -> Result<Self> {
         let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
-        let conn = open_readonly_connection(&sqlite_path)?;
+        // A sealed donor never changes; open it without locks or a WAL.
+        let conn = if crate::views::donor::is_sealed(&sqlite_path) {
+            open_sealed_connection(&sqlite_path)?
+        } else {
+            open_readonly_connection(&sqlite_path)?
+        };
         ensure_database_ready(&conn)?;
         configure_serving_reader(&conn)?;
         let mut inner = CallGraphStore::from_connection(
@@ -11739,6 +11744,21 @@ fn manifest_view_database_path(view_dir: &Path, generation: &str) -> Result<Path
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     open_readonly_connection_before(path, Instant::now())
+}
+
+/// A sealed donor (see `views::donor`) is opened with `immutable=1`: SQLite
+/// then takes no locks and never looks for a WAL, which is what lets a
+/// worker clone the file with a plain descriptor.
+fn open_sealed_connection(path: &Path) -> Result<TrackedConnection> {
+    crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let uri = format!("{}&immutable=1", sqlite_readonly_uri(path));
+    let conn = TrackedConnection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        SqliteStore::CallgraphGeneration,
+    )?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(conn)
 }
 
 fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
