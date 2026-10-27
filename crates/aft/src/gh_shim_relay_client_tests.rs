@@ -300,20 +300,76 @@ fn refusal_explanation(reply: Value) -> String {
 #[test]
 fn refusal_explanation_preserves_plexus_detail_message_verbatim() {
     let refusal = json!({"status":"refused","refusal_code":"pr_edit_not_own","code":"pr_edit_not_own","detail":{"message":"'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."},"retry_same_nonce":false});
-    assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), "Plexus refused the bot write: pr_edit_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), "Plexus refused the bot write: pr_edit_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received only reads; nothing was written. The agent must change the request.");
     let mut stack = refusal;
     stack["refusal_code"] = json!("stack_pr_not_own");
     stack["code"] = json!("stack_pr_not_own");
     stack["detail"]["number"] = json!(285);
     stack["detail"]["author_login"] = json!("contributor");
-    assert_eq!(refusal_explanation(json!({"result": stack})), "Plexus refused the bot write: stack_pr_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    assert_eq!(refusal_explanation(json!({"result": stack})), "Plexus refused the bot write: stack_pr_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received only reads; nothing was written. The agent must change the request.");
 }
 
 #[test]
 fn refusal_explanation_bare_pr_edit_not_own_keeps_generic_fallback() {
     assert_eq!(refusal_explanation(json!({"result": {
         "status": "refused", "refusal_code": "pr_edit_not_own", "retry_same_nonce": false,
-    }})), "Plexus refused the bot write: pr_edit_not_own. The pull request was not opened by this bot. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    }})), "Plexus refused the bot write: pr_edit_not_own. The pull request was not opened by this bot. GitHub received only reads; nothing was written. The agent must change the request.");
+}
+
+#[test]
+fn refusal_explanation_read_only_gates_do_not_warn_unless_steps_were_sent() {
+    for (code, explanation) in [
+        (
+            "pr_edit_not_own",
+            "The pull request was not opened by this bot.",
+        ),
+        (
+            "issue_edit_not_own",
+            "The issue was not opened by this bot.",
+        ),
+        (
+            "stack_pr_not_own",
+            "A stacked pull request was not opened by this bot.",
+        ),
+        (
+            "comment_author_mismatch",
+            "The comment was not written by the expected bot.",
+        ),
+        (
+            "agent_repository_conflict",
+            "The GitHub target does not match the bound repository.",
+        ),
+        ("not_present", "The GitHub target was not found."),
+        (
+            "pre_dispatch_read_incomplete{reason: page_bound}",
+            "The GitHub read exceeded its page limit.",
+        ),
+    ] {
+        let mut refusal =
+            json!({"status": "refused", "refusal_code": code, "retry_same_nonce": false});
+        assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), format!("Plexus refused the bot write: {code}. {explanation} GitHub received only reads; nothing was written. The agent must change the request."));
+        refusal["legs_sent"] = json!(["comment"]);
+        refusal["transmission"] = json!("not_sent");
+        assert_eq!(refusal_explanation(json!({"result": refusal})), format!("Plexus refused the bot write: {code}. {explanation} GitHub received a request. Already-sent write steps: comment. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+}
+
+#[test]
+fn refusal_explanation_ambiguous_read_failures_keep_conservative_warning() {
+    for (code, explanation) in [
+        (
+            "pre_dispatch_read_incomplete{reason: invalid_response}",
+            "The GitHub read response could not be used.",
+        ),
+        (
+            "pre_dispatch_read_incomplete{reason: lease_expired}",
+            "The GitHub read did not finish.",
+        ),
+    ] {
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": code, "retry_same_nonce": false,
+        }})), format!("Plexus refused the bot write: {code}. {explanation} Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
 }
 
 #[test]
@@ -508,7 +564,7 @@ fn refusal_explanation_table_covers_bot_request_codes() {
     }
     assert_eq!(refusal_explanation(json!({"result": {
         "status": "refused", "refusal_code": "agent_repository_conflict", "retry_same_nonce": false,
-    }})), "Plexus refused the bot write: agent_repository_conflict. The GitHub target does not match the bound repository. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    }})), "Plexus refused the bot write: agent_repository_conflict. The GitHub target does not match the bound repository. GitHub received only reads; nothing was written. The agent must change the request.");
     assert_eq!(refusal_explanation(json!({"result": {
         "status": "refused", "refusal_code": "pr_head_cross_repository", "retry_same_nonce": false,
     }})), "Plexus refused the bot write: pr_head_cross_repository. The pull request head is outside the bound repository. Nothing reached GitHub. The agent must change the request.");

@@ -205,6 +205,7 @@ fn detail_field(detail: &str, key: &str) -> Option<String> {
 #[derive(Clone, Copy)]
 enum GithubReach {
     Never,
+    ReadsOnly,
     Maybe,
     Yes,
 }
@@ -219,18 +220,19 @@ enum RefusalActor {
 // More specific detail selectors precede the fallback for the same code.
 // Transmission includes reads, not just writes. A later gate can follow sent
 // steps, so phase-dependent codes must not promise that nothing reached GitHub.
+// Read-only gates stop before writes; sent-step evidence still takes precedence.
 const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &[
     ("agent_grant_absent", "", "The agent has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
     ("agent_grant_excludes_request", "", "The agent's grant does not cover this request.", GithubReach::Never, RefusalActor::Operator),
     ("agent_handle_unknown", "", "The agent's GitHub bot handle is unknown.", GithubReach::Never, RefusalActor::Operator),
     ("agent_repository_conflict", "claimed_agent=*", "This command speaks as agent {claimed_agent}, but the repository is bound to agent {bound_agent}.", GithubReach::Never, RefusalActor::Operator),
-    ("agent_repository_conflict", "", "The GitHub target does not match the bound repository.", GithubReach::Yes, RefusalActor::Agent),
+    ("agent_repository_conflict", "", "The GitHub target does not match the bound repository.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("argument_undeclared", "", "The request contains an unsupported identity field.", GithubReach::Never, RefusalActor::Agent),
     ("approval_agent_mismatch", "", "The approval belongs to another agent.", GithubReach::Never, RefusalActor::Agent),
     ("approval_denied", "", "Approval for this write was denied.", GithubReach::Never, RefusalActor::Operator),
     ("approval_expired", "", "The approval has expired.", GithubReach::Never, RefusalActor::Agent),
     ("call_mode_unsupported", "", "This call mode cannot make bot writes.", GithubReach::Never, RefusalActor::Agent),
-    ("comment_author_mismatch", "", "The comment was not written by the expected bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("comment_author_mismatch", "", "The comment was not written by the expected bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("connector_home_not_held", "", "This machine does not hold permission to send GitHub requests.", GithubReach::Never, RefusalActor::Operator),
     ("consent_unavailable", "", "This flow cannot answer the required consent prompt.", GithubReach::Never, RefusalActor::Operator),
     ("delegating_scope_required", "", "The route has no scope authorized to act as an agent.", GithubReach::Never, RefusalActor::Agent),
@@ -250,7 +252,7 @@ const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &
     ("module_grant_absent", "", "The calling module has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
     ("nonce_in_flight", "", "Another worker is still handling this request nonce.", GithubReach::Maybe, RefusalActor::Nobody),
     ("nonce_payload_mismatch", "", "This nonce already belongs to a different request.", GithubReach::Maybe, RefusalActor::Agent),
-    ("not_present", "", "The GitHub target was not found.", GithubReach::Yes, RefusalActor::Agent),
+    ("not_present", "", "The GitHub target was not found.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("outcome_unknown", "", "The GitHub read outcome is unknown.", GithubReach::Maybe, RefusalActor::Operator),
     ("pipeline_denied", "denial=RecipientArgumentInvalid", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
     ("pipeline_denied", "denial=ArgumentUndeclared", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
@@ -259,11 +261,11 @@ const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &
     ("pipeline_denied", "denial=ResourceFilter(WriteFiltersAbsent)", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
     ("pipeline_denied", "", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Operator),
     ("policy_blocked", "", "Policy blocks this write.", GithubReach::Never, RefusalActor::Operator),
-    ("pre_dispatch_read_incomplete", "reason=page_bound", "The GitHub read exceeded its page limit.", GithubReach::Yes, RefusalActor::Agent),
+    ("pre_dispatch_read_incomplete", "reason=page_bound", "The GitHub read exceeded its page limit.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("pre_dispatch_read_incomplete", "reason=invalid_response", "The GitHub read response could not be used.", GithubReach::Maybe, RefusalActor::Nobody),
     ("pre_dispatch_read_incomplete", "", "The GitHub read did not finish.", GithubReach::Maybe, RefusalActor::Nobody),
-    ("pr_edit_not_own", "", "The pull request was not opened by this bot.", GithubReach::Yes, RefusalActor::Agent),
-    ("issue_edit_not_own", "", "The issue was not opened by this bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("pr_edit_not_own", "", "The pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("issue_edit_not_own", "", "The issue was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("pr_head_cross_repository", "", "The pull request head is outside the bound repository.", GithubReach::Never, RefusalActor::Agent),
     ("probe_unproven", "", "The bot handle has not passed its proof check.", GithubReach::Never, RefusalActor::Operator),
     ("repository_unbound", "", "The repository has no bot binding.", GithubReach::Maybe, RefusalActor::Operator),
@@ -280,7 +282,7 @@ const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &
     ("stale_authority", "dimension=expected_handle", "The expected bot handle has changed.", GithubReach::Never, RefusalActor::Agent),
     ("stale_authority", "dimension=expected_binding", "The expected repository binding has changed.", GithubReach::Never, RefusalActor::Agent),
     ("stale_authority", "", "The write's authorization changed or expired.", GithubReach::Maybe, RefusalActor::Operator),
-    ("stack_pr_not_own", "", "A stacked pull request was not opened by this bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("stack_pr_not_own", "", "A stacked pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("store_failure", "", "Request storage failed.", GithubReach::Maybe, RefusalActor::Operator),
     ("transport_not_sent", "", "The current step was not sent.", GithubReach::Maybe, RefusalActor::Operator),
     ("vendor_rejected", "status=429", "GitHub rejected the request.", GithubReach::Yes, RefusalActor::Nobody),
@@ -355,6 +357,7 @@ fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts, budget_ms: Optio
     };
     text.push_str(match reach {
         Some(GithubReach::Never) => " Nothing reached GitHub.",
+        Some(GithubReach::ReadsOnly) => " GitHub received only reads; nothing was written.",
         Some(GithubReach::Maybe) => " Earlier reads or writes may have reached GitHub.",
         Some(GithubReach::Yes) => " GitHub received a request.",
         None => " Whether anything reached GitHub is unknown.",
@@ -385,6 +388,7 @@ fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts, budget_ms: Optio
         ));
     }
     text.push_str(match (reach, actor) {
+        (Some(GithubReach::ReadsOnly), _) => "",
         (Some(GithubReach::Never), Some(RefusalActor::Nobody)) => " Rerunning the command is safe.",
         (Some(GithubReach::Never), Some(RefusalActor::Agent | RefusalActor::Operator)) => "",
         (Some(GithubReach::Maybe | GithubReach::Yes), _) => {
