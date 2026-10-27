@@ -629,7 +629,7 @@ fn daemon_refusal(code: &str, stage: &str, message: &str, facts: &RefusalFacts) 
         _ => {
             RouteOutcome::RelayRefusal {
                 code: code.to_string(),
-                text: refusal_text("AFT", code, facts),
+                text: refusal_text(if stage == "plexus" { "Plexus" } else { "AFT" }, code, facts),
             }
         }
     }

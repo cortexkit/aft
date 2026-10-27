@@ -364,6 +364,20 @@ fn refusal_explanation_relay_originated_identity_conflict() {
 }
 
 #[test]
+fn refusal_explanation_forwarded_plexus_gate_keeps_its_origin() {
+    let RouteOutcome::RelayRefusal { code, text } = daemon_refusal(
+        "scope_not_synced",
+        "plexus",
+        "scope not ready",
+        &RefusalFacts::default(),
+    ) else {
+        panic!("expected forwarded refusal");
+    };
+    assert_eq!(code, "scope_not_synced");
+    assert_eq!(text, "Plexus refused the bot write: scope_not_synced. The agent's scope has not synced yet. Earlier reads or writes may have reached GitHub. An operator must fix the setup, grants, or policy. Retry safety is unknown.");
+}
+
+#[test]
 fn refusal_explanation_unknown_code_respects_retry_metadata() {
     for (retry, expected) in [
         (Value::Null, "Plexus refused the bot write: future_code. This shim does not recognize the refusal code. Whether anything reached GitHub is unknown. Retry safety is unknown."),
