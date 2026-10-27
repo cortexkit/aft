@@ -21,6 +21,40 @@ pub enum ObjectFormat {
 }
 
 impl ObjectFormat {
+    /// The format whose object IDs are `hex_len` hex digits long.
+    pub fn from_hex_len(hex_len: usize) -> Option<Self> {
+        match hex_len {
+            40 => Some(Self::Sha1),
+            64 => Some(Self::Sha256),
+            _ => None,
+        }
+    }
+
+    /// Git's name for the format (`extensions.objectFormat`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+
+    /// The object ID Git gives `bytes` stored as a blob: the digest of
+    /// `blob <length>\0<bytes>`. These are the exact bytes read, so the caller
+    /// must already know that no conversion applies between them and the blob.
+    pub fn blob_oid(self, bytes: &[u8]) -> Vec<u8> {
+        self.object_oid(b"blob", bytes)
+    }
+
+    fn object_oid(self, kind: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut object = Vec::with_capacity(body.len() + 32);
+        object.extend_from_slice(kind);
+        object.push(b' ');
+        object.extend_from_slice(body.len().to_string().as_bytes());
+        object.push(0);
+        object.extend_from_slice(body);
+        self.digest(&object)
+    }
+
     fn oid_len(self) -> usize {
         match self {
             Self::Sha1 => 20,
@@ -471,6 +505,110 @@ fn parse_index(
         checksum: checksum.to_vec(),
         modified,
     })
+}
+
+/// Why a coherent index snapshot cannot prove a full tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeRefusal {
+    /// An unmerged, assume-valid, skip-worktree or intent-to-add entry.
+    Exception(Vec<u8>, EntryException),
+    /// A mode other than regular, executable, symlink or gitlink.
+    Mode(Vec<u8>, u32),
+    /// An empty, `.`, `..` or `.git` component.
+    Path(Vec<u8>),
+    /// The same path twice, or a path that is both a file and a directory.
+    Conflict(Vec<u8>),
+}
+
+enum TreeNode<'a> {
+    Leaf { mode: u32, oid: &'a [u8] },
+    Directory(std::collections::BTreeMap<&'a [u8], TreeNode<'a>>),
+}
+
+/// Computes the root tree object ID that `git write-tree` would write for
+/// this index, from every entry. Any entry that a plain tree cannot
+/// represent exactly refuses the whole computation rather than being skipped,
+/// so an equal result proves the full index, not a subset of it.
+pub fn index_tree(snapshot: &IndexSnapshot) -> Result<Vec<u8>, TreeRefusal> {
+    let mut root = std::collections::BTreeMap::new();
+    for entry in &snapshot.entries {
+        if let Some(exception) = entry.exceptions().into_iter().next() {
+            return Err(TreeRefusal::Exception(entry.path.clone(), exception));
+        }
+        if !matches!(entry.stat.mode, 0o100644 | 0o100755 | 0o120000 | 0o160000) {
+            return Err(TreeRefusal::Mode(entry.path.clone(), entry.stat.mode));
+        }
+        let components: Vec<&[u8]> = entry.path.split(|&b| b == b'/').collect();
+        if components.iter().any(|component| {
+            component.is_empty()
+                || *component == b"."
+                || *component == b".."
+                || component.eq_ignore_ascii_case(b".git")
+        }) {
+            return Err(TreeRefusal::Path(entry.path.clone()));
+        }
+        let conflict = || TreeRefusal::Conflict(entry.path.clone());
+        let (leaf, parents) = components.split_last().expect("split yields one item");
+        let mut directory = &mut root;
+        for parent in parents {
+            let node = directory
+                .entry(*parent)
+                .or_insert_with(|| TreeNode::Directory(Default::default()));
+            directory = match node {
+                TreeNode::Directory(children) => children,
+                TreeNode::Leaf { .. } => return Err(conflict()),
+            };
+        }
+        if directory
+            .insert(
+                leaf,
+                TreeNode::Leaf {
+                    mode: entry.stat.mode,
+                    oid: &entry.oid,
+                },
+            )
+            .is_some()
+        {
+            return Err(conflict());
+        }
+    }
+    Ok(write_tree(snapshot.object_format, &root))
+}
+
+fn write_tree(
+    format: ObjectFormat,
+    children: &std::collections::BTreeMap<&[u8], TreeNode<'_>>,
+) -> Vec<u8> {
+    // Git orders tree entries by name, comparing a directory as if its name
+    // ended in '/'.
+    let mut rows: Vec<(Vec<u8>, String, &[u8], Vec<u8>)> = children
+        .iter()
+        .map(|(name, node)| match node {
+            TreeNode::Leaf { mode, oid } => {
+                (name.to_vec(), format!("{mode:o}"), *name, oid.to_vec())
+            }
+            TreeNode::Directory(grandchildren) => {
+                let mut key = name.to_vec();
+                key.push(b'/');
+                (
+                    key,
+                    "40000".to_owned(),
+                    *name,
+                    write_tree(format, grandchildren),
+                )
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut body = Vec::new();
+    for (_, mode, name, oid) in rows {
+        body.extend_from_slice(mode.as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend_from_slice(&oid);
+    }
+    format.object_oid(b"tree", &body)
 }
 
 /// Git metadata queries for one snapshot evaluation. Every spawned Git child, including a
@@ -1217,6 +1355,160 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.path == name));
+    }
+
+    fn trimmed_hex(output: Output) -> String {
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn index_tree_and_blob_oids_match_git_for_both_object_formats() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let dir = fixture(format);
+            // Names whose Git tree order differs from plain byte order once
+            // the directory `a` is compared as `a/`.
+            for path in ["order/a-b", "order/a/x", "order/a.b", "order/a0"] {
+                let path = dir.path().join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let contents = path_bytes(&path);
+                fs::write(path, contents).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let tool = dir.path().join("tool.sh");
+                fs::write(&tool, b"#!/bin/sh\n").unwrap();
+                fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+                std::os::unix::fs::symlink("plain", dir.path().join("link")).unwrap();
+            }
+            git(dir.path(), &["add", "."], &[]);
+            let commit = trimmed_hex(git(dir.path(), &["rev-parse", "HEAD"], &[]));
+            git(
+                dir.path(),
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{commit},module"),
+                ],
+                &[],
+            );
+            let snapshot = snapshot(dir.path(), format);
+            assert_eq!(
+                hex(&index_tree(&snapshot).unwrap()),
+                trimmed_hex(git(dir.path(), &["write-tree"], &[])),
+                "{format:?}"
+            );
+            let bytes = b"blob bytes\0with a NUL\n";
+            assert_eq!(
+                hex(&format.blob_oid(bytes)),
+                trimmed_hex(git(dir.path(), &["hash-object", "--stdin"], bytes))
+            );
+            assert_eq!(
+                ObjectFormat::from_hex_len(hex(&format.blob_oid(b"")).len()),
+                Some(format)
+            );
+        }
+    }
+
+    fn path_bytes(path: &Path) -> Vec<u8> {
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn index_tree_refuses_real_git_exception_entries() {
+        let dir = fixture(ObjectFormat::Sha1);
+        let tree = |dir: &TempDir| index_tree(&snapshot(dir.path(), ObjectFormat::Sha1));
+        assert!(tree(&dir).is_ok());
+        fs::write(dir.path().join("new"), b"new\n").unwrap();
+        git(dir.path(), &["add", "-N", "new"], &[]);
+        assert_eq!(
+            tree(&dir),
+            Err(TreeRefusal::Exception(
+                b"new".to_vec(),
+                EntryException::IntentToAdd
+            ))
+        );
+        git(dir.path(), &["update-index", "--force-remove", "new"], &[]);
+        git(dir.path(), &["update-index", "--skip-worktree", "skip"], &[]);
+        assert_eq!(
+            tree(&dir),
+            Err(TreeRefusal::Exception(
+                b"skip".to_vec(),
+                EntryException::SkipWorktree
+            ))
+        );
+        git(dir.path(), &["update-index", "--no-skip-worktree", "skip"], &[]);
+        git(dir.path(), &["update-index", "--assume-unchanged", "plain"], &[]);
+        assert_eq!(
+            tree(&dir),
+            Err(TreeRefusal::Exception(
+                b"plain".to_vec(),
+                EntryException::AssumeValid
+            ))
+        );
+    }
+
+    #[test]
+    fn index_tree_refuses_modes_paths_and_conflicts_a_tree_cannot_hold() {
+        let entry = |path: &[u8], mode: u32| IndexEntry {
+            path: path.to_vec(),
+            oid: vec![7; 20],
+            stat: IndexStat {
+                ctime: IndexTime {
+                    seconds: 0,
+                    nanoseconds: 0,
+                },
+                mtime: IndexTime {
+                    seconds: 0,
+                    nanoseconds: 0,
+                },
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+            },
+            stage: 0,
+            assume_valid: false,
+            skip_worktree: false,
+            intent_to_add: false,
+        };
+        let tree = |entries: Vec<IndexEntry>| {
+            index_tree(&IndexSnapshot {
+                version: 2,
+                object_format: ObjectFormat::Sha1,
+                entries,
+                checksum: Vec::new(),
+                modified: SystemTime::UNIX_EPOCH,
+            })
+        };
+        assert!(tree(vec![entry(b"a", 0o100644), entry(b"b/c", 0o120000)]).is_ok());
+        assert_eq!(
+            tree(vec![entry(b"a", 0o100664)]),
+            Err(TreeRefusal::Mode(b"a".to_vec(), 0o100664))
+        );
+        assert_eq!(
+            tree(vec![entry(b"x/.GIT/y", 0o100644)]),
+            Err(TreeRefusal::Path(b"x/.GIT/y".to_vec()))
+        );
+        assert_eq!(
+            tree(vec![entry(b"a", 0o100644), entry(b"a/b", 0o100644)]),
+            Err(TreeRefusal::Conflict(b"a/b".to_vec()))
+        );
+        assert_eq!(
+            tree(vec![entry(b"a/b", 0o100644), entry(b"a", 0o100644)]),
+            Err(TreeRefusal::Conflict(b"a".to_vec()))
+        );
+        assert_eq!(
+            tree(vec![entry(b"a", 0o100644), entry(b"a", 0o100755)]),
+            Err(TreeRefusal::Conflict(b"a".to_vec()))
+        );
     }
 
     #[test]
