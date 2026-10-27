@@ -48,6 +48,15 @@ pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
         .filter(|language| *language != crate::parser::LangId::Markdown)
 }
 
+/// Whether a member needs a callgraph blob: a source file in a callgraph
+/// language, or resolver configuration such as `package.json`.
+pub(crate) fn applies_to(path: &RelPath) -> bool {
+    super::assembly::is_resolution_input(path.as_bytes())
+        || std::str::from_utf8(path.as_bytes())
+            .ok()
+            .is_some_and(|p| source_language(Path::new(p)).is_some())
+}
+
 /// Attach evidence computed from exactly the caller's already-read byte buffer.
 /// No disk access, blob put, publication or membership decision occurs here.
 pub fn attach(
@@ -234,10 +243,7 @@ impl PlaneAdapter for CallgraphPlane {
         PRODUCER.into()
     }
     fn applies_to(&self, path: &RelPath) -> bool {
-        super::assembly::is_resolution_input(path.as_bytes())
-            || std::str::from_utf8(path.as_bytes())
-                .ok()
-                .is_some_and(|p| source_language(Path::new(p)).is_some())
+        applies_to(path)
     }
     fn open_generation(
         &self,

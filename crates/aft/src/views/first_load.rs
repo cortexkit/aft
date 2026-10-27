@@ -1249,6 +1249,25 @@ pub trait CompositePlane: Send + Sync {
         None
     }
 
+    /// Whether this plane can complete its entries of a freshly built v3
+    /// base itself (see [`Self::complete_v3_base`]). Fresh bootstrap refuses a
+    /// nonlexical plane that cannot, rather than strand its base entries.
+    fn completes_fresh_base(&self) -> bool {
+        false
+    }
+
+    /// Completes this plane's pending entries of the claimed base from the
+    /// attachments the bootstrap's strict reconciliation computed for the
+    /// same bytes, and publishes the result as a readiness successor.
+    fn complete_v3_base(
+        &self,
+        claim: &super::base_builder::BuildClaim,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+    ) -> Result<(), PlaneError> {
+        let _ = (claim, observed);
+        Ok(())
+    }
+
     /// Derive a payload key without extraction. Planes with deferred extraction
     /// may leave this absent and keep their own cheap attachment format.
     fn key(
@@ -1710,8 +1729,8 @@ impl CheckoutDriver {
         if let Some(plane) = self
             .planes
             .iter()
+            .find(|plane| plane.plane() != FamilyPlane::Trigram && !plane.completes_fresh_base())
             .map(|plane| plane.plane())
-            .find(|plane| *plane != FamilyPlane::Trigram)
         {
             return Err(FreshBootstrapRefusal::NonLexicalPlane(plane));
         }
@@ -1720,7 +1739,13 @@ impl CheckoutDriver {
                 FamilyPlane::Semantic,
             ));
         }
-        if self.producers.callgraph != super::semantic_runtime::UNREGISTERED_PRODUCER {
+        // A registered call-graph producer needs a registered plane that
+        // completes the base's graph entries.
+        if self.producers.callgraph != super::semantic_runtime::UNREGISTERED_PRODUCER
+            && !self.planes.iter().any(|plane| {
+                plane.plane() == FamilyPlane::Callgraph && plane.completes_fresh_base()
+            })
+        {
             return Err(FreshBootstrapRefusal::NonLexicalPlane(
                 FamilyPlane::Callgraph,
             ));
@@ -1860,10 +1885,12 @@ impl CheckoutDriver {
             return Ok((snapshot, revision));
         }
         let own = self.build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING);
+        // Every plane of a fresh bootstrap has completed its base entries by
+        // now (lexical in the build, others in `bootstrap_v3_base`).
         if self
             .planes
             .iter()
-            .all(|plane| plane.plane() == FamilyPlane::Trigram)
+            .all(|plane| plane.plane() == FamilyPlane::Trigram || plane.completes_fresh_base())
         {
             if let Some(claim) = self
                 .base_claim
@@ -1929,8 +1956,8 @@ impl CheckoutDriver {
             if let super::snapshot::DiskState::Present { content, size } = state {
                 manifest
                     .insert(
-                        path,
-                        super::manifest_v2::EntryV2::regular(content, size, Default::default()),
+                        path.clone(),
+                        super::base_builder::base_entry(&path, content, size, Default::default()),
                     )
                     .map_err(|e| SiblingLoader::error(e.to_string()))?;
             }
@@ -1991,6 +2018,7 @@ impl CheckoutDriver {
                     }
                 }
             };
+        let resolved = self.complete_fresh_base(&route, resolved)?;
         let header = resolved.header();
         let generation = resolved.into_generation(&route.storage, &route.family);
         let manifest = super::manifest_v2::ManifestV2::new_v3(
@@ -2003,6 +2031,68 @@ impl CheckoutDriver {
             ComposedGeneration::compose(generation.name(), manifest, generation.clone(), None)
                 .map_err(|e| SiblingLoader::error(e.to_string()))?;
         Ok(Arc::new(composed.with_v3_route(seed_route)))
+    }
+
+    /// Completes the nonlexical planes of a fresh base before a worker
+    /// publishes over it, so the worker's graph composes a ready base. The
+    /// base's build claim is the completion lock: this driver uses the claim
+    /// it took building the base, or takes over a dead builder's claim. A live
+    /// foreign builder still owns the completion, so the bind refuses.
+    fn complete_fresh_base(
+        &self,
+        route: &super::snapshot::V3Route,
+        base: super::base_refs::AuthenticatedBase,
+    ) -> Result<super::base_refs::AuthenticatedBase, PlaneError> {
+        let completing: Vec<_> = self
+            .planes
+            .iter()
+            .filter(|plane| plane.completes_fresh_base())
+            .filter(|plane| {
+                base.manifest().entries().any(|(_, entry)| {
+                    entry
+                        .plane_state(plane.plane())
+                        .is_some_and(super::readiness::PlaneState::is_pending)
+                })
+            })
+            .cloned()
+            .collect();
+        if completing.is_empty() {
+            return Ok(base);
+        }
+        let scope = base.scope().to_owned();
+        drop(base);
+        let mut held = self
+            .base_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.as_ref().is_none_or(|claim| claim.scope() != scope) {
+            match super::base_builder::claim_base(&route.storage, &route.family, &scope, None)
+                .map_err(|e| SiblingLoader::error(e.to_string()))?
+            {
+                super::base_builder::ClaimOutcome::Claimed(claim) => {
+                    if let Some(previous) = held.replace(claim) {
+                        let _ = previous.release();
+                    }
+                }
+                outcome => {
+                    return Err(SiblingLoader::error(format!(
+                        "v3 base plane completion is owned elsewhere: {outcome:?}"
+                    )))
+                }
+            }
+        }
+        let claim = held.as_ref().expect("claim held above");
+        let observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .clone();
+        for plane in completing {
+            plane.complete_v3_base(claim, &observed)?;
+        }
+        super::base_refs::resolve_base(&route.storage, &route.family, &scope)
+            .map_err(|e| SiblingLoader::error(e.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3094,6 +3184,18 @@ impl CheckoutDriver {
                 &super::readiness::FillMap::default(),
             )
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        // A deleted path the base never had (a file this worker added and then
+        // removed) leaves the delta without an entry or a tombstone: a
+        // tombstone may only name an inherited base entry.
+        for (path, entry) in snapshot.live_entries() {
+            if entry.disk == super::snapshot::DiskState::Absent
+                && generation
+                    .base()
+                    .is_some_and(|base| base.entry(path).is_none())
+            {
+                delta.inherit(path.clone(), None);
+            }
+        }
         delta
             .set_base_header(base_header.clone())
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
@@ -4464,9 +4566,146 @@ mod composite_tests {
 #[derive(Default)]
 pub struct CallgraphBridge {
     pub adapter: Arc<super::callgraph::CallgraphPlane>,
+    /// Source files this bridge parsed for call-graph evidence. Unchanged
+    /// files whose blob already exists reuse it and are not counted.
+    extractions: std::sync::atomic::AtomicUsize,
+}
+
+impl CallgraphBridge {
+    pub fn extraction_count(&self) -> usize {
+        self.extractions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The sealed donor of `base`'s derived graph, or why there is none.
+fn sealed_donor(base: &ComposedGeneration) -> Result<std::path::PathBuf, super::donor::ColdReason> {
+    use super::donor::ColdReason;
+    let route = base.v3_route().ok_or(ColdReason::NoSealedDonor)?;
+    let donor = super::resolve_derived_path(&route.member_dir(), base.name())
+        .map_err(|_| ColdReason::NoSealedDonor)?;
+    if !super::donor::is_sealed(&donor) {
+        return Err(ColdReason::NoSealedDonor);
+    }
+    super::donor::verify(&donor).map_err(ColdReason::SealInvalid)?;
+    Ok(donor)
+}
+
+fn remove_private_database(database: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = database.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(name));
+    }
 }
 
 impl CompositePlane for CallgraphBridge {
+    fn completes_fresh_base(&self) -> bool {
+        true
+    }
+
+    fn complete_v3_base(
+        &self,
+        claim: &super::base_builder::BuildClaim,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+    ) -> Result<(), PlaneError> {
+        let error = |reason: String| PlaneError {
+            plane: Some(FamilyPlane::Callgraph),
+            reason,
+        };
+        let base = super::base_refs::resolve_base(claim.storage(), claim.family(), claim.scope())
+            .map_err(|e| error(e.to_string()))?;
+        let route = super::base_refs::route(claim.storage(), claim.family(), claim.scope());
+        let mut keys = Vec::new();
+        let mut payloads = Vec::new();
+        for (path, entry) in base.manifest().entries() {
+            if !entry
+                .plane_state(FamilyPlane::Callgraph)
+                .is_some_and(super::readiness::PlaneState::is_pending)
+            {
+                continue;
+            }
+            // The base was read independently of the reconciliation; only
+            // evidence for the very bytes the base names may complete it.
+            let observation = observed.get(path).filter(|live| {
+                matches!(
+                    (live.disk, entry),
+                    (
+                        super::snapshot::DiskState::Present { content, size },
+                        super::manifest_v2::EntryV2::Regular { content: c, size: s, .. },
+                    ) if content == *c && size == *s
+                )
+            });
+            let attachment = observation
+                .and_then(|live| live.attachments.get(&FamilyPlane::Callgraph))
+                .ok_or_else(|| {
+                    error(format!(
+                        "{path:?}: base member changed before its graph was completed"
+                    ))
+                })?;
+            if let Some(cached) = attachment.downcast_ref::<CachedAttachment>() {
+                keys.push((path.clone(), cached.0));
+            } else if let Some(attachment) =
+                attachment.downcast_ref::<super::callgraph::CallgraphAttachment>()
+            {
+                keys.push((path.clone(), attachment.key));
+                payloads.push((
+                    attachment.key,
+                    attachment
+                        .blob
+                        .to_bytes()
+                        .map_err(|e| error(e.to_string()))?,
+                ));
+            } else {
+                return Err(error(format!("{path:?}: callgraph attachment missing")));
+            }
+        }
+        drop(base);
+        let mut live =
+            crate::pins::LivePin::create_v3(claim.storage(), claim.family(), claim.scope())
+                .map_err(|e| error(e.to_string()))?;
+        live.protect(&keys.iter().map(|(_, key)| *key).collect::<Vec<_>>())
+            .map_err(|e| error(e.to_string()))?;
+        if !payloads.is_empty() {
+            let request = payloads
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+                .saturating_mul(2)
+                .saturating_add(1 << 20);
+            let schema = FamilyPlane::Callgraph.payload_schema();
+            crate::blob_store::v3::publish(claim.storage(), claim.family(), request, None, |p| {
+                for (key, bytes) in &payloads {
+                    p.put(key, bytes, schema)?;
+                }
+                Ok(())
+            })
+            .map_err(|e| error(e.to_string()))?;
+        }
+        for (_, key) in &keys {
+            if !v3_contains(&route, key) {
+                return Err(error(
+                    "base callgraph row disappeared before publication".into(),
+                ));
+            }
+        }
+        super::base_builder::publish_successor(
+            claim,
+            |manifest| {
+                for (path, key) in &keys {
+                    if let Some(super::manifest_v2::EntryV2::Regular { planes, .. }) =
+                        manifest.get_mut(path)
+                    {
+                        planes.callgraph = Some(super::readiness::PlaneState::ready(key));
+                    }
+                }
+            },
+            None,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        drop(live);
+        Ok(())
+    }
+
     fn plane(&self) -> FamilyPlane {
         FamilyPlane::Callgraph
     }
@@ -4522,6 +4761,8 @@ impl CompositePlane for CallgraphBridge {
             .to_lowercase()
         };
         let mut entry = LiveEntry::new(super::snapshot::DiskState::of_bytes(bytes), 0);
+        self.extractions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let attachment = super::callgraph::attach(&mut entry, bytes, &language)?;
         Ok(Arc::new(attachment))
     }
@@ -4765,6 +5006,43 @@ impl CompositePlane for CallgraphBridge {
         super::ViewStore::open_dir(dir.clone()).map_err(|e| error(e.to_string()))?;
         let database =
             super::resolve_derived_path(&dir, staging).map_err(|e| error(e.to_string()))?;
+        // Prefer a private clone of the base's sealed donor, patched with the
+        // manifest diff, over rebuilding the whole graph. `staging` is a fresh
+        // name, so the clone never reuses another file's name.
+        match sealed_donor(base) {
+            Ok(donor) => {
+                let base_projected = super::callgraph::project_manifest(base)?;
+                let projected = super::callgraph::project_manifest(&composed)?;
+                let mechanism = super::donor::clone_sealed(&donor, &database).map_err(error)?;
+                match super::materialization::apply_manifest_diff_from_blob_reader(
+                    &database,
+                    &base_projected,
+                    &projected,
+                    &reader,
+                ) {
+                    Ok(_) => {
+                        super::donor::record(&dir, super::donor::DonorEvent::Cloned(mechanism));
+                        return Ok(());
+                    }
+                    Err(e) if super::materialization::is_base_fingerprint_mismatch(&e) => {
+                        remove_private_database(&database);
+                        super::donor::record(
+                            &dir,
+                            super::donor::DonorEvent::Cold(
+                                super::donor::ColdReason::BaseFingerprintMismatch,
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        remove_private_database(&database);
+                        return Err(error(e.to_string()));
+                    }
+                }
+            }
+            Err(reason) => {
+                super::donor::record(&dir, super::donor::DonorEvent::Cold(reason));
+            }
+        }
         super::callgraph::materialize(&database, &composed, &reader)
     }
     fn finish_generation_v3(

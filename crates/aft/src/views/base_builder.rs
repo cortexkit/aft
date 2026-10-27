@@ -349,6 +349,12 @@ impl BuildClaim {
     pub fn scope(&self) -> &str {
         &self.scope
     }
+    pub fn storage(&self) -> &Path {
+        &self.storage
+    }
+    pub fn family(&self) -> &str {
+        &self.family
+    }
     pub fn attempt(&self) -> i64 {
         self.attempt
     }
@@ -408,6 +414,12 @@ impl BuildClaim {
                 "base derived graph checkpoint incomplete",
             )));
         }
+        // Seal it as the base's donor before the pointer can name it: no
+        // reader can have it open yet, and every later opener reads it
+        // immutably. Worker checkouts clone it instead of rebuilding.
+        super::donor::seal(&database)
+            .map_err(|reason| BaseRefError::Io(std::io::Error::other(reason)))?;
+        super::donor::record(store.view_dir(), super::donor::DonorEvent::Sealed);
         let reference = store.view_dir().join(format!("derived-{generation}.ref"));
         let temporary = store
             .view_dir()
@@ -558,6 +570,25 @@ pub fn read_stable(path: &Path) -> std::io::Result<Vec<u8>> {
     ))
 }
 
+/// A base member entry. Whether a path is resolver configuration is part of
+/// the membership digest, so it is fixed here, before the base identity is
+/// computed: a later readiness successor cannot change it.
+pub(crate) fn base_entry(
+    path: &super::RelPath,
+    content: crate::blob_store::v2::ContentHash,
+    size: u64,
+    planes: super::manifest_v2::EntryPlanes,
+) -> super::manifest_v2::EntryV2 {
+    let mut entry = super::manifest_v2::EntryV2::regular(content, size, planes);
+    if let super::manifest_v2::EntryV2::Regular {
+        resolution_input, ..
+    } = &mut entry
+    {
+        *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+    }
+    entry
+}
+
 /// Inputs of one base build: the membership the configured walker produced
 /// for `root`, and the effective identity inputs.
 pub struct BaseBuildInput<'a> {
@@ -618,7 +649,7 @@ pub fn build_base(
         producers: super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
             semantic: semantic_producer.clone(),
-            callgraph: callgraph_producer,
+            callgraph: callgraph_producer.clone(),
         },
         head_tree: None,
         ignore_fingerprint,
@@ -640,17 +671,24 @@ pub fn build_base(
             std::ffi::OsString::from(String::from_utf8_lossy(path.as_bytes()).into_owned());
         let source = read_stable(&root.join(relative))?;
         source_bytes += source.len() as u64;
+        // A registered graph producer completes only the members it needs a
+        // blob for; any other member stays without callgraph state, so a
+        // completed base projects. An unregistered producer keeps every
+        // member pending, as lexical-only bases always have.
+        let graph_registered = callgraph_producer != super::semantic_runtime::UNREGISTERED_PRODUCER;
         let planes = super::manifest_v2::EntryPlanes {
             trigram: Some(PlaneState::pending("lexical plane not built")),
             semantic: semantic_producer
                 .as_ref()
                 .filter(|_| super::semantic::applies_to(path))
                 .map(|_| PlaneState::pending("awaiting the base owner")),
-            callgraph: Some(PlaneState::pending("awaiting the base owner")),
+            callgraph: (!graph_registered || super::callgraph::applies_to(path))
+                .then(|| PlaneState::pending("awaiting the base owner")),
         };
         manifest.insert(
             path.clone(),
-            super::manifest_v2::EntryV2::regular(
+            base_entry(
+                path,
                 crate::blob_store::v2::ContentHash::of(&source),
                 source.len() as u64,
                 planes,

@@ -276,6 +276,28 @@ pub fn materialize_from_blob_reader(
     materialize_reading(database_path, manifest, None, reader, None).map(|_| ())
 }
 
+/// [`apply_manifest_diff`] over an immutable blob reader, for a private clone
+/// of a sealed donor built from `base_manifest`. Without the legacy blob
+/// table there are no per-fact resolution inputs, so callers that may read a
+/// changed fact are re-resolved; rows are still rewritten only where they
+/// change. A clone whose recorded fingerprint is not `base_manifest`'s is
+/// refused unchanged (see [`is_base_fingerprint_mismatch`]).
+pub(crate) fn apply_manifest_diff_from_blob_reader(
+    database_path: &Path,
+    base_manifest: &crate::views::Manifest,
+    new_manifest: &crate::views::Manifest,
+    reader: &impl join::ManifestBlobReader,
+) -> Result<MaterializeStats> {
+    materialize_reading(
+        database_path,
+        new_manifest,
+        Some(base_manifest),
+        reader,
+        None,
+    )
+    .map(|(stats, _)| stats)
+}
+
 fn materialize_reading(
     database_path: &Path,
     manifest: &crate::views::Manifest,
