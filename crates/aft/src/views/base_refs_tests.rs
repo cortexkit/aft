@@ -331,7 +331,7 @@ fn an_older_membership_only_reader_refuses_a_published_tree_keyed_base() {
     else {
         panic!("first tree base publication lost")
     };
-    // This reader resolves it with the tree identity.
+    // The current resolver authenticates the scope with its tree identity.
     let resolved = resolve_base(storage.path(), FAMILY, &identity.scope).unwrap();
     assert_eq!(resolved.identity().kind(), BaseKind::Tree);
     assert_eq!(resolved.generation(), generation);
