@@ -2203,7 +2203,7 @@ fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
     }
 }
 
-pub(super) fn is_resolution_input(path: &[u8]) -> bool {
+pub(crate) fn is_resolution_input(path: &[u8]) -> bool {
     let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
     name == b"package.json"
         || name == b"Cargo.toml"

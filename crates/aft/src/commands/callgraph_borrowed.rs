@@ -276,9 +276,12 @@ pub fn disclose_borrowed_answer(
 
 /// Describe the borrowed callgraph this context answers from, or `None` when
 /// callgraph answers come from this checkout's own data: the owner checkout,
-/// a per-checkout query runtime, or a pinned per-HEAD view.
+/// a per-checkout query runtime, a checkout's v3 view or a pinned per-HEAD view.
 pub fn borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
-    if !ctx.shared_artifacts_read_only() || ctx.checkout_query_runtime_active() {
+    if !ctx.shared_artifacts_read_only()
+        || ctx.checkout_query_runtime_active()
+        || ctx.callgraph_views_enabled()
+    {
         return None;
     }
     if ctx.config().views.enabled

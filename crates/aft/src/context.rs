@@ -296,6 +296,10 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The call-graph reader each pinned request acquired from its checkout
+    /// view, so every graph read in one request answers from one generation.
+    static CALLGRAPH_QUERY_READERS: std::cell::RefCell<Vec<(usize, Result<Arc<ReadonlyCallGraphStore>, String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -388,6 +392,8 @@ impl Drop for ConfigPinGuard {
         if let Some(key) = self.key {
             LEXICAL_QUERY_SNAPSHOTS
                 .with(|snapshots| snapshots.borrow_mut().retain(|(id, _)| *id != key));
+            CALLGRAPH_QUERY_READERS
+                .with(|readers| readers.borrow_mut().retain(|(id, _)| *id != key));
             CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
                 outcomes
                     .borrow_mut()
@@ -4555,6 +4561,8 @@ pub struct AppContext {
     checkout_driver: crate::views::first_load::InstalledDriver,
     lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
     lexical_routes: [AtomicU64; 3],
+    callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    callgraph_view_routes: AtomicU64,
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
     /// Wall-clock milliseconds at which the completion drain should next
@@ -5406,6 +5414,8 @@ impl AppContext {
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
             lexical_routes: Default::default(),
+            callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_view_routes: AtomicU64::new(0),
             checkout_semantic: Arc::default(),
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
@@ -8996,6 +9006,7 @@ impl AppContext {
         self.arm_view_disk_limits(next.views.enabled);
         if !next.views.enabled || project_root_changed {
             self.lexical_view.lock().take();
+            self.callgraph_view.lock().take();
         }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
@@ -10534,6 +10545,9 @@ impl AppContext {
         if let Some(view) = self.lexical_view.lock().as_ref() {
             view.record_change(path);
         }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.record_change(path);
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_absolute_change(path);
         }
@@ -10547,6 +10561,9 @@ impl AppContext {
         if let Some(view) = self.lexical_view.lock().as_ref() {
             view.record_overflow();
         }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.record_overflow();
+        }
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_watcher_overflow();
         }
@@ -10556,6 +10573,9 @@ impl AppContext {
     pub(crate) fn record_checkout_watcher_cookie(&self, path: &Path) {
         self.record_checkout_pending_watcher_gap();
         if let Some(view) = self.lexical_view.lock().as_ref() {
+            view.record_cookie(path);
+        }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
             view.record_cookie(path);
         }
         if let Some(driver) = self.checkout_driver.get() {
@@ -10928,6 +10948,23 @@ impl AppContext {
                     CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
                 }
                 Err(_) => CallgraphStoreAccess::Building,
+            };
+        }
+        if self.callgraph_views_enabled() {
+            // Warming runs on the transport loop and must not bind a view
+            // there; only a use of the graph acquires it.
+            if !demand {
+                return CallgraphStoreAccess::Building;
+            }
+            return match self.callgraph_view_reader() {
+                Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+                Some(Err(reason)) if reason.contains(crate::views::read::CALLGRAPH_DISABLED) => {
+                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason))
+                }
+                Some(Err(reason)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                    format!("callgraph view unavailable: {reason}"),
+                )),
+                None => CallgraphStoreAccess::Unavailable,
             };
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
@@ -12059,6 +12096,104 @@ impl AppContext {
     /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
     pub fn lexical_view_route_counts(&self) -> [u64; 3] {
         std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
+    }
+
+    /// With views enabled, call-graph reads (navigation, zoom, inspect) use
+    /// the checkout's v3 view rather than the legacy store or a v1 view. An
+    /// explicitly installed checkout query runtime keeps precedence.
+    pub(crate) fn callgraph_views_enabled(&self) -> bool {
+        let config = self.config();
+        config.views.enabled
+            && config.indexes.callgraph
+            && config.project_root.is_some()
+            && self.heavy_root_work_allowed()
+            && self.cache_unavailable_reason().is_none()
+            && !self.checkout_query_runtime_active()
+    }
+
+    pub(crate) fn callgraph_view_is_ready(&self) -> bool {
+        self.callgraph_view
+            .lock()
+            .as_ref()
+            .is_some_and(|view| view.is_ready())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_callgraph_source_for_test(
+        &self,
+        source: Arc<dyn crate::views::callgraph::CallgraphReaderSource>,
+    ) {
+        let root = self.canonical_cache_root();
+        let family = self.memoized_artifact_cache_key(&root);
+        *self.callgraph_view.lock() = Some(Arc::new(
+            crate::views::callgraph::CallgraphView::with_source(
+                root,
+                self.storage_paths(),
+                family,
+                crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: self.config().search_index_max_file_size,
+                },
+                source,
+            ),
+        ));
+    }
+
+    /// The call-graph reader of this checkout's view, acquired once per
+    /// pinned request. `None` means views do not route call-graph reads; an
+    /// acquisition error is final and never answered from another store.
+    pub(crate) fn callgraph_view_reader(
+        &self,
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, String>> {
+        if !self.callgraph_views_enabled() {
+            return None;
+        }
+        if let Some(reader) = CALLGRAPH_QUERY_READERS.with(|readers| {
+            readers
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == self.config_pin_key())
+                .map(|(_, reader)| reader.clone())
+        }) {
+            return Some(reader);
+        }
+        let config = self.config();
+        let root = self.canonical_cache_root();
+        let storage = self.storage_paths();
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: config.search_index_max_file_size,
+        };
+        let family = self.memoized_artifact_cache_key(&root);
+        let view = {
+            let mut slot = self.callgraph_view.lock();
+            if !slot
+                .as_ref()
+                .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+            {
+                match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
+                    Ok(view) => *slot = Some(Arc::new(view)),
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+            slot.as_ref().unwrap().clone()
+        };
+        self.record_checkout_pending_watcher_gap();
+        let result = view.reader();
+        if pinned_config_for(self.config_pin_key()).is_some() {
+            CALLGRAPH_QUERY_READERS.with(|readers| {
+                readers
+                    .borrow_mut()
+                    .push((self.config_pin_key(), result.clone()))
+            });
+        }
+        if result.is_ok() {
+            self.callgraph_view_routes.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
+    /// Executed v3 call-graph acquisitions (one per pinned request).
+    pub fn callgraph_view_route_count(&self) -> u64 {
+        self.callgraph_view_routes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn search_exact_memo(

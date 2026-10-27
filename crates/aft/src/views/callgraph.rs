@@ -343,6 +343,303 @@ impl PlaneAdapter for CallgraphPlane {
         }
     }
 }
+/// Supplies a checkout's verified call graph to one request, without
+/// exposing its storage layout. Implementations never publish v1/v2 data and
+/// never substitute another store when acquisition fails.
+pub(crate) trait CallgraphReaderSource: Send + Sync {
+    fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, String>;
+    fn record_change(&self, path: &Path);
+    fn record_overflow(&self) {}
+    fn record_cookie(&self, _: &Path) {}
+    /// Source files parsed for call-graph evidence so far.
+    #[cfg(test)]
+    fn extraction_count(&self) -> usize {
+        0
+    }
+}
+
+/// The production source: a v3-only checkout driver carrying the lexical
+/// plane (bases are lexical-ready first) and the call-graph plane.
+struct CheckoutCallgraphSource {
+    driver: Arc<super::first_load::CheckoutDriver>,
+    access: ViewAccess,
+    bridge: Arc<super::first_load::CallgraphBridge>,
+    storage: PathBuf,
+    family: String,
+    scope: String,
+    producers: super::manifest_v2::Producers,
+}
+
+/// True when the snapshot's live entries differ from its published
+/// generation: a graph opened for that generation would answer for older
+/// bytes than the checkout holds.
+fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
+    snapshot
+        .live_entries()
+        .any(|(path, entry)| entry.disk != snapshot.generation().disk_state(path))
+}
+
+impl CallgraphReaderSource for CheckoutCallgraphSource {
+    fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, String> {
+        use super::first_load::FirstLoadDriver;
+        let installed = self.driver.installed_snapshot();
+        // After a restart, start from this checkout's own published worker
+        // generation; verification still reconciles it against the disk.
+        let seed = if installed.generation().name() == "empty" {
+            match super::base_refs::open_foreign_v3(
+                &self.storage,
+                &self.family,
+                &self.scope,
+                &self.producers,
+            ) {
+                Ok(Some(generation)) => generation,
+                Ok(None) => installed.generation().clone(),
+                Err(error) => {
+                    crate::slog_debug!(
+                        "callgraph v3 seed unavailable; reconciling current tree: {}",
+                        error
+                    );
+                    installed.generation().clone()
+                }
+            }
+        } else {
+            installed.generation().clone()
+        };
+        let (mut snapshot, revision) = self
+            .driver
+            .verified_bind(&self.access, seed)
+            .map_err(|error| error.to_string())?;
+        if has_unpublished_changes(&snapshot) {
+            // Publish the edits as a new worker generation (a donor clone
+            // patched with the diff) before the single install, as a fresh
+            // bootstrap does inside `verified_bind`. A second install would
+            // see the first one marked overflowed on a checkout without a
+            // steady watcher subscription and refuse its own cut.
+            let own = self
+                .driver
+                .build_own_generation(
+                    &self.access,
+                    &snapshot,
+                    super::first_load::DERIVED_CALLGRAPH_SEEDING,
+                )
+                .map_err(|error| error.to_string())?;
+            let cut = snapshot
+                .install_cut()
+                .cloned()
+                .ok_or("callgraph view snapshot has no install cut")?;
+            let mut delta = super::snapshot::LiveDelta::from_snapshot(&snapshot);
+            let draft = super::snapshot::derive_successor(
+                &delta.cut(),
+                own,
+                &super::snapshot::carry_disk_state_only,
+            );
+            delta
+                .replay_and_swap(draft, &super::snapshot::carry_disk_state_only)
+                .map_err(|error| format!("{error:?}"))?;
+            snapshot = delta
+                .snapshot()
+                .with_install_cut(cut.clone())
+                .with_reconciled_epoch(snapshot.reconciled_epoch().unwrap_or(cut.epoch));
+        }
+        self.driver
+            .install(&self.access, &snapshot, revision)
+            .map_err(|error| error.to_string())?;
+        // Read the installed cut directly: `installed_snapshot` would mark a
+        // checkout without a steady watcher subscription overflowed at once.
+        // That mark only decides how the next bind reconciles; this cut was
+        // just verified against the disk.
+        let (snapshot, _) = self.driver.installed_cut();
+        if snapshot.pending_intent().next().is_some()
+            || snapshot.watcher() != super::snapshot::WatcherState::Healthy
+            || has_unpublished_changes(&snapshot)
+        {
+            return Err(format!(
+                "callgraph view has unverified writes (pending={:?}, watcher={:?}, unpublished={:?})",
+                snapshot.pending_intent().take(3).collect::<Vec<_>>(),
+                snapshot.watcher(),
+                snapshot
+                    .live_entries()
+                    .filter(|(path, entry)| entry.disk
+                        != snapshot.generation().disk_state(path))
+                    .map(|(path, _)| path.clone())
+                    .take(3)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let reader = match self.bridge.adapter.reader(&self.access, &snapshot) {
+            Ok(reader) => reader,
+            Err(error) if error.reason == super::read::CALLGRAPH_DISABLED => {
+                return Err(error.reason)
+            }
+            Err(_) => {
+                // A generation installed from the durable pointer (after a
+                // restart) has no resident reader yet; it is this checkout's
+                // own v3 member, so open its derived graph here.
+                self.bridge
+                    .adapter
+                    .open_generation(&self.access, snapshot.generation())
+                    .map_err(|error| error.to_string())?;
+                self.bridge
+                    .adapter
+                    .reader(&self.access, &snapshot)
+                    .map_err(|error| error.to_string())?
+            }
+        };
+        Ok(reader.store.clone())
+    }
+
+    fn record_change(&self, path: &Path) {
+        self.driver.record_absolute_change(path);
+    }
+    fn record_overflow(&self) {
+        self.driver.record_watcher_overflow();
+    }
+    fn record_cookie(&self, path: &Path) {
+        self.driver.record_watcher_cookie(path);
+    }
+    #[cfg(test)]
+    fn extraction_count(&self) -> usize {
+        self.bridge.extraction_count()
+    }
+}
+
+/// Checkout-local call-graph authority used when views are enabled. Its v3
+/// member is separate from the lexical view's, so lexical service never waits
+/// for graph extraction; both share the family's content-addressed rows.
+pub(crate) struct CallgraphView {
+    root: PathBuf,
+    storage: crate::root_cache::StoragePaths,
+    family: String,
+    policy: crate::blob_store::v2::TrigramPolicy,
+    source: Arc<dyn CallgraphReaderSource>,
+    query: std::sync::Mutex<()>,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+/// The v3 member scope of a checkout's call-graph view.
+pub(crate) fn view_scope(root: &Path) -> String {
+    format!(
+        "{}.callgraph",
+        crate::path_identity::project_scope_key(root)
+    )
+}
+
+impl CallgraphView {
+    pub(crate) fn matches(
+        &self,
+        root: &Path,
+        storage: &crate::root_cache::StoragePaths,
+        family: &str,
+        policy: crate::blob_store::v2::TrigramPolicy,
+    ) -> bool {
+        self.root == root
+            && self.storage == *storage
+            && self.family == family
+            && self.policy == policy
+    }
+
+    pub(crate) fn new(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: crate::blob_store::v2::TrigramPolicy,
+    ) -> Result<Self, String> {
+        let scope = view_scope(&root);
+        let producers = super::manifest_v2::Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let trigram = Arc::new(super::first_load::TrigramBridge::new(
+            storage.artifacts.clone(),
+            policy,
+        ));
+        let bridge = Arc::new(super::first_load::CallgraphBridge::default());
+        let adapter: Arc<dyn PlaneAdapter> = bridge.adapter.clone();
+        let driver = Arc::new(
+            super::first_load::CheckoutDriver::new_v3(
+                &storage.artifacts,
+                &family,
+                &scope,
+                &root,
+                producers.clone(),
+                Arc::new(super::first_load::ConfiguredMembershipWalker),
+                vec![trigram, bridge.clone()],
+            )
+            .map_err(|error| error.to_string())?
+            .with_adapters(vec![adapter]),
+        );
+        driver.register_write_intent();
+        let source = Arc::new(CheckoutCallgraphSource {
+            access: driver.access(),
+            driver,
+            bridge,
+            storage: storage.artifacts.clone(),
+            family: family.clone(),
+            scope,
+            producers,
+        });
+        Ok(Self::with_source(root, storage, family, policy, source))
+    }
+
+    pub(crate) fn with_source(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: crate::blob_store::v2::TrigramPolicy,
+        source: Arc<dyn CallgraphReaderSource>,
+    ) -> Self {
+        Self {
+            root,
+            storage,
+            family,
+            policy,
+            source,
+            query: std::sync::Mutex::new(()),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn record_change(&self, path: &Path) {
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.source.record_change(path);
+    }
+
+    pub(crate) fn record_overflow(&self) {
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.source.record_overflow();
+    }
+
+    pub(crate) fn record_cookie(&self, path: &Path) {
+        self.source.record_cookie(path);
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extraction_count(&self) -> usize {
+        self.source.extraction_count()
+    }
+
+    /// Acquires a reader pinned to one verified generation. Acquisitions are
+    /// serialized so an installed membership and its graph come from the
+    /// same reconciliation.
+    pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, String> {
+        let _query = self
+            .query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = self.source.acquire();
+        self.ready
+            .store(result.is_ok(), std::sync::atomic::Ordering::Release);
+        result
+    }
+}
+
 fn queryable_manifest(
     manifest: &super::snapshot::ComposedGeneration,
 ) -> Result<Manifest, PlaneError> {
@@ -364,6 +661,173 @@ fn error(reason: impl std::fmt::Display) -> PlaneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FILES: &[(&str, &str)] = &[
+        ("a.ts", "export function target() { return 1; }\n"),
+        (
+            "b.ts",
+            "import { target } from './a';\nexport function caller() { return target(); }\n",
+        ),
+        ("package.json", "{\"name\": \"donor-fixture\"}\n"),
+        ("notes.md", "# notes\n"),
+    ];
+
+    fn checkout(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        for (name, text) in FILES {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    fn callers(store: &ReadonlyCallGraphStore, file: &str, symbol: &str) -> Vec<String> {
+        let mut names: Vec<_> = store
+            .callers_of(Path::new(file), symbol, 1)
+            .unwrap()
+            .callers
+            .iter()
+            .map(|caller| format!("{caller:?}"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn view(root: &Path, storage: &Path) -> CallgraphView {
+        CallgraphView::new(
+            root.to_path_buf(),
+            crate::root_cache::StoragePaths::same(storage),
+            "donor-reuse".into(),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+        )
+        .unwrap()
+    }
+
+    fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
+        super::super::donor::events_under(dir)
+    }
+
+    #[test]
+    fn sealed_base_donor_serves_checkouts_without_reextraction_or_cold_builds() {
+        use super::super::donor::DonorEvent;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let first = checkout(&temp.path().join("first"));
+        let second = checkout(&temp.path().join("second"));
+        let member = |root: &Path| {
+            crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(root)).unwrap()
+        };
+
+        // A fresh checkout bootstraps the base through the base builder,
+        // completes and seals its graph, then clones the donor for itself.
+        let first_view = view(&first, &storage);
+        let first_store = first_view.reader().unwrap();
+        assert_eq!(callers(&first_store, "a.ts", "target").len(), 1);
+        assert_eq!(first_view.extraction_count(), 3, "a.ts, b.ts, package.json");
+        let all = events(&storage);
+        assert_eq!(
+            all.iter().filter(|e| **e == DonorEvent::Sealed).count(),
+            1,
+            "{all:?}"
+        );
+        assert!(
+            !all.iter().any(|e| matches!(e, DonorEvent::Cold(_))),
+            "{all:?}"
+        );
+        assert!(matches!(
+            events(&member(&first)).as_slice(),
+            [DonorEvent::Cloned(_)]
+        ));
+
+        // The base fixed configuration metadata before its first publication.
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let worker = super::super::base_refs::open_foreign_v3(
+            &storage,
+            "donor-reuse",
+            &view_scope(&first),
+            &producers,
+        )
+        .unwrap()
+        .unwrap();
+        let base_scope = worker.base_header().unwrap().scope.clone();
+        let base =
+            super::super::base_refs::resolve_base(&storage, "donor-reuse", &base_scope).unwrap();
+        let config = RelPath::new(b"package.json".to_vec()).unwrap();
+        assert!(matches!(
+            base.manifest().get(&config),
+            Some(EntryV2::Regular {
+                resolution_input: true,
+                ..
+            })
+        ));
+        let donor = super::super::resolve_derived_path(base.view_dir(), base.generation()).unwrap();
+        let seal = super::super::donor::verify(&donor).unwrap();
+        drop((base, worker));
+
+        // A second checkout of the same bytes reuses the base's blobs and its
+        // sealed donor: nothing is parsed and no graph is built cold.
+        let second_view = view(&second, &storage);
+        let second_store = second_view.reader().unwrap();
+        assert_eq!(second_view.extraction_count(), 0);
+        assert_eq!(
+            callers(&second_store, "a.ts", "target"),
+            callers(&first_store, "a.ts", "target")
+        );
+        assert!(matches!(
+            events(&member(&second)).as_slice(),
+            [DonorEvent::Cloned(_)]
+        ));
+
+        // An edit publishes a new worker generation: another fresh clone of
+        // the donor, patched with the diff; only the edited file is parsed.
+        std::fs::write(
+            second.join("c.ts"),
+            "import { caller } from './b';\nexport function top() { return caller(); }\n",
+        )
+        .unwrap();
+        second_view.record_change(&second.join("c.ts"));
+        let edited = second_view.reader().unwrap();
+        assert_eq!(callers(&edited, "b.ts", "caller").len(), 1);
+        assert!(callers(&first_store, "b.ts", "caller").is_empty());
+        assert_eq!(second_view.extraction_count(), 1);
+        let second_events = events(&member(&second));
+        assert_eq!(second_events.len(), 2, "{second_events:?}");
+        assert!(second_events
+            .iter()
+            .all(|e| matches!(e, DonorEvent::Cloned(_))));
+        // Readers of the donor never see a write.
+        super::super::donor::verify_fingerprint(&donor, &seal).unwrap();
+
+        // Deleting a file the worker added leaves no tombstone behind: the
+        // base never had it.
+        std::fs::remove_file(second.join("c.ts")).unwrap();
+        second_view.record_change(&second.join("c.ts"));
+        let deleted = second_view.reader().unwrap();
+        assert!(callers(&deleted, "b.ts", "caller").is_empty());
+        assert_eq!(
+            callers(&deleted, "a.ts", "target"),
+            callers(&first_store, "a.ts", "target")
+        );
+
+        // A restart reopens the published worker generation without parsing
+        // or rebuilding anything.
+        drop((first_store, first_view));
+        let restarted = view(&first, &storage);
+        let reopened = restarted.reader().unwrap();
+        assert_eq!(callers(&reopened, "a.ts", "target").len(), 1);
+        assert_eq!(restarted.extraction_count(), 0);
+        assert_eq!(events(&member(&first)).len(), 1);
+        assert!(!storage.join("blobs/v2").exists());
+    }
 
     #[test]
     fn markdown_is_not_a_callgraph_input_but_resolution_config_is() {

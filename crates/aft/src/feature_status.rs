@@ -403,6 +403,13 @@ pub const fn local_semantic_platform_supported() -> bool {
 }
 
 fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
+    if ctx.callgraph_views_enabled() {
+        return if ctx.callgraph_view_is_ready() {
+            IndexObservation::ready()
+        } else {
+            IndexObservation::building()
+        };
+    }
     let resident = match ctx.callgraph_store().try_read() {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
@@ -466,6 +473,7 @@ pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
 /// transient busy or locked error while opening the published view database.
 pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
     let served_by_view = ctx.checkout_query_runtime_active()
+        || ctx.callgraph_views_enabled()
         || (ctx.config().views.enabled
             && ctx
                 .pinned_view_runtime()

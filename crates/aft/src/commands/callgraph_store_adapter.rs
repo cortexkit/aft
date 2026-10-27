@@ -3058,8 +3058,28 @@ fn content_matches_store(
     };
     Ok(
         stored == crate::cache_freshness::zero_hash().to_hex().as_str()
-            || stored == current.to_hex().as_str(),
+            || stored == current.to_hex().as_str()
+            || stored == view_blob_key(file, current).unwrap_or_default(),
     )
+}
+
+/// A view-materialized graph records each file's call-graph blob key rather
+/// than its raw content hash. The key is derived from the content hash, the
+/// file's language and the extractor version, so the current bytes match
+/// exactly when they derive the stored key.
+fn view_blob_key(file: &str, current: blake3::Hash) -> Option<String> {
+    let language = if crate::views::assembly::is_resolution_input(file.as_bytes()) {
+        "config".to_owned()
+    } else {
+        format!("{:?}", crate::parser::detect_language(Path::new(file))?).to_lowercase()
+    };
+    let key = crate::blob_store::CallgraphKey::from_source_digest(
+        *current.as_bytes(),
+        language,
+        crate::views::callgraph::PRODUCER,
+    )
+    .full_key();
+    Some(crate::blob_store::v2::FamilyKey::from(&key).to_hex())
 }
 
 fn file_matches_store(

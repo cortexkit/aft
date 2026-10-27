@@ -708,12 +708,16 @@ fn handle_inspect_payload(
         .iter()
         .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
     start_on_demand_callgraph_for_inspect(ctx, &snapshot.config);
-    let routed_store = if tier2_enabled && ctx.checkout_query_runtime_active() {
+    // With views on, the graph-backed categories read the checkout's v3 view,
+    // pinned once for this request; an unavailable view is reported, never
+    // replaced by the legacy scanner's store.
+    let v3_routed = tier2_enabled && ctx.callgraph_views_enabled();
+    let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
         ctx.callgraph_store_for_ops()
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
     };
-    let checkout_routed = ctx.checkout_query_outcome().is_some();
+    let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
     let checkout_store = if checkout_routed {
         match routed_store {
             crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
@@ -761,7 +765,7 @@ fn handle_inspect_payload(
     } else {
         None
     };
-    let use_checkout_view = needs_ephemeral_view
+    let use_checkout_view = (needs_ephemeral_view || v3_routed)
         && snapshot.config.views.enabled
         && (checkout_routed || checkout_store.is_some());
     let checkout_view_unavailability = (needs_ephemeral_view

@@ -15716,6 +15716,249 @@ mod tests {
         lexical_views_assert_public_parity(&ctx, &root);
     }
 
+    fn configure_callgraph_views(root: &Path, storage: &Path, views: bool) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode", "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": views },
+                "indexes": { "trigram": true, "semantic": false, "callgraph": true }
+            }))]
+        }))
+    }
+
+    /// The navigation answers whose output the views route must reproduce.
+    fn callgraph_views_answers(ctx: &AppContext, root: &Path) -> Vec<(String, Response)> {
+        let requests = [
+            ("callers", "a.ts", "target", 2),
+            ("impact", "a.ts", "target", 3),
+            ("call_tree", "c.ts", "top", 3),
+            ("trace_to", "a.ts", "target", 5),
+            ("callers", "b.ts", "caller", 1),
+        ];
+        requests
+            .into_iter()
+            .map(|(command, file, symbol, depth)| {
+                let request = RawRequest {
+                    id: format!("callgraph-views-{command}"),
+                    command: command.into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join(file), "symbol": symbol, "depth": depth}),
+                };
+                let response = match command {
+                    "callers" => crate::commands::callers::handle_callers(&request, ctx),
+                    "impact" => crate::commands::impact::handle_impact(&request, ctx),
+                    "call_tree" => crate::commands::call_tree::handle_call_tree(&request, ctx),
+                    _ => crate::commands::trace_to::handle_trace_to(&request, ctx),
+                };
+                (format!("{command} {file} {symbol}"), response)
+            })
+            .collect()
+    }
+
+    /// Compares the views route with the legacy store over the same files,
+    /// built cold by a views-off context in separate storage. The legacy
+    /// store serves no linked worktree, so it reads a plain copy of the
+    /// checkout's files, and both sides render their root as `<root>`.
+    fn callgraph_views_assert_parity(ctx: &AppContext, root: &Path) {
+        let storage = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let copy_root = std::fs::canonicalize(copy.path()).unwrap();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != ".git" {
+                std::fs::copy(entry.path(), copy_root.join(entry.file_name())).unwrap();
+            }
+        }
+        let oracle = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&copy_root, storage.path(), false),
+                &oracle
+            )
+            .success
+        );
+        {
+            let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&oracle, 60_000);
+            let legacy = lazy_ready(oracle.callgraph_store_for_ops());
+            assert_eq!(legacy.reader_kind(), "legacy");
+        }
+        let normalized = |data: &serde_json::Value, root: &Path| {
+            data.to_string()
+                .replace(&root.display().to_string(), "<root>")
+        };
+        let before = ctx.callgraph_view_route_count();
+        let expected = callgraph_views_answers(&oracle, &copy_root);
+        let actual = callgraph_views_answers(ctx, root);
+        for ((label, expected), (_, actual)) in expected.iter().zip(&actual) {
+            assert!(expected.success, "legacy {label}: {:?}", expected.data);
+            assert!(actual.success, "view {label}: {:?}", actual.data);
+            assert_eq!(
+                normalized(&actual.data, root),
+                normalized(&expected.data, &copy_root),
+                "{label}"
+            );
+        }
+        assert!(ctx.callgraph_view_route_count() > before);
+        assert_eq!(oracle.callgraph_view_route_count(), 0);
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+    }
+
+    fn callgraph_views_checkout(kind: OlderCheckoutKind) {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live");
+        init_git_fixture(&live);
+        for (name, text) in [
+            ("a.ts", "export function target() { return 1; }\n"),
+            (
+                "b.ts",
+                "import { target } from './a';\nexport function caller() { return target(); }\n",
+            ),
+            (
+                "c.ts",
+                "import { caller } from './b';\nexport function top() { return caller(); }\n",
+            ),
+        ] {
+            std::fs::write(live.join(name), text).unwrap();
+        }
+        git_commit_all(&live, "graph");
+        let scratch = temp.path().join("scratch");
+        match kind {
+            OlderCheckoutKind::LinkedWorktree => git_ok(
+                &live,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    scratch.to_str().unwrap(),
+                    "HEAD",
+                ],
+            ),
+            _ => git_ok(temp.path(), &["clone", "--quiet", "live", "scratch"]),
+        }
+        let root = std::fs::canonicalize(&scratch).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        callgraph_views_assert_parity(&ctx, &root);
+
+        // Edits: a new caller, a changed callee file and a deletion.
+        std::fs::write(
+            root.join("d.ts"),
+            "import { target } from './a';\nexport function second() { return target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("d.ts"));
+        callgraph_views_assert_parity(&ctx, &root);
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("b.ts"));
+        callgraph_views_assert_parity(&ctx, &root);
+        std::fs::remove_file(root.join("d.ts")).unwrap();
+        ctx.record_checkout_watcher_overflow();
+        callgraph_views_assert_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+
+        // Restart: a new context reopens the published view.
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        drop(ctx);
+        let restarted = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &restarted
+            )
+            .success
+        );
+        callgraph_views_assert_parity(&restarted, &root);
+    }
+
+    #[test]
+    fn callgraph_views_public_linked_worktree_parity_across_edits_and_restart() {
+        callgraph_views_checkout(OlderCheckoutKind::LinkedWorktree);
+    }
+
+    #[test]
+    fn callgraph_views_public_plain_clone_parity_across_edits_and_restart() {
+        callgraph_views_checkout(OlderCheckoutKind::PlainClone);
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_failure_never_uses_the_legacy_store() {
+        struct Refused(std::sync::atomic::AtomicUsize);
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<Arc<crate::callgraph_store::ReadonlyCallGraphStore>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("callgraph source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        // A legacy store built for this very root must not answer either.
+        let legacy = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, false), &legacy)
+                .success
+        );
+        let legacy_store = {
+            let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&legacy, 60_000);
+            lazy_ready(legacy.callgraph_store_for_ops())
+        };
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        *ctx.callgraph_store().write().unwrap() = Some(legacy_store);
+        let refused = Arc::new(Refused(Default::default()));
+        ctx.install_callgraph_source_for_test(refused.clone());
+        let _pin = ctx.pin_config();
+        let answers = callgraph_views_answers(&ctx, &root);
+        for (label, answer) in &answers {
+            assert!(!answer.success, "{label}: {:?}", answer.data);
+            assert!(
+                answer.data.to_string().contains("deliberately refused"),
+                "{label}: {:?}",
+                answer.data
+            );
+        }
+        // One pinned request acquires once and keeps its refusal.
+        let inspect_access = ctx.callgraph_store_for_query_without_wait();
+        assert!(matches!(
+            inspect_access,
+            CallgraphStoreAccess::Error(ref error) if error.to_string().contains("deliberately refused")
+        ));
+        assert_eq!(refused.0.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.callgraph_view_route_count(), 0);
+        // Views off keeps the legacy store exactly as before.
+        assert_eq!(legacy.callgraph_view_route_count(), 0);
+        let legacy_answers = callgraph_views_answers(&legacy, &root);
+        assert!(
+            legacy_answers[0].1.success,
+            "{:?}",
+            legacy_answers[0].1.data
+        );
+    }
+
     fn configure_search_with_max_file_size(
         root: &std::path::Path,
         storage: &std::path::Path,
