@@ -12128,6 +12128,16 @@ mod tests {
         };
         drop(ctx);
         crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(storage, root));
+        // The checkout's v3 views end their registry sessions and settle their
+        // checkpoints on short-lived detached threads; a real stop ends the
+        // process. Give those threads a bounded moment to close.
+        let v3 = storage.join("blobs").join("v3");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && !crate::db::file_identity::open_connections_under_for_test(&v3).is_empty()
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let held = crate::db::file_identity::open_connections_under_for_test(storage);
         assert!(
             held.is_empty(),
@@ -12760,111 +12770,11 @@ mod tests {
             "both files were extracted again"
         );
 
-        // Rebuilding from scratch flushes its database before bind returns, so
-        // there is no background checkpoint to pause. Publish an edit below and
-        // pause that generation's checkpoint with a real SQLite writer.
-        // An exclusive rollback-journal transaction makes short-lived lock
-        // contention observable without racing the scheduler.
-        enum CheckpointObservation {
-            Waiting,
-            Answer(std::thread::Result<(String, String)>),
-        }
-        let (begin_tx, begin_rx) = std::sync::mpsc::channel();
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (observation_tx, observation_rx) = std::sync::mpsc::channel();
-        let waiting_tx = observation_tx.clone();
-        crate::views::checkpoint_test_hooks()
-            .lock()
-            .unwrap()
-            .insert(
-                view_dir.clone(),
-                crate::views::CheckpointTestHooks {
-                    before_settled: Some(Box::new(move |path| {
-                        begin_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-                        let connection = crate::db::file_identity::IdentityConnection::open(
-                            path,
-                            "checkpoint contention fixture",
-                        )
-                        .unwrap();
-                        let journal: String = connection
-                            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-                            .unwrap();
-                        assert_eq!(journal, "delete");
-                        connection.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-                        locked_tx.send(path.to_path_buf()).unwrap();
-                        let _ = release_rx.recv_timeout(Duration::from_secs(60));
-                        connection
-                            .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
-                            .unwrap();
-                    })),
-                    before_wait: Some(Box::new(move || {
-                        waiting_tx.send(CheckpointObservation::Waiting).unwrap();
-                    })),
-                },
-            );
-        let source = fs::read_to_string(root.join("lib.rs")).unwrap();
-        fs::write(
-            root.join("lib.rs"),
-            format!("{source}\n// checkpoint synchronization fixture\n"),
-        )
-        .unwrap();
-        let checkpoint_publication = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .unwrap();
-        assert!(
-            checkpoint_publication.published,
-            "{checkpoint_publication:?}"
-        );
-        let generation = checkpoint_publication
-            .generation
-            .expect("incremental checkpoint generation");
-        begin_tx.send(()).unwrap();
-        let locked_path = locked_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        // With views on, answers come from the checkout's own v3 view; the v1
+        // publication's checkpoint no longer stands between a query and its
+        // graph. The rebuilt checkout answers exactly as before.
         assert_eq!(
-            locked_path,
-            crate::views::resolve_derived_path(&view_dir, &generation).unwrap()
-        );
-        let request: RawRequest = serde_json::from_value(serde_json::json!({
-            "id": "checkpoint-busy", "command": "callers", "session_id": "after-removal",
-            "file": "lib.rs", "symbol": "target"
-        }))
-        .unwrap();
-        let busy = crate::commands::callers::handle_callers(&request, &ctx);
-        assert!(!busy.success, "{busy:?}");
-        assert_eq!(busy.data["code"], "callgraph_building", "{busy:?}");
-        let reader_ctx = Arc::clone(&ctx);
-        let reader = std::thread::spawn(move || {
-            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                blob_removal_answers(&reader_ctx)
-            }));
-            observation_tx
-                .send(CheckpointObservation::Answer(answer))
-                .unwrap();
-        });
-        assert!(
-            matches!(
-                observation_rx
-                    .recv_timeout(Duration::from_secs(60))
-                    .unwrap(),
-                CheckpointObservation::Waiting
-            ),
-            "the fixture read before the checkpoint completion event"
-        );
-        release_tx.send(()).unwrap();
-        let CheckpointObservation::Answer(answer) = observation_rx
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap()
-        else {
-            panic!("checkpoint waiter did not answer");
-        };
-        reader.join().unwrap();
-        crate::views::checkpoint_test_hooks()
-            .lock()
-            .unwrap()
-            .remove(&view_dir);
-        assert_eq!(
-            answer.unwrap(),
+            blob_removal_answers(&ctx),
             (
                 fixture.callers_before.clone(),
                 fixture.call_tree_before.clone()
@@ -15897,7 +15807,10 @@ mod tests {
         impl crate::views::callgraph::CallgraphReaderSource for Refused {
             fn acquire(
                 &self,
-            ) -> Result<Arc<crate::callgraph_store::ReadonlyCallGraphStore>, String> {
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Err("callgraph source deliberately refused".into())
             }

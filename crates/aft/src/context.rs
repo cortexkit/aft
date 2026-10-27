@@ -298,7 +298,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// The call-graph reader each pinned request acquired from its checkout
     /// view, so every graph read in one request answers from one generation.
-    static CALLGRAPH_QUERY_READERS: std::cell::RefCell<Vec<(usize, Result<Arc<ReadonlyCallGraphStore>, String>)>> =
+    static CALLGRAPH_QUERY_READERS: std::cell::RefCell<Vec<(usize, Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -10958,11 +10958,24 @@ impl AppContext {
             }
             return match self.callgraph_view_reader() {
                 Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
-                Some(Err(reason)) if reason.contains(crate::views::read::CALLGRAPH_DISABLED) => {
-                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason))
+                // A lock held on the view's database says nothing about the
+                // graph: report SQLite's busy error, which callers present as
+                // building, retry shortly.
+                Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(
+                    CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        Some(error.reason),
+                    )),
+                ),
+                Some(Err(error))
+                    if error
+                        .reason
+                        .contains(crate::views::read::CALLGRAPH_DISABLED) =>
+                {
+                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
                 }
-                Some(Err(reason)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
-                    format!("callgraph view unavailable: {reason}"),
+                Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                    format!("callgraph view unavailable: {error}"),
                 )),
                 None => CallgraphStoreAccess::Unavailable,
             };
@@ -12143,7 +12156,8 @@ impl AppContext {
     /// acquisition error is final and never answered from another store.
     pub(crate) fn callgraph_view_reader(
         &self,
-    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, String>> {
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
+    {
         if !self.callgraph_views_enabled() {
             return None;
         }
@@ -12171,7 +12185,7 @@ impl AppContext {
             {
                 match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
                     Ok(view) => *slot = Some(Arc::new(view)),
-                    Err(error) => return Some(Err(error)),
+                    Err(error) => return Some(Err(error.into())),
                 }
             }
             slot.as_ref().unwrap().clone()
@@ -20427,10 +20441,15 @@ mod callgraph_store_for_ops_tests {
         assert!(!message.contains("retry shortly"), "{message}");
     }
 
+    /// With views on, a commit that changes the graph is answered from the
+    /// checkout as it now is: the stale legacy store, which still holds the
+    /// removed call, never answers.
     #[test]
-    fn views_pending_head_callers_reports_building_instead_of_serving_legacy() {
+    fn views_changed_head_callers_answer_the_current_tree_not_the_stale_legacy_store() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
+        let before = fixture.callers();
+        assert!(before.success, "{:#}", before.data);
+        assert_eq!(before.data["total_callers"], 1, "{:#}", before.data);
         fixture.commit_source(
             "pub fn caller() {}\npub fn target() {}\n",
             "remove stale call",
@@ -20447,55 +20466,53 @@ mod callgraph_store_for_ops_tests {
 
         let response = fixture.callers();
 
-        assert!(!response.success, "pending HEAD must not serve stale rows");
-        assert_eq!(response.data["code"], "callgraph_building");
+        assert!(response.success, "{:#}", response.data);
         assert_eq!(
-            response.data["message"],
-            "callers: callgraph store is building in the background; retry shortly"
+            response.data["total_callers"], 0,
+            "the changed HEAD must not serve stale rows: {:#}",
+            response.data
         );
     }
 
     impl ViewsCallgraphFixture {
-        /// Publish the current HEAD as a generation without call graph data,
-        /// as a session with the call graph off does, and pin it as this
-        /// context's view, as configure does when it loads that generation.
-        fn publish_without_callgraph(&self) -> String {
-            let view = self.ctx.view_runtime_snapshot().expect("view runtime");
-            let head = crate::alias::head_tree_entries(&self.root).expect("HEAD entries");
-            let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
-            let report = crate::views::assembly::publish_checkout(
-                &crate::views::assembly::AssemblyRequest {
-                    storage: view.storage.clone(),
-                    project_root: self.root.clone(),
-                    family: view.family.clone(),
-                    scope: view.scope.clone(),
-                    desired_head: desired_head.clone(),
-                    changed_paths: Default::default(),
-                    semantic_keys: Default::default(),
-                    require_semantic: false,
-                    allow_blob_put: true,
-                    callgraph: false,
-                },
+        /// Hold this checkout's v3 call-graph view database busy the way a
+        /// writer does mid-maintenance: an exclusive lock that a reader cannot
+        /// get past. Binds the view first (one answered query), then drops
+        /// this context's view (turning views off and on again) so the next
+        /// query must open the database, and waits for the deferred checkpoint
+        /// so only the returned connection holds the file.
+        fn hold_checkout_view_derived_busy(&self) -> rusqlite::Connection {
+            let bound = self.callers();
+            assert!(bound.success, "{:#}", bound.data);
+            self.ctx
+                .update_config(|config| config.views.enabled = false);
+            self.ctx.update_config(|config| config.views.enabled = true);
+            let storage = self.ctx.storage_paths().artifacts;
+            let family = self.ctx.memoized_artifact_cache_key(&self.root);
+            let member = crate::blob_store::v3::view_dir(
+                &storage,
+                &family,
+                &crate::views::callgraph::view_scope(&self.root),
             )
-            .expect("keyless view publication");
-            assert!(report.published, "keyless generation must publish");
-            let manifest = report.manifest.expect("published manifest");
-            assert!(crate::views::assembly::manifest_lacks_callgraph(&manifest));
-            let generation = report.generation.expect("published generation");
-            let pin =
-                crate::pins::QueryPin::acquire(&view.view_dir, &generation).expect("query pin");
-            self.ctx.install_view_runtime(
-                ViewRuntimeSnapshot {
-                    generation: Some(generation.clone()),
-                    manifest: Some(manifest),
-                    head_fingerprint: desired_head,
-                    pending_paths: BTreeSet::new(),
-                    pending_inputs: BTreeMap::new(),
-                    ..view
-                },
-                Some(pin),
+            .expect("v3 member directory");
+            crate::views::wait_for_derived_checkpoint_for_test(&member);
+            let generation = crate::views::ViewStore::open_dir(member.clone())
+                .expect("v3 member view")
+                .current_generation()
+                .expect("v3 pointer")
+                .expect("published v3 generation");
+            let path =
+                crate::views::resolve_derived_path(&member, &generation).expect("derived path");
+            assert!(
+                path.is_file(),
+                "derived database {} missing",
+                path.display()
             );
-            generation
+            let holder = rusqlite::Connection::open(&path).expect("derived writer");
+            holder
+                .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+                .expect("exclusive derived lock");
+            holder
         }
 
         /// Hold the derived database of the pinned generation busy the way a
@@ -20522,43 +20539,46 @@ mod callgraph_store_for_ops_tests {
         }
     }
 
-    /// Whether a generation carries a call graph is a property of its
-    /// manifest alone. A generation published with the call graph off must
-    /// answer "disabled" even while its derived database is busy; answering
-    /// "building, retry" would send the agent into a retry loop for a graph
-    /// that will never be built from this generation.
+    /// A call graph turned off is never built and never answered: with views
+    /// on and `indexes.callgraph=false` the call-graph tools report the index
+    /// off without binding a checkout view.
     #[test]
-    fn views_keyless_generation_answers_disabled_while_derived_store_is_busy() {
+    fn views_callgraph_index_off_answers_off_without_binding_a_view() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish_without_callgraph();
-        let _busy = fixture.hold_pinned_derived_busy();
+        fixture
+            .ctx
+            .update_config(|config| config.indexes.callgraph = false);
 
         let response = fixture.callers();
 
         assert!(!response.success, "{:#}", response.data);
         assert_eq!(
-            response.data["code"], "callgraph_unavailable",
+            response.data["code"], "callgraph_off",
             "{:#}",
             response.data
         );
-        assert!(
-            response.data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(crate::views::read::CALLGRAPH_DISABLED)),
-            "{:#}",
-            response.data
-        );
+        assert!(matches!(
+            fixture.ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Off
+        ));
+        assert_eq!(fixture.ctx.callgraph_view_route_count(), 0);
+        let member = crate::blob_store::v3::view_dir(
+            &fixture.ctx.storage_paths().artifacts,
+            &fixture.ctx.memoized_artifact_cache_key(&fixture.root),
+            &crate::views::callgraph::view_scope(&fixture.root),
+        )
+        .unwrap();
+        assert!(!member.exists());
     }
 
-    /// The counterpart: a generation that does carry a call graph, read while
+    /// A generation that does carry a call graph, read while
     /// its derived database is busy, is temporarily unreadable and says so as
     /// a retryable `callgraph_building`. This also proves the busy hold above
     /// really blocks a reader that opens the store.
     #[test]
     fn views_keyed_generation_answers_building_while_derived_store_is_busy() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
-        let _busy = fixture.hold_pinned_derived_busy();
+        let busy = fixture.hold_checkout_view_derived_busy();
 
         let response = fixture.callers();
 
@@ -20572,13 +20592,15 @@ mod callgraph_store_for_ops_tests {
             response.data["message"],
             "callers: persisted callgraph store is busy; retry shortly"
         );
+        drop(busy);
+        let response = fixture.callers();
+        assert!(response.success, "{:#}", response.data);
     }
 
     #[test]
     fn views_keyed_generation_inspect_reports_pending_while_derived_store_is_busy() {
         let fixture = ViewsCallgraphFixture::new();
         fixture.ctx.set_harness(crate::harness::Harness::Runner);
-        fixture.publish();
         let inspect = || {
             crate::commands::inspect::handle_inspect(
                 &RawRequest {
@@ -20594,7 +20616,7 @@ mod callgraph_store_for_ops_tests {
                 &fixture.ctx,
             )
         };
-        let busy = fixture.hold_pinned_derived_busy();
+        let busy = fixture.hold_checkout_view_derived_busy();
 
         let response = inspect();
 
@@ -20740,7 +20762,6 @@ mod callgraph_store_for_ops_tests {
     #[test]
     fn views_keyed_generation_zoom_reports_building_while_derived_store_is_busy() {
         let fixture = ViewsCallgraphFixture::new();
-        fixture.publish();
         let zoom = || {
             crate::commands::zoom::handle_zoom(
                 &RawRequest {
@@ -20757,7 +20778,7 @@ mod callgraph_store_for_ops_tests {
                 &fixture.ctx,
             )
         };
-        let busy = fixture.hold_pinned_derived_busy();
+        let busy = fixture.hold_checkout_view_derived_busy();
 
         let response = zoom();
 

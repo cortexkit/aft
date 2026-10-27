@@ -718,6 +718,24 @@ fn handle_inspect_payload(
         crate::context::CallgraphStoreAccess::Unavailable
     };
     let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
+    // Why the v3 view could not serve, observed once from the access this
+    // request already holds: a SQLite lock is contention (pending, retry),
+    // anything else is unavailability.
+    let routed_observation = v3_routed.then(|| match &routed_store {
+        crate::context::CallgraphStoreAccess::Error(error)
+            if error.is_transient_lock_contention() =>
+        {
+            (crate::feature_status::IndexObservation::building(), true)
+        }
+        crate::context::CallgraphStoreAccess::Error(error) => (
+            crate::feature_status::IndexObservation::unavailable(error.to_string()),
+            false,
+        ),
+        access => (
+            crate::feature_status::callgraph_access_observation(ctx, access),
+            false,
+        ),
+    });
     let checkout_store = if checkout_routed {
         match routed_store {
             crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
@@ -762,12 +780,17 @@ fn handle_inspect_payload(
         && checkout_store.is_none()
     {
         Some(crate::feature_status::observe_callgraph_query_with_contention(ctx))
+    } else if checkout_store.is_none() {
+        routed_observation
     } else {
         None
     };
+    // A v3-routed request scans only with a reader in hand; without one its
+    // graph-backed categories report the gap below rather than running the
+    // legacy reuse scanner.
     let use_checkout_view = (needs_ephemeral_view || v3_routed)
         && snapshot.config.views.enabled
-        && (checkout_routed || checkout_store.is_some());
+        && (checkout_store.is_some() || (checkout_routed && !v3_routed));
     let checkout_view_unavailability = (needs_ephemeral_view
         && snapshot.config.views.enabled
         && !checkout_routed
@@ -834,7 +857,7 @@ fn handle_inspect_payload(
         if outcomes.contains_key(&category) {
             continue;
         }
-        if (scope_was_provided || !ctx.inspect_writer()) && !use_checkout_view {
+        if (scope_was_provided || !ctx.inspect_writer() || v3_routed) && !use_checkout_view {
             continue;
         }
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {

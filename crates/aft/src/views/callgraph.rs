@@ -70,8 +70,11 @@ pub fn attach(
     let blob = if language == "config" {
         CallgraphBlob::config(source.to_vec(), PRODUCER)
     } else {
+        // A source that is not valid UTF-8 cannot be parsed. As in checkout
+        // assembly, it gets the call graph of an empty file rather than
+        // failing the whole reconciliation.
         CallgraphBlob::extract(
-            std::str::from_utf8(source).map_err(error)?,
+            std::str::from_utf8(source).unwrap_or(""),
             language,
             PRODUCER,
         )
@@ -291,7 +294,13 @@ impl PlaneAdapter for CallgraphPlane {
             dir,
             generation.name(),
         )
-        .map_err(error)?;
+        .map_err(|e| {
+            if e.is_transient_lock_contention() {
+                error(format!("{DERIVED_STORE_BUSY}: {e}"))
+            } else {
+                error(e)
+            }
+        })?;
         let retired = self
             .readers
             .write()
@@ -343,11 +352,45 @@ impl PlaneAdapter for CallgraphPlane {
         }
     }
 }
+/// Why a checkout view could not supply a reader. `busy` marks a transient
+/// SQLite lock on the view's database: the graph exists and the caller should
+/// retry, which is reported as building rather than unavailable.
+#[derive(Clone, Debug)]
+pub(crate) struct CallgraphViewError {
+    pub reason: String,
+    pub busy: bool,
+}
+
+impl From<String> for CallgraphViewError {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            busy: false,
+        }
+    }
+}
+
+impl From<&str> for CallgraphViewError {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for CallgraphViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// Prefix of the plane error for a derived database that a SQLite lock kept
+/// from opening.
+pub(crate) const DERIVED_STORE_BUSY: &str = "callgraph derived store is busy";
+
 /// Supplies a checkout's verified call graph to one request, without
 /// exposing its storage layout. Implementations never publish v1/v2 data and
 /// never substitute another store when acquisition fails.
 pub(crate) trait CallgraphReaderSource: Send + Sync {
-    fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, String>;
+    fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError>;
     fn record_change(&self, path: &Path);
     fn record_overflow(&self) {}
     fn record_cookie(&self, _: &Path) {}
@@ -380,7 +423,7 @@ fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
 }
 
 impl CallgraphReaderSource for CheckoutCallgraphSource {
-    fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, String> {
+    fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
         use super::first_load::FirstLoadDriver;
         let installed = self.driver.installed_snapshot();
         // After a restart, start from this checkout's own published worker
@@ -464,12 +507,13 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                     .map(|(path, _)| path.clone())
                     .take(3)
                     .collect::<Vec<_>>(),
-            ));
+            )
+            .into());
         }
         let reader = match self.bridge.adapter.reader(&self.access, &snapshot) {
             Ok(reader) => reader,
             Err(error) if error.reason == super::read::CALLGRAPH_DISABLED => {
-                return Err(error.reason)
+                return Err(error.reason.into())
             }
             Err(_) => {
                 // A generation installed from the durable pointer (after a
@@ -478,7 +522,10 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                 self.bridge
                     .adapter
                     .open_generation(&self.access, snapshot.generation())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| CallgraphViewError {
+                        busy: error.reason.starts_with(DERIVED_STORE_BUSY),
+                        reason: error.to_string(),
+                    })?;
                 self.bridge
                     .adapter
                     .reader(&self.access, &snapshot)
@@ -628,7 +675,7 @@ impl CallgraphView {
     /// Acquires a reader pinned to one verified generation. Acquisitions are
     /// serialized so an installed membership and its graph come from the
     /// same reconciliation.
-    pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, String> {
+    pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
         let _query = self
             .query
             .lock()
@@ -813,6 +860,9 @@ mod tests {
         second_view.record_change(&second.join("c.ts"));
         let deleted = second_view.reader().unwrap();
         assert!(callers(&deleted, "b.ts", "caller").is_empty());
+        // A reader acquired before the deletion keeps answering for its own
+        // generation: publication never reclaims a generation a reader holds.
+        assert_eq!(callers(&edited, "b.ts", "caller").len(), 1);
         assert_eq!(
             callers(&deleted, "a.ts", "target"),
             callers(&first_store, "a.ts", "target")

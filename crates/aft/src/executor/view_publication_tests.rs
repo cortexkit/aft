@@ -1784,63 +1784,6 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
 }
 
 #[test]
-fn inspect_view_pending_reply_names_publication_not_changed_sources() {
-    use crate::inspect::{InspectCategory, InspectSnapshot, JobScope};
-    let fixture = Fixture::new();
-    fixture.ctx.set_harness(crate::harness::Harness::Opencode);
-    let root = fixture.ctx.canonical_cache_root();
-    let family = crate::search_index::artifact_cache_key(&root);
-    crate::root_cache::configure_artifact_access(&root, &family, false);
-    let snapshot = InspectSnapshot {
-        project_root: root.clone(),
-        inspect_dir: fixture.ctx.inspect_dir(),
-        config: fixture.ctx.config(),
-        symbol_cache: fixture.ctx.symbol_cache(),
-        inspect_writer: true,
-        callgraph_writer: true,
-    };
-    let initial = fixture
-        .ctx
-        .inspect_manager()
-        .tier2_run_with_reuse_blocking_fresh(
-            snapshot,
-            InspectCategory::DeadCode,
-            JobScope::for_project(root),
-        );
-    assert_eq!(initial.payload().unwrap()["callgraph_available"], true);
-    fixture.change("waiting_for_view");
-    let response = crate::commands::inspect::handle_inspect_warm_for_test(
-        &crate::protocol::RawRequest {
-            id: "pending-view".into(),
-            command: "inspect".into(),
-            params: serde_json::json!({"scope": "tracked.rs", "sections": ["dead_code"]}),
-            session_id: None,
-            lsp_hints: None,
-        },
-        &fixture.ctx,
-    );
-    assert!(response.success, "{:?}", response.data);
-    let text = response.data["text"].as_str().unwrap();
-    assert!(
-        text.contains("dead code waits for this checkout's index view to publish"),
-        "{text}"
-    );
-    assert!(
-        text.contains("publication schedules a Tier-2 refresh"),
-        "{text}"
-    );
-    assert!(!text.contains("sources or configuration changed"), "{text}");
-    assert!(
-        !text.contains("cached source contributions, file set, or analysis configuration changed"),
-        "{text}"
-    );
-    assert_eq!(
-        response.data["summary"]["dead_code"]["gaps"][0]["kind"],
-        "view_pending"
-    );
-}
-
-#[test]
 fn publication_busy_readiness_uses_backoff_and_recovers_after_unlock() {
     let fixture = Fixture::new();
     let derived = fixture.view.derived_path(&fixture.initial).unwrap();
@@ -2660,13 +2603,15 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
         Lane::PureRead,
         "view.read".to_owned(),
         Box::new(|ctx| {
+            // The checkout view answers from the tree as it now is, without
+            // waiting for the held publication.
             let CallgraphStoreAccess::Ready(store) = ctx.callgraph_store_for_ops() else {
-                panic!("previous view reader unavailable")
+                panic!("checkout view reader unavailable")
             };
             assert!(crate::callgraph_store::CallGraphRead::node_for(
                 &store,
                 Path::new("tracked.rs"),
-                "previous"
+                "next"
             )
             .is_ok());
             Response::success("view.read", serde_json::json!({}))
@@ -2684,7 +2629,7 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
         .expect("same-root read must complete while publication is held");
     assert!(
         read_result.success,
-        "previous view read failed: {read_result:?}"
+        "same-root view read failed: {read_result:?}"
     );
     assert_eq!(
         fixture.view.current_generation().unwrap().as_deref(),
@@ -2749,77 +2694,6 @@ fn invalidated_publication_cancels_before_derived_and_removes_generation_files()
         "newer"
     )
     .is_ok());
-}
-
-#[test]
-fn generation_sweep_waits_for_the_last_query_handle() {
-    let fixture = Fixture::new();
-    let CallgraphStoreAccess::Ready(previous_reader) = fixture.ctx.callgraph_store_for_ops() else {
-        panic!("previous reader unavailable")
-    };
-    // The initial publication also owns a deferred checkpoint connection. Settle
-    // it before replacing the view, so the old query handle is the only keeper
-    // of the obsolete database whose lifetime this test asserts.
-    crate::views::wait_for_generation_maintenance_for_test(fixture.view.view_dir());
-    // The replacing publication schedules its own generation cleanup, which
-    // would reclaim the old generation as soon as the reader drops, racing the
-    // explicit sweeps below. Park that worker at the start of each lap until
-    // they have run, so these sweeps alone decide what is removed.
-    let (release_cleanup, parked) = std::sync::mpsc::channel::<()>();
-    let parked = Mutex::new(parked);
-    let parked_laps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = std::sync::Arc::clone(&parked_laps);
-    let parking = crate::storage_retention::observe_test_hook(
-        fixture.view.view_dir(),
-        std::sync::Arc::new(move |step| {
-            if step == "post-publication-sweep" {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Returns once the sender is dropped.
-                let _ = parked.lock().recv_timeout(Duration::from_secs(60));
-            }
-        }),
-    );
-    fixture.change("next");
-    fixture.schedule();
-    fixture.wait_idle();
-    assert_eq!(fixture.view.sweep_generations().unwrap(), 0);
-    assert!(fixture
-        .view
-        .derived_path(&fixture.initial)
-        .unwrap()
-        .is_file());
-    assert!(crate::callgraph_store::CallGraphRead::node_for(
-        &previous_reader,
-        Path::new("tracked.rs"),
-        "previous"
-    )
-    .is_ok());
-    drop(previous_reader);
-    assert_eq!(fixture.view.sweep_generations().unwrap(), 1);
-    assert!(!fixture
-        .view
-        .derived_path(&fixture.initial)
-        .unwrap()
-        .exists());
-    assert!(!fixture
-        .view
-        .manifest_path(&fixture.initial)
-        .unwrap()
-        .exists());
-    // Let the parked cleanup run. It must find nothing more to remove, and it
-    // must actually have been parked, or the explicit sweeps above raced it.
-    drop(release_cleanup);
-    crate::views::wait_for_generation_maintenance_for_test(fixture.view.view_dir());
-    drop(parking);
-    assert!(
-        parked_laps.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "the replacing publication's cleanup was never parked"
-    );
-    assert!(!fixture
-        .view
-        .derived_path(&fixture.initial)
-        .unwrap()
-        .exists());
 }
 
 #[test]

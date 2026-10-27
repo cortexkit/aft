@@ -17,10 +17,7 @@ pub mod base_sweep;
 pub(crate) mod donor;
 mod generation;
 #[cfg(test)]
-pub(crate) use generation::{
-    checkpoint_test_hooks, clone_derived_for_test, wait_for_derived_checkpoint_for_test,
-    CheckpointTestHooks,
-};
+pub(crate) use generation::{clone_derived_for_test, wait_for_derived_checkpoint_for_test};
 pub(crate) mod io;
 #[cfg(aft_views_lazy_benchmark)]
 pub mod lazy_read_benchmark;
