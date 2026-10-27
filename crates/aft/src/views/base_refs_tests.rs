@@ -227,6 +227,141 @@ fn a_membership_keyed_base_never_claims_tree_identity() {
     ));
 }
 
+/// A tree claim over `files`: every entry carries its real Git blob OID and
+/// the header names `tree` (a well-formed but unproven string).
+pub(crate) fn tree_manifest(files: &[(&str, &[u8])], tree: &str) -> ManifestV2 {
+    let mut manifest = base_manifest(files);
+    manifest.header_mut().head_tree = Some(tree.into());
+    for (name, bytes) in files {
+        if let Some(EntryV2::Regular { git_oid, .. }) = manifest.get_mut(&path(name)) {
+            *git_oid = Some(to_hex(
+                &crate::git_index_reader::ObjectFormat::Sha1.blob_oid(bytes),
+            ));
+        }
+    }
+    manifest
+}
+
+#[test]
+fn tree_claims_get_their_own_identity_kind_and_never_a_membership_scope() {
+    let files: &[(&str, &[u8])] = &[("a.rs", b"one"), ("b.rs", b"two")];
+    let tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let manifest = tree_manifest(files, tree);
+    let identity = BaseIdentity::of(FAMILY, &manifest).unwrap();
+    assert_eq!(identity.kind(), BaseKind::Tree);
+    assert!(identity.scope.starts_with(TREE_BASE_SCOPE_PREFIX));
+    let membership = BaseIdentity::of(FAMILY, &base_manifest(files)).unwrap();
+    assert_eq!(membership.kind(), BaseKind::Membership);
+    assert_ne!(identity.scope, membership.scope);
+    assert_ne!(identity.membership, membership.membership);
+
+    // The tree string and every OID are part of the identity.
+    let other_tree = tree_manifest(files, &"1".repeat(40));
+    assert_ne!(BaseIdentity::of(FAMILY, &other_tree).unwrap(), identity);
+    let mut other_oid = manifest.clone();
+    if let Some(EntryV2::Regular { git_oid, .. }) = other_oid.get_mut(&path("a.rs")) {
+        *git_oid = Some("2".repeat(40));
+    }
+    assert_ne!(BaseIdentity::of(FAMILY, &other_oid).unwrap(), identity);
+    // Readiness successors keep the identity.
+    let mut ready = manifest.clone();
+    if let Some(EntryV2::Regular { planes, .. }) = ready.get_mut(&path("a.rs")) {
+        planes.semantic = Some(PlaneState::ready(&FamilyKey::new(
+            FamilyPlane::Semantic,
+            [9; 32],
+        )));
+    }
+    assert_eq!(BaseIdentity::of(FAMILY, &ready).unwrap(), identity);
+
+    // Malformed claims are refused, never reinterpreted.
+    for forged in ["caller-supplied", &tree.to_uppercase(), &tree[..39]] {
+        let mut bad = manifest.clone();
+        bad.header_mut().head_tree = Some(forged.to_owned());
+        assert!(matches!(
+            BaseIdentity::of(FAMILY, &bad),
+            Err(BaseRefError::Corrupt(_))
+        ));
+    }
+    let mut missing_oid = manifest.clone();
+    if let Some(EntryV2::Regular { git_oid, .. }) = missing_oid.get_mut(&path("b.rs")) {
+        *git_oid = None;
+    }
+    assert!(matches!(
+        BaseIdentity::of(FAMILY, &missing_oid),
+        Err(BaseRefError::Corrupt(_))
+    ));
+    let mut sha256_oid = manifest.clone();
+    if let Some(EntryV2::Regular { git_oid, .. }) = sha256_oid.get_mut(&path("b.rs")) {
+        *git_oid = Some("3".repeat(64));
+    }
+    assert!(matches!(
+        BaseIdentity::of(FAMILY, &sha256_oid),
+        Err(BaseRefError::Corrupt(_))
+    ));
+    // Dropping the tree while keeping the OIDs does not relabel the claim as
+    // membership-keyed.
+    let mut relabelled = manifest.clone();
+    relabelled.header_mut().head_tree = None;
+    assert!(matches!(
+        BaseIdentity::of(FAMILY, &relabelled),
+        Err(BaseRefError::Corrupt(_))
+    ));
+}
+
+/// A reader that knows only membership-keyed bases (the rules this module had
+/// before tree-keyed bases): it accepts a scope only with the membership
+/// prefix, and only a manifest whose membership digest derives that scope.
+fn membership_only_reader_accepts(manifest: &ManifestV2, scope: &str) -> bool {
+    scope.starts_with(BASE_SCOPE_PREFIX)
+        && membership_digest(manifest).is_ok_and(|membership| {
+            base_scope_for(&identity_digest(FAMILY, manifest.header(), &membership)) == scope
+        })
+}
+
+#[test]
+fn an_older_membership_only_reader_refuses_a_published_tree_keyed_base() {
+    let _serial = v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let files: &[(&str, &[u8])] = &[("a.rs", b"alpha")];
+    put_rows(storage.path(), &[b"alpha"]);
+    let manifest = tree_manifest(files, "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+    let identity = BaseIdentity::of(FAMILY, &manifest).unwrap();
+    let BasePublication::Published { generation, .. } =
+        publish_base(storage.path(), FAMILY, &manifest, None).unwrap()
+    else {
+        panic!("first tree base publication lost")
+    };
+    // This reader resolves it with the tree identity.
+    let resolved = resolve_base(storage.path(), FAMILY, &identity.scope).unwrap();
+    assert_eq!(resolved.identity().kind(), BaseKind::Tree);
+    assert_eq!(resolved.generation(), generation);
+    // The durable manifest, as an older reader would load it, is refused
+    // under both of its rules: the scope prefix and the membership digest.
+    let stored = ViewStore::existing_dir(resolved.view_dir().to_path_buf())
+        .unwrap()
+        .load_manifest_v2(&generation)
+        .unwrap();
+    assert!(!membership_only_reader_accepts(&stored, &identity.scope));
+    assert!(matches!(
+        membership_digest(&stored),
+        Err(BaseRefError::Corrupt(_))
+    ));
+    // No membership-keyed scope can name the tree-keyed manifest either.
+    let membership = BaseIdentity::of(FAMILY, &base_manifest(files)).unwrap();
+    assert!(!membership_only_reader_accepts(&stored, &membership.scope));
+    // A worker cannot register under a tree-keyed base scope.
+    assert!(matches!(
+        with_base_barrier(storage.path(), FAMILY, |tx| register_view_in(
+            tx,
+            storage.path(),
+            FAMILY,
+            &identity.scope,
+            Path::new("/checkout")
+        )),
+        Err(BaseRefError::Corrupt(_))
+    ));
+}
+
 #[test]
 fn resolution_authenticates_the_pinned_base_and_rejects_forged_headers() {
     let _serial = v3::serial_for_test();

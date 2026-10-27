@@ -1434,7 +1434,11 @@ mod tests {
             ))
         );
         git(dir.path(), &["update-index", "--force-remove", "new"], &[]);
-        git(dir.path(), &["update-index", "--skip-worktree", "skip"], &[]);
+        git(
+            dir.path(),
+            &["update-index", "--skip-worktree", "skip"],
+            &[],
+        );
         assert_eq!(
             tree(&dir),
             Err(TreeRefusal::Exception(
@@ -1442,8 +1446,16 @@ mod tests {
                 EntryException::SkipWorktree
             ))
         );
-        git(dir.path(), &["update-index", "--no-skip-worktree", "skip"], &[]);
-        git(dir.path(), &["update-index", "--assume-unchanged", "plain"], &[]);
+        git(
+            dir.path(),
+            &["update-index", "--no-skip-worktree", "skip"],
+            &[],
+        );
+        git(
+            dir.path(),
+            &["update-index", "--assume-unchanged", "plain"],
+            &[],
+        );
         assert_eq!(
             tree(&dir),
             Err(TreeRefusal::Exception(

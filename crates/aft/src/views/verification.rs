@@ -749,6 +749,326 @@ pub(crate) fn read_evidence(
     Some(result)
 }
 
+/// SQLite application ID of a tree-keyed base's proof file ("AFTT").
+pub(crate) const TREE_PROOF_APP: i64 = 0x41465454;
+/// The proof file's name inside a tree-keyed base's member directory.
+pub(crate) const TREE_PROOF_FILE: &str = "tree-proof.sqlite";
+const TREE_PROOF_SCHEMA: &str = "CREATE TABLE proof_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, base_scope TEXT NOT NULL, identity_digest TEXT NOT NULL, membership_digest TEXT NOT NULL, object_format TEXT NOT NULL, head_tree TEXT NOT NULL, root BLOB NOT NULL, policy TEXT NOT NULL, receipts_digest TEXT NOT NULL);
+CREATE TABLE blob_receipts(path BLOB PRIMARY KEY, record BLOB NOT NULL);";
+const TREE_RECEIPTS_TAG: &[u8] = b"aft/views-v3/tree-receipts/1";
+
+/// What one stable read of a tree-keyed base member observed: the bytes'
+/// content digest and Git blob OID, the native stat taken around the read,
+/// and the conversion policy in force at that read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct BlobReceipt {
+    pub version: u32,
+    pub mode: u32,
+    pub size: u64,
+    pub content: String,
+    pub git_oid: String,
+    pub stat: NativeStat,
+    pub observed_ns: u128,
+    pub policy: String,
+    pub delivery_seq: u64,
+}
+
+/// The durable proof of one tree-keyed base.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TreeProof {
+    pub base_scope: String,
+    pub identity_digest: String,
+    pub membership_digest: String,
+    pub object_format: String,
+    pub head_tree: String,
+    pub root: FileIdentity,
+    pub policy: String,
+    pub receipts: BTreeMap<RelPath, BlobReceipt>,
+}
+
+fn receipts_digest<'a>(records: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])>) -> String {
+    let mut hash = blake3::Hasher::new();
+    let field = |hash: &mut blake3::Hasher, bytes: &[u8]| {
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    field(&mut hash, TREE_RECEIPTS_TAG);
+    hash.update(&(records.len() as u64).to_le_bytes());
+    for (path, record) in records {
+        field(&mut hash, path);
+        field(&mut hash, record);
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+/// Writes `proof` into `dir` (the base's member directory). Only the build
+/// claim owner calls this, before the base's first publication; afterwards
+/// the file is never rewritten. The registry floor is raised to the
+/// verification version first, so readers without that support refuse.
+pub(crate) fn write_tree_proof(
+    storage: &Path,
+    family: &str,
+    dir: &Path,
+    proof: &TreeProof,
+) -> io::Result<()> {
+    let lock =
+        crate::blob_store::v3::ReservationLock::acquire(storage).map_err(io::Error::other)?;
+    drop(
+        crate::blob_store::v3::open_verification_registry(storage, family, &lock)
+            .map_err(io::Error::other)?,
+    );
+    drop(lock);
+    let mut encoded = BTreeMap::new();
+    for (path, receipt) in &proof.receipts {
+        encoded.insert(path.as_bytes().to_vec(), serde_json::to_vec(receipt)?);
+    }
+    let digest = receipts_digest(
+        encoded
+            .iter()
+            .map(|(path, record)| (path.as_slice(), record.as_slice())),
+    );
+    let root = serde_json::to_vec(&proof.root)?;
+    let destination = dir.join(TREE_PROOF_FILE);
+    let staging = dir.join(format!(
+        ".{TREE_PROOF_FILE}.tmp.{}",
+        super::base_refs::fresh_nonce()
+    ));
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut db = rusqlite::Connection::open(&staging)?;
+        db.pragma_update(None, "application_id", TREE_PROOF_APP)?;
+        db.pragma_update(None, "user_version", 1)?;
+        db.pragma_update(None, "journal_mode", "DELETE")?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.execute_batch(TREE_PROOF_SCHEMA)?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO proof_meta VALUES(1,1,1,?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                proof.base_scope,
+                proof.identity_digest,
+                proof.membership_digest,
+                proof.object_format,
+                proof.head_tree,
+                root,
+                proof.policy,
+                digest
+            ],
+        )?;
+        for (path, record) in &encoded {
+            tx.execute(
+                "INSERT INTO blob_receipts VALUES(?1,?2)",
+                rusqlite::params![path, record],
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+        fs::File::open(&staging)?.sync_all()?;
+        fs::rename(&staging, &destination)?;
+        super::sync_directory(dir)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&staging);
+        return Err(io::Error::other(error.to_string()));
+    }
+    Ok(())
+}
+
+/// Reads the proof in `dir`. `None` for a missing, foreign, newer, corrupt or
+/// internally inconsistent file: the caller then takes the full check.
+pub(crate) fn read_tree_proof(dir: &Path) -> Option<TreeProof> {
+    let db = rusqlite::Connection::open_with_flags(
+        dir.join(TREE_PROOF_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    if db
+        .pragma_query_value::<i64, _>(None, "application_id", |r| r.get(0))
+        .ok()?
+        != TREE_PROOF_APP
+        || db
+            .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .ok()?
+            != 1
+    {
+        return None;
+    }
+    type Meta = (
+        u32,
+        u32,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Vec<u8>,
+        String,
+        String,
+    );
+    let meta: Meta = db
+        .query_row(
+            "SELECT format_version,schema_version,base_scope,identity_digest,membership_digest,object_format,head_tree,root,policy,receipts_digest FROM proof_meta WHERE singleton=1",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                    r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?,
+                ))
+            },
+        )
+        .ok()?;
+    let (
+        format,
+        schema,
+        base_scope,
+        identity_digest,
+        membership_digest,
+        object_format,
+        head_tree,
+        root,
+        policy,
+        digest,
+    ) = meta;
+    if (format, schema) != (1, 1) {
+        return None;
+    }
+    let mut statement = db
+        .prepare("SELECT path,record FROM blob_receipts ORDER BY path")
+        .ok()?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .ok()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .ok()?;
+    if receipts_digest(
+        rows.iter()
+            .map(|(path, record)| (path.as_slice(), record.as_slice())),
+    ) != digest
+    {
+        return None;
+    }
+    let mut receipts = BTreeMap::new();
+    for (path, record) in rows {
+        let receipt: BlobReceipt = serde_json::from_slice(&record).ok()?;
+        if receipt.version != 1 || receipt.policy != policy {
+            return None;
+        }
+        receipts.insert(RelPath::new(path).ok()?, receipt);
+    }
+    Some(TreeProof {
+        base_scope,
+        identity_digest,
+        membership_digest,
+        object_format,
+        head_tree,
+        root: serde_json::from_slice(&root).ok()?,
+        policy,
+        receipts,
+    })
+}
+
+/// Stat-evidence candidates from a tree-keyed base's blob receipts, or `None`
+/// when the base is membership-keyed or its proof does not hold now (every
+/// path then takes the full check).
+///
+/// The proof must match the authenticated base, the current root and the
+/// current reusable policy. Git must still agree: `rev-parse HEAD^{tree}`
+/// (taken by the guard) names the base's tree, and a coherent index read of
+/// the same index file the guard observed computes that tree. A receipt is
+/// offered only for a path whose stage-0 index entry has no exception flag
+/// and the receipt's mode and OID. Callers still apply the stat-evidence
+/// reuse rules to every candidate before skipping a read.
+pub(crate) fn tree_receipt_evidence(
+    base: &super::base_refs::AuthenticatedBase,
+    guard: &BindGuard,
+) -> Option<BTreeMap<RelPath, Evidence>> {
+    use crate::blob_store::v2::to_hex;
+    use crate::git_index_reader::{index_tree, read_index, IndexRead, ObjectFormat};
+    if base.identity().kind() != super::base_refs::BaseKind::Tree || !guard.policy.reusable {
+        return None;
+    }
+    let manifest = base.manifest();
+    let head_tree = manifest.header().head_tree.as_deref()?;
+    let format = ObjectFormat::from_hex_len(head_tree.len())?;
+    let proof = read_tree_proof(base.view_dir())?;
+    if proof.base_scope != base.scope()
+        || proof.identity_digest != to_hex(&base.identity().identity)
+        || proof.membership_digest != to_hex(&base.identity().membership)
+        || proof.object_format != format.name()
+        || proof.head_tree != head_tree
+        || proof.root != guard.root
+        || proof.policy != guard.policy.digest
+        || proof.receipts.len() != manifest.len()
+    {
+        return None;
+    }
+    if guard.head_tree.as_deref()?.trim_ascii() != head_tree.as_bytes() {
+        return None;
+    }
+    let index_path = guard.gitdir.as_ref()?.0.join("index");
+    let IndexRead::Snapshot(snapshot) = read_index(&index_path, format, Default::default()) else {
+        return None;
+    };
+    // The snapshot must come from the index file the guard recorded, which
+    // final validation re-checks before publication.
+    if NativeStat::strict_read(&index_path).ok()? != guard.index.as_ref()?.0
+        || to_hex(&index_tree(&snapshot).ok()?) != head_tree
+    {
+        return None;
+    }
+    let index: BTreeMap<&[u8], &crate::git_index_reader::IndexEntry> = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_slice(), entry))
+        .collect();
+    let mut candidates = BTreeMap::new();
+    for (path, entry) in manifest.entries() {
+        let super::manifest_v2::EntryV2::Regular {
+            mode,
+            content,
+            size,
+            git_oid: Some(git_oid),
+            ..
+        } = entry
+        else {
+            return None;
+        };
+        let receipt = proof.receipts.get(path)?;
+        if receipt.mode != *mode
+            || receipt.size != *size
+            || receipt.content != content.to_hex()
+            || &receipt.git_oid != git_oid
+        {
+            return None;
+        }
+        let Some(current) = index.get(path.as_bytes()) else {
+            continue;
+        };
+        if !current.exceptions().is_empty()
+            || current.stat.mode != *mode
+            || to_hex(&current.oid) != *git_oid
+        {
+            continue;
+        }
+        candidates.insert(
+            path.clone(),
+            Evidence {
+                version: 1,
+                stat: receipt.stat.clone(),
+                observed_ns: receipt.observed_ns,
+                content: receipt.content.clone(),
+                size: receipt.size,
+                git_oid: Some(receipt.git_oid.clone()),
+                policy: receipt.policy.clone(),
+                keys: BTreeMap::new(),
+            },
+        );
+    }
+    Some(candidates)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

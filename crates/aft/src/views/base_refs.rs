@@ -46,9 +46,17 @@ use super::ViewStore;
 pub const MEMBERSHIP_DIGEST_TAG: &[u8] = b"aft/views-v3/base-membership/1";
 /// Domain tag of the effective-identity digest, version 1.
 pub const IDENTITY_DIGEST_TAG: &[u8] = b"aft/views-v3/base-identity/1";
-/// Membership-keyed base scopes. Slice 4v's tree-keyed scopes will use a
-/// different prefix; a scope is never relabelled from one to the other.
+/// Membership-keyed base scopes. Tree-keyed scopes use
+/// [`TREE_BASE_SCOPE_PREFIX`]; a scope is never relabelled from one to the other.
 pub const BASE_SCOPE_PREFIX: &str = "base-m1-";
+/// Domain tag of a tree-keyed base's membership digest, version 1. It covers
+/// each entry's `git_oid`, which the membership digest refuses.
+pub const TREE_MEMBERSHIP_DIGEST_TAG: &[u8] = b"aft/views-v3/base-tree-membership/1";
+/// Domain tag of a tree-keyed base's effective-identity digest, version 1.
+pub const TREE_IDENTITY_DIGEST_TAG: &[u8] = b"aft/views-v3/base-identity-tree/1";
+/// Tree-keyed base scopes. Readers that know only membership-keyed bases
+/// refuse this prefix, so they never authenticate such a base.
+pub const TREE_BASE_SCOPE_PREFIX: &str = "base-t1-";
 /// Pin-then-verify attempts before a base is reported unavailable.
 pub const RESOLVE_ATTEMPTS: usize = 3;
 /// `base_refs.state` values.
@@ -148,8 +156,9 @@ impl TaggedHasher {
 /// entry kind, mode, content hash, size and resolution-input flag, in path
 /// order. Readiness is excluded, so readiness successors keep the digest.
 ///
-/// Slice 4 bases are membership-keyed: a manifest that claims a HEAD tree or
-/// any `git_oid`, or carries composition sections, is not a valid base.
+/// Membership-keyed bases carry no tree claim: a manifest that claims a HEAD
+/// tree or any `git_oid`, or carries composition sections, is not a valid
+/// membership-keyed base. Tree claims use [`tree_membership_digest`].
 pub fn membership_digest(manifest: &ManifestV2) -> Result<[u8; 32]> {
     if manifest.base_header().is_some() {
         return Err(BaseRefError::Corrupt(
@@ -229,6 +238,115 @@ pub fn base_scope_for(identity: &[u8; 32]) -> String {
     format!("{BASE_SCOPE_PREFIX}{}", to_hex(identity))
 }
 
+/// The two kinds of base. The kind follows from the manifest (a `head_tree`
+/// makes it tree-keyed) and is visible in the scope prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseKind {
+    Membership,
+    Tree,
+}
+
+/// The kind of base `scope` names, or `None` when it names no base.
+pub fn base_kind(scope: &str) -> Option<BaseKind> {
+    if scope.starts_with(BASE_SCOPE_PREFIX) {
+        Some(BaseKind::Membership)
+    } else if scope.starts_with(TREE_BASE_SCOPE_PREFIX) {
+        Some(BaseKind::Tree)
+    } else {
+        None
+    }
+}
+
+/// The object format of a lowercase-hex object ID, or `None` when `text` is
+/// not one. Uppercase is refused so that each OID has a single spelling.
+fn object_format_of(text: &str) -> Option<crate::git_index_reader::ObjectFormat> {
+    text.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        .then(|| crate::git_index_reader::ObjectFormat::from_hex_len(text.len()))
+        .flatten()
+}
+
+/// The membership digest of a tree-keyed base: like [`membership_digest`],
+/// plus each entry's `git_oid`. Returns the object format shared by the
+/// manifest's tree and every OID. These strings are checked for shape only;
+/// whether the bytes really are that tree is proven at bind time, never
+/// taken from the manifest.
+pub fn tree_membership_digest(
+    manifest: &ManifestV2,
+) -> Result<([u8; 32], crate::git_index_reader::ObjectFormat)> {
+    if manifest.base_header().is_some() {
+        return Err(BaseRefError::Corrupt(
+            "a base manifest names another base".into(),
+        ));
+    }
+    if !manifest.tombstones().is_empty() || !manifest.readiness_overrides().is_empty() {
+        return Err(BaseRefError::Corrupt(
+            "a base manifest carries worker composition sections".into(),
+        ));
+    }
+    let format = manifest
+        .header()
+        .head_tree
+        .as_deref()
+        .and_then(object_format_of)
+        .ok_or_else(|| {
+            BaseRefError::Corrupt("a tree-keyed base needs a hex HEAD tree object ID".into())
+        })?;
+    let mut hasher = TaggedHasher::new(TREE_MEMBERSHIP_DIGEST_TAG);
+    hasher.u64(manifest.len() as u64);
+    for (path, entry) in manifest.entries() {
+        let EntryV2::Regular {
+            mode,
+            content,
+            size,
+            git_oid: Some(git_oid),
+            resolution_input,
+            ..
+        } = entry
+        else {
+            return Err(BaseRefError::Corrupt(format!(
+                "tree-keyed base entry {path:?} is not a regular file with a git_oid"
+            )));
+        };
+        if object_format_of(git_oid) != Some(format) {
+            return Err(BaseRefError::Corrupt(format!(
+                "tree-keyed base entry {path:?} has a malformed git_oid"
+            )));
+        }
+        hasher.field(path.as_bytes());
+        hasher.byte(1);
+        hasher.u64(u64::from(*mode));
+        hasher.field(content.as_bytes());
+        hasher.u64(*size);
+        hasher.byte(u8::from(*resolution_input));
+        hasher.field(git_oid.as_bytes());
+    }
+    Ok((hasher.finish(), format))
+}
+
+/// The effective identity of a tree-keyed base: the inputs of
+/// [`identity_digest`] with the object format and HEAD tree in place of
+/// `head_tree:none`, over the tree-membership digest.
+pub fn tree_identity_digest(
+    family: &str,
+    header: &ManifestHeader,
+    format: crate::git_index_reader::ObjectFormat,
+    membership: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = TaggedHasher::new(TREE_IDENTITY_DIGEST_TAG);
+    hasher.field(family.as_bytes());
+    hasher.field(header.producers.trigram.as_bytes());
+    hasher.optional(header.producers.semantic.as_deref().map(str::as_bytes));
+    hasher.field(header.producers.callgraph.as_bytes());
+    hasher.optional(header.ignore_fingerprint.as_deref().map(str::as_bytes));
+    hasher.field(std::env::consts::FAMILY.as_bytes());
+    hasher.field(format.name().as_bytes());
+    let tree = format!("head_tree:{}", header.head_tree.as_deref().unwrap_or(""));
+    hasher.field(tree.as_bytes());
+    hasher.field(membership);
+    hasher.finish()
+}
+
 /// The authenticated identity of one base manifest, without any protection.
 /// Builders use it before a base is published; readers use
 /// [`AuthenticatedBase`].
@@ -240,7 +358,18 @@ pub struct BaseIdentity {
 }
 
 impl BaseIdentity {
+    /// A manifest with a `head_tree` gets a tree-keyed identity; any other
+    /// manifest keeps the membership-keyed identity, computed exactly as before.
     pub fn of(family: &str, manifest: &ManifestV2) -> Result<Self> {
+        if manifest.header().head_tree.is_some() {
+            let (membership, format) = tree_membership_digest(manifest)?;
+            let identity = tree_identity_digest(family, manifest.header(), format, &membership);
+            return Ok(Self {
+                scope: format!("{TREE_BASE_SCOPE_PREFIX}{}", to_hex(&identity)),
+                membership,
+                identity,
+            });
+        }
         let membership = membership_digest(manifest)?;
         let identity = identity_digest(family, manifest.header(), &membership);
         Ok(Self {
@@ -248,6 +377,11 @@ impl BaseIdentity {
             membership,
             identity,
         })
+    }
+
+    /// Which kind of base this identity names.
+    pub fn kind(&self) -> BaseKind {
+        base_kind(&self.scope).expect("identities only derive base scopes")
     }
 
     pub fn header(&self, bound_generation: &str) -> BaseHeader {
@@ -363,9 +497,9 @@ fn expected_dir(storage: &Path, family: &str, scope: &str, stored: &str) -> Resu
 /// [`RESOLVE_ATTEMPTS`] times when the pointer or row moves; a missing base is
 /// reported unavailable, never replaced by another generation.
 pub fn resolve_base(storage: &Path, family: &str, scope: &str) -> Result<AuthenticatedBase> {
-    if !scope.starts_with(BASE_SCOPE_PREFIX) {
+    if base_kind(scope).is_none() {
         return Err(BaseRefError::Corrupt(format!(
-            "{scope} is not a membership-keyed base scope"
+            "{scope} is not a base scope"
         )));
     }
     for _ in 0..RESOLVE_ATTEMPTS {
@@ -540,7 +674,7 @@ pub(crate) fn register_view_in(
     scope: &str,
     root: &Path,
 ) -> Result<PathBuf> {
-    if scope.starts_with(BASE_SCOPE_PREFIX) {
+    if base_kind(scope).is_some() {
         return Err(BaseRefError::Corrupt(format!(
             "{scope} is reserved for bases"
         )));

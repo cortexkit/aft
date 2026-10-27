@@ -1674,6 +1674,8 @@ pub(crate) struct ReconcileWork {
     pub reads: usize,
     pub content_hash_bytes: usize,
     pub attachments: usize,
+    /// Paths whose read was skipped on a tree-keyed base's blob receipt.
+    pub tree_receipts: usize,
 }
 
 /// Why this driver cannot own and complete a fresh base.
@@ -1937,11 +1939,24 @@ impl CheckoutDriver {
         }
         let expected = super::base_refs::BaseIdentity::of(&route.family, &manifest)
             .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        // A Git-proven tree-keyed base is preferred; without that proof the
+        // membership-keyed base below is resolved or built exactly as before.
+        let paths: Vec<_> = manifest.entries().map(|(path, _)| path.clone()).collect();
+        let tree_base = super::tree_base::bootstrap(
+            super::tree_base::TreeBaseInput {
+                route: &route,
+                root: self.owner.root(),
+                paths: &paths,
+                policy,
+                producers: &self.producers,
+                ignore_fingerprint: ignore_fingerprint.clone(),
+            },
+            &self.base_claim,
+        );
         let resolved =
-            match super::base_refs::resolve_base(&route.storage, &route.family, &expected.scope) {
+            match super::tree_base::resolve_preferring(tree_base, &route, &expected.scope) {
                 Ok(base) => base,
                 Err(_) => {
-                    let paths: Vec<_> = manifest.entries().map(|(path, _)| path.clone()).collect();
                     match super::base_builder::build_base(
                         super::base_builder::BaseBuildInput {
                             storage: &route.storage,
@@ -2369,6 +2384,14 @@ impl FirstLoadDriver for CheckoutDriver {
                 )
             })
             .unwrap_or_default();
+        // A proven tree-keyed base adds its blob receipts as candidates;
+        // membership-keyed bases add none.
+        let (persisted, _receipt_paths) = super::tree_base::with_receipts(
+            persisted,
+            durable.as_deref(),
+            guard.as_deref(),
+            &route,
+        );
         let subscription = crate::watcher_backend::subscription::current(self.owner.root());
         let mut changed = pending.clone();
         changed.extend(
@@ -2552,6 +2575,10 @@ impl FirstLoadDriver for CheckoutDriver {
                         }
                         let mut current = current.clone();
                         current.recorded_ns = record.observed_ns;
+                        #[cfg(test)]
+                        if _receipt_paths.contains(&path) {
+                            self.work.lock().unwrap().tree_receipts += 1;
+                        }
                         stats.insert(path.clone(), current);
                         entries.insert(path.clone(), entry);
                         evidence.insert(path, record.clone());
