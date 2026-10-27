@@ -322,7 +322,16 @@ fn a_file_whose_bytes_no_longer_match_its_receipt_takes_the_full_check() {
         snapshot.disk_state(&rel(FILES[0].0)),
         DiskState::of_bytes(&edited)
     );
-    assert_current_bytes(&snapshot, root.path());
+    // The unchanged member keeps its ready base entry; the edited one waits
+    // for its own lexical entry like any other changed file.
+    assert_eq!(
+        snapshot.disk_state(&rel(FILES[1].0)),
+        DiskState::of_bytes(FILES[1].1)
+    );
+    assert!(matches!(
+        snapshot.plane_readiness(&rel(FILES[1].0), FamilyPlane::Trigram),
+        Some(crate::views::readiness::PlaneState::Ready { .. })
+    ));
 }
 
 #[test]
