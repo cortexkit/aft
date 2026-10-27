@@ -202,32 +202,179 @@ fn detail_field(detail: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// The caller-facing text for a plexus refusal that ends the command.
-pub(super) fn plexus_refusal_text(code: &str, class: CodeClass) -> String {
-    match class {
-        CodeClass::Terminal if code_prefix(code) == "agent_repository_conflict" => {
-            let detail = code_detail(code);
-            format!(
-                "plexus refused the bot write: agent_repository_conflict - this command speaks as agent {} but the repository is bound to agent {} ({code})",
-                detail_field(detail, "claimed_agent").unwrap_or_else(|| "(unnamed)".to_string()),
-                detail_field(detail, "bound_agent").unwrap_or_else(|| "(unnamed)".to_string()),
-            )
+#[derive(Clone, Copy)]
+enum GithubReach {
+    Never,
+    Maybe,
+    Yes,
+}
+
+#[derive(Clone, Copy)]
+enum RefusalActor {
+    Agent,
+    Operator,
+    Nobody,
+}
+
+// More specific detail selectors precede the fallback for the same code.
+// Transmission includes reads, not just writes. A later gate can follow sent
+// steps, so phase-dependent codes must not promise that nothing reached GitHub.
+const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &[
+    ("agent_grant_absent", "", "The agent has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
+    ("agent_grant_excludes_request", "", "The agent's grant does not cover this request.", GithubReach::Never, RefusalActor::Operator),
+    ("agent_handle_unknown", "", "The agent's GitHub bot handle is unknown.", GithubReach::Never, RefusalActor::Operator),
+    ("agent_repository_conflict", "claimed_agent=*", "This command speaks as agent {claimed_agent}, but the repository is bound to agent {bound_agent}.", GithubReach::Never, RefusalActor::Operator),
+    ("agent_repository_conflict", "", "The GitHub target does not match the bound repository.", GithubReach::Yes, RefusalActor::Agent),
+    ("argument_undeclared", "", "The request contains an unsupported identity field.", GithubReach::Never, RefusalActor::Agent),
+    ("approval_agent_mismatch", "", "The approval belongs to another agent.", GithubReach::Never, RefusalActor::Agent),
+    ("approval_denied", "", "Approval for this write was denied.", GithubReach::Never, RefusalActor::Operator),
+    ("approval_expired", "", "The approval has expired.", GithubReach::Never, RefusalActor::Agent),
+    ("call_mode_unsupported", "", "This call mode cannot make bot writes.", GithubReach::Never, RefusalActor::Agent),
+    ("comment_author_mismatch", "", "The comment was not written by the expected bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("connector_home_not_held", "", "This machine does not hold permission to send GitHub requests.", GithubReach::Never, RefusalActor::Operator),
+    ("consent_unavailable", "", "This flow cannot answer the required consent prompt.", GithubReach::Never, RefusalActor::Operator),
+    ("delegating_scope_required", "", "The route has no scope authorized to act as an agent.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_audience_conflict", "", "The flow's approved repository sets conflict.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_not_approved", "", "The flow is not approved.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_unknown", "", "The flow is unknown.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_audience_excludes_repository", "", "The repository is outside the flow's approved set.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_audience_mismatch", "", "The flow requires a matching agent-scoped route.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_audience_unavailable", "", "The flow's approved repository set could not be read.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_carrier_not_admitted", "", "This caller is not allowed to carry flow requests.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_scope_required", "", "The route has no required flow scope.", GithubReach::Never, RefusalActor::Agent),
+    ("handle_credential_rejected", "", "GitHub rejected the bot's credential.", GithubReach::Yes, RefusalActor::Operator),
+    ("handle_credential_unresolvable", "class=transient", "The bot's credential is temporarily unavailable.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("handle_credential_unresolvable", "", "The bot's credential could not be loaded.", GithubReach::Maybe, RefusalActor::Operator),
+    ("handle_disabled", "", "The bot handle is disabled.", GithubReach::Never, RefusalActor::Operator),
+    ("invalid_request", "", "The request has an invalid field or shape.", GithubReach::Never, RefusalActor::Agent),
+    ("module_grant_absent", "", "The calling module has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
+    ("nonce_in_flight", "", "Another worker is still handling this request nonce.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("nonce_payload_mismatch", "", "This nonce already belongs to a different request.", GithubReach::Maybe, RefusalActor::Agent),
+    ("not_present", "", "The GitHub target was not found.", GithubReach::Yes, RefusalActor::Agent),
+    ("outcome_unknown", "", "The GitHub read outcome is unknown.", GithubReach::Maybe, RefusalActor::Operator),
+    ("pipeline_denied", "", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Operator),
+    ("policy_blocked", "", "Policy blocks this write.", GithubReach::Never, RefusalActor::Operator),
+    ("pre_dispatch_read_incomplete", "reason=page_bound", "The GitHub read exceeded its page limit.", GithubReach::Yes, RefusalActor::Agent),
+    ("pre_dispatch_read_incomplete", "reason=invalid_response", "The GitHub read response could not be used.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("pre_dispatch_read_incomplete", "", "The GitHub read did not finish.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("pr_edit_not_own", "", "The pull request was not opened by this bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("issue_edit_not_own", "", "The issue was not opened by this bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("pr_head_cross_repository", "", "The pull request head is outside the bound repository.", GithubReach::Never, RefusalActor::Agent),
+    ("probe_unproven", "", "The bot handle has not passed its proof check.", GithubReach::Never, RefusalActor::Operator),
+    ("repository_unbound", "", "The repository has no bot binding.", GithubReach::Maybe, RefusalActor::Operator),
+    ("request_deadline_exceeded", "", "The request deadline expired before dispatch.", GithubReach::Never, RefusalActor::Nobody),
+    ("request_field_forbidden", "", "The request contains a forbidden field.", GithubReach::Never, RefusalActor::Agent),
+    ("request_kind_unmapped", "", "This request action or shape is not supported.", GithubReach::Never, RefusalActor::Agent),
+    ("route_not_bound", "", "The route is not bound to GitHub.", GithubReach::Never, RefusalActor::Operator),
+    ("run_scope_not_child", "", "The run scope is not a live child of the route scope.", GithubReach::Maybe, RefusalActor::Agent),
+    ("scope_ended", "", "The agent's route scope has ended.", GithubReach::Maybe, RefusalActor::Operator),
+    ("delegation_withdrawn", "", "Permission to act as this agent was withdrawn.", GithubReach::Maybe, RefusalActor::Operator),
+    ("scope_not_synced", "", "The agent's scope has not synced yet.", GithubReach::Maybe, RefusalActor::Operator),
+    ("scope_unverifiable", "", "The agent's scope could not be verified.", GithubReach::Maybe, RefusalActor::Operator),
+    ("secret_input_rejected", "", "The request contains credential material that is not allowed here.", GithubReach::Never, RefusalActor::Agent),
+    ("stale_authority", "dimension=expected_handle", "The expected bot handle has changed.", GithubReach::Never, RefusalActor::Agent),
+    ("stale_authority", "dimension=expected_binding", "The expected repository binding has changed.", GithubReach::Never, RefusalActor::Agent),
+    ("stale_authority", "", "The write's authorization changed or expired.", GithubReach::Maybe, RefusalActor::Operator),
+    ("stack_pr_not_own", "", "A stacked pull request was not opened by this bot.", GithubReach::Yes, RefusalActor::Agent),
+    ("store_failure", "", "Request storage failed.", GithubReach::Maybe, RefusalActor::Operator),
+    ("transport_not_sent", "", "The current step was not sent.", GithubReach::Maybe, RefusalActor::Operator),
+    ("vendor_rejected", "", "GitHub rejected the request.", GithubReach::Yes, RefusalActor::Agent),
+    ("agent_identity_conflict", "", "The repository is bound to another agent's bot.", GithubReach::Never, RefusalActor::Agent),
+    ("bot_write_requires_scope", "", "This session has no agent scope for bot writes.", GithubReach::Never, RefusalActor::Operator),
+    ("ticket_unknown", "", "This command's agent session ticket is no longer live.", GithubReach::Never, RefusalActor::Agent),
+    ("untrusted_principal", "", "Only first-party callers may relay bot writes.", GithubReach::Never, RefusalActor::Operator),
+];
+
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct RefusalFacts {
+    retry_same_nonce: Option<bool>,
+    legs_sent: Vec<Value>,
+    not_sent: bool,
+}
+
+impl RefusalFacts {
+    fn from_reply(refusal: &Value) -> Self {
+        Self {
+            retry_same_nonce: refusal.get("retry_same_nonce").and_then(Value::as_bool),
+            legs_sent: refusal
+                .get("legs_sent")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            not_sent: refusal.get("transmission").and_then(Value::as_str) == Some("not_sent"),
         }
-        CodeClass::Terminal => format!("plexus refused the bot write: {code}"),
-        CodeClass::PlexusSetup => format!(
-            "plexus configuration problem: {code} - the bot write was not attempted; the operator must fix plexus's GitHub handle, grant or assertion setup"
-        ),
-        CodeClass::Transient => format!(
-            "plexus refused the bot write: {code} (still refused after retrying with the same request nonce)"
-        ),
-        CodeClass::Remint => format!(
-            "plexus refused the bot write: {code} (a freshly minted assertion was refused too)"
-        ),
-        CodeClass::OutcomeUnknown => outcome_undetermined_text(code),
-        CodeClass::Unknown => format!(
-            "plexus refused the bot write with a code this shim does not know: {code}; it was not retried"
-        ),
     }
+}
+
+fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts) -> String {
+    let explanation = REFUSAL_EXPLANATIONS.iter().find(|(name, selector, ..)| {
+        *name == code_prefix(code)
+            && (selector.is_empty()
+                || selector.split_once('=').is_some_and(|(key, value)| {
+                    detail_field(code_detail(code), key)
+                        .is_some_and(|actual| value == "*" || actual == value)
+                }))
+    });
+    let mut text = format!("{origin} refused the bot write: {code}. ");
+    if let Some((_, _, sentence, _, _)) = explanation {
+        let mut sentence = sentence.to_string();
+        for key in ["claimed_agent", "bound_agent"] {
+            sentence = sentence.replace(
+                &format!("{{{key}}}"),
+                &detail_field(code_detail(code), key).unwrap_or_else(|| "(unnamed)".to_string()),
+            );
+        }
+        text.push_str(&sentence);
+    } else {
+        text.push_str("This shim does not recognize the refusal code.");
+    }
+    let reach = if !facts.legs_sent.is_empty() {
+        Some(GithubReach::Yes)
+    } else if facts.not_sent {
+        Some(GithubReach::Never)
+    } else {
+        explanation.map(|(_, _, _, reach, _)| *reach)
+    };
+    text.push_str(match reach {
+        Some(GithubReach::Never) => " Nothing reached GitHub.",
+        Some(GithubReach::Maybe) => " Earlier reads or writes may have reached GitHub.",
+        Some(GithubReach::Yes) => " GitHub received a request.",
+        None => " Whether anything reached GitHub is unknown.",
+    });
+    if !facts.legs_sent.is_empty() {
+        let steps: Vec<_> = facts
+            .legs_sent
+            .iter()
+            .map(|step| {
+                step.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| step.to_string())
+            })
+            .collect();
+        text.push_str(&format!(" Already-sent write steps: {}.", steps.join(", ")));
+    }
+    if let Some((_, _, _, _, actor)) = explanation {
+        text.push_str(match actor {
+            RefusalActor::Agent => " The agent must change the request.",
+            RefusalActor::Operator => " An operator must fix the setup, grants, or policy.",
+            RefusalActor::Nobody => " No request change is needed for this transient refusal.",
+        });
+    }
+    text.push_str(match facts.retry_same_nonce {
+        Some(true) if code_prefix(code) == "nonce_in_flight" => {
+            " Wait, then retry the same request and nonce; already-sent steps will be skipped."
+        }
+        Some(true) => {
+            " It is safe to retry the same request and nonce; already-sent steps will be skipped."
+        }
+        Some(false) => " The same request and nonce cannot succeed; use a new request.",
+        None => " Retry safety is unknown.",
+    });
+    text
+}
+
+fn plexus_refusal_text(code: &str, facts: &RefusalFacts) -> String {
+    refusal_text("Plexus", code, facts)
 }
 
 fn outcome_undetermined_text(code: &str) -> String {
@@ -250,6 +397,13 @@ pub(super) enum Reply {
         stage: String,
         message: String,
         generation: Option<u64>,
+        facts: RefusalFacts,
+    },
+    /// Module errors historically use the unknown-outcome exit. Keep that
+    /// status while explaining their refusal code and retry metadata.
+    ModuleRefused {
+        code: String,
+        facts: RefusalFacts,
     },
     Malformed(String),
 }
@@ -265,6 +419,16 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
     match envelope.get("status").and_then(Value::as_str) {
         Some("ok") => {
             let reply = facade_reply(&data);
+            if let Some(code) = reply
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+            {
+                return Reply::ModuleRefused {
+                    code: code.to_string(),
+                    facts: RefusalFacts::from_reply(&reply["error"]),
+                };
+            }
             let generation = reply.get("repo_binding_generation").and_then(Value::as_u64);
             let result = reply.get("result").cloned().unwrap_or(Value::Null);
             match result.get("status").and_then(Value::as_str) {
@@ -320,6 +484,7 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                         stage: PLEXUS_REPLY_STAGE.to_string(),
                         message: String::new(),
                         generation,
+                        facts: RefusalFacts::from_reply(&result),
                     },
                     None => Reply::Malformed("plexus refused without a refusal_code".to_string()),
                 },
@@ -348,6 +513,7 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     .unwrap_or("")
                     .to_string(),
                 generation: None,
+                facts: RefusalFacts::from_reply(&data),
             },
             None => Reply::Malformed("the relay refused without a refusal_code".to_string()),
         },
@@ -425,7 +591,7 @@ fn render_thread_state_confirmation(result: &Value, request: &Value) -> Option<S
     Some(format!("✓ {past} {noun} {repository}#{number}{title}\n"))
 }
 
-fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
+fn daemon_refusal(code: &str, stage: &str, message: &str, facts: &RefusalFacts) -> RouteOutcome {
     if stage == crate::gh_shim_speech::REFUSAL_STAGE
         && crate::gh_shim_speech::Code::parse(code).is_some()
     {
@@ -437,17 +603,13 @@ fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
     match code {
         "gh_shim_worker_write_refused"=>RouteOutcome::WorkerWriteRefused,
         "ticket_absent" => RouteOutcome::NoAgentSession,
-        "ticket_unknown" => RouteOutcome::RelayRefusal {
+        // These are AFT's own pre-dispatch gates, not Plexus receipt replies.
+        "ticket_unknown" | "untrusted_principal" | "bot_write_requires_scope" | "agent_identity_conflict" => RouteOutcome::RelayRefusal {
             code: code.to_string(),
-            text: "this command's agent session ticket is not live (its command ended, or this daemon never issued it); bot speech must come from an agent's own session".to_string(),
-        },
-        "untrusted_principal" => RouteOutcome::RelayRefusal {
-            code: code.to_string(),
-            text: "the AFT daemon relays bot writes only for first-party callers".to_string(),
-        },
-        "bot_write_requires_scope" => RouteOutcome::RelayRefusal {
-            code: code.to_string(),
-            text: "AFT refused the bot write: this session's tool route has no agent scope, so bot writes are refused; a head session needs to bind with its core scope".to_string(),
+            text: refusal_text("AFT", code, &RefusalFacts {
+                retry_same_nonce: facts.retry_same_nonce.or(Some(false)),
+                ..RefusalFacts::default()
+            }),
         },
         "relay_unavailable" => RouteOutcome::Unavailable(format!(
             "the AFT daemon could not reach {} to relay the bot write, so nothing was sent: {message}",
@@ -465,10 +627,9 @@ fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
             ),
         },
         _ => {
-            let class = classify_code(code);
             RouteOutcome::RelayRefusal {
                 code: code.to_string(),
-                text: plexus_refusal_text(code, class),
+                text: refusal_text("AFT", code, facts),
             }
         }
     }
@@ -801,7 +962,12 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
                 .unwrap_or("relay_refused");
             let stage = data.get("stage").and_then(Value::as_str).unwrap_or("relay");
             let message = data.get("message").and_then(Value::as_str).unwrap_or("");
-            return Err(daemon_refusal(code, stage, message));
+            return Err(daemon_refusal(
+                code,
+                stage,
+                message,
+                &RefusalFacts::from_reply(&data),
+            ));
         }
         let reply = facade_reply(&data);
         if let Some(code) = facade_refusal_code(&reply) {
@@ -809,7 +975,7 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
                 code: code.to_string(),
                 text: format!(
                     "plexus refused the repository bindings read for the version check: {}",
-                    plexus_refusal_text(code, classify_code(code))
+                    plexus_refusal_text(code, &RefusalFacts::from_reply(&reply["result"]))
                 ),
             });
         }
@@ -877,7 +1043,7 @@ async fn exchange(
         let reply = parse_reply(&bytes);
         let reply_generation = match &reply {
             Reply::Completed { generation, .. } | Reply::Refused { generation, .. } => *generation,
-            Reply::Malformed(_) => None,
+            Reply::Malformed(_) | Reply::ModuleRefused { .. } => None,
         };
         // A new binding generation means plexus's bindings changed since the
         // last check; compare again before trusting the next write.
@@ -928,28 +1094,31 @@ async fn exchange(
                     "unreadable plexus reply: {message}"
                 )));
             }
+            Reply::ModuleRefused { code, facts } => {
+                return RouteOutcome::OutcomeUndetermined(plexus_refusal_text(&code, &facts));
+            }
             Reply::Refused {
                 code,
                 stage,
                 message,
+                facts,
                 ..
             } => {
                 if let Some(outcome) = mismatch {
                     return outcome;
                 }
                 if stage != PLEXUS_REPLY_STAGE {
-                    return daemon_refusal(&code, &stage, &message);
+                    return daemon_refusal(&code, &stage, &message, &facts);
                 }
                 let class = classify_code(&code);
                 match class {
                     CodeClass::Transient if transient_retries < transient_delays.len() => {
                         let delay = transient_delays[transient_retries];
                         if exchange.io.now() + delay >= exchange.deadline() {
-                            // Plexus refused this attempt, so nothing was
-                            // written; stopping here is a named refusal.
                             return RouteOutcome::RelayRefusal {
                                 text: format!(
-                                    "plexus refused the bot write: {code} (transient, but the gh relay's {} ms budget would run out before the next retry, so it was not resent)",
+                                    "{} The relay's {} ms budget cannot fit another retry.",
+                                    plexus_refusal_text(&code, &facts),
                                     exchange.budget_ms()
                                 ),
                                 code,
@@ -960,11 +1129,13 @@ async fn exchange(
                     }
                     CodeClass::Remint if !reminted => reminted = true,
                     CodeClass::OutcomeUnknown => {
-                        return RouteOutcome::OutcomeUndetermined(outcome_undetermined_text(&code))
+                        return RouteOutcome::OutcomeUndetermined(plexus_refusal_text(
+                            &code, &facts,
+                        ))
                     }
                     _ => {
                         return RouteOutcome::RelayRefusal {
-                            text: plexus_refusal_text(&code, class),
+                            text: plexus_refusal_text(&code, &facts),
                             code,
                         }
                     }
