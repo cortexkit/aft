@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aft-tokenizer"
-version = "0.62.0"
+version = "0.63.0"
 dependencies = [
  "criterion",
  "fancy-regex 0.18.0",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agent-file-tools"
-version = "0.62.0"
+version = "0.63.0"
 dependencies = [
  "aft-tokenizer",
  "agent-file-tools",
