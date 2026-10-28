@@ -553,6 +553,7 @@ async fn flow_scoped_tool_call_refused_before_dispatch() {
     for body in [
         json!({"name": "read", "arguments": {"path": "secret"}}),
         json!({"op": "tool.call", "name": "read", "arguments": {"path": "secret"}}),
+        json!({"method": "diagnostics.findings", "params": {}}),
     ] {
         assert_eq!(
             wire(route.clone(), body).await["code"],

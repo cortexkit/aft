@@ -917,10 +917,13 @@ mod tests {
         // to a database read or a general tool just because it lacks a method.
         for body in [
             json!({"method": "memory.census", "params": {}}),
+            json!({"method": "writes.census", "params": {}}),
+            json!({"method": "backups.purge", "params": {}}),
             json!({"op": "tool.call", "name": "read", "arguments": {"path": "secret"}}),
             json!({"name": "read", "arguments": {"path": "secret"}}),
             json!({"op": "tool.list"}),
             json!({"method": "unknown.operation"}),
+            Value::Null,
         ] {
             let answer = request(&mut daemon, 41, 43, body).await;
             assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
@@ -928,28 +931,37 @@ mod tests {
             assert_eq!(error.code, "flow_scope_not_supported");
         }
 
-        for (channel, role_versions) in [
-            (44, None),
+        for (channel, target, role_versions) in [
+            (
+                44,
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                None,
+            ),
             (
                 45,
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
                 Some(std::collections::BTreeMap::from([(
                     "tool-provider".into(),
                     "v1".into(),
                 )])),
+            ),
+            (
+                46,
+                RouteTarget::ManagementSurface {
+                    module_id: "other".into(),
+                },
+                None,
             ),
         ] {
             let answer = request(
                 &mut daemon,
                 0,
                 u64::from(channel),
-                serde_json::to_value(bind(
-                    channel,
-                    RouteTarget::ToolProvider {
-                        module_id: "aft".into(),
-                    },
-                    role_versions,
-                ))
-                .unwrap(),
+                serde_json::to_value(bind(channel, target, role_versions)).unwrap(),
             )
             .await;
             assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");

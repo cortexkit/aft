@@ -5805,7 +5805,7 @@ where
                             .or_else(|| management_routes.get(&route).and_then(|identity| identity.scope.as_ref()));
                         if let Some(error) = flow_scope_refusal(scope) {
                             let result = match decoded.body() {
-                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
+                                Ok(body) if management_routes.contains_key(&route) && diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
                                     &writer_tx, &dispatch_path_metrics, &decoded.frame,
                                     scope, body, &health_rollup_cache, &executor,
                                 ).await,
@@ -8086,7 +8086,10 @@ async fn handle_control_request(
         } => {
             // Management routes admit only diagnostics.findings at request ingress.
             // Refuse flow tool binds before workdir probes or actor setup.
-            if !matches!(&target, RouteTarget::ManagementSurface { .. }) {
+            let bind_trust = trust_for_bind(&identity.harness, &principal);
+            if !matches!(&target, RouteTarget::ManagementSurface { module_id } if module_id == "aft")
+                || !matches!(bind_trust, BindTrust::FirstParty)
+            {
                 if let Some(refusal) = flow_scope_refusal(scope.as_ref()) {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
                 }
@@ -8132,7 +8135,6 @@ async fn handle_control_request(
                 }
             };
 
-            let bind_trust = trust_for_bind(&identity.harness, &principal);
             if installed_route_epochs
                 .get(&route_channel)
                 .is_some_and(|installed| *installed >= epoch)
