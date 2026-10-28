@@ -553,6 +553,14 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         description: None,
                     },
                     ManagementOperation {
+                        name: super::diagnostics_findings::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: Some(
+                            "Read AFT's recorded health findings without scheduling work."
+                                .to_owned(),
+                        ),
+                    },
+                    ManagementOperation {
                         name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
                         description: None,
@@ -626,6 +634,9 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 concurrency: Concurrency::ModuleManaged,
             },
         ])
+        .flow_operations(Some(
+            vec![super::diagnostics_findings::OPERATION.to_owned()],
+        ))
         .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
@@ -902,6 +913,10 @@ mod tests {
                 ),
                 (
                     crate::commands::health_digest::HEALTH_DIGEST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    super::super::diagnostics_findings::OPERATION,
                     &ManagementOperationKind::Query,
                 ),
                 (

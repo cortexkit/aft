@@ -221,6 +221,7 @@ mod consent;
 pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
+mod diagnostics_findings;
 // The secret vault seam and its consent adapter. They read ragged route
 // fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
@@ -1538,6 +1539,12 @@ struct RouteBindCompletion {
 
 #[derive(Debug, Clone)]
 struct RouteIdentity(Arc<RouteIdentityData>);
+
+#[derive(Default)]
+struct ManagementIdentity {
+    principal: Option<Principal>,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+}
 
 impl RouteIdentity {
     fn reply_policy(&self) -> wire::ToolResponsePolicy {
@@ -3871,7 +3878,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -4860,7 +4867,7 @@ async fn process_route_bind_completion(
     writer_tx: &WriterSender,
     completion: ControlCompletion,
     a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -4892,11 +4899,11 @@ async fn process_route_bind_completion(
             _ => return Err(SubcError::WriterClosed),
         },
         ControlCompletion::ManagementAckWritten {
-            route, principal, ..
+            route, identity, ..
         } => {
             a0.retire(route);
             if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
-                management_routes.insert(route, principal);
+                management_routes.insert(route, identity);
             }
             return Ok(());
         }
@@ -4932,7 +4939,7 @@ async fn drain_pending_route_bind_completions(
     control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     configure_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -5211,7 +5218,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
-    let mut management_routes: HashMap<RouteChannel, Option<Principal>> = HashMap::new();
+    let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
@@ -5800,6 +5807,15 @@ where
                                 }
                                 continue;
                             }
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
                             if let Some(error) = occipital_session_refusal(identity, body) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
                                     break Err(error);
@@ -5808,6 +5824,17 @@ where
                             }
                             if let Err(error) = carrier_read_only::admit(identity, body) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
+                        if let (Some(identity), Ok(body)) = (management_routes.get(&route), decoded.body()) {
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -5964,7 +5991,7 @@ where
                                 &routes,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
-                                management_routes.get(&route).and_then(Option::as_ref),
+                                management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
                                 storage_dir,
                             )
                             .await
@@ -7995,7 +8022,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -8189,7 +8216,7 @@ async fn handle_control_request(
                         ack,
                         ControlCompletion::ManagementAckWritten {
                             route: route_id,
-                            principal,
+                            identity: ManagementIdentity { principal, scope },
                             corr: frame.header.corr,
                         },
                         metrics,
