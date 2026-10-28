@@ -821,7 +821,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("no-project-setup");
-        let module_root = root.clone();
+        // Module startup opens shared storage for the GitHub speech service before
+        // any route binds. Keep it outside the project whose setup we forbid.
+        let storage = dir.path().join("module-storage");
         let (mut daemon, module) = tokio::io::duplex(64 * 1024);
         let module_thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -832,7 +834,7 @@ mod tests {
             runtime.block_on(run_module_loop(
                 read,
                 write,
-                &module_root.join("absent-connection.json"),
+                &storage.join("absent-connection.json"),
                 App::default_shared(),
                 Arc::new(Executor::new()),
                 |_, _| panic!("flow scope must not execute commands"),
@@ -840,7 +842,7 @@ mod tests {
                 false,
                 usize::MAX,
                 None,
-                &module_root.join("storage"),
+                &storage,
                 QuiescedLsp::ReapInBackground,
                 None,
                 None,
@@ -864,6 +866,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            !root.exists(),
+            "module startup must not initialize a project"
+        );
 
         let mut flow = scope(ScopeKind::Ephemeral);
         flow.attributes.agent_id = None;
@@ -901,6 +907,10 @@ mod tests {
             serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
             ModuleControlResponse::RouteBindAck {}
         ));
+        assert!(
+            !root.exists(),
+            "flow bind must not initialize project storage"
+        );
 
         let findings = request(
             &mut daemon,
@@ -912,6 +922,10 @@ mod tests {
         assert_eq!(findings.header.ty, FrameType::Response, "{findings:?}");
         let findings: Value = serde_json::from_slice(&findings.body).unwrap();
         assert!(findings["result"]["findings"].is_array(), "{findings}");
+        assert!(
+            !root.exists(),
+            "diagnostics.findings must not initialize project storage"
+        );
 
         // Include provider reads and unknown operations: none may fall through
         // to a database read or a general tool just because it lacks a method.
@@ -929,6 +943,10 @@ mod tests {
             assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
             let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
             assert_eq!(error.code, "flow_scope_not_supported");
+            assert!(
+                !root.exists(),
+                "refused flow request must not initialize project storage"
+            );
         }
 
         // Flow-scoped tool-provider binds follow the call-mode contract
