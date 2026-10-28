@@ -310,6 +310,23 @@ fn refusal_explanation_preserves_plexus_detail_message_verbatim() {
 }
 
 #[test]
+fn refusal_explanation_review_thread_not_own_preserves_not_sent_detail() {
+    let refusal = json!({
+        "status": "refused",
+        "refusal_code": "review_thread_not_own",
+        "code": "review_thread_not_own",
+        "transmission": "not_sent",
+        "retry_same_nonce": false,
+        "detail": {
+            "number": 285,
+            "author_login": "<author>",
+            "message": "'resolveReviewThread' works only on pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Reply to the finding as the bot, then resolve the thread as the operator.",
+        },
+    });
+    assert_eq!(refusal_explanation(json!({"result": refusal})), "Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.");
+}
+
+#[test]
 fn refusal_explanation_bare_pr_edit_not_own_keeps_generic_fallback() {
     assert_eq!(refusal_explanation(json!({"result": {
         "status": "refused", "refusal_code": "pr_edit_not_own", "retry_same_nonce": false,
@@ -321,6 +338,10 @@ fn refusal_explanation_read_only_gates_do_not_warn_unless_steps_were_sent() {
     for (code, explanation) in [
         (
             "pr_edit_not_own",
+            "The pull request was not opened by this bot.",
+        ),
+        (
+            "review_thread_not_own",
             "The pull request was not opened by this bot.",
         ),
         (
@@ -498,8 +519,8 @@ fn refusal_explanation_names_already_sent_steps() {
 
 #[test]
 fn refusal_explanation_table_covers_bot_request_codes() {
-    // Bot-request codes from Plexus's published refusal table. Older assertion
-    // codes are deliberately left to the unknown-code fallback.
+    // Current bot-request refusal codes. Failures from the retired signed-assertion
+    // identity flow (for example, assertion_absent) keep the unknown-code fallback.
     for code in [
         "agent_grant_absent",
         "agent_grant_excludes_request",
@@ -535,6 +556,7 @@ fn refusal_explanation_table_covers_bot_request_codes() {
         "policy_blocked",
         "pre_dispatch_read_incomplete",
         "pr_edit_not_own",
+        "review_thread_not_own",
         "issue_edit_not_own",
         "pr_head_cross_repository",
         "probe_unproven",

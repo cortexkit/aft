@@ -265,6 +265,7 @@ const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &
     ("pre_dispatch_read_incomplete", "reason=invalid_response", "The GitHub read response could not be used.", GithubReach::Maybe, RefusalActor::Nobody),
     ("pre_dispatch_read_incomplete", "", "The GitHub read did not finish.", GithubReach::Maybe, RefusalActor::Nobody),
     ("pr_edit_not_own", "", "The pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("review_thread_not_own", "", "The pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("issue_edit_not_own", "", "The issue was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("pr_head_cross_repository", "", "The pull request head is outside the bound repository.", GithubReach::Never, RefusalActor::Agent),
     ("probe_unproven", "", "The bot handle has not passed its proof check.", GithubReach::Never, RefusalActor::Operator),
