@@ -878,13 +878,17 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
+      const warning =
+        typeof data.bot_write_revocation_warning === "string"
+          ? `\n${data.bot_write_revocation_warning}`
+          : "";
       if (data.kill_signaled === true) {
-        return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants`;
+        return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants${warning}`;
       }
       if (typeof data.remote_cancel === "string") {
-        return `Task ${args.taskId}: ${String(data.status ?? "fate_unknown")} · ${data.remote_cancel}`;
+        return `Task ${args.taskId}: ${String(data.status ?? "fate_unknown")} · ${data.remote_cancel}${warning}`;
       }
-      return `Task ${args.taskId}: ${String(data.status ?? "killed")}`;
+      return `Task ${args.taskId}: ${String(data.status ?? "killed")}${warning}`;
     },
   };
 }

@@ -304,6 +304,9 @@ fn replayed_reuse_only_closure_is_whole_or_absent_after_any_power_cut() {
 fn replayed_retry_after_a_failed_floor_directory_sync_is_whole_or_absent() {
     let _guard = serial();
     let fail_floor_sync = |fixture: &Fixture| {
+        // The seed already synced this floor. Model a publisher without that
+        // process-local proof so its first covered raise must sync again.
+        crate::reader_floor::forget_durable_for_test(&fixture.storage);
         crate::durability::FAIL_DIRECTORY_SYNC
             .with(|slot| *slot.borrow_mut() = Some(fixture.storage.clone()));
         let error = copy(fixture).unwrap_err();

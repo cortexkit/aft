@@ -1444,14 +1444,21 @@ export function createBashKillTool(ctx: PluginContext) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
       const details = data as unknown as BashKillDetails;
+      const warning =
+        typeof data.bot_write_revocation_warning === "string"
+          ? `\n${data.bot_write_revocation_warning}`
+          : "";
       if (details.kill_signaled === true) {
         return bashKillResult(
-          `Task ${params.task_id}: kill_signaled · reached ${details.kill_reached ?? 0} live descendants`,
+          `Task ${params.task_id}: kill_signaled · reached ${details.kill_reached ?? 0} live descendants${warning}`,
           details,
         );
       }
       const cancel = details.remote_cancel ? ` · ${details.remote_cancel}` : "";
-      return bashKillResult(`Task ${params.task_id}: ${details.status}${cancel}`, details);
+      return bashKillResult(
+        `Task ${params.task_id}: ${details.status}${cancel}${warning}`,
+        details,
+      );
     },
   };
 }

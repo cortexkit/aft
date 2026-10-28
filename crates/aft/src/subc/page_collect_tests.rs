@@ -659,6 +659,7 @@ async fn read_tool_allows_on(
     let request_id = format!("parity-read-{request}");
     let arguments = json!({ "path": path });
     let run = PlainToolRun {
+        speech_seed: None,
         bare_name: "read".into(),
         arguments: arguments.clone(),
         format_context: Default::default(),

@@ -122,6 +122,7 @@ impl Fixture {
             .openpty(portable_pty::PtySize::default())
             .unwrap();
         task.state.lock().unwrap().runtime = TaskRuntime::Pty(Some(PtyRuntime {
+            bootstrap_release: None,
             master: Some(pair.master),
             writer: Arc::new(Mutex::new(Box::new(io::sink()))),
             killer: Box::new(NoopKiller),

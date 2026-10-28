@@ -10092,8 +10092,8 @@ mod tests {
         );
     }
 
-    /// After a fill is folded into a new generation, the worker installs that
-    /// generation before it rebuilds the scored index. A search in that window
+    /// After a fill publishes a base readiness successor, the worker installs
+    /// that successor before it rebuilds the scored index. A search in that window
     /// must still see the views-on semantic lane as ready: with no snapshot the
     /// engine plans no semantic lane and answers lexical hits only, with no
     /// symbol names or previews, while the reply still says `semantic: ready`.
@@ -10122,9 +10122,18 @@ mod tests {
             .unwrap(),
         );
         runtime.load().unwrap();
-        // Fill and fold, which publishes and installs a new generation, without
-        // the scored-index rebuild the worker runs afterwards.
-        let published_before = runtime.installed().generation().name().to_owned();
+        // The file is inherited from the base. Its fill replaces the composed
+        // base generation; the worker manifest's base header stays fixed.
+        // Do not build the scored index here. The source.sample() call below
+        // must supply it even when publication has finished but the worker's
+        // index rebuild has not.
+        let published_before = runtime
+            .installed()
+            .generation()
+            .base()
+            .unwrap()
+            .name()
+            .to_owned();
         runtime
             .refresh(
                 crate::views::semantic::FillBudget::default(),
@@ -10132,9 +10141,9 @@ mod tests {
             )
             .unwrap();
         assert_ne!(
-            runtime.installed().generation().name(),
+            runtime.installed().generation().base().unwrap().name(),
             published_before,
-            "the fill must publish a new generation"
+            "the fill must install the base readiness successor"
         );
         assert!(slot.install(epoch, Arc::clone(&runtime)));
         *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();

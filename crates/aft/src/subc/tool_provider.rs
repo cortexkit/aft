@@ -5051,7 +5051,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+pub(in crate::subc) mod route_tests {
     mod carrier_samples;
     #[path = "../../rich_ui/admission/route_tests.rs"]
     mod operation_admission;
@@ -5196,12 +5196,33 @@ mod route_tests {
         exchange_decoded_with_actor(decoded, &routes, &executor, metrics, dispatch).await
     }
 
-    async fn exchange_decoded_with_actor(
+    pub(in crate::subc) async fn exchange_decoded_with_actor(
         decoded: DecodedFrame,
         routes: &HashMap<RouteChannel, RouteIdentity>,
         executor: &Arc<Executor>,
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
+    ) -> WriterFrame {
+        exchange_decoded_with_capabilities(
+            decoded,
+            routes,
+            executor,
+            metrics,
+            dispatch,
+            crate::subc::rich_ui::session::ProofCapabilities::from_manifest(
+                &manifest::build_manifest(),
+            ),
+        )
+        .await
+    }
+
+    pub(in crate::subc) async fn exchange_decoded_with_capabilities(
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Arc<Executor>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+        proofs: crate::subc::rich_ui::session::ProofCapabilities,
     ) -> WriterFrame {
         let (writer, mut replies) = mpsc::channel(8);
         let (bash_tx, _bash_rx) = mpsc::channel(8);
@@ -5212,7 +5233,7 @@ mod route_tests {
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
         let frame = decoded.frame;
-        handle_tool_call(
+        handle_tool_call_with_capabilities(
             &writer,
             &frame,
             None,
@@ -5243,6 +5264,7 @@ mod route_tests {
             1024 * 1024,
             &drain::ModuleDrainWindow::default(),
             None,
+            proofs,
         )
         .await
         .unwrap();
@@ -6968,6 +6990,7 @@ mod route_tests {
                 worker_mode
             };
             let run = PlainToolRun {
+                speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
                 format_context: Default::default(),
@@ -7089,6 +7112,7 @@ mod route_tests {
         };
         let call = |content: &str, profile_reads: usize| -> Value {
             let run = PlainToolRun {
+                speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": content}),
                 format_context: Default::default(),
@@ -8521,6 +8545,7 @@ mod authorization_failure_tests {
             arguments: json!({"command":"printf must-not-run"}),
             format_context: crate::subc_format::FormatContext::default(),
             cancel: bash::BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,

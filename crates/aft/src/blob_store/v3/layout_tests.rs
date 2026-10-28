@@ -154,6 +154,61 @@ fn both_layouts_allow_liveness_touch_and_delete() {
 }
 
 #[test]
+fn touch_batches_one_transaction_per_present_plane_in_both_layouts() {
+    let _guard = tests::serial();
+    for old in [true, false] {
+        CREATE_3A_LAYOUT.set(old);
+        let root = tempfile::tempdir().unwrap();
+        let present: Vec<_> = (0..16)
+            .map(|i| FamilyKey::new(FamilyPlane::Semantic, [i; 32]))
+            .collect();
+        publish(root.path(), FAMILY, 1 << 20, None, |p| {
+            for key in &present {
+                p.put(key, b"payload", 3)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        CREATE_3A_LAYOUT.set(false);
+        let db = connections::shared(
+            &plane_path(root.path(), FAMILY, FamilyPlane::Semantic).unwrap(),
+            Kind::Plane(FamilyPlane::Semantic),
+            false,
+            false,
+        )
+        .unwrap();
+        db.connection()
+            .unwrap()
+            .execute("UPDATE store_meta SET gc_epoch=23", [])
+            .unwrap();
+        let absent = FamilyKey::new(FamilyPlane::Trigram, [99; 32]);
+        let missing = FamilyKey::new(FamilyPlane::Semantic, [99; 32]);
+        let mut keys = vec![absent, missing];
+        keys.extend(&present);
+        keys.push(absent);
+        work_profile::take();
+        let untouched = publish(root.path(), FAMILY, 1 << 20, None, |p| p.touch(&keys)).unwrap();
+        assert_eq!(untouched, vec![absent, missing, absent]);
+        assert_eq!(work_profile::count("touch_transaction"), 1);
+        assert!(!plane_path(root.path(), FAMILY, FamilyPlane::Trigram)
+            .unwrap()
+            .exists());
+        let sql = if old {
+            "SELECT COUNT(*) FROM blob_payloads WHERE ref_epoch=23"
+        } else {
+            "SELECT COUNT(*) FROM blob_liveness WHERE ref_epoch=23"
+        };
+        assert_eq!(
+            db.connection()
+                .unwrap()
+                .query_row(sql, [], |r| r.get::<_, usize>(0))
+                .unwrap(),
+            present.len()
+        );
+    }
+}
+
+#[test]
 fn per_file_format_report_reads_both_layouts_and_registry_without_writes() {
     let _guard = tests::serial();
     for old in [true, false] {

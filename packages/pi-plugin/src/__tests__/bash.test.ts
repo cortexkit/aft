@@ -2064,6 +2064,26 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("bash_kill preserves its outcome and appends the durable-revocation warning", async () => {
+    const warning =
+      "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
+    const tools = new Map<string, MockToolDef>();
+    const bridge = {
+      send: async () => ({
+        success: true,
+        status: "killed",
+        bot_write_revocation_warning: warning,
+      }),
+    } as unknown as BinaryBridge;
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = await tools
+      .get("bash_kill")!
+      .execute("call", { task_id: "bash-warning" }, undefined, undefined, { cwd: projectRoot });
+    expect((result.content[0] as { text: string }).text).toBe(
+      `Task bash-warning: killed\n${warning}`,
+    );
+  });
+
   test("bash_status text includes a failed task's spawn reason", async () => {
     const reason = "failed to spawn background bash command: No such file or directory";
     const tools = new Map<string, MockToolDef>();

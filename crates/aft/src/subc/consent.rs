@@ -1140,6 +1140,16 @@ where
     let Some(grant) = requested_ask(&first.0) else {
         return Some((first.0, Some(first.1)));
     };
+    if access_grants::scope_grants_denial(&call.identity).is_some() {
+        return Some((
+            Response::error(
+                &call.request_id,
+                "path_outside_root",
+                "outside-path access needs a permission-capable route",
+            ),
+            None,
+        ));
+    }
     let owner = SettlementOwner::new(&call);
     let result = run_held(&call, grant, rerun, &owner.0).await;
     owner.complete(&result);
@@ -1362,6 +1372,9 @@ fn prepare(
     directory_scope: &AccessGrant,
     own_holder: Option<&str>,
 ) -> Result<Prep, String> {
+    if let Some(reason) = access_grants::scope_grants_denial(identity) {
+        return Err(format!("saved scope grants unavailable: {reason:?}"));
+    }
     let worker = identity
         .scope
         .as_ref()
@@ -2561,6 +2574,11 @@ fn apply_allow(
     scope: bool,
     by_user: bool,
 ) -> Result<Applied, String> {
+    if scope {
+        if let Some(reason) = access_grants::scope_grants_denial(identity) {
+            return Err(format!("saved scope grants unavailable: {reason:?}"));
+        }
+    }
     with_head_policy(db, ctx, identity, !by_user, |conn, head| {
         // A head may pass on only what it holds now: its authority is
         // checked again against the head's current policy and grants.

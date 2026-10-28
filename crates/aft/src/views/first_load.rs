@@ -663,6 +663,8 @@ impl SiblingLoader {
 
     /// Refresh an already installed owner without reopening sibling manifests.
     /// Membership is still strictly reconciled, including unreported edits.
+    /// Only v2 drivers use it, and production no longer runs one.
+    #[cfg(test)]
     pub(crate) fn refresh(
         &self,
         access: &ViewAccess,
@@ -1256,6 +1258,14 @@ pub trait CompositePlane: Send + Sync {
         false
     }
 
+    /// Whether this plane's base entries are completed later by the base's
+    /// owner rather than during the bind that bootstraps or verifies the
+    /// base. A bind neither claims the base for such a plane nor refuses
+    /// while another owner is completing it.
+    fn defers_base_completion(&self) -> bool {
+        false
+    }
+
     /// Completes this plane's pending entries of the claimed base from the
     /// attachments the bootstrap's strict reconciliation computed for the
     /// same bytes, and publishes the result as a readiness successor.
@@ -1673,10 +1683,42 @@ enum StableRead {
 #[derive(Clone)]
 struct CachedAttachment(crate::blob_store::v2::FamilyKey);
 
-fn v3_contains(route: &super::snapshot::V3Route, key: &crate::blob_store::v2::FamilyKey) -> bool {
-    crate::blob_store::v3::PlaneReader::open_existing(&route.storage, &route.family, key.plane())
-        .and_then(|reader| reader.contains(key))
-        .unwrap_or(false)
+/// Readers live for one reconcile or materialization pass, not across binds.
+/// Opening validates the database's identity and full schema; doing that for
+/// every file repeats schema construction thousands of times. Presence is
+/// still queried afresh for every key, including keys missing earlier in the
+/// pass. Failed opens are not retained, so a newly created plane can be used.
+struct V3PlaneReaders<'a> {
+    route: &'a super::snapshot::V3Route,
+    readers: BTreeMap<FamilyPlane, crate::blob_store::v3::PlaneReader>,
+}
+
+impl<'a> V3PlaneReaders<'a> {
+    fn new(route: &'a super::snapshot::V3Route) -> Self {
+        Self {
+            route,
+            readers: BTreeMap::new(),
+        }
+    }
+
+    fn contains(&mut self, key: &crate::blob_store::v2::FamilyKey) -> bool {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("firstload_contains");
+        let reader = match self.readers.entry(key.plane()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let Ok(reader) = crate::blob_store::v3::PlaneReader::open_existing(
+                    &self.route.storage,
+                    &self.route.family,
+                    key.plane(),
+                ) else {
+                    return false;
+                };
+                entry.insert(reader)
+            }
+        };
+        reader.contains(key).unwrap_or(false)
+    }
 }
 
 struct PreparedReaders {
@@ -1736,7 +1778,14 @@ impl CheckoutDriver {
         {
             return Err(FreshBootstrapRefusal::NonLexicalPlane(plane));
         }
-        if self.producers.semantic.is_some() {
+        // A registered semantic producer needs a registered semantic plane
+        // that takes part in a fresh base (its owner fills the base later).
+        if self.producers.semantic.is_some()
+            && !self
+                .planes
+                .iter()
+                .any(|plane| plane.plane() == FamilyPlane::Semantic && plane.completes_fresh_base())
+        {
             return Err(FreshBootstrapRefusal::NonLexicalPlane(
                 FamilyPlane::Semantic,
             ));
@@ -2061,7 +2110,7 @@ impl CheckoutDriver {
         let completing: Vec<_> = self
             .planes
             .iter()
-            .filter(|plane| plane.completes_fresh_base())
+            .filter(|plane| plane.completes_fresh_base() && !plane.defers_base_completion())
             .filter(|plane| {
                 base.manifest().entries().any(|(_, entry)| {
                     entry
@@ -2464,6 +2513,7 @@ impl FirstLoadDriver for CheckoutDriver {
         } else {
             None
         };
+        let mut v3_readers = V3PlaneReaders::new(&route);
         let persisted = durable
             .as_ref()
             .and_then(|generation| {
@@ -2602,7 +2652,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         });
                     let keys_present = old.attachments.values().all(|a| {
                         a.downcast_ref::<CachedAttachment>()
-                            .is_none_or(|cached| v3_contains(&route, &cached.0))
+                            .is_none_or(|cached| v3_readers.contains(&cached.0))
                     });
                     if cached.reusable(current)
                         && delivered <= cached.delivery_seq
@@ -2639,7 +2689,7 @@ impl FirstLoadDriver for CheckoutDriver {
                             record.key(p.plane()).is_some_and(|key| {
                                 matches!(generation.plane_readiness(&path, p.plane()), Some(super::readiness::PlaneState::Ready { key: ready }) if *ready == key.to_hex())
                                     && record.content().is_some_and(|content| p.key(&path, content).is_none_or(|expected| expected == key))
-                                    && v3_contains(&route, &key)
+                                    && v3_readers.contains(&key)
                             })
                         })
                         && self
@@ -2705,7 +2755,7 @@ impl FirstLoadDriver for CheckoutDriver {
             for plane in &self.planes {
                 if plane.applies_to(&path) {
                     let key = plane.key(&path, content);
-                    if v3 && key.is_some_and(|key| v3_contains(&route, &key)) {
+                    if v3 && key.is_some_and(|key| v3_readers.contains(&key)) {
                         let key = key.unwrap();
                         keys.insert(format!("{:?}", plane.plane()), key.to_hex());
                         entry
@@ -2771,163 +2821,7 @@ impl FirstLoadDriver for CheckoutDriver {
         snapshot: &Snapshot,
         _revision: u64,
     ) -> Result<(), PlaneError> {
-        self.check_owner(access)?;
-        let cut = snapshot
-            .install_cut()
-            .ok_or_else(|| SiblingLoader::error("missing installed bundle identity"))?;
-        let old_bundle = self.installed_bundle();
-        let previously_owned = old_bundle.own_installed
-            && old_bundle.composed.resident_key() == snapshot.generation().resident_key();
-        drop(old_bundle);
-        let prepared = self
-            .prepared_readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(snapshot.generation().name())
-            .map(|prepared| prepared.readers.clone());
-        let from_prepared = prepared.is_some();
-        let own_installed = prepared.is_some() || previously_owned;
-        let readers = match prepared {
-            Some(readers) => readers,
-            None => {
-                let old = self
-                    .installed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if Arc::ptr_eq(&old.composed, snapshot.generation()) {
-                    old.readers.clone()
-                } else {
-                    drop(old);
-                    let adapters: Vec<_> = self
-                        .adapters
-                        .iter()
-                        .filter(|adapter| {
-                            snapshot.generation().name() != "empty"
-                                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
-                        })
-                        .cloned()
-                        .collect();
-                    PlaneReaders::open(access, snapshot.generation().clone(), &adapters)?
-                }
-            }
-        };
-        let publication_guard = self
-            .publication_transition
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let install_error = |error: PlaneError| {
-            if from_prepared {
-                self.retry.store(true, std::sync::atomic::Ordering::Release);
-                SiblingLoader::error(format!(
-                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: published installation refused: {}",
-                    error.reason
-                ))
-            } else {
-                error
-            }
-        };
-        let mut successor = live.replay_onto(snapshot, cut).map_err(|error| {
-            install_error(SiblingLoader::error(format!(
-                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"
-            )))
-        })?;
-        let mut installed = self
-            .installed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.validate_install_identity(snapshot, cut, &live, &installed)
-            .map_err(install_error)?;
-        let seq = installed.seq + 1;
-        successor.set_watcher(super::snapshot::WatcherState::Healthy);
-        let published = snapshot
-            .generation()
-            .published()
-            .cloned()
-            .unwrap_or_default();
-        let mut installed_snapshot = successor
-            .snapshot()
-            .with_readers(readers.clone())
-            .with_install_cut(InstallCut {
-                seq,
-                resident: snapshot.generation().clone(),
-                epoch: successor.epoch(),
-                version: successor.version(),
-                intent_version: successor.snapshot().intent_version(),
-                verification: cut.verification.clone(),
-            });
-        if snapshot.reconciled_epoch().is_some() {
-            if let Some(base) = snapshot.publication_base() {
-                installed_snapshot = installed_snapshot.with_publication_base(base.clone());
-            }
-        }
-        let coverage = FamilyPlane::ALL
-            .into_iter()
-            .map(|plane| {
-                (
-                    plane,
-                    if installed_snapshot.pending_intent().any(|path| {
-                        self.planes
-                            .iter()
-                            .any(|driver| driver.plane() == plane && driver.applies_to(path))
-                    }) {
-                        super::readiness::PlaneReadiness::Building
-                    } else {
-                        super::readiness::plane_readiness(
-                            plane,
-                            Some(snapshot.generation()),
-                            &installed_snapshot,
-                            &Default::default(),
-                            &|path| {
-                                self.planes.iter().any(|bridge| {
-                                    bridge.plane() == plane && bridge.applies_to(path)
-                                })
-                            },
-                        )
-                    },
-                )
-            })
-            .collect();
-        let replacement = Arc::new(InstalledBundle {
-            seq,
-            composed: snapshot.generation().clone(),
-            coverage,
-            readers,
-            published,
-            revision: installed.revision,
-            snapshot: installed_snapshot,
-            uncertain_paths: Default::default(),
-            own_installed,
-        });
-        let retired_bundle = std::mem::replace(&mut *installed, replacement);
-        let retired_delta = std::mem::replace(&mut *live, successor);
-        drop(installed);
-        drop(live);
-        drop(publication_guard);
-        // Last-drop reader close and residency-pin cleanup can perform I/O.
-        // Keep displaced owners alive until both root locks are released.
-        drop(retired_bundle);
-        drop(retired_delta);
-        let mut retired_prepared = Vec::new();
-        {
-            let mut prepared = self
-                .prepared_readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            prepared.retain(|_, entry| {
-                if entry.seq < seq {
-                    retired_prepared.push(entry.readers.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-        drop(retired_prepared);
-        Ok(())
+        self.install_bundle(access, snapshot, true)
     }
     fn build_own_generation(
         &self,
@@ -3068,7 +2962,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         published = true;
                         self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
                         for adapter in &self.adapters {
-                            adapter.generation_published(access, &generation, &|| self.installed_snapshot())?;
+                            adapter.generation_published(access, &generation, &|| self.installed_cut().0)?;
                         }
                         let rebound = readers.rebind(access)?;
                         let retired = self.prepared_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3355,9 +3249,12 @@ impl CheckoutDriver {
         match outcome {
             Ok(super::base_refs::WorkerOutcome::Published { composed, .. }) => {
                 let readers = PlaneReaders::open(access, composed.clone(), &self.adapters)?;
+                // The installed cut, read without the subscription check:
+                // `installed_snapshot` would mark a checkout without a steady
+                // watcher subscription overflowed in the middle of this
+                // publication, and the install that follows would refuse it.
                 for adapter in &self.adapters {
-                    adapter
-                        .generation_published(access, &composed, &|| self.installed_snapshot())?;
+                    adapter.generation_published(access, &composed, &|| self.installed_cut().0)?;
                 }
                 let retired = self
                     .prepared_readers
@@ -4750,6 +4647,7 @@ impl CompositePlane for CallgraphBridge {
         let base = super::base_refs::resolve_base(claim.storage(), claim.family(), claim.scope())
             .map_err(|e| error(e.to_string()))?;
         let route = super::base_refs::route(claim.storage(), claim.family(), claim.scope());
+        let mut v3_readers = V3PlaneReaders::new(&route);
         let mut keys = Vec::new();
         let mut payloads = Vec::new();
         for (path, entry) in base.manifest().entries() {
@@ -4824,7 +4722,7 @@ impl CompositePlane for CallgraphBridge {
             .map_err(|e| error(e.to_string()))?;
         }
         for (_, key) in &keys {
-            if !v3_contains(&route, key) {
+            if !v3_readers.contains(key) {
                 return Err(error(
                     "base callgraph row disappeared before publication".into(),
                 ));
@@ -5042,6 +4940,9 @@ impl CompositePlane for CallgraphBridge {
             plane: Some(FamilyPlane::Callgraph),
             reason,
         };
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("callgraph_materialize");
+        let mut v3_readers = V3PlaneReaders::new(route);
         let mut attachments = Vec::new();
         for (path, entry) in observed {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
@@ -5061,7 +4962,7 @@ impl CompositePlane for CallgraphBridge {
             {
                 live.protect(&[cached.0])
                     .map_err(|e| error(e.to_string()))?;
-                if !v3_contains(route, &cached.0) {
+                if !v3_readers.contains(&cached.0) {
                     return Err(error(
                         "cached callgraph row disappeared before protection".into(),
                     ));
@@ -5858,16 +5759,28 @@ impl CompositePlane for TrigramBridge {
         if delta.header().producers.trigram != self.policy.fingerprint_hex() {
             return Err(SiblingLoader::error("trigram producer mismatch"));
         }
+        let mut v3_readers = V3PlaneReaders::new(route);
+        let entries: Vec<_> = delta
+            .entries()
+            .filter_map(|(path, entry)| match entry {
+                super::manifest_v2::EntryV2::Regular { content, .. } => {
+                    Some((path.clone(), *content, self.key(path, *content).unwrap()))
+                }
+                _ => None,
+            })
+            .collect();
+        // Every key is protected before any is checked against the store, so
+        // a sweep cannot remove a row between the check and the publication.
+        // One call writes the live pin's key list once; protecting key by key
+        // rewrote the whole growing list per entry, quadratic in the entries.
+        live.protect(&entries.iter().map(|(_, _, key)| *key).collect::<Vec<_>>())
+            .map_err(|e| SiblingLoader::error(e.to_string()))?;
         let mut keys = Vec::new();
         let mut payloads = Vec::new();
-        for (path, entry) in delta.entries() {
-            let super::manifest_v2::EntryV2::Regular { content, .. } = entry else {
-                continue;
-            };
-            let key = self.key(path, *content).unwrap();
-            live.protect(&[key])
-                .map_err(|e| SiblingLoader::error(e.to_string()))?;
-            if !v3_contains(route, &key) {
+        for (path, content, key) in entries {
+            let path = &path;
+            let content = &content;
+            if !v3_readers.contains(&key) {
                 let attachment = observed
                     .get(path)
                     .filter(|e| e.disk == super::snapshot::DiskState::in_generation(delta, path))
@@ -5909,6 +5822,197 @@ impl CompositePlane for TrigramBridge {
 }
 
 impl CheckoutDriver {
+    /// Installs a snapshot whose cut this driver took without reading the
+    /// installed bundle through the subscription check first.
+    ///
+    /// `install` reads the installed bundle through that check. On a checkout
+    /// without a steady watcher subscription, a healthy installed bundle is
+    /// marked overflowed by the check, which bumps the live epoch under the
+    /// cut being installed, so a second install after a verified one (a
+    /// view folding completions into the generation it just installed)
+    /// always refuses. A caller that already applied the check once for the
+    /// work this install finishes uses this instead; the next read that
+    /// vouches for the checkout applies the check again.
+    pub(crate) fn install_without_subscription_check(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+    ) -> Result<(), PlaneError> {
+        self.install_bundle(access, snapshot, false)
+    }
+
+    fn install_bundle(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+        check_subscription: bool,
+    ) -> Result<(), PlaneError> {
+        self.check_owner(access)?;
+        let cut = snapshot
+            .install_cut()
+            .ok_or_else(|| SiblingLoader::error("missing installed bundle identity"))?;
+        let old_bundle = if check_subscription {
+            self.installed_bundle()
+        } else {
+            self.installed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let previously_owned = old_bundle.own_installed
+            && old_bundle.composed.resident_key() == snapshot.generation().resident_key();
+        drop(old_bundle);
+        let prepared = self
+            .prepared_readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(snapshot.generation().name())
+            .map(|prepared| prepared.readers.clone());
+        let from_prepared = prepared.is_some();
+        let own_installed = prepared.is_some() || previously_owned;
+        let readers = match prepared {
+            Some(readers) => readers,
+            None => {
+                let old = self
+                    .installed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if Arc::ptr_eq(&old.composed, snapshot.generation()) {
+                    old.readers.clone()
+                } else {
+                    drop(old);
+                    let adapters: Vec<_> = self
+                        .adapters
+                        .iter()
+                        .filter(|adapter| {
+                            snapshot.generation().name() != "empty"
+                                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
+                        })
+                        .cloned()
+                        .collect();
+                    PlaneReaders::open(access, snapshot.generation().clone(), &adapters)?
+                }
+            }
+        };
+        let publication_guard = self
+            .publication_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let install_error = |error: PlaneError| {
+            if from_prepared {
+                self.retry.store(true, std::sync::atomic::Ordering::Release);
+                SiblingLoader::error(format!(
+                    "{CHECKOUT_CHANGED_BEFORE_INSTALL}: published installation refused: {}",
+                    error.reason
+                ))
+            } else {
+                error
+            }
+        };
+        let mut successor = live.replay_onto(snapshot, cut).map_err(|error| {
+            install_error(SiblingLoader::error(format!(
+                "{CHECKOUT_CHANGED_BEFORE_INSTALL}: {error:?}"
+            )))
+        })?;
+        let mut installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_install_identity(snapshot, cut, &live, &installed)
+            .map_err(install_error)?;
+        let seq = installed.seq + 1;
+        successor.set_watcher(super::snapshot::WatcherState::Healthy);
+        let published = snapshot
+            .generation()
+            .published()
+            .cloned()
+            .unwrap_or_default();
+        let mut installed_snapshot = successor
+            .snapshot()
+            .with_readers(readers.clone())
+            .with_install_cut(InstallCut {
+                seq,
+                resident: snapshot.generation().clone(),
+                epoch: successor.epoch(),
+                version: successor.version(),
+                intent_version: successor.snapshot().intent_version(),
+                verification: cut.verification.clone(),
+            });
+        if snapshot.reconciled_epoch().is_some() {
+            if let Some(base) = snapshot.publication_base() {
+                installed_snapshot = installed_snapshot.with_publication_base(base.clone());
+            }
+        }
+        let coverage = FamilyPlane::ALL
+            .into_iter()
+            .map(|plane| {
+                (
+                    plane,
+                    if installed_snapshot.pending_intent().any(|path| {
+                        self.planes
+                            .iter()
+                            .any(|driver| driver.plane() == plane && driver.applies_to(path))
+                    }) {
+                        super::readiness::PlaneReadiness::Building
+                    } else {
+                        super::readiness::plane_readiness(
+                            plane,
+                            Some(snapshot.generation()),
+                            &installed_snapshot,
+                            &Default::default(),
+                            &|path| {
+                                self.planes.iter().any(|bridge| {
+                                    bridge.plane() == plane && bridge.applies_to(path)
+                                })
+                            },
+                        )
+                    },
+                )
+            })
+            .collect();
+        let replacement = Arc::new(InstalledBundle {
+            seq,
+            composed: snapshot.generation().clone(),
+            coverage,
+            readers,
+            published,
+            revision: installed.revision,
+            snapshot: installed_snapshot,
+            uncertain_paths: Default::default(),
+            own_installed,
+        });
+        let retired_bundle = std::mem::replace(&mut *installed, replacement);
+        let retired_delta = std::mem::replace(&mut *live, successor);
+        drop(installed);
+        drop(live);
+        drop(publication_guard);
+        // Last-drop reader close and residency-pin cleanup can perform I/O.
+        // Keep displaced owners alive until both root locks are released.
+        drop(retired_bundle);
+        drop(retired_delta);
+        let mut retired_prepared = Vec::new();
+        {
+            let mut prepared = self
+                .prepared_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prepared.retain(|_, entry| {
+                if entry.seq < seq {
+                    retired_prepared.push(entry.readers.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        drop(retired_prepared);
+        Ok(())
+    }
+
     fn check_subscription(&self) {
         let stale = {
             let installed = self
@@ -5978,8 +6082,8 @@ impl CheckoutDriver {
     }
 
     pub fn record_absolute_change(&self, absolute: &std::path::Path) {
-        if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
-            if let Ok(path) = RelPath::from_os_path(relative) {
+        if let Some(relative) = super::intent::relative_to_root(absolute, self.owner.root()) {
+            if let Ok(path) = RelPath::from_os_path(&relative) {
                 self.record_change(path);
             }
         }
@@ -5997,17 +6101,14 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
         match change {
             super::intent::WriteIntent::Paths(paths) => {
                 for absolute in paths {
-                    if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
-                        if let Ok(path) = RelPath::from_os_path(relative) {
-                            self.record_change(path);
-                        }
-                    }
+                    self.record_absolute_change(absolute);
                 }
             }
             super::intent::WriteIntent::Directory(absolute) => {
-                if !absolute.starts_with(self.owner.root()) {
+                let Some(relative) = super::intent::relative_to_root(absolute, self.owner.root())
+                else {
                     return;
-                }
+                };
                 {
                     let mut live = self
                         .live
@@ -6020,7 +6121,9 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let installed = Arc::make_mut(&mut installed);
                     installed.revision += 1;
-                    installed.uncertain_paths.insert(absolute.clone());
+                    installed
+                        .uncertain_paths
+                        .insert(self.owner.root().join(&relative));
                     installed.snapshot = live
                         .snapshot()
                         .with_readers(installed.readers.clone())
@@ -6044,17 +6147,15 @@ impl super::intent::WriteIntentListener for CheckoutDriver {
                 }
                 // A directory write can create previously unknown members. Keep
                 // an explicit subtree intent even when the previous view was empty.
-                if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
-                    if let Ok(path) = RelPath::from_os_path(relative) {
-                        self.record_change(path);
-                    } else {
-                        let mut installed = self
-                            .installed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let installed = Arc::make_mut(&mut installed);
-                        installed.revision += 1;
-                    }
+                if let Ok(path) = RelPath::from_os_path(&relative) {
+                    self.record_change(path);
+                } else {
+                    let mut installed = self
+                        .installed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let installed = Arc::make_mut(&mut installed);
+                    installed.revision += 1;
                 }
             }
         }
@@ -6297,6 +6398,53 @@ mod checkout_kind_tests {
 
 #[cfg(test)]
 mod v3_bootstrap_tests {
+    #[test]
+    fn v3_presence_batch_validates_once_and_rechecks_rows_and_later_schema_drift() {
+        use super::*;
+        use crate::blob_store::v2::FamilyKey;
+        use crate::blob_store::v3;
+        let storage = tempfile::tempdir().unwrap();
+        let family = "0123456789abcdef";
+        let route = super::super::base_refs::route(storage.path(), family, "member");
+        let keys: Vec<_> = (0..16)
+            .map(|i| FamilyKey::new(FamilyPlane::Semantic, [i; 32]))
+            .collect();
+        v3::publish(storage.path(), family, 1 << 20, None, |p| {
+            for key in &keys {
+                p.put(key, b"payload", FamilyPlane::Semantic.payload_schema())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let before = v3::work_profile::count("validate_database");
+        let mut readers = V3PlaneReaders::new(&route);
+        for key in &keys {
+            assert!(readers.contains(key));
+        }
+        assert_eq!(
+            v3::work_profile::count("validate_database") - before,
+            1,
+            "schema validation belongs to the plane's batch open, not each key"
+        );
+        let next = FamilyKey::new(FamilyPlane::Semantic, [99; 32]);
+        assert!(!readers.contains(&next));
+        v3::publish(storage.path(), family, 1 << 20, None, |p| {
+            p.put(&next, b"next", FamilyPlane::Semantic.payload_schema())
+        })
+        .unwrap();
+        assert!(readers.contains(&next), "a row miss must not be cached");
+        drop(readers);
+        let path = v3::plane_path(storage.path(), family, FamilyPlane::Semantic).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unexpected(value TEXT)")
+            .unwrap();
+        assert!(
+            !V3PlaneReaders::new(&route).contains(&keys[0]),
+            "the next pass must validate the schema again"
+        );
+    }
+
     use super::*;
 
     struct NamedPlane(FamilyPlane);
@@ -6425,6 +6573,48 @@ mod v3_bootstrap_tests {
         )
         .unwrap()
         .with_adapters(vec![plane.adapter.clone()])
+    }
+
+    #[test]
+    fn absolute_changes_match_canonical_roots_for_missing_descendants() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        let relative = std::path::Path::new("missing").join("deleted.rs");
+        let ordinary = root.path().join(&relative);
+        let canonical = std::fs::canonicalize(root.path()).unwrap().join(&relative);
+        assert!(!ordinary.exists());
+
+        driver.record_absolute_change(&ordinary);
+        driver.record_absolute_change(&canonical);
+        driver.record_absolute_change(&outside.path().join(&relative));
+        driver.record_absolute_change(&relative);
+        use super::super::intent::{WriteIntent, WriteIntentListener, WritePhase};
+        WriteIntentListener::record_change(
+            &driver,
+            &WriteIntent::Paths(vec![ordinary]),
+            WritePhase::Before,
+        );
+        WriteIntentListener::record_change(
+            &driver,
+            &WriteIntent::Directory(root.path().join("missing")),
+            WritePhase::After,
+        );
+        assert_eq!(
+            driver.delivery.lock().unwrap().paths,
+            BTreeMap::from([
+                (RelPath::new(b"missing/deleted.rs".to_vec()).unwrap(), 3),
+                (RelPath::new(b"missing".to_vec()).unwrap(), 4),
+            ])
+        );
+        assert_eq!(
+            driver.installed_bundle().uncertain_paths,
+            std::collections::BTreeSet::from([std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("missing")])
+        );
     }
 
     #[test]

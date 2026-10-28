@@ -379,6 +379,16 @@ struct CapturedFrame {
 fn relay_reply(gh_route_response: &[u8]) -> Vec<u8> {
     let response: Value =
         serde_json::from_slice(gh_route_response).expect("gh.route response is JSON");
+    // Plexus's reply vectors already carry the facade envelope. Preserve it
+    // intact instead of translating it through the retired holder protocol.
+    if response.get("repo_binding_generation").is_some() {
+        return serde_json::to_vec(&json!({
+            "op": "gh_shim.bot_request",
+            "status": "ok",
+            "data": response,
+        }))
+        .expect("native facade relay reply");
+    }
     let result = match response["outcome"].as_str() {
         Some("result") => json!({"status": "completed", "result": response["result"]}),
         Some("applied") => {
@@ -1890,6 +1900,15 @@ struct V22Run {
 fn run_v22_row(row: &V22Row, manifest_bytes: &[u8], agent_id: &str) -> V22Run {
     let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
         .expect("read success response");
+    run_v22_row_with_reply(row, manifest_bytes, agent_id, reply)
+}
+
+fn run_v22_row_with_reply(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+) -> V22Run {
     let bindings = serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
         "status": "ok",
@@ -2044,38 +2063,145 @@ fn stand_in_holder_answers_routed_requests_from_the_plexus_contract() {
     }))
     .expect("canned reply");
     let vectors = plexus_contract_judge::load_vectors();
-    let request = |name: &str| {
-        vectors
-            .iter()
-            .find(|vector| vector.name == name)
-            .unwrap_or_else(|| panic!("{name}: no such vendored vector"))
-            .request
-            .clone()
+    for vector in &vectors {
+        let expected = match &vector.expect {
+            plexus_contract_judge::ContractExpect::Accepted => Some(relay_reply(&canned)),
+            plexus_contract_judge::ContractExpect::Refused(code) => Some(relay_reply(
+                &serde_json::to_vec(&json!({"outcome": "refusal", "refusal_code": code})).unwrap(),
+            )),
+        };
+        assert_eq!(
+            stand_in_route_reply(&vector.request, Some(&canned)),
+            expected,
+            "{}",
+            vector.name,
+        );
+        let expected_without_canned = match vector.expect {
+            plexus_contract_judge::ContractExpect::Accepted => None,
+            plexus_contract_judge::ContractExpect::Refused(_) => expected,
+        };
+        assert_eq!(
+            stand_in_route_reply(&vector.request, None),
+            expected_without_canned,
+            "{}: no canned reply",
+            vector.name,
+        );
+    }
+}
+
+/// Construct argv for each reply vector's request, failing on a new family
+/// rather than silently leaving a native reply without a real-shim exchange.
+fn reply_contract_row(vector: &Value) -> V22Row {
+    let request = &vector["request"];
+    let text = |value: &Value| value.as_str().expect("request string").to_string();
+    let action = request["action"]
+        .as_str()
+        .or(request["verb"].as_str())
+        .unwrap();
+    let argv: Vec<String> = match action {
+        "pr ready" => {
+            let mut argv = vec!["pr".into(), "ready".into(), text(&request["number"])];
+            if request["undo"] == true {
+                argv.push("--undo".into());
+            }
+            argv
+        }
+        "pr edit" => vec![
+            "pr".into(),
+            "edit".into(),
+            text(&request["target"]["number"]),
+            "--title".into(),
+            text(&request["body"]["title"]),
+        ],
+        "graphql resolvereviewthread" | "graphql unresolvereviewthread" => {
+            let mutation = if action == "graphql resolvereviewthread" {
+                "resolveReviewThread"
+            } else {
+                "unresolveReviewThread"
+            };
+            vec!["api".into(), "graphql".into(), "-f".into(), format!(
+                "query=mutation {{ {mutation}(input: {{threadId: \"{}\"}}) {{ thread {{ id }} }} }}",
+                text(&request["target"]["thread_id"]),
+            )]
+        }
+        "api:POST:/repos/*/*/stacks"
+        | "api:POST:/repos/*/*/stacks/*/add"
+        | "api:POST:/repos/*/*/stacks/*/unstack" => {
+            let mut endpoint = format!("repos/{REPOSITORY}/stacks");
+            if action.ends_with("/add") || action.ends_with("/unstack") {
+                endpoint += &format!(
+                    "/{}/{}",
+                    text(&request["target"]["stack_number"]),
+                    action.rsplit('/').next().unwrap()
+                );
+            }
+            let mut argv = vec!["api".into(), "-X".into(), "POST".into(), endpoint];
+            if let Some(numbers) = request["body"]["pull_requests"].as_array() {
+                for number in numbers {
+                    argv.extend(["-F".into(), format!("pull_requests[]={number}")]);
+                }
+            }
+            argv
+        }
+        other => panic!("{}: untested reply request {other}", vector["name"]),
     };
-    // An accepted request is answered with the canned reply bytes.
-    assert_eq!(
-        stand_in_route_reply(&request("accepted-comment-issue"), Some(&canned)),
-        Some(relay_reply(&canned)),
-    );
-    // Silence stays silent: an accepted request with no canned reply gets no
-    // answer, which is what the outcome-unknown rows pin.
-    assert_eq!(
-        stand_in_route_reply(&request("accepted-comment-issue"), None),
-        None,
-    );
-    // A refused request is answered with a refusal carrying the contract's
-    // exact code, even though a canned reply was staged.
-    let refused = request("refused-pr-edit-unknown-top-level-field");
-    assert_eq!(
-        stand_in_route_reply(&refused, Some(&canned)),
-        Some(relay_reply(
-            &serde_json::to_vec(&json!({
-                "outcome": "refusal",
-                "refusal_code": "request_field_forbidden{field: draft}",
-            }))
-            .expect("refusal reply")
-        )),
-    );
+    V22Row {
+        name: leak(text(&vector["name"])),
+        argv: argv.into_iter().map(leak).collect(),
+        expect: V22Expect::Routed(request.clone()),
+    }
+}
+
+#[test]
+fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
+    let vectors = plexus_contract_judge::load_reply_vectors();
+    assert_eq!(vectors.len(), 17);
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for vector in vectors {
+        let row = reply_contract_row(&vector);
+        let native = serde_json::to_vec(&vector["reply"]).unwrap();
+        let wrapped: Value = serde_json::from_slice(
+            &stand_in_route_reply(&vector["request"], Some(&native)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wrapped["data"], vector["reply"], "{}", row.name);
+        let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", native);
+        assert!(
+            run.upstream_invocations.is_none(),
+            "{} delegated to gh",
+            row.name
+        );
+        let mut routed = run.routed_request.expect("one request, with no retries");
+        let mut expected = vector["request"].clone();
+        expected["repository"] = json!(REPOSITORY);
+        for request in [&mut routed, &mut expected] {
+            request
+                .as_object_mut()
+                .unwrap()
+                .remove("rung_as_of_unix_secs");
+            request.as_object_mut().unwrap().remove("metadata");
+        }
+        assert_eq!(routed, expected, "{}", row.name);
+        let result = &vector["reply"]["result"];
+        if result["status"] == "completed" {
+            assert_eq!(run.exit_code, Some(0), "{}: {}", row.name, run.stderr);
+            assert_eq!(row.name, "resolve-thread-own", "unhandled completed vector");
+            assert_eq!(run.stdout, "id: \"PRRT_kwDOAbc123\"\nresolved: true\n");
+        } else {
+            assert_eq!(run.exit_code, Some(86), "{}: {}", row.name, run.stderr);
+            assert!(run.stdout.is_empty(), "{}", row.name);
+            assert!(
+                run.stderr
+                    .contains(result["refusal_code"].as_str().unwrap()),
+                "{}",
+                row.name
+            );
+            assert!(!run.stderr.contains("outcome unknown"), "{}", row.name);
+            if row.name == "resolve-thread-not-own" {
+                assert_eq!(run.stderr, "gh-shim: gh_shim_seam_refusal: plexus refused the bot write with a code this shim does not know: review_thread_not_own; it was not retried\n");
+            }
+        }
+    }
 }
 
 #[test]

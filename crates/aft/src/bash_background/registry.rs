@@ -1382,6 +1382,7 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    speech_db_path: RwLock<Option<PathBuf>>,
     /// Ids of tasks whose aft.db row write found no handle attached. A
     /// configured root opens aft.db after its bind is acknowledged and
     /// releases the handle while it is unbound, so its tasks can be written
@@ -1972,6 +1973,7 @@ impl BgTaskRegistry {
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                speech_db_path: RwLock::new(None),
                 db_writes_awaiting_pool: Mutex::new(HashSet::new()),
                 db_detached_logged: AtomicBool::new(false),
                 db_harness: RwLock::new(None),
@@ -2320,6 +2322,43 @@ impl BgTaskRegistry {
         }
     }
 
+    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn install_pty_seal_pause_for_test(
+        &self,
+        arrived: std::sync::mpsc::Sender<String>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.before_bootstrap_release.lock().unwrap() = Some((arrived, release));
+    }
+
+    pub(crate) fn speech_database_path(&self) -> Option<PathBuf> {
+        self.inner
+            .speech_db_path
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn queued_bot_writes(&self, session: &str, task: &str) -> Option<u64> {
+        let mut paths = std::collections::BTreeSet::new();
+        if let Some(path) = self.speech_database_path() {
+            paths.insert(path);
+        } else {
+            for speech in crate::gh_shim_ticket::speech_for_task(session, task) {
+                paths.insert(speech.prepared.context.service.store.path().to_path_buf());
+            }
+        }
+        let mut queued = 0_u64;
+        for path in paths {
+            queued = queued.saturating_add(
+                crate::db::gh_speech::Store::new(path)
+                    .pending_legacy_for_identity(session, task)
+                    .ok()?,
+            );
+        }
+        Some(queued)
+    }
+
     pub(crate) fn uses_db_pool(&self, conn: &Arc<Mutex<TrackedConnection>>) -> bool {
         self.inner
             .db_pool
@@ -2328,6 +2367,15 @@ impl BgTaskRegistry {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
+        let path = conn
+            .lock()
+            .ok()
+            .and_then(|conn| conn.path().map(PathBuf::from));
+        *self
+            .inner
+            .speech_db_path
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = path;
         if let Ok(mut slot) = self.inner.db_pool.write() {
             if slot.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &conn)) {
                 if let Err(error) = crate::db::call_ledger::recover_pool_once(&conn) {
@@ -5244,6 +5292,10 @@ impl BgTaskRegistry {
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
+        let defer_bootstrap = crate::gh_shim_ticket::pty_seal_required();
+        if defer_bootstrap {
+            crate::gh_shim_ticket::mark_spawn_background(true);
+        }
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
@@ -5293,9 +5345,10 @@ impl BgTaskRegistry {
                 &mut spawned_pgid,
                 &mut memory_monitor,
                 &mut publish_memory_policy,
+                defer_bootstrap,
             )
         };
-        let runtime = match spawned {
+        let mut runtime = match spawned {
             Ok(runtime) => runtime,
             Err(error) => {
                 crate::slog_warn!("failed to spawn PTY background bash task {task_id}: {error}");
@@ -5319,6 +5372,25 @@ impl BgTaskRegistry {
             }
         };
 
+        if defer_bootstrap {
+            if let Some(pid) = runtime.child_pid {
+                metadata.child_pid = Some(pid);
+                metadata.pgid = Some(pid as i32);
+                metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(pid);
+            }
+            if let Err(error) = self.persist_task(&paths, &metadata) {
+                let _ = crate::gh_shim_speech::service::revoke_task_records(&session_id, &task_id);
+                return Err(self.fail_deferred_pty_start(
+                    &mut runtime,
+                    &mut metadata,
+                    &paths,
+                    error.to_string(),
+                ));
+            }
+            #[cfg(all(test, unix))]
+            self.wait_before_bootstrap_release_for_test(&task_id);
+        }
+
         if let Some(monitor) = memory_monitor {
             metadata.memory_policy = Some(monitor.policy.clone());
             self.inner
@@ -5335,9 +5407,28 @@ impl BgTaskRegistry {
             metadata.pgid = None;
         }
         if let Err(error) = self.persist_task(&paths, &metadata) {
+            if defer_bootstrap {
+                let _ = crate::gh_shim_speech::service::revoke_task_records(&session_id, &task_id);
+                return Err(self.fail_deferred_pty_start(
+                    &mut runtime,
+                    &mut metadata,
+                    &paths,
+                    error.to_string(),
+                ));
+            }
             crate::slog_warn!(
                 "running PTY task {task_id} persistence failed; retaining live task: {error}"
             );
+        }
+        if defer_bootstrap {
+            if let Err(error) = crate::gh_shim_ticket::finish_pty_seal_or_revoke(&task_id) {
+                return Err(self.fail_deferred_pty_start(
+                    &mut runtime,
+                    &mut metadata,
+                    &paths,
+                    error.agent_text(),
+                ));
+            }
         }
 
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
@@ -5395,6 +5486,11 @@ impl BgTaskRegistry {
             }),
         });
 
+        let mut bootstrap_guard = PtyBootstrapGateGuard {
+            task: &task,
+            armed: defer_bootstrap,
+        };
+
         #[cfg(unix)]
         if !shell.is_powershell() {
             let job = Arc::new(crate::bash_db_hints::HintJob::new(
@@ -5425,9 +5521,63 @@ impl BgTaskRegistry {
             .watchdog_tasks
             .lock()
             .map_err(|_| "background watchdog lock poisoned")?
-            .insert(task_id.clone(), task);
+            .insert(task_id.clone(), Arc::clone(&task));
+
+        drop(_admission);
+        if defer_bootstrap {
+            let released = {
+                let mut state = task
+                    .lock_state()
+                    .map_err(|_| "background task lock poisoned".to_string())?;
+                if state.metadata.status.is_terminal() || state.kill_in_flight {
+                    false
+                } else if let TaskRuntime::Pty(Some(runtime)) = &mut state.runtime {
+                    match runtime.release_bootstrap() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            crate::slog_warn!(
+                                "PTY task {task_id} bootstrap release failed: {error}"
+                            );
+                            runtime.stop_bootstrap();
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            };
+            if released {
+                bootstrap_guard.armed = false;
+            }
+        }
 
         Ok(task_id)
+    }
+
+    fn fail_deferred_pty_start(
+        &self,
+        runtime: &mut super::pty_runtime::PtyRuntime,
+        metadata: &mut PersistedTask,
+        paths: &TaskPaths,
+        error: String,
+    ) -> RegistryError {
+        runtime.abort_bootstrap();
+        self.inner
+            .memory_monitors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&metadata.task_id);
+        metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
+        let _ = self.persist_task(paths, metadata);
+        crate::gh_shim_ticket::revoke_task(&metadata.task_id);
+        if super::spawn_receipt_committed() {
+            let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+            self.record_live_delivery_session(&metadata.session_id);
+            self.enqueue_completion_if_needed(metadata, Some(paths), true);
+        } else {
+            let _ = delete_task_bundle(paths);
+        }
+        error.into()
     }
 
     #[cfg(windows)]
@@ -9639,6 +9789,8 @@ impl BgTaskRegistry {
         };
         if terminal_after_promote {
             self.post_terminal_transition(&task, true)?;
+        } else {
+            crate::gh_shim_ticket::promote_speech_task(session_id, task_id);
         }
         Ok(true)
     }
@@ -11498,6 +11650,17 @@ impl BgTaskRegistry {
         let mut errors = Vec::new();
         for storage_dir in storage_dirs {
             let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            // Harness task directories share the module-root authority database.
+            // Deriving a database beside a harness's bash-tasks would revoke in
+            // the wrong store (or silently fall back to warm tickets only).
+            let speech_db = storage_root.join("aft.db");
+            if speech_db.is_file() {
+                *registry
+                    .inner
+                    .speech_db_path
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(speech_db);
+            }
             registry
                 .inner
                 .saved_task_recovery
@@ -12542,6 +12705,25 @@ impl BgTaskRegistry {
             && task
                 .lock_state()
                 .is_ok_and(|state| state.metadata.memory_policy.is_some());
+        let speech_path = self
+            .inner
+            .speech_db_path
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or_else(|| {
+                let tasks = task.paths.session_dir.parent()?;
+                if tasks.file_name() != Some(std::ffi::OsStr::new("bash-tasks")) {
+                    return None;
+                }
+                let path = tasks.parent()?.join("aft.db");
+                path.is_file().then_some(path)
+            });
+        if let Some(path) = speech_path {
+            let _ = crate::gh_shim_speech::service::revoke_at(&path, session_id, task_id);
+        } else {
+            let _ = crate::gh_shim_speech::service::revoke_task_records(session_id, task_id);
+        }
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             if scope_end_label(reason.as_deref()).is_some() {
@@ -16497,6 +16679,26 @@ enum LocalIdentityGate {
     CommittedFallback,
 }
 
+struct PtyBootstrapGateGuard<'a> {
+    task: &'a BgTask,
+    armed: bool,
+}
+
+impl Drop for PtyBootstrapGateGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self
+                .task
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let TaskRuntime::Pty(Some(runtime)) = &mut state.runtime {
+                runtime.stop_bootstrap();
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 struct BootstrapGateGuard<'a> {
     task: &'a BgTask,
@@ -16903,6 +17105,10 @@ mod spawn_tests;
 #[cfg(test)]
 #[path = "default_kill_test.rs"]
 pub(crate) mod default_kill_tests;
+
+#[cfg(test)]
+#[path = "carrier_observation_tests.rs"]
+mod carrier_observation_tests;
 
 #[cfg(all(test, unix))]
 #[path = "completion_replay_ordering_tests.rs"]
@@ -24057,6 +24263,63 @@ mod tests {
         assert_eq!(completions[0].status, BgTaskStatus::Killed);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cancel_commits_before_process_is_signalled() {
+        use crate::gh_shim_speech::model::{AuthorityRecord, LaunchAuthority};
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let pool = Arc::new(Mutex::new(crate::db::open(&path).unwrap()));
+        registry.set_db_pool(pool);
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "cancel-head",
+            7,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("agent-a".into()))
+                .with_delegates(true),
+        )
+        .with_owner_authorized(true);
+        let store = crate::db::gh_speech::Store::new(&path);
+        store
+            .capture(&AuthorityRecord {
+                incarnation: "cancel-inc".into(),
+                minting_run: "minting-process".into(),
+                harness: "test".into(),
+                session_id: "session".into(),
+                task_id: task_id.clone(),
+                project_root: dir.path().display().to_string(),
+                launch: LaunchAuthority::classic(scope, None).unwrap(),
+                policy: None,
+                bindings: Default::default(),
+                seal: None,
+                ineligible_reason: None,
+            })
+            .unwrap();
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+        let killing = registry.clone();
+        let id = task_id.clone();
+        let killer = std::thread::spawn(move || killing.kill(&id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its pre-signal gate");
+        let marker_before_signal = store.get("cancel-inc");
+        release.send(()).unwrap();
+        let result = killer.join().unwrap().unwrap();
+        assert_eq!(result.info.status, BgTaskStatus::Killed);
+        assert!(
+            matches!(marker_before_signal,Err(ref error)if error.reason=="revoked"),
+            "the durable marker must already exist before the signal"
+        );
+    }
+
     /// `bash_status` answers with a settled status: during a kill held in
     /// flight by the test gate it waits for the kill's outcome instead of
     /// answering `killing`, and with no kill in flight it does not wait.
@@ -25800,6 +26063,8 @@ mod tests {
                 task_id: task_id.clone(),
                 project_root: "/project".to_string(),
                 read_repository: None,
+                launch: None,
+                lifecycle_scope: None,
             }),
             "a running task's ticket redeems to its own session"
         );

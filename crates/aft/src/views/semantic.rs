@@ -339,11 +339,14 @@ fn decode_chunk_vector(payload: &[u8], identity: &str, text: &str) -> Option<Vec
 
 /// Where a fill reads and writes semantic rows: the owner's v2 family store,
 /// or the family's v3 semantic plane store for a generation published in the
-/// v3 namespace. A v3 write goes through one v3 publication (reservation,
-/// closure flush, ledger commit) per call.
+/// v3 namespace. Each completed model batch is stored before requesting more
+/// embeddings, sharing its v3 reservation, plane transaction and ledger flush.
 pub(crate) enum SemanticStore {
     V2(FamilyStore),
-    V3(super::snapshot::V3Route),
+    V3(
+        super::snapshot::V3Route,
+        std::sync::OnceLock<crate::blob_store::v3::PlaneReader>,
+    ),
 }
 
 /// A v3 source with no semantic store yet: every read misses.
@@ -370,7 +373,7 @@ impl SemanticStore {
         generation: &ComposedGeneration,
     ) -> Result<Self, PlaneError> {
         match generation.v3_route() {
-            Some(route) => Ok(Self::V3(route.clone())),
+            Some(route) => Ok(Self::V3(route.clone(), std::sync::OnceLock::new())),
             None => owner
                 .open_store(FamilyPlane::Semantic)
                 .map(Self::V2)
@@ -379,31 +382,39 @@ impl SemanticStore {
     }
 
     fn is_v3(&self) -> bool {
-        matches!(self, Self::V3(_))
+        matches!(self, Self::V3(..))
     }
 
-    fn v3_reader(
+    fn v3_reader<'a>(
         route: &super::snapshot::V3Route,
-    ) -> Result<Option<crate::blob_store::v3::PlaneReader>, crate::blob_store::v2::StoreError> {
+        opened: &'a std::sync::OnceLock<crate::blob_store::v3::PlaneReader>,
+    ) -> Result<Option<&'a crate::blob_store::v3::PlaneReader>, crate::blob_store::v2::StoreError>
+    {
+        // A SemanticStore belongs to one fill/materialization pass. Validate
+        // once, then share the handle for file and chunk lookups in that pass.
+        // Do not remember an absent plane: this fill may create it later.
+        if let Some(reader) = opened.get() {
+            return Ok(Some(reader));
+        }
         let path =
             crate::blob_store::v3::plane_path(&route.storage, &route.family, FamilyPlane::Semantic)
                 .map_err(v3_store_error)?;
         if !path.exists() {
             return Ok(None);
         }
-        crate::blob_store::v3::PlaneReader::open_existing(
+        let reader = crate::blob_store::v3::PlaneReader::open_existing(
             &route.storage,
             &route.family,
             FamilyPlane::Semantic,
         )
-        .map(Some)
-        .map_err(v3_store_error)
+        .map_err(v3_store_error)?;
+        Ok(Some(opened.get_or_init(|| reader)))
     }
 
     fn get(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>, crate::blob_store::v2::StoreError> {
         match self {
             Self::V2(store) => store.get(key),
-            Self::V3(route) => match Self::v3_reader(route)? {
+            Self::V3(route, opened) => match Self::v3_reader(route, opened)? {
                 Some(reader) => reader.get(key).map_err(v3_store_error),
                 None => Ok(None),
             },
@@ -413,48 +424,84 @@ impl SemanticStore {
     fn reader(&self) -> Box<dyn super::semantic_arena::RunSource> {
         match self {
             Self::V2(store) => Box::new(store.reader()),
-            Self::V3(route) => match Self::v3_reader(route) {
-                Ok(Some(reader)) => Box::new(reader),
+            Self::V3(route, opened) => match Self::v3_reader(route, opened) {
+                Ok(Some(reader)) => Box::new(reader.clone()),
                 _ => Box::new(NoRuns),
             },
         }
     }
 
+    #[cfg(test)]
     fn put_or_touch(
         &self,
         key: &FamilyKey,
         payload: &[u8],
     ) -> Result<PutOrTouch, crate::blob_store::v2::StoreError> {
+        self.put_batch(&[(*key, payload.to_vec())])?
+            .pop()
+            .expect("one row")
+    }
+
+    fn put_batch(
+        &self,
+        rows: &[(FamilyKey, Vec<u8>)],
+    ) -> Result<
+        Vec<Result<PutOrTouch, crate::blob_store::v2::StoreError>>,
+        crate::blob_store::v2::StoreError,
+    > {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
         match self {
-            Self::V2(store) => store.put_or_touch(key, payload),
-            Self::V3(route) => {
-                let request = (payload.len() as u64)
+            Self::V2(store) => Ok(rows
+                .iter()
+                .map(|(key, payload)| store.put_or_touch(key, payload))
+                .collect()),
+            Self::V3(route, _) => {
+                #[cfg(test)]
+                let _profile =
+                    crate::blob_store::v3::work_profile::span("semantic_put_publication");
+                let request = rows
+                    .iter()
+                    .fold(0u64, |bytes, (_, payload)| {
+                        bytes.saturating_add(payload.len() as u64)
+                    })
                     .saturating_mul(2)
                     .saturating_add(1 << 20);
-                let inserted = crate::blob_store::v3::publish(
+                let outcomes = crate::blob_store::v3::publish(
                     &route.storage,
                     &route.family,
                     request,
                     None,
                     |publication| {
-                        publication.put_or_touch(
-                            key,
-                            payload,
+                        publication.put_or_touch_batch(
+                            FamilyPlane::Semantic,
+                            rows,
                             FamilyPlane::Semantic.payload_schema(),
                         )
                     },
                 )
-                .map_err(|error| match error {
-                    crate::blob_store::v3::Error::Refused("payload_mismatch") => {
-                        crate::blob_store::v2::StoreError::ConflictingPayload(*key)
-                    }
-                    other => v3_store_error(other),
-                })?;
-                Ok(if inserted {
-                    PutOrTouch::Inserted { ref_epoch: 0 }
-                } else {
-                    PutOrTouch::Reused { ref_epoch: 0 }
-                })
+                .map_err(v3_store_error)?;
+                Ok(rows
+                    .iter()
+                    .zip(outcomes)
+                    .map(|((key, _), outcome)| {
+                        outcome
+                            .map(|inserted| {
+                                if inserted {
+                                    PutOrTouch::Inserted { ref_epoch: 0 }
+                                } else {
+                                    PutOrTouch::Reused { ref_epoch: 0 }
+                                }
+                            })
+                            .map_err(|error| match error {
+                                crate::blob_store::v3::Error::Refused("payload_mismatch") => {
+                                    crate::blob_store::v2::StoreError::ConflictingPayload(*key)
+                                }
+                                other => v3_store_error(other),
+                            })
+                    })
+                    .collect())
             }
         }
     }
@@ -467,7 +514,7 @@ impl SemanticStore {
     ) -> Result<Option<PutOrTouch>, crate::blob_store::v2::StoreError> {
         match self {
             Self::V2(store) => store.put_at_deletion_epoch(build),
-            Self::V3(_) => Ok(None),
+            Self::V3(..) => Ok(None),
         }
     }
 
@@ -477,7 +524,7 @@ impl SemanticStore {
     {
         match self {
             Self::V2(store) => store.deletion_epoch(),
-            Self::V3(_) => Ok(None),
+            Self::V3(..) => Ok(None),
         }
     }
 
@@ -487,8 +534,8 @@ impl SemanticStore {
     ) -> Result<crate::blob_store::v2::TouchReport, crate::blob_store::v2::StoreError> {
         match self {
             Self::V2(store) => store.touch(keys),
-            Self::V3(route) => {
-                if Self::v3_reader(route)?.is_none() {
+            Self::V3(route, opened) => {
+                if Self::v3_reader(route, opened)?.is_none() {
                     return Ok(crate::blob_store::v2::TouchReport {
                         missing: keys.to_vec(),
                         ..Default::default()
@@ -1014,10 +1061,12 @@ impl SemanticPlane {
         generation: &ComposedGeneration,
     ) -> Result<Option<Box<dyn super::semantic_arena::RunSource>>, PlaneError> {
         if let super::contracts::StorageRoute::V3(route) = access.route(generation) {
-            return SemanticStore::v3_reader(&route)
+            let opened = std::sync::OnceLock::new();
+            return SemanticStore::v3_reader(&route, &opened)
                 .map(|reader| {
-                    reader
-                        .map(|reader| Box::new(reader) as Box<dyn super::semantic_arena::RunSource>)
+                    reader.map(|reader| {
+                        Box::new(reader.clone()) as Box<dyn super::semantic_arena::RunSource>
+                    })
                 })
                 .map_err(|error| plane_error(error.to_string()));
         }
@@ -1185,6 +1234,67 @@ impl SemanticPlane {
                 .get(path, &content, FamilyPlane::Semantic)
                 .is_none()
             && !state.failed.contains_key(&(path.clone(), content))
+    }
+
+    /// The base entries `snapshot` inherits whose semantic plane the base
+    /// still has pending. Only the base's owner may complete them, by
+    /// publishing a readiness successor; a worker never overrides them.
+    pub(crate) fn inherited_pending(&self, snapshot: &Snapshot) -> Vec<(RelPath, ContentHash)> {
+        let generation = snapshot.generation();
+        if generation.base_header().is_none() {
+            return Vec::new();
+        }
+        generation
+            .entries()
+            .filter_map(|(path, entry)| {
+                let EntryV2::Regular {
+                    content, planes, ..
+                } = entry
+                else {
+                    return None;
+                };
+                (applies_to(path)
+                    && !matches!(snapshot.source(path), Source::Live(_))
+                    && !generation.owns_work(path, FamilyPlane::Semantic)
+                    && planes.semantic.as_ref().is_some_and(PlaneState::is_pending))
+                .then(|| (path.clone(), *content))
+            })
+            .collect()
+    }
+
+    /// The keys this view's fills completed for `paths` (at the content
+    /// given) whose rows the family's store holds, as `(path, content, key)`.
+    pub(crate) fn completed_keys(
+        &self,
+        owner: &ViewRegistration,
+        snapshot: &Snapshot,
+        paths: &[(RelPath, ContentHash)],
+    ) -> Result<Vec<(RelPath, ContentHash, FamilyKey)>, PlaneError> {
+        let candidates = {
+            let view = self.view(&ViewAccess::Owner(owner.clone()));
+            let state = lock(&view);
+            paths
+                .iter()
+                .filter_map(|(path, content)| {
+                    state
+                        .fill
+                        .get(path, content, FamilyPlane::Semantic)
+                        .map(|key| (path.clone(), *content, *key))
+                })
+                .collect::<Vec<_>>()
+        };
+        let store = SemanticStore::for_generation(owner, snapshot.generation())?;
+        let mut stored = Vec::new();
+        for (path, content, key) in candidates {
+            if store
+                .get(&key)
+                .map_err(|error| plane_error(error.to_string()))?
+                .is_some()
+            {
+                stored.push((path, content, key));
+            }
+        }
+        Ok(stored)
     }
 
     /// Missing vectors and owner-only summary repairs are separate work:
@@ -1641,12 +1751,34 @@ impl SemanticPlane {
             match embedded {
                 Ok(runs) => {
                     let store_started = Instant::now();
-                    for ((item, relative, full_key, claim), mut run) in
-                        to_embed.into_iter().zip(runs)
+                    let payloads: Vec<_> = to_embed
+                        .iter()
+                        .zip(&runs)
+                        .map(|((_, _, _, claim), run)| {
+                            (*claim.key(), run.encode_view_payload(&payload_producer))
+                        })
+                        .collect();
+                    let outcomes = match store.put_batch(&payloads) {
+                        Ok(outcomes) => outcomes,
+                        Err(error) => {
+                            if store_error_is_busy(&error) {
+                                report.errors.push(error.to_string());
+                            } else {
+                                report.store_errors.push(error.to_string());
+                            }
+                            report.deferred += to_embed.len() + pending.count();
+                            report.timing.store_write += store_started.elapsed();
+                            break;
+                        }
+                    };
+                    for (((item, relative, full_key, claim), mut run), ((_, payload), outcome)) in
+                        to_embed
+                            .into_iter()
+                            .zip(runs)
+                            .zip(payloads.into_iter().zip(outcomes))
                     {
                         let key = *claim.key();
-                        let payload = run.encode_view_payload(&payload_producer);
-                        match store.put_or_touch(&key, &payload) {
+                        match outcome {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => {
                                 succeeded.push(full_key);
                                 // The stored row now holds exactly `payload`.
@@ -1895,8 +2027,31 @@ impl SemanticPlane {
             report.embedded_texts += misses.len();
             // Validate backend rows and consume adaptive HTTP metadata before
             // caching: shortened or skipped input must not poison the original.
-            let mut embedded =
-                crate::semantic_index::execute_build_embedding_batch(misses, embed)?.into_iter();
+            let embedded = crate::semantic_index::execute_build_embedding_batch(misses, embed)?;
+            let store_started = Instant::now();
+            let mut payloads = Vec::new();
+            let missing_texts = rows
+                .iter()
+                .zip(&texts)
+                .zip(&keys)
+                .filter(|((row, _), _)| row.is_none());
+            for (((_, text), key), result) in missing_texts.zip(&embedded) {
+                if let BuildEmbeddingRow::Embedded {
+                    embedded_text,
+                    vector,
+                } = result
+                {
+                    if embedded_text == text {
+                        payloads.push((*key, encode_chunk_vector(&identity, text, vector)?));
+                    }
+                }
+            }
+            let mut outcomes = store
+                .put_batch(&payloads)
+                .map_err(|error| chunk_store_error(error, report))?
+                .into_iter();
+            report.timing.store_write += store_started.elapsed();
+            let mut embedded = embedded.into_iter();
             for ((row, text), key) in rows.iter_mut().zip(&texts).zip(&keys) {
                 if row.is_some() {
                     continue;
@@ -1909,8 +2064,7 @@ impl SemanticPlane {
                 {
                     if embedded_text == text {
                         let store_started = Instant::now();
-                        let payload = encode_chunk_vector(&identity, text, vector)?;
-                        let cacheable = match store.put_or_touch(key, &payload) {
+                        let cacheable = match outcomes.next().expect("stored exact-text chunk") {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => true,
                             Ok(PutOrTouch::Quarantined) => false,
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
@@ -2610,6 +2764,18 @@ impl super::first_load::CompositePlane for SemanticPlane {
         FamilyPlane::Semantic
     }
 
+    /// A fresh base may carry the semantic plane: its entries start pending
+    /// and the checkout holding the base's build claim fills them later,
+    /// publishing readiness successors (see `CheckoutSemantic::fill_base`).
+    /// Nothing is embedded during the bind, so completion here is a no-op.
+    fn completes_fresh_base(&self) -> bool {
+        true
+    }
+
+    fn defers_base_completion(&self) -> bool {
+        true
+    }
+
     fn applies_to(&self, rel_path: &RelPath) -> bool {
         applies_to(rel_path)
     }
@@ -2688,7 +2854,7 @@ impl super::first_load::CompositePlane for SemanticPlane {
             observed,
             delta,
             live,
-            &SemanticStore::V3(route.clone()),
+            &SemanticStore::V3(route.clone(), std::sync::OnceLock::new()),
         )
     }
 
@@ -4997,11 +5163,14 @@ mod v3_store_tests {
     fn a_v3_semantic_store_puts_touches_and_admits_runs_without_the_v2_store() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let storage = tempfile::tempdir().unwrap();
-        let store = SemanticStore::V3(super::super::snapshot::V3Route {
-            storage: storage.path().to_path_buf(),
-            family: "00112233445566ff".into(),
-            scope: "worker".into(),
-        });
+        let store = SemanticStore::V3(
+            super::super::snapshot::V3Route {
+                storage: storage.path().to_path_buf(),
+                family: "00112233445566ff".into(),
+                scope: "worker".into(),
+            },
+            std::sync::OnceLock::new(),
+        );
         let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
         assert_eq!(store.get(&key).unwrap(), None);
         assert_eq!(store.touch(&[key]).unwrap().missing, vec![key]);
@@ -5027,5 +5196,40 @@ mod v3_store_tests {
             Some(b"run".to_vec())
         );
         assert!(!storage.path().join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn v3_semantic_file_and_chunk_lookups_share_one_validated_reader_per_pass() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let store = SemanticStore::V3(
+            super::super::snapshot::V3Route {
+                storage: storage.path().to_path_buf(),
+                family: "00112233445566ff".into(),
+                scope: "worker".into(),
+            },
+            std::sync::OnceLock::new(),
+        );
+        let rows: Vec<_> = (0..16)
+            .map(|i| (FamilyKey::new(FamilyPlane::Semantic, [i; 32]), vec![i; 8]))
+            .collect();
+        assert_eq!(store.get(&rows[0].0).unwrap(), None);
+        assert!(store
+            .put_batch(&rows)
+            .unwrap()
+            .iter()
+            .all(|outcome| matches!(outcome, Ok(PutOrTouch::Inserted { .. }))));
+        let before = crate::blob_store::v3::work_profile::count("validate_database");
+        for (key, payload) in &rows {
+            assert_eq!(store.get(key).unwrap().as_ref(), Some(payload));
+            assert_eq!(
+                store.reader().run_payload(key).unwrap().as_ref(),
+                Some(payload)
+            );
+        }
+        assert_eq!(
+            crate::blob_store::v3::work_profile::count("validate_database") - before,
+            1
+        );
     }
 }

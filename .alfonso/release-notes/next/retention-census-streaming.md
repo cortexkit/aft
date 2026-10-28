@@ -1,0 +1,1 @@
+- Storage cleanup reads fewer files per pass and stops on its time limit, using less CPU when many projects and finished commands are kept.

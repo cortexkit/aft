@@ -13,6 +13,10 @@
 //! terminal state, and a daemon restart forgets all of them, so a task replayed
 //! after a restart has no ticket and its shim calls are refused.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::sync::{LazyLock, Mutex};
 
 /// Environment variable that carries the ticket into a spawned command.
@@ -36,6 +40,8 @@ pub struct Redeemed {
     /// Repository captured from the primary checkout when this ticket was
     /// minted. Later worktree config edits cannot retarget an existing ticket.
     pub read_repository: Option<String>,
+    pub(crate) launch: Option<crate::gh_shim_speech::model::LaunchAuthority>,
+    pub(crate) lifecycle_scope: Option<subc_protocol::scope::ScopeStamp>,
 }
 
 enum Owner {
@@ -57,8 +63,326 @@ struct Entry {
     owner: Owner,
     project_root: String,
     read_repository: Option<String>,
+    launch: Option<crate::gh_shim_speech::model::LaunchAuthority>,
+    lifecycle_scope: Option<subc_protocol::scope::ScopeStamp>,
+    speech: Option<Arc<SpeechTicket>>,
     #[cfg(unix)]
     worker_read: Option<WorkerReadGrant>,
+}
+
+pub(crate) struct SpeechTicket {
+    pub(crate) prepared: crate::gh_shim_speech::service::PreparedLaunch,
+    pub(crate) incarnation: String,
+    pub(crate) stored: AtomicBool,
+    pub(crate) background: AtomicBool,
+    pub(crate) active: AtomicBool,
+    pub(crate) failure: Mutex<Option<crate::gh_shim_speech::Refusal>>,
+}
+
+thread_local! {static SPAWN_TICKET:std::cell::RefCell<Option<[u8;TICKET_BYTES]>>=const{std::cell::RefCell::new(None)};}
+
+pub(crate) struct SpawnTicketGuard(Option<[u8; TICKET_BYTES]>);
+impl Drop for SpawnTicketGuard {
+    fn drop(&mut self) {
+        SPAWN_TICKET.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+pub(crate) fn spawn_ticket_guard(ticket: Option<&str>) -> SpawnTicketGuard {
+    SpawnTicketGuard(SPAWN_TICKET.with(|slot| slot.replace(ticket.and_then(decode))))
+}
+
+pub(crate) fn capture_spawn(metadata: &crate::bash_background::persistence::PersistedTask) {
+    let Some((speech, _)) = spawn_speech(&metadata.task_id) else {
+        return;
+    };
+    capture_record(&speech, &metadata.session_id, &metadata.task_id);
+}
+
+pub(crate) fn pty_seal_required() -> bool {
+    let raw = SPAWN_TICKET.with(|slot| *slot.borrow());
+    let Some(raw) = raw else { return false };
+    registry()
+        .iter()
+        .find(|entry| constant_time_eq(&entry.ticket, &raw))
+        .and_then(|entry| entry.speech.as_ref())
+        .is_some_and(|speech| {
+            speech.stored.load(Ordering::SeqCst)
+                && speech.prepared.denial.is_none()
+                && speech.prepared.policy.is_some()
+        })
+}
+
+pub(crate) fn finish_pty_seal_or_revoke(
+    task_id: &str,
+) -> Result<(), crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
+    let Some((speech, _)) = spawn_speech(task_id) else {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "task_unverifiable",
+        ));
+    };
+    let stored = speech
+        .prepared
+        .context
+        .service
+        .store
+        .get(&speech.incarnation);
+    let stored_error = stored.as_ref().err().cloned();
+    let failure = if stored_error
+        .as_ref()
+        .is_some_and(|error| error.reason == "revoked" || error.code == Code::ScopeEnded)
+    {
+        stored_error
+    } else {
+        speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or(stored_error)
+    };
+    if let Some(error) = &failure {
+        // A speech-bookkeeping failure may downgrade a launch. A task cancel or
+        // a definitive end of its work scope must still stop the command itself.
+        let lifecycle_ended = error.code == Code::ScopeEnded
+            && speech
+                .prepared
+                .context
+                .seed
+                .launch
+                .as_ref()
+                .is_ok_and(|launch| {
+                    let ended = if error.role == Some(ScopeRole::Run) {
+                        launch.run.as_ref()
+                    } else {
+                        Some(&launch.authority)
+                    };
+                    ended
+                        .zip(speech.prepared.context.seed.lifecycle.as_ref())
+                        .is_some_and(|(ended, lifecycle)| {
+                            crate::db::access_grants::ScopeKey::from_stamp(ended)
+                                == crate::db::access_grants::ScopeKey::from_stamp(lifecycle)
+                        })
+                });
+        if error.reason == "revoked" || lifecycle_ended {
+            return Err(error.clone());
+        }
+    }
+    if failure.is_none()
+        && speech.active.load(Ordering::SeqCst)
+        && stored.is_ok_and(|stored| stored.record.seal.is_some())
+    {
+        return Ok(());
+    }
+    speech
+        .prepared
+        .context
+        .service
+        .revoke(&speech.incarnation, "execution_unsealed")?;
+    speech.active.store(false, Ordering::SeqCst);
+    *speech
+        .failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(
+        failure
+            .filter(|error| error.code == Code::ScopeEnded)
+            .unwrap_or_else(|| Refusal::new(Code::AuthorityUnavailable, "revoked")),
+    );
+    Ok(())
+}
+
+fn capture_record(speech: &SpeechTicket, session: &str, task: &str) {
+    if !speech.prepared.provisioned {
+        return;
+    }
+    let launch = match &speech.prepared.context.seed.launch {
+        Ok(launch) => launch.clone(),
+        Err(error) => {
+            *speech
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(error.clone());
+            return;
+        }
+    };
+    let record = crate::gh_shim_speech::model::AuthorityRecord {
+        incarnation: speech.incarnation.clone(),
+        minting_run: crate::gh_shim_speech::service::run_nonce()
+            .unwrap_or_default()
+            .into(),
+        harness: speech.prepared.context.seed.harness.clone(),
+        session_id: session.to_string(),
+        task_id: task.to_string(),
+        project_root: speech.prepared.context.seed.project_root.clone(),
+        launch,
+        policy: speech.prepared.policy.clone(),
+        bindings: speech.prepared.bindings.clone(),
+        seal: None,
+        ineligible_reason: speech
+            .prepared
+            .denial
+            .as_ref()
+            .map(|error| error.reason.clone()),
+    };
+    match speech.prepared.context.service.store.capture(&record) {
+        Ok(()) => {
+            speech.stored.store(true, Ordering::SeqCst);
+        }
+        Err(error) => {
+            *speech
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(error)
+        }
+    }
+}
+
+pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::PersistedTask) {
+    let Some((speech, raw)) = spawn_speech(&metadata.task_id) else {
+        return;
+    };
+    if !speech.stored.load(Ordering::SeqCst) {
+        return;
+    }
+    #[cfg(test)]
+    if let Some(error) = speech.prepared.context.service.test_seal_failure() {
+        *speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(error);
+        return;
+    }
+    #[cfg(unix)]
+    if metadata.remote.is_some() {
+        *speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "guard_unsupported",
+            ));
+        return;
+    }
+    let seal = metadata
+        .child_pid
+        .zip(metadata.child_start_time_ms)
+        .and_then(|(pid, start)| {
+            if crate::root_cache::process_start_time_ms(pid) != Some(start) {
+                return None;
+            }
+            Some(crate::gh_shim_speech::model::ExecutionSeal {
+                child_pid: pid,
+                child_start_time_ms: start,
+                birth_identity: crate::fs_lock::speech_process_identity(pid)?,
+            })
+        });
+    let result = seal
+        .ok_or_else(|| {
+            crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "task_unverifiable",
+            )
+        })
+        .and_then(|seal| {
+            speech
+                .prepared
+                .context
+                .service
+                .store
+                .seal(&speech.incarnation, &seal)
+        });
+    if let Err(error) = result {
+        *speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(error);
+        return;
+    }
+    if speech.background.load(Ordering::SeqCst) {
+        activate_speech(&speech, &raw);
+    }
+}
+
+fn activate_speech(speech: &SpeechTicket, raw: &[u8; TICKET_BYTES]) {
+    if speech.active.load(Ordering::SeqCst)
+        || speech
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    {
+        return;
+    }
+    let digest = blake3::derive_key("aft-gh-speech-ticket-v1", raw);
+    match speech.prepared.context.service.store.activate(
+        &speech.incarnation,
+        &digest,
+        crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            speech.active.store(true, Ordering::SeqCst);
+        }
+        Err(error) => {
+            *speech
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(error)
+        }
+    }
+}
+
+pub(crate) fn mark_spawn_background(background: bool) {
+    let raw = SPAWN_TICKET.with(|slot| *slot.borrow());
+    if let Some(raw) = raw {
+        if let Some(speech) = registry()
+            .iter()
+            .find(|entry| constant_time_eq(&entry.ticket, &raw))
+            .and_then(|entry| entry.speech.clone())
+        {
+            speech.background.store(background, Ordering::SeqCst);
+        }
+    }
+}
+
+pub(crate) fn promote_speech_task(session: &str, task: &str) {
+    let entries: Vec<_> = registry()
+        .iter()
+        .filter(|entry| {
+            entry.session_id == session && matches!(&entry.owner,Owner::Task(id)if id==task)
+        })
+        .filter_map(|entry| entry.speech.clone().map(|speech| (speech, entry.ticket)))
+        .collect();
+    for (speech, raw) in entries {
+        speech.background.store(true, Ordering::SeqCst);
+        activate_speech(&speech, &raw);
+    }
+}
+
+fn spawn_speech(task_id: &str) -> Option<(Arc<SpeechTicket>, [u8; TICKET_BYTES])> {
+    let raw = SPAWN_TICKET.with(|slot| *slot.borrow())?;
+    let mut entries = registry();
+    let entry = entries
+        .iter_mut()
+        .find(|entry| constant_time_eq(&entry.ticket, &raw))?;
+    entry.owner = Owner::Task(task_id.to_string());
+    Some((entry.speech.clone()?, raw))
+}
+
+pub(crate) fn speech_digest(text: &str) -> Option<[u8; 32]> {
+    Some(blake3::derive_key(
+        "aft-gh-speech-ticket-v1",
+        &decode(text)?,
+    ))
+}
+
+pub(crate) fn speech_for_ticket(text: &str) -> Option<Arc<SpeechTicket>> {
+    let raw = decode(text)?;
+    registry()
+        .iter()
+        .find(|entry| constant_time_eq(&entry.ticket, &raw))
+        .and_then(|entry| entry.speech.clone())
 }
 
 /// The worker-read capability is separate from the general relay ticket. Dropping
@@ -130,6 +454,53 @@ fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> 
     // ticket, which makes its governed writes refuse rather than guessable.
     getrandom::fill(&mut ticket).ok()?;
     let encoded = encode(&ticket);
+    let context = crate::gh_shim_speech::service::current();
+    if context
+        .as_ref()
+        .is_some_and(|context| context.seed.session != session_id)
+    {
+        return None;
+    }
+    let lifecycle = context
+        .as_ref()
+        .and_then(|context| context.seed.lifecycle.clone())
+        .or_else(crate::bash_background::registry::scope_for_spawn);
+    let launch = context
+        .as_ref()
+        .and_then(|context| context.seed.launch.as_ref().ok().cloned())
+        .or_else(|| {
+            lifecycle.clone().and_then(|stamp| {
+                crate::gh_shim_speech::model::LaunchAuthority::classic(stamp, None).ok()
+            })
+        });
+    let worker = lifecycle
+        .as_ref()
+        .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker);
+    let prepared = context.filter(|_| !worker).map(|context| context.prepare());
+    let call_id = match &owner {
+        Owner::Call(id) => Some(id.clone()),
+        Owner::Task(_) => None,
+    };
+    let speech = prepared.map(|prepared| {
+        Arc::new(SpeechTicket {
+            failure: Mutex::new(prepared.denial.clone()),
+            prepared,
+            incarnation: blake3::derive_key("aft-gh-task-incarnation-v1", &ticket)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            stored: AtomicBool::new(false),
+            background: AtomicBool::new(false),
+            active: AtomicBool::new(false),
+        })
+    });
+    if let (Some(call), Some(speech)) = (&call_id, &speech) {
+        capture_record(
+            speech,
+            session_id,
+            &format!("call:{call}:{}", speech.incarnation),
+        );
+    }
     let read_repository =
         crate::gh_shim::ticket_repository_snapshot(std::path::Path::new(project_root));
     registry().push(Entry {
@@ -138,6 +509,9 @@ fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> 
         owner,
         project_root: project_root.to_string(),
         read_repository,
+        launch,
+        lifecycle_scope: lifecycle,
+        speech,
         #[cfg(unix)]
         worker_read: None,
     });
@@ -157,6 +531,8 @@ pub fn redeem(ticket: &str) -> Option<Redeemed> {
                 task_id: entry.owner.id().to_string(),
                 project_root: entry.project_root.clone(),
                 read_repository: entry.read_repository.clone(),
+                launch: entry.launch.clone(),
+                lifecycle_scope: entry.lifecycle_scope.clone(),
             });
         }
     }
@@ -169,14 +545,50 @@ pub fn revoke_task(task_id: &str) {
     if task_id.is_empty() {
         return;
     }
-    registry().retain(|entry| !matches!(&entry.owner, Owner::Task(id) if id == task_id));
+    let mut entries = registry();
+    let revocations: Vec<_> = entries
+        .iter()
+        .filter(|entry| matches!(&entry.owner,Owner::Task(id)if id==task_id))
+        .filter_map(|entry| entry.speech.clone())
+        .collect();
+    entries.retain(|entry| !matches!(&entry.owner, Owner::Task(id) if id == task_id));
+    drop(entries);
+    for speech in revocations {
+        queue_terminal_marker(speech);
+    }
 }
 
 fn revoke(ticket: &str) {
     let Some(candidate) = decode(ticket) else {
         return;
     };
-    registry().retain(|entry| !constant_time_eq(&entry.ticket, &candidate));
+    let mut entries = registry();
+    let speech = entries
+        .iter()
+        .find(|entry| constant_time_eq(&entry.ticket, &candidate))
+        .and_then(|entry| entry.speech.clone());
+    entries.retain(|entry| !constant_time_eq(&entry.ticket, &candidate));
+    drop(entries);
+    if let Some(speech) = speech {
+        queue_terminal_marker(speech);
+    }
+}
+
+fn queue_terminal_marker(speech: Arc<SpeechTicket>) {
+    if speech.stored.load(Ordering::SeqCst) {
+        let work = speech.prepared.context.service.track_finalization();
+        // Task-file publication can hold task state, so durable SQL runs afterward.
+        // Once removed from memory, a ticket minted by this daemon cannot use the
+        // database-backed redemption path reserved for tickets from an earlier daemon.
+        std::thread::spawn(move || {
+            let _work = work;
+            let _ = speech
+                .prepared
+                .context
+                .service
+                .revoke(&speech.incarnation, "terminal");
+        });
+    }
 }
 
 /// Number of live tickets; lets tests prove a ticket was dropped.
@@ -348,6 +760,8 @@ pub(crate) fn redeem_worker_read(capability: &str, socket: &std::path::Path) -> 
             task_id: entry.owner.id().to_string(),
             project_root: entry.project_root.clone(),
             read_repository: entry.read_repository.clone(),
+            launch: None,
+            lifecycle_scope: entry.lifecycle_scope.clone(),
         })
     })
 }
@@ -432,6 +846,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ticket_captures_the_authenticated_launch_scope_before_routes_change() {
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "original-scope",
+            7,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("agent-a".into()))
+                .with_delegates(true),
+        )
+        .with_owner_authorized(true);
+        let pending =
+            crate::bash_background::registry::with_scope_spawn(Some(scope.clone()), || {
+                PendingTicket::issue("launch-pin-session", "/does-not-exist")
+            });
+        let redeemed = redeem(pending.value().unwrap()).unwrap();
+        assert_eq!(
+            redeemed.launch.as_ref().map(|launch| &launch.authority),
+            Some(&scope)
+        );
+        assert_eq!(redeemed.lifecycle_scope.as_ref(), Some(&scope));
+    }
+
+    #[test]
     fn tickets_are_128_bit_hex_and_unique() {
         let first = ScopedTicket::issue("ses-ticket-unique", "call-a", "/p");
         let second = ScopedTicket::issue("ses-ticket-unique", "call-b", "/p");
@@ -463,6 +905,8 @@ mod tests {
                 task_id: String::new(),
                 project_root: "/p".to_string(),
                 read_repository: None,
+                launch: None,
+                lifecycle_scope: None,
             })
         );
         pending.bind_task("task-redeem");
@@ -517,4 +961,96 @@ mod tests {
         drop(scoped);
         assert_eq!(redeem(&scoped_value), None);
     }
+}
+
+pub(crate) fn redeem_speech_cold(
+    ticket: &str,
+    service: &crate::gh_shim_speech::service::Service,
+) -> Result<Redeemed, crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    let invalid = || Refusal::new(Code::AuthorityUnavailable, "task_unverifiable");
+    let digest = speech_digest(ticket).ok_or_else(invalid)?;
+    let stored = service.store.find_digest(
+        &digest,
+        crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
+    )?;
+    let seal = stored.record.seal.as_ref().ok_or_else(invalid)?;
+    if crate::root_cache::process_start_time_ms(seal.child_pid) != Some(seal.child_start_time_ms)
+        || crate::fs_lock::speech_process_identity(seal.child_pid).as_deref()
+            != Some(seal.birth_identity.as_str())
+    {
+        return Err(invalid());
+    }
+    let conn = service.store.connect()?;
+    let row = crate::db::bash_tasks::get_bash_task(
+        &conn,
+        &stored.record.harness,
+        &stored.record.session_id,
+        &stored.record.task_id,
+    )
+    .map_err(|_| invalid())?
+    .ok_or_else(invalid)?;
+    let metadata: crate::bash_background::persistence::PersistedTask =
+        serde_json::from_str(&row.metadata).map_err(|_| invalid())?;
+    #[cfg(unix)]
+    if metadata.remote.is_some() {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "guard_unsupported",
+        ));
+    }
+    let lifecycle = stored
+        .record
+        .launch
+        .run
+        .as_ref()
+        .unwrap_or(&stored.record.launch.authority);
+    if !matches!(row.status.as_str(), "starting" | "running")
+        || !matches!(
+            metadata.status,
+            crate::bash_background::BgTaskStatus::Starting
+                | crate::bash_background::BgTaskStatus::Running
+        )
+        || row.harness != stored.record.harness
+        || row.session_id != stored.record.session_id
+        || row.task_id != stored.record.task_id
+        || metadata.harness.as_deref() != Some(stored.record.harness.as_str())
+        || metadata.session_id != row.session_id
+        || metadata.task_id != row.task_id
+        || metadata.child_pid != Some(seal.child_pid)
+        || metadata.child_start_time_ms != Some(seal.child_start_time_ms)
+        || metadata.scope.as_ref() != Some(lifecycle)
+        || row.pid != Some(i64::from(seal.child_pid))
+        || row.project_key
+            != crate::path_identity::project_scope_key(std::path::Path::new(
+                &stored.record.project_root,
+            ))
+        || metadata
+            .project_root
+            .as_deref()
+            .map(crate::path_identity::project_scope_key)
+            .as_deref()
+            != Some(row.project_key.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(Redeemed {
+        session_id: stored.record.session_id,
+        task_id: stored.record.task_id,
+        project_root: stored.record.project_root,
+        read_repository: None,
+        lifecycle_scope: Some(lifecycle.clone()),
+        launch: Some(stored.record.launch),
+    })
+}
+
+pub(crate) fn speech_for_task(session: &str, task: &str) -> Vec<Arc<SpeechTicket>> {
+    registry()
+        .iter()
+        .filter(|entry| {
+            entry.session_id == session && matches!(&entry.owner,Owner::Task(id)if id==task)
+        })
+        .filter_map(|entry| entry.speech.clone())
+        .filter(|speech| speech.stored.load(Ordering::SeqCst))
+        .collect()
 }

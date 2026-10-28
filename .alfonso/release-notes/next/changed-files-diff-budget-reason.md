@@ -1,1 +1,0 @@
-- Bash changed-files diffs: a file whose diff was not produced in time is now marked "no diff: the diff time budget ran out" instead of being shown as having no clean git before-image, or with no explanation at all.

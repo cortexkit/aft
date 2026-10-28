@@ -154,6 +154,10 @@ fn bound(head: &RouteIdentity, run_stamp: ScopeStamp) -> RouteIdentity {
         },
         run_id: "run-1".into(),
         owner_route: head.clone(),
+        owner_route_channel: RouteChannel {
+            channel: 1,
+            epoch: 1,
+        },
         run_route: RouteChannel {
             channel: 7,
             epoch: 1,

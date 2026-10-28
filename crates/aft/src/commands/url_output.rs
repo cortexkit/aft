@@ -36,18 +36,28 @@ pub(crate) fn request_has_url(req: &RawRequest) -> bool {
             .is_some_and(is_http_url)
     }) || req
         .params
-        .get("targets")
-        .and_then(|v| v.as_array())
-        .is_some_and(|targets| {
-            targets.iter().any(|target| {
-                ["file", "path", "url"].iter().any(|key| {
-                    target
-                        .get(*key)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(is_http_url)
+        .get("files")
+        .and_then(|value| value.as_array())
+        .is_some_and(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.as_str())
+                .any(is_http_url)
+        })
+        || req
+            .params
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    ["file", "path", "url"].iter().any(|key| {
+                        target
+                            .get(*key)
+                            .and_then(|v| v.as_str())
+                            .is_some_and(is_http_url)
+                    })
                 })
             })
-        })
 }
 
 /// Replace cached-document paths before a URL response is shown to an agent.
@@ -417,6 +427,47 @@ mod tests {
     #[test]
     fn zoom_mixed_cap_preserves_source_manifests_and_metadata() {
         assert_zoom_cap_preserves_metadata(true);
+    }
+
+    #[test]
+    fn outline_url_array_errors_redact_cached_document_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let url = "https://example.com/docs.md";
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "url-array-cache-redaction",
+            "command": "outline",
+            "files": ["local.rs", url]
+        }))
+        .unwrap();
+        let cache_file = storage.join("url_cache").join("c7502988ff3e8388.md");
+        let mut response = Response::success(
+            "url-array-cache-redaction",
+            serde_json::json!({
+                "complete": false,
+                "skipped_files": [{
+                    "file": url,
+                    "reason": format!("parse_error: syntax errors in {}", cache_file.display())
+                }]
+            }),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        assert_eq!(response.data["skipped_files"][0]["file"], url);
+        let reason = response.data["skipped_files"][0]["reason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("the requested URL"), "{reason}");
+        assert!(!reason.contains("url_cache"), "{reason}");
+        assert!(!reason.contains("c7502988ff3e8388.md"), "{reason}");
     }
 
     #[test]

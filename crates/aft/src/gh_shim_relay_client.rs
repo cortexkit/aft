@@ -272,6 +272,48 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     generation,
                     result: result.get("result").cloned().unwrap_or(Value::Null),
                 },
+                Some("refused")
+                    if result
+                        .get("legs_sent")
+                        .and_then(Value::as_array)
+                        .is_some_and(|legs| !legs.is_empty()) =>
+                {
+                    let legs = result["legs_sent"].as_array().expect("checked above");
+                    if legs
+                        .iter()
+                        .any(|leg| leg.as_str().is_none_or(str::is_empty))
+                    {
+                        return Reply::Malformed("plexus reported posted legs without valid action names; check GitHub before retrying".into());
+                    }
+                    Reply::Completed {
+                        generation,
+                        result: json!({
+                            "status":"partial_posted",
+                            "posted_legs":legs,
+                            "refusal_code":result.get("refusal_code").or_else(||result.get("code")).cloned().unwrap_or(Value::Null),
+                            "scope_role":result.get("scope_role").cloned().unwrap_or(Value::Null),
+                        }),
+                    }
+                }
+                Some("refused")
+                    if crate::gh_shim_speech::partner::map_refusal(
+                        &result,
+                        crate::gh_shim_speech::ScopeRole::Authority,
+                    )
+                    .is_some() =>
+                {
+                    let refusal = crate::gh_shim_speech::partner::map_refusal(
+                        &result,
+                        crate::gh_shim_speech::ScopeRole::Authority,
+                    )
+                    .expect("checked above");
+                    Reply::Refused {
+                        code: refusal.code.as_str().into(),
+                        stage: crate::gh_shim_speech::REFUSAL_STAGE.into(),
+                        message: refusal.text(),
+                        generation,
+                    }
+                }
                 Some("refused") => match facade_refusal_code(&reply) {
                     Some(code) => Reply::Refused {
                         code: code.to_string(),
@@ -320,13 +362,23 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
 /// GitHub did not return, so every field is optional; a reply with no detail
 /// prints a plain completion line.
 ///
-/// Plexus posts a close or reopen comment before it changes state and only
-/// changes state if the comment succeeded, so the partial "state applied,
-/// comment failed" rendering can never arise on this path.
+/// A multi-leg write can post a comment before its state change is stopped.
+/// Such a result reports posted actions and must never look safe to retry.
 pub(super) fn render_completed(result: &Value) -> Result<String, RouteOutcome> {
     let Some(object) = result.as_object().filter(|object| !object.is_empty()) else {
         return Ok("completed\n".to_string());
     };
+    if object.get("status").and_then(Value::as_str) == Some("partial_posted") {
+        let actions = object.get("posted_legs").cloned().unwrap_or(Value::Null);
+        let code = object
+            .get("refusal_code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let code: String = code.chars().flat_map(char::escape_default).collect();
+        return Err(RouteOutcome::PartiallyApplied(format!(
+            "Posted as the bot: {actions}.\nThe rest of this GitHub write did not finish ({code}). Check GitHub before trying again.\n"
+        )));
+    }
     if let Some(url) = object.get("url").and_then(Value::as_str) {
         return Ok(format!("{url}\n"));
     }
@@ -374,7 +426,16 @@ fn render_thread_state_confirmation(result: &Value, request: &Value) -> Option<S
 }
 
 fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
+    if stage == crate::gh_shim_speech::REFUSAL_STAGE
+        && crate::gh_shim_speech::Code::parse(code).is_some()
+    {
+        return RouteOutcome::RelayRefusal {
+            code: code.to_string(),
+            text: format!("{code}: {message}"),
+        };
+    }
     match code {
+        "gh_shim_worker_write_refused"=>RouteOutcome::WorkerWriteRefused,
         "ticket_absent" => RouteOutcome::NoAgentSession,
         "ticket_unknown" => RouteOutcome::RelayRefusal {
             code: code.to_string(),
@@ -719,7 +780,7 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
             // The daemon ignores agent_id: plexus answers the binding read
             // with every repository's binding, whoever asks. It is still sent
             // so a daemon from before this change keeps answering.
-            "params": {"ticket": self.ticket, "agent_id": agent_id},
+            "params": {"ticket": self.ticket, "agent_id": agent_id,"purpose":"speech"},
         });
         let bytes = self.send(&body).await.map_err(|outcome| match outcome {
             // A read cannot have written anything, so an unanswered read is
@@ -943,12 +1004,14 @@ pub(super) fn route(
     let project_root = project_root_for(&cwd);
     // One nonce per invocation: every resend of this request reuses it, so
     // plexus can tell a retry from a second write.
+    let invocation = request.invocation.clone();
     let body = json!({
         "op": BOT_REQUEST_OPERATION,
         "params": {
             "ticket": ticket,
             "request_nonce": new_nonce(),
             "request": governed_wire_request(determination, &agent_binding.agent_id, request),
+            "invocation":invocation,
         },
     });
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -1143,6 +1206,10 @@ fn describe_session_agent_mismatch(
 #[cfg(test)]
 #[path = "gh_shim_relay_client_tests.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "gh_shim_speech/partner_client_tests.rs"]
+mod partner_contract_tests;
 
 /// Resolve session kind from the daemon's ticket record, never from a body claim.
 pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, String> {

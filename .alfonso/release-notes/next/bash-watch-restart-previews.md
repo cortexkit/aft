@@ -1,3 +1,0 @@
-- After a daemon restart, background bash watch and completion previews are no longer withheld just because AFT's own co-author setting (`AFT_GIT_CO_AUTHOR`) was in the command's environment; names like `GIT_AUTHOR_NAME` no longer count as secret either.
-- A substring `bash_watch` now always reports its own pattern as the matched text instead of `<REDACTED_SECRET>`, including in `each_line` rows, where the rest of a masked credential stays masked.
-- When a watch preview or `each_line` row still has to be withheld after a restart, it names the output file to read instead of pointing at `bash_status`, which shows no output while a task runs.

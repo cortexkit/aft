@@ -74,6 +74,227 @@ fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }
 
+fn with_carrier(route: &RouteIdentity, principal: &str) -> RouteIdentity {
+    let mut data = copied_identity(route);
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some(principal.into());
+    }
+    RouteIdentity(Arc::new(data))
+}
+
+fn assert_saved_scope_grants(
+    ctx: &AppContext,
+    route: &RouteIdentity,
+    outside: &Path,
+    denial: Option<crate::access_policy::ScopeGrantsDenial>,
+) {
+    let _storage = crate::test_env::without_storage_override();
+    let raw_outside = outside.to_owned();
+    let outside = policy_path(outside);
+    ctx.update_config(|config| {
+        config.project_root = Some(route.project_root.clone());
+        config.restrict_to_project_root = true;
+    });
+    for operation in [AccessOperation::Read, AccessOperation::Write] {
+        store::insert(
+            &ctx.db().unwrap().lock().unwrap(),
+            &policy_scope_key(route),
+            &AccessGrant {
+                path: outside.clone(),
+                kind: GrantKind::File,
+                operation,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(scope_grants_denial(route), denial);
+    let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+        Duration::from_secs(5),
+    )));
+    call_policy::with_tool_call_policy(
+        ctx,
+        route,
+        "saved-grant-carrier",
+        ask_route(route),
+        BindTrust::Untrusted,
+        "read",
+        json!({}),
+        |_| {
+            assert_eq!(
+                ctx.validate_read_path("saved-grant-carrier", &route.session, &raw_outside)
+                    .is_ok(),
+                denial.is_none(),
+                "production validation must resolve the caller's path spelling"
+            );
+            ctx.with_read_policy_snapshot("saved-grant-carrier", || {
+                let policy = ctx.access_policy("saved-grant-carrier").unwrap();
+                assert_eq!(policy.scope_grants_denial, denial);
+                {
+                    let _nested = crate::access_policy::scope_grants_guard(Some(
+                        crate::access_policy::ScopeGrantsDenial::NotSessionHost,
+                    ));
+                    let captured = ctx.access_policy("saved-grant-carrier").unwrap();
+                    assert!(
+                        captured.grants.is_empty(),
+                        "must not reuse a host's cached grants"
+                    );
+                }
+                if denial.is_some() {
+                    assert!(policy.grants.is_empty());
+                }
+                let expected = denial.map_or(AccessDecision::Allow, |reason| {
+                    AccessDecision::Deny(AccessDenial::ScopeGrants(reason))
+                });
+                for operation in [AccessOperation::Read, AccessOperation::Write] {
+                    assert_eq!(policy.decide(operation, &outside, false), expected);
+                    assert_eq!(
+                        policy.decide(operation, &route.project_root.join("local.txt"), false),
+                        AccessDecision::Allow
+                    );
+                }
+                let outside = outside.to_owned();
+                assert_eq!(
+                    std::thread::spawn(move || policy.decide(
+                        AccessOperation::Read,
+                        &outside,
+                        false
+                    ))
+                    .join()
+                    .unwrap(),
+                    expected
+                );
+            });
+        },
+        |result| result.unwrap(),
+    );
+}
+
+#[test]
+fn saved_scope_grants_direct_broca_and_runner_hosts_keep_grants() {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    for principal in ["direct", "reserved:broca", "reserved:thalamus-harness"] {
+        for route in [&head, &worker] {
+            assert_saved_scope_grants(&ctx, &with_carrier(route, principal), &outside, None);
+        }
+    }
+}
+
+fn basal_session_run(parent: &RouteIdentity, worker: bool) -> RouteIdentity {
+    let mut run = copied_identity(parent);
+    let stamp = run.scope.as_mut().unwrap();
+    stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+    stamp.parent = Some(
+        serde_json::from_value(json!({
+            "owner": stamp.owner, "ref": stamp.scope_ref, "scope_epoch": stamp.scope_epoch,
+        }))
+        .unwrap(),
+    );
+    let run_id = if worker { "worker-run" } else { "head-run" };
+    stamp.scope_ref = format!("codemode/{run_id}");
+    stamp.attributes.run_id = Some(run_id.into());
+    stamp.attributes.agent_id = (!worker).then(|| "head".into());
+    stamp.attributes.on_behalf_of_agent = worker.then(|| "head".into());
+    run.run_owner = Some(Arc::new(codemode::RunOwner {
+        kind: if worker {
+            codemode::RunKind::Worker {
+                on_behalf_of_agent: "head".into(),
+            }
+        } else {
+            codemode::RunKind::Agent {
+                agent_id: "head".into(),
+            }
+        },
+        run_id: run_id.into(),
+        owner_route: parent.clone(),
+        owner_route_channel: route_key(41, 1),
+        run_route: route_key(42, 1),
+        run_principal: with_carrier(parent, "reserved:basal")
+            .spawn_principal
+            .clone(),
+    }));
+    RouteIdentity(Arc::new(run))
+}
+
+#[test]
+fn saved_scope_grants_basal_codemode_keeps_grants_but_flow_id_loses_them() {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    let run = basal_session_run(&head, false);
+    assert_saved_scope_grants(&ctx, &run, &outside, None);
+    let worker_run = basal_session_run(&worker, true);
+    assert_eq!(policy_scope_key(&worker_run), scope_key(&worker));
+    assert_ne!(policy_scope_key(&worker_run), scope_key(&head));
+    assert_saved_scope_grants(&ctx, &worker_run, &outside, None);
+    let mut flow = copied_identity(&run);
+    flow.run_owner = run.run_owner.clone();
+    flow.scope.as_mut().unwrap().attributes.flow_id = Some("flow-target-lease".into());
+    assert_saved_scope_grants(
+        &ctx,
+        &RouteIdentity(Arc::new(flow)),
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::Flow),
+    );
+}
+
+#[test]
+fn saved_scope_grants_rich_ui_and_unknown_carriers_lose_grants() {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    for principal in [
+        "reserved:occipital",
+        "reserved:unknown-runner",
+        "reserved:plexus",
+        "reserved:basal",
+    ] {
+        for route in [&head, &worker] {
+            assert_saved_scope_grants(
+                &ctx,
+                &with_carrier(route, principal),
+                &outside,
+                Some(crate::access_policy::ScopeGrantsDenial::NotSessionHost),
+            );
+        }
+    }
+}
+
+#[test]
+fn saved_scope_grants_unknown_scope_kind_fails_closed_with_typed_reason() {
+    let (dir, ctx, _, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    let mut unknown = copied_identity(&worker);
+    unknown.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Ephemeral;
+    let unknown = with_carrier(&RouteIdentity(Arc::new(unknown)), "reserved:basal");
+    assert_saved_scope_grants(
+        &ctx,
+        &unknown,
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+    let mut parentless = copied_identity(&unknown);
+    parentless.scope.as_mut().unwrap().parent = None;
+    assert_saved_scope_grants(
+        &ctx,
+        &RouteIdentity(Arc::new(parentless)),
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+    let mut missing = copied_identity(&worker);
+    missing.scope = None;
+    let missing = RouteIdentity(Arc::new(missing));
+    register(&missing, &ctx).unwrap();
+    assert_saved_scope_grants(
+        &ctx,
+        &missing,
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+}
+
 fn worker_at_parent_epoch(worker: &RouteIdentity, parent: &str, epoch: u64) -> RouteIdentity {
     let mut data = copied_identity(worker);
     let parent_stamp = data.scope.as_mut().unwrap().parent.as_mut().unwrap();

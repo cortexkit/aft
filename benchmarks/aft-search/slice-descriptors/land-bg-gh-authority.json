@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "The only fenced change declares the gh_shim_speech module in lib.rs. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

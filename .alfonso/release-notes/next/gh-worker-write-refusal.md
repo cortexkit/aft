@@ -1,1 +1,0 @@
-- A GitHub write from a worker shell (for example, `gh issue comment`) is now refused immediately with `gh_shim_worker_write_refused`, telling the agent that workers cannot write to GitHub and to report what should be posted to its parent instead, rather than suggesting a retry that could never succeed.

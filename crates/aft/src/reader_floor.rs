@@ -196,19 +196,49 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<ReaderFloor, FloorError> {
 /// the per-store maximum. Never lowers any store and never drops a store name
 /// this build does not know. Writes nothing when the floor already covers the
 /// requirements. Refuses (without writing) when the existing floor cannot be
-/// interpreted. A covered v3 request re-syncs the storage-root directory: a
-/// previous raise may have renamed the floor but failed to sync that rename.
-/// Covered legacy requests keep their existing no-sync behavior.
+/// interpreted. A covered v3 request re-syncs only when this process has not
+/// proved the current floor entry durable: a previous raise in another process
+/// may have renamed it but failed to sync that rename. Covered legacy requests
+/// keep their existing no-sync behavior.
 pub fn raise(
     storage_root: &Path,
     requirements: &[(PersistedStore, u32)],
 ) -> Result<ReaderFloor, FloorError> {
+    #[cfg(test)]
+    let _profile = crate::blob_store::v3::work_profile::span("floor_raise");
     crate::persisted_format::register_storage_root(storage_root);
     crate::production_storage::refuse_write(storage_root).map_err(|error| FloorError::Io {
         path: storage_root.to_path_buf(),
         error,
     })?;
     let path = floor_path(storage_root);
+    let strict = requirements.iter().any(|(store, _)| {
+        matches!(
+            store,
+            PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store
+        )
+    });
+    if strict {
+        let proven = durable_floors()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(storage_root)
+            .cloned();
+        if let Some(proven) = proven {
+            if let Some(current) = durable_snapshot(storage_root) {
+                if current == proven
+                    && requirements.iter().all(|(store, version)| {
+                        current
+                            .floor
+                            .get(*store)
+                            .is_some_and(|v| v >= u64::from(*version))
+                    })
+                {
+                    return Ok(current.floor);
+                }
+            }
+        }
+    }
     crate::private_storage::open_root(storage_root).map_err(|error| FloorError::Io {
         path: storage_root.to_path_buf(),
         error,
@@ -226,23 +256,75 @@ pub fn raise(
         let entry = next.stores.entry(store.name().to_string()).or_insert(0);
         *entry = (*entry).max(u64::from(*version));
     }
-    let strict = requirements.iter().any(|(store, _)| {
-        matches!(
-            store,
-            PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store
-        )
-    });
     if current.as_ref() == Some(&next) {
         if strict {
             sync_dir(storage_root, strict).map_err(|error| FloorError::Io {
                 path: storage_root.to_path_buf(),
                 error,
             })?;
+            remember_durable(storage_root);
         }
         return Ok(next);
     }
     write_atomic(&path, &next, strict)?;
+    if strict {
+        remember_durable(storage_root);
+    }
     Ok(next)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DurableFloor {
+    root: crate::file_identity::FileIdentity,
+    stamp: FloorStamp,
+    floor: ReaderFloor,
+}
+
+fn durable_floors() -> &'static Mutex<HashMap<PathBuf, DurableFloor>> {
+    static FLOORS: OnceLock<Mutex<HashMap<PathBuf, DurableFloor>>> = OnceLock::new();
+    FLOORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn forget_durable_for_test(storage_root: &Path) {
+    durable_floors().lock().unwrap().remove(storage_root);
+}
+
+fn durable_snapshot(storage_root: &Path) -> Option<DurableFloor> {
+    use crate::file_identity::FileIdentity;
+    let (_, root @ FileIdentity::Known { .. }) =
+        crate::file_identity::metadata(storage_root).ok()?
+    else {
+        return None;
+    };
+    let path = floor_path(storage_root);
+    let (Some(stamp), Some(bytes)) = read_snapshot(&path).ok()? else {
+        return None;
+    };
+    if stamp.identity == FileIdentity::Unavailable {
+        return None;
+    }
+    Some(DurableFloor {
+        root,
+        stamp,
+        floor: parse(&path, &bytes).ok()?,
+    })
+}
+
+fn remember_durable(storage_root: &Path) {
+    // Called under the floor lock only after a successful strict sync. Never
+    // trust a version alone: replacement of either directory or floor entry
+    // invalidates the proof, including a rename whose directory sync failed.
+    if let Some(snapshot) = durable_snapshot(storage_root) {
+        let mut floors = durable_floors()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Eviction costs a later re-sync, not a loss of the ordering guarantee.
+        if floors.len() >= 256 {
+            floors.clear();
+        }
+        floors.insert(storage_root.to_path_buf(), snapshot);
+    }
 }
 
 /// Raise the floor for `store` to `version`, then run `write`. The floor is
@@ -270,6 +352,8 @@ pub fn publish_v3_with_floor<T>(
     store_version: u32,
     write: impl FnOnce() -> T,
 ) -> Result<T, FloorError> {
+    #[cfg(test)]
+    crate::storage_retention::test_hook(storage_root, "v3-floor-raising");
     raise(
         storage_root,
         &[
@@ -277,6 +361,11 @@ pub fn publish_v3_with_floor<T>(
             (PersistedStore::ViewsV3Store, store_version),
         ],
     )?;
+    #[cfg(test)]
+    crate::storage_retention::test_hook(
+        storage_root,
+        &format!("v3-floor-raised:{registry_version}:{store_version}"),
+    );
     Ok(write())
 }
 
@@ -314,6 +403,8 @@ fn write_atomic(path: &Path, floor: &ReaderFloor, strict: bool) -> Result<(), Fl
 }
 
 fn sync_dir(dir: &Path, strict: bool) -> io::Result<()> {
+    #[cfg(test)]
+    let _profile = crate::blob_store::v3::work_profile::span("floor_sync_dir");
     let result = crate::durability::sync_dir(dir);
     // Legacy floor writers ignore every directory-sync error. Only v3 writers
     // require directory durability before their publication closure may run.
@@ -652,7 +743,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn covered_v3_floor_resyncs_without_rewriting_and_propagates_failure() {
+    fn covered_v3_floor_reads_once_without_rewriting_locking_or_syncing() {
         let root = tempfile::tempdir().unwrap();
         let requirements = [(PersistedStore::ViewsV3Store, 1)];
         raise(root.path(), &requirements).unwrap();
@@ -662,14 +753,12 @@ pub(crate) mod tests {
             .modified()
             .unwrap();
         crate::durability::take();
+        PARSE_COUNT.with(|count| count.set(0));
+        let _lock =
+            crate::fs_lock::try_acquire(&root.path().join(LOCK_FILE), LOCK_TIMEOUT).unwrap();
         raise(root.path(), &requirements).unwrap();
-        assert_eq!(
-            crate::durability::take(),
-            vec![(
-                crate::durability::EventKind::DirectorySync,
-                root.path().to_path_buf()
-            )]
-        );
+        assert_eq!(PARSE_COUNT.with(|count| count.get()), 1);
+        assert!(crate::durability::take().is_empty());
         assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
         assert_eq!(
             fs::metadata(floor_path(root.path()))
@@ -678,11 +767,62 @@ pub(crate) mod tests {
                 .unwrap(),
             stamp
         );
-        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
-            *slot.borrow_mut() = Some(root.path().to_path_buf());
-        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_covered_floor_must_sync_again_even_with_identical_bytes_and_times() {
+        let root = tempfile::tempdir().unwrap();
+        let requirements = [(PersistedStore::ViewsV3Store, 1)];
+        raise(root.path(), &requirements).unwrap();
+        let path = floor_path(root.path());
+        let before = fs::read(&path).unwrap();
+        crate::file_identity::replace_keeping_times(&path, &before);
+        fail_directory_sync(root.path(), Some(libc::EIO));
         let result = raise(root.path(), &requirements);
         assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+        crate::durability::take();
+        raise(root.path(), &requirements).unwrap();
+        assert!(crate::durability::take().contains(&(
+            crate::durability::EventKind::DirectorySync,
+            root.path().to_path_buf()
+        )));
+        crate::durability::take();
+        raise(root.path(), &requirements).unwrap();
+        assert!(crate::durability::take().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn covered_floor_without_process_local_proof_must_sync_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        publish_v3_with_floor(root.path(), 1, 1, || ()).unwrap();
+        durable_floors().lock().unwrap().remove(root.path());
+        fail_directory_sync(root.path(), Some(libc::EIO));
+        let mut wrote = false;
+        let result = publish_v3_with_floor(root.path(), 1, 1, || wrote = true);
+        assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+        assert!(!wrote);
+        publish_v3_with_floor(root.path(), 1, 1, || wrote = true).unwrap();
+        assert!(wrote);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_root_cannot_reuse_a_floor_proof_even_for_the_same_floor_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let retired = temp.path().join("retired");
+        fs::create_dir(&root).unwrap();
+        let requirements = [(PersistedStore::ViewsV3Store, 1)];
+        raise(&root, &requirements).unwrap();
+        fs::rename(&root, &retired).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::hard_link(floor_path(&retired), floor_path(&root)).unwrap();
+        fail_directory_sync(&root, Some(libc::EIO));
+        let result = raise(&root, &requirements);
+        assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+        raise(&root, &requirements).unwrap();
     }
 
     #[test]

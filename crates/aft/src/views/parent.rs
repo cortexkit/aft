@@ -11,9 +11,9 @@
 //!   changes on top). A child whose sessions run with views off publishes
 //!   only its persisted `cache.bin`, which the parent opens through the
 //!   borrowed read-only loader and keeps current in RAM from its watcher.
-//! - **semantic:** the child's per-checkout (v2) view, opened through a
-//!   registry *reader* registration (a reader marker, never a view) and a read
-//!   marker on the generation it serves.
+//! - **semantic:** the child's published v3 semantic member
+//!   (`<scope>.semantic`), opened with read markers on the generation it
+//!   serves and the base it composes; answers are as of that publication.
 //! - **callgraph:** the child's published v3 call-graph view, protected by a
 //!   read marker on the generation it serves. Answers name the publication
 //!   they are as of (`as_of`).
@@ -55,7 +55,7 @@ use crate::readonly_artifacts::BorrowedArtifactGeneration;
 use crate::search_index::SearchIndex;
 
 use super::contracts::ViewAccess;
-use super::registry::{FamilyRegistry, ReaderRegistration};
+
 use super::semantic::SemanticPlane;
 use super::snapshot::{OpenGeneration, Snapshot};
 
@@ -793,11 +793,6 @@ pub struct Child {
     /// Ignore files read for deciding whether a newly created file belongs
     /// to the child, keyed by path with the mtime they were read at.
     ignore_files: Mutex<worker::IgnoreCache>,
-    /// The family registry reader registration, created once on first use.
-    reader: Mutex<Option<Arc<ReaderRegistration>>>,
-    /// Size and mtime of the child's semantic view pointer database and its
-    /// WAL when the worker last read the pointer; see `worker::refresh_semantic`.
-    pub(crate) semantic_pointer_stat: Mutex<Option<Vec<u8>>>,
     loads: AtomicUsize,
     applied: AtomicUsize,
 }
@@ -821,8 +816,6 @@ impl Child {
             engine: Mutex::new(None),
             pending: Mutex::new(BTreeSet::new()),
             ignore_files: Mutex::new(worker::IgnoreCache::default()),
-            reader: Mutex::new(None),
-            semantic_pointer_stat: Mutex::new(None),
             loads: AtomicUsize::new(0),
             applied: AtomicUsize::new(0),
         }
@@ -884,28 +877,6 @@ impl Child {
         read(&self.semantic)
             .ready()
             .map(|semantic| semantic.generation.name().to_owned())
-    }
-
-    fn reader(&self, storage: &Path) -> Result<Option<Arc<ReaderRegistration>>, String> {
-        let mut reader = lock(&self.reader);
-        if let Some(reader) = reader.as_ref() {
-            return Ok(Some(Arc::clone(reader)));
-        }
-        // The family registry lists a repository's per-checkout views. A
-        // reader never creates one: a child whose own sessions never
-        // published such a view has nothing to read yet.
-        let Some(registry) = FamilyRegistry::open_existing(storage, self.family(storage)?)
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let registration = Arc::new(
-            registry
-                .register_reader("parent-folder")
-                .map_err(|error| error.to_string())?,
-        );
-        *reader = Some(Arc::clone(&registration));
-        Ok(Some(registration))
     }
 }
 

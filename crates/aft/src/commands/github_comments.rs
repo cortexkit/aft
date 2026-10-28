@@ -476,6 +476,7 @@ pub(crate) fn run_governed_gh(
         ticket.value(),
     )
     .map_err(|error| format!("could not prepare the governed gh shim: {error}"))?;
+    crate::gh_shim_speech::start_view::inject(ticket.value(), &mut environment, &ctx.storage_dir());
     if worker {
         environment.insert(
             crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.to_string(),

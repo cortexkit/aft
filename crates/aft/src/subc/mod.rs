@@ -1593,6 +1593,61 @@ struct RouteIdentityData {
     run_owner: Option<Arc<codemode::RunOwner>>,
 }
 
+fn speech_launch_seed(
+    identity: &RouteIdentity,
+    route: RouteChannel,
+    control: Option<&Arc<readiness::DaemonControl>>,
+) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
+    use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
+    let lifecycle = identity.scope.clone()?;
+    let origin = |channel: RouteChannel| {
+        control.and_then(|control| {
+            Some(RouteOrigin {
+                run_nonce: crate::gh_shim_speech::service::run_nonce()?.into(),
+                connection_generation: format!("{:p}", Arc::as_ptr(control)),
+                channel: u32::from(channel.channel),
+                epoch: u64::from(channel.epoch),
+            })
+        })
+    };
+    let launch = if let Some(owner) = &identity.run_owner {
+        if matches!(owner.kind, codemode::RunKind::Worker { .. }) {
+            Err(crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "owner_unresolved",
+            ))
+        } else {
+            owner
+                .owner_route
+                .scope
+                .clone()
+                .ok_or_else(|| {
+                    crate::gh_shim_speech::Refusal::new(
+                        crate::gh_shim_speech::Code::AuthorityUnavailable,
+                        "owner_unresolved",
+                    )
+                })
+                .and_then(|head| {
+                    LaunchAuthority::codemode(
+                        head,
+                        lifecycle.clone(),
+                        origin(route),
+                        origin(owner.owner_route_channel),
+                    )
+                })
+        }
+    } else {
+        LaunchAuthority::classic(lifecycle.clone(), origin(route))
+    };
+    Some(crate::gh_shim_speech::service::LaunchSeed {
+        launch,
+        lifecycle: Some(lifecycle),
+        session: identity.session.clone(),
+        harness: identity.harness.clone(),
+        project_root: identity.project_root.display().to_string(),
+    })
+}
+
 impl Deref for RouteIdentity {
     type Target = RouteIdentityData;
 
@@ -3509,6 +3564,11 @@ async fn handle_bash_elicitation_reply(
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
+            let _grants = crate::access_policy::scope_grants_guard(
+                routes
+                    .get(&key.route)
+                    .and_then(access_grants::scope_grants_denial),
+            );
             let _ask_route = crate::access_policy::ask_route_guard(
                 routes.get(&key.route).map(access_grants::ask_route),
             );
@@ -4249,8 +4309,8 @@ fn run_subc_mode_inner(
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
         crate::bash_background::note_storage_root(&storage_dir);
-        // Page snapshots an earlier daemon left behind are deleted now; the
-        // storage lease above makes this daemon their only user.
+        // Initialize the page snapshot store. The shared storage-use lease
+        // excludes cache cleanup, not other AFT daemons.
         crate::page_collect::snapshot::SnapshotStore::for_storage(&storage_dir);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
@@ -5027,6 +5087,7 @@ where
     let launch_nonce = crate::launch_nonce::current();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
+    let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
     let manifest_provides = manifest.provides.clone();
     let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
@@ -5128,8 +5189,31 @@ where
         HELLO_CORR + 1,
     ));
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
-    let (scope_describes, mut scopes_ended_rx, scope_describe_task) =
-        scope_describe::start(control.clone(), executor.clone(), run_scopes.clone());
+    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
+    let speech_control = Arc::clone(&control);
+    let speech = crate::gh_shim_speech::service::start(
+        storage_dir,
+        &gh_relay,
+        Arc::new(move |scope| {
+            let control = Arc::clone(&speech_control);
+            Box::pin(async move {
+                control
+                    .describe(&scope)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        format!("{:p}", Arc::as_ptr(&control)),
+        control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP),
+    );
+    let speech_runtime = speech.runtime_guard();
+    let (scope_describes, mut scopes_ended_rx, mut scope_describe_task) =
+        scope_describe::start_for_speech(
+            control.clone(),
+            executor.clone(),
+            run_scopes.clone(),
+            Arc::clone(&speech),
+        );
     let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
     let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at);
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
@@ -5203,7 +5287,6 @@ where
         spawn_fleet_status_dial(connection_file_path, 64);
     // Serves the gh shim's bot-write relay on management routes; it dials
     // prefrontal and plexus over its own connection, off the frame loop.
-    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
     let (_worker_read_service, mut worker_read_scopes) =
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
@@ -5590,7 +5673,7 @@ where
             }
             Some(query) = worker_read_scopes.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("gh_relay_route_scopes", "", 0);
-                let scopes = gh_relay_route_scopes(&routes);
+                let scopes = gh_relay_route_scopes(&routes,&speech);
                 let _ = query.reply.send(scopes.for_session(&query.session).cloned());
             }
             _ = shutdown.notified() => {
@@ -5997,7 +6080,7 @@ where
                                 &gh_relay,
                                 &dispatch_path_metrics,
                                 true,
-                                gh_relay_route_scopes(&routes),
+                                gh_relay_route_scopes(&routes,&speech),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
@@ -6019,7 +6102,7 @@ where
                             // The tool-call future is polled on this loop's
                             // thread, so it is boxed to keep its own frame on
                             // the heap instead of widening this loop's frame.
-                            Box::pin(handle_tool_call(
+                            Box::pin(handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
                                 parsed_body,
@@ -6050,6 +6133,7 @@ where
                                 tool_response_body_limit,
                                 &module_drain,
                                 Some(&control),
+                                rich_ui_proofs,
                             ))
                             .await
                         };
@@ -6706,6 +6790,14 @@ where
     health_rollup_worker.shutdown();
     // The flip retries until accepted; the connection ending is what stops it.
     scope_describe_task.abort();
+    // Cancellation is not a join guarantee. If the monitor does not stop in
+    // 100 ms, keep the locks: it may still publish scope-end revocations.
+    if tokio::time::timeout(Duration::from_millis(100), &mut scope_describe_task)
+        .await
+        .is_err()
+    {
+        speech_runtime.retain_until_process_exit();
+    }
     ledger_edge.detach_shells(&executor, None).await;
     if let Some(task) = readiness_task {
         task.abort();
@@ -6787,6 +6879,11 @@ where
         }
     }
 
+    // No new relay can enter after the frame loop. Retire the speech owner
+    // before joining the writer: its runtime also owns a control sender.
+    // Relays may still enqueue bot writes or finish durable state. Their work
+    // guards retain the serving/storage locks until both operations finish.
+    speech_runtime.retire();
     // The run-scope coordinator owns a writer sender even when no run is live.
     // Release it before joining the writer so an idle connection can drain.
     drop(run_scopes);
@@ -9019,10 +9116,23 @@ fn gh_relay_operation(frame: &Frame) -> Option<String> {
 /// command; the relay finds that route by the session its ticket names.
 fn gh_relay_route_scopes(
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    speech: &Arc<crate::gh_shim_speech::service::Service>,
 ) -> crate::gh_shim_relay::RouteScopes {
     let mut scopes = crate::gh_shim_relay::RouteScopes::default();
-    for identity in routes.values() {
+    scopes.speech = Some(Arc::clone(speech));
+    for (channel, identity) in routes {
         scopes.push(&identity.session, identity.scope.clone());
+        scopes.push_origin(
+            crate::gh_shim_speech::model::RouteOrigin {
+                run_nonce: crate::gh_shim_speech::service::run_nonce()
+                    .unwrap_or_default()
+                    .into(),
+                connection_generation: speech.generation(),
+                channel: u32::from(channel.channel),
+                epoch: u64::from(channel.epoch),
+            },
+            identity.scope.clone(),
+        );
     }
     scopes
 }
@@ -9042,7 +9152,12 @@ fn spawn_gh_relay(
     let frame = frame.clone();
     let relay = Arc::clone(relay);
     let metrics = Arc::clone(metrics);
+    let speech_work = route_scopes
+        .speech
+        .as_ref()
+        .map(|speech| speech.track_finalization());
     tokio::spawn(async move {
+        let _speech_work = speech_work;
         let decoded = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
         let operation = decoded
             .get("op")
@@ -9906,6 +10021,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
+    speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
@@ -9938,6 +10054,7 @@ impl PlainToolRun {
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
+                speech_seed,
                 bare_name,
                 mut arguments,
                 format_context,
@@ -10006,30 +10123,35 @@ impl PlainToolRun {
                             access_grants::alfonso_worker(&identity_for_run),
                         )
                     });
-                    crate::sandbox_spawn::ToolLaunchPolicy::with_current(tool_policy, || {
-                        let mut trace = phase_trace.borrow_mut();
-                        let dispatch = |request: RawRequest, ctx: &AppContext| {
-                            if observation_only && bare_name == "bash_status" {
-                                crate::commands::bash_status::handle_with_observation_only(
-                                    &request,
-                                    ctx,
-                                    observation_only,
-                                )
-                            } else {
-                                dispatch(request, ctx)
-                            }
-                        };
-                        run_tool_call(
-                            &bare_name,
-                            arguments,
-                            &format_context,
-                            &tool_call_context,
-                            ctx,
-                            &dispatch,
-                            Some(&finalizer),
-                            trace.as_mut(),
-                        )
-                    })
+                    crate::gh_shim_speech::service::with_launch(
+                        speech_seed.clone(),
+                        &ctx.storage_dir(),
+                        || {
+                            crate::sandbox_spawn::ToolLaunchPolicy::with_current(
+                                tool_policy,
+                                || {
+                                    let mut trace = phase_trace.borrow_mut();
+                                    let dispatch = |request: RawRequest, ctx: &AppContext| {
+                                        if observation_only && bare_name == "bash_status" {
+                                            crate::commands::bash_status::handle_with_observation_only(&request,ctx,observation_only)
+                                        } else {
+                                            dispatch(request, ctx)
+                                        }
+                                    };
+                                    run_tool_call(
+                                        &bare_name,
+                                        arguments,
+                                        &format_context,
+                                        &tool_call_context,
+                                        ctx,
+                                        &dispatch,
+                                        Some(&finalizer),
+                                        trace.as_mut(),
+                                    )
+                                },
+                            )
+                        },
+                    )
                 };
                 let finish = |outcome: Result<ToolCallOutcome, Response>| {
                     let outcome = outcome.unwrap_or_else(|response| {
@@ -10271,11 +10393,83 @@ fn bash_watch_warning_wait_ms(
     })
 }
 
+// Direct decoder fixtures use the build's default HELLO capabilities. The live
+// loop passes the snapshot of the actual HELLO sent on that connection instead.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_tool_call(
+    tx: &WriterSender,
+    frame: &Frame,
+    parsed_body: Option<Result<Value, serde_json::Error>>,
+    confinement: Option<remote_policy::CarriedConfinement>,
+    phase_trace: PhaseTrace,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    reclaimed_routes: &ReclaimedRoutes,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    active_tool_calls: &ActiveToolCalls,
+    pending_deferred_setups: &Arc<PendingDeferredSetups>,
+    shutdown: &Arc<Notify>,
+    connection_cancel: &PersistentCancelSignal,
+    bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    next_bash_ask_corr: &mut u64,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut BgSubsBySession,
+    bg_wake_pending: &mut BgWakePending,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    dispatch: DispatchFn,
+    deferred_response_tx: &DeferredResponseSender,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    module_drain: &drain::ModuleDrainWindow,
+    daemon_control: Option<&Arc<readiness::DaemonControl>>,
+) -> Result<(), SubcError> {
+    handle_tool_call_with_capabilities(
+        tx,
+        frame,
+        parsed_body,
+        confinement,
+        phase_trace,
+        routes,
+        pending_binds,
+        reclaimed_routes,
+        live_roots,
+        executor,
+        active_tool_calls,
+        pending_deferred_setups,
+        shutdown,
+        connection_cancel,
+        bash_deferred_tx,
+        bash_poll_touch_tx,
+        metrics,
+        route_bash_cancels,
+        pending_bash_asks,
+        next_bash_ask_corr,
+        bg_subs,
+        bg_sub_by_session,
+        bg_wake_pending,
+        bg_wake_epoch,
+        dispatch,
+        deferred_response_tx,
+        allow_native_passthrough,
+        tool_response_body_limit,
+        module_drain,
+        daemon_control,
+        rich_ui::session::ProofCapabilities::from_manifest(&manifest::build_manifest()),
+    )
+    .await
+}
+
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
-async fn handle_tool_call(
+async fn handle_tool_call_with_capabilities(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
@@ -10306,6 +10500,7 @@ async fn handle_tool_call(
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
     daemon_control: Option<&Arc<readiness::DaemonControl>>,
+    rich_ui_proofs: rich_ui::session::ProofCapabilities,
 ) -> Result<(), SubcError> {
     metrics.mark_frame_loop_entry("handle_tool_call", frame);
     let module_draining = module_drain.is_active();
@@ -10497,14 +10692,18 @@ async fn handle_tool_call(
                 )
                 .await;
             }
-            Ok(Some(_operation)) => {
-                // A published operation alone grants no access to a session.
-                // Refuse rather than dispatch without a proven session policy.
-                return send_provider_error(
+            Ok(Some(operation)) => {
+                return rich_ui::session::submit(
                     tx,
-                    metrics,
                     frame,
-                    rich_ui::chunks::refusal("session_not_bound"),
+                    identity,
+                    routes,
+                    executor,
+                    active_tool_calls,
+                    metrics,
+                    operation,
+                    dispatch,
+                    rich_ui_proofs,
                 )
                 .await;
             }
@@ -11045,6 +11244,7 @@ async fn handle_tool_call(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11107,6 +11307,7 @@ async fn handle_tool_call(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11123,6 +11324,8 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _grants =
+            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(&identity));
         let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
@@ -11225,6 +11428,7 @@ async fn handle_tool_call(
                 | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
             format_context: format_context.clone(),
@@ -11260,6 +11464,9 @@ async fn handle_tool_call(
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
+            let _grants = crate::access_policy::scope_grants_guard(
+                access_grants::scope_grants_denial(&identity_for_run),
+            );
             let _ask_route =
                 crate::access_policy::ask_route_guard(Some(access_grants::ask_route_for_call(
                     &identity_for_run,
@@ -11628,6 +11835,7 @@ async fn handle_tool_call(
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
+        speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
         bare_name,
         arguments,
         format_context,
@@ -16589,6 +16797,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        speech_seed: None,
                         run_scope: None,
                         scope: None,
                         late_results: false,

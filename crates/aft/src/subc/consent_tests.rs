@@ -812,6 +812,196 @@ async fn occipital_outside_read_refuses_without_any_permission_ask() {
     assert!(text(&local).contains("local-read-marker"), "{local}");
 }
 
+#[tokio::test]
+async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let grant = AccessGrant {
+        path: f.head_root.join("shared.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let db = f.ctx.db().unwrap();
+    crate::db::access_grants::insert(
+        &db.lock().unwrap(),
+        &access_grants::scope_key(&f.worker),
+        &grant,
+    )
+    .unwrap();
+    let arguments = json!({"path": grant.path});
+    for principal in [
+        "reserved:unrecognized-carrier",
+        "reserved:occipital",
+        "reserved:basal",
+    ] {
+        let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
+        let data = Arc::get_mut(&mut carrier.0).unwrap();
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+            *principal_id = Some(principal.into());
+        }
+        if principal == "reserved:basal" {
+            let scope = data.scope.as_mut().unwrap();
+            scope.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+            scope.attributes.flow_id = Some("flow-target-lease".into());
+        }
+        let call = HeldCall {
+            reply_deadline: Instant::now() + Duration::from_secs(5),
+            identity: carrier.clone(),
+            tool: "read".into(),
+            arguments: arguments.clone(),
+            request_id: "nonhost-consent".into(),
+            executor: f.executor.clone(),
+            route: RouteChannel {
+                channel: 41,
+                epoch: 1,
+            },
+            corr: 803,
+            active: f.active.clone(),
+            connection_cancel: f.connection_cancel.clone(),
+            drain: drain::ModuleDrainWindow::default(),
+        };
+        let mut first = Response::error(
+            "nonhost-consent",
+            crate::access_policy::ACCESS_ASK_REQUIRED,
+            "approval required",
+        );
+        first.data["ask"] = serde_json::to_value(&grant).unwrap();
+        let (refusal, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_with_consent(call, (first, String::new()), |_| async {
+                panic!("carrier must not rerun")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!refusal.success);
+        assert_eq!(refusal.data["code"], "path_outside_root");
+        assert!(prepare(&db, &f.ctx, &carrier, "read", &arguments, &grant, &grant, None).is_err());
+        assert!(f.asks().is_empty());
+        assert!(f.fake.calls("consent.request").is_empty());
+        let Prep::Ask(prep) = prepare(
+            &db, &f.ctx, &f.worker, "read", &arguments, &grant, &grant, None,
+        )
+        .unwrap() else {
+            panic!("host must be able to prepare a consent card");
+        };
+        assert!(apply_allow(
+            &db,
+            &f.ctx,
+            &carrier,
+            &prep.key,
+            &prep.call_key,
+            "carrier",
+            &grant,
+            true,
+            true,
+        )
+        .is_err());
+        asks::discard(&db.lock().unwrap(), &prep.key).unwrap();
+    }
+    assert_eq!(f.worker_grants().len(), 1);
+}
+
+#[tokio::test]
+async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let mut direct = identity(&f.head.project_root, f.head.scope.clone());
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut Arc::get_mut(&mut direct.0).unwrap().spawn_principal
+    {
+        *principal_id = Some("direct".into());
+    }
+    let mut routes = vec![direct, f.worker.clone()];
+    for (parent, worker) in [(&f.head, false), (&f.worker, true)] {
+        let run_id = if worker { "save-worker" } else { "save-head" };
+        let mut run = identity(
+            &parent.project_root,
+            Some(stamp(
+                &format!("codemode/{run_id}"),
+                "ephemeral",
+                Some(&parent.scope.as_ref().unwrap().scope_ref),
+            )),
+        );
+        let data = Arc::get_mut(&mut run.0).unwrap();
+        let scope = data.scope.as_mut().unwrap();
+        scope.attributes.run_id = Some(run_id.into());
+        scope.attributes.agent_id = (!worker).then(|| "head".into());
+        scope.attributes.on_behalf_of_agent = worker.then(|| "head".into());
+        let mut run_principal = parent.spawn_principal.clone();
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut run_principal {
+            *principal_id = Some("reserved:basal".into());
+        }
+        data.run_owner = Some(Arc::new(codemode::RunOwner {
+            kind: if worker {
+                codemode::RunKind::Worker {
+                    on_behalf_of_agent: "head".into(),
+                }
+            } else {
+                codemode::RunKind::Agent {
+                    agent_id: "head".into(),
+                }
+            },
+            run_id: run_id.into(),
+            owner_route: parent.clone(),
+            owner_route_channel: RouteChannel {
+                channel: 41,
+                epoch: 1,
+            },
+            run_route: RouteChannel {
+                channel: 42,
+                epoch: 1,
+            },
+            run_principal,
+        }));
+        access_grants::register(&run, &f.ctx).unwrap();
+        routes.push(run);
+    }
+    let db = f.ctx.db().unwrap();
+    for (index, route) in routes.iter().enumerate() {
+        let outside = f.dir.path().join(format!("consent-outside-{index}.txt"));
+        std::fs::write(&outside, "consent scope grant").unwrap();
+        let grant = AccessGrant {
+            path: crate::access_policy::policy_path(&outside),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let Prep::Ask(prep) = prepare(
+            &db,
+            &f.ctx,
+            route,
+            "read",
+            &json!({"path": grant.path}),
+            &grant,
+            &grant,
+            None,
+        )
+        .unwrap() else {
+            panic!("qualifying route must prepare a card");
+        };
+        let applied = apply_allow(
+            &db,
+            &f.ctx,
+            route,
+            &prep.key,
+            &prep.call_key,
+            &asks::new_holder(),
+            &grant,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(applied, Applied::Run(_)));
+        assert!(crate::db::access_grants::list(
+            &db.lock().unwrap(),
+            &access_grants::policy_scope_key(route)
+        )
+        .unwrap()
+        .contains(&grant));
+    }
+}
+
 fn text(reply: &Value) -> String {
     reply["content"]
         .as_array()

@@ -218,6 +218,7 @@ impl Default for LockConfig {
 struct ProcessIdentity {
     start_time: u64,
     boot_id: Option<String>,
+    exited: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2447,6 +2448,10 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     Some(ProcessIdentity {
         start_time,
         boot_id: Some(boot_id),
+        exited: matches!(
+            stat.rsplit_once(") ")?.1.split_ascii_whitespace().next()?,
+            "Z" | "X"
+        ),
     })
 }
 
@@ -2482,6 +2487,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     Some(ProcessIdentity {
         start_time,
         boot_id: None,
+        exited: info.pbi_status == 5,
     })
 }
 
@@ -2493,7 +2499,69 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
         .map(|start_time| ProcessIdentity {
             start_time,
             boot_id: None,
+            exited: false,
         })
+}
+
+/// Exact birth and boot identity for speech redemption. Missing evidence is denial,
+/// unlike the deliberately conservative "still alive" policy used by lock cleanup.
+pub(crate) fn speech_process_identity(pid: u32) -> Option<String> {
+    let identity = process_identity(pid)?;
+    if identity.exited {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let boot = identity.boot_id?;
+    #[cfg(target_os = "macos")]
+    let boot = crate::storage_retention::boot_id()?;
+    #[cfg(windows)]
+    let boot = speech_windows_boot_id()?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let boot = return None;
+    Some(format!(
+        "{}:{boot}:{}",
+        std::env::consts::OS,
+        identity.start_time
+    ))
+}
+
+#[cfg(windows)]
+fn speech_windows_boot_id() -> Option<String> {
+    #[repr(C)]
+    struct BootInfo {
+        id: [u8; 16],
+        firmware: u32,
+        flags: u64,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        #[link_name = "NtQuerySystemInformation"]
+        fn nt_query_system_information(
+            class: u32,
+            buffer: *mut std::ffi::c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    let mut info = BootInfo {
+        id: [0; 16],
+        firmware: 0,
+        flags: 0,
+    };
+    let mut returned = 0;
+    // SystemBootEnvironmentInformation (90) supplies the kernel's per-boot GUID.
+    let status = unsafe {
+        nt_query_system_information(
+            90,
+            (&mut info as *mut BootInfo).cast(),
+            std::mem::size_of::<BootInfo>() as u32,
+            &mut returned,
+        )
+    };
+    if status < 0 || returned < 16 || info.id == [0; 16] {
+        return None;
+    }
+    Some(info.id.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

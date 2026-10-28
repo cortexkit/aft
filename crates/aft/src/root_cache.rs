@@ -58,6 +58,9 @@ pub use location::{
     CACHE_DIR_BUSY_MESSAGE, CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
+    acquire_speech_serving_lease, release_quiescent_speech_serving_lease, SpeechServingLease,
+};
+pub(crate) use location::{
     cache_deletion_protections, cache_status_code, check_cache_access, durable_route,
     ensure_config_storage_lease, identity_storage_root, pin_cache_path, pin_owned_cache_path,
     prepare_process_cache_root, prepare_third_party_cache_dir, refuse_durable_cache_write,

@@ -1,1 +1,0 @@
-- When a folder grant is allowed, other open permission asks it covers are now settled and withdrawn instead of waiting for a second answer.

@@ -1140,7 +1140,9 @@ jobs:
     # This runner builds its own binary and consumes no archive artifacts.
     # The summary still requires both conformance and every archive/shard lane.
     runs-on: macos-26
-    timeout-minutes: 30
+    # 45 minutes: a cold-cache cargo build alone has taken 15 minutes here, and
+    # three merge-queue runs hit 30 while their tests were still passing.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache

@@ -136,7 +136,7 @@ fn run_with_scopes<T: RelayTransport>(
         .enable_all()
         .build()
         .unwrap();
-    let reply = runtime.block_on(relay(
+    let reply = runtime.block_on(relay_transport_contract(
         transport,
         RelayCall {
             operation,
@@ -211,7 +211,7 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
         .enable_all()
         .build()
         .unwrap();
-    let reply = runtime.block_on(relay(
+    let reply = runtime.block_on(relay_transport_contract(
         &transport,
         RelayCall {
             operation: BOT_REQUEST_OPERATION,
@@ -541,6 +541,268 @@ fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeS
 
 fn delegating_stamp() -> ScopeStamp {
     stamp(Some("agent-fixture"), true, true)
+}
+
+#[test]
+fn authority_never_widens_across_reconnect() {
+    let original = delegating_stamp();
+    let mut replacement = original.clone();
+    replacement.scope_ref = "new-work-scope".into();
+    replacement.scope_epoch = 99;
+    let ticket = crate::gh_shim_ticket::Redeemed {
+        session_id: "same-head-session".into(),
+        task_id: "bash-original".into(),
+        project_root: "/project".into(),
+        read_repository: None,
+        launch: Some(
+            crate::gh_shim_speech::model::LaunchAuthority::classic(original.clone(), None).unwrap(),
+        ),
+        lifecycle_scope: Some(original.clone()),
+    };
+    let routes = scopes_for("same-head-session", Some(replacement));
+    assert_eq!(bot_authority(&ticket, &routes), Some(original));
+}
+
+// Exercise relay admission rather than only the immutable-authority helper:
+// a captured Call ticket must not adopt the session's replacement scope.
+#[tokio::test]
+async fn call_ticket_must_not_adopt_a_rebound_agent() {
+    let original = delegating_stamp();
+    let live = crate::bash_background::registry::with_scope_spawn(Some(original.clone()), || {
+        crate::gh_shim_ticket::ScopedTicket::issue("audit-call-rebind", "call", "/p")
+    });
+    let redeemed = crate::gh_shim_ticket::redeem(live.value().unwrap()).unwrap();
+    assert_eq!(redeemed.launch.unwrap().authority, original);
+    let mut replacement = delegating_stamp();
+    replacement.scope_ref = "different-head".into();
+    replacement.scope_epoch = 99;
+    replacement.attributes.agent_id = Some("agent-replacement".into());
+    let routes = scopes_for("audit-call-rebind", Some(replacement));
+    let mut params = bot_params(live.value().unwrap(), "audit-call-rebound-write");
+    params["request"]["metadata"]["agent_id"] = json!("agent-replacement");
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(
+        transport.calls().is_empty(),
+        "the Call ticket captured another head/agent, but relay forwarded under the replacement: {:?}",
+        answer.data
+    );
+}
+
+fn background_ticket(
+    root: &std::path::Path,
+    session: &str,
+    stamp: &ScopeStamp,
+) -> crate::gh_shim_ticket::PendingTicket {
+    let launch = crate::gh_shim_speech::model::LaunchAuthority::classic(
+        stamp.clone(),
+        Some(launch_origin()),
+    )
+    .unwrap();
+    let seed = crate::gh_shim_speech::service::LaunchSeed {
+        launch: Ok(launch),
+        lifecycle: Some(stamp.clone()),
+        session: session.into(),
+        harness: "fixture".into(),
+        project_root: "/project".into(),
+    };
+    let ticket = crate::gh_shim_speech::service::with_launch(Some(seed), root, || {
+        crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
+            crate::gh_shim_ticket::PendingTicket::issue(session, "/project")
+        })
+    });
+    crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap())
+        .unwrap()
+        .background
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    ticket
+}
+
+fn launch_origin() -> crate::gh_shim_speech::model::RouteOrigin {
+    crate::gh_shim_speech::model::RouteOrigin {
+        run_nonce: crate::gh_shim_speech::service::run_nonce().unwrap().into(),
+        connection_generation: "control-fixture".into(),
+        channel: 1,
+        epoch: 1,
+    }
+}
+
+#[tokio::test]
+async fn production_foreground_without_capture_and_background_without_policy_are_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let relay_state = GhRelay::new(root.path().join("unused-connection.json"));
+    let service = crate::gh_shim_speech::service::start(
+        root.path(),
+        &relay_state,
+        std::sync::Arc::new(|_| {
+            Box::pin(async { panic!("unconfirmed posting must not probe scopes") })
+        }),
+        "control-fixture".into(),
+        true,
+    );
+    let stamp = delegating_stamp();
+    let foreground =
+        crate::gh_shim_ticket::ScopedTicket::issue("unconfirmed-post", "call", "/project");
+    let mut params = bot_params(foreground.value().unwrap(), "foreground-write");
+    params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
+    let mut routes = scopes_for("unconfirmed-post", Some(stamp.clone()));
+    routes.speech = Some(service);
+    let transport = FakeTransport::scoped();
+    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_ok());
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(answer.data["reason"], "owner_unresolved");
+    assert!(transport.calls().is_empty());
+
+    let background = background_ticket(root.path(), "unconfirmed-post", &stamp);
+    *crate::gh_shim_ticket::speech_for_ticket(background.value().unwrap())
+        .unwrap()
+        .failure
+        .lock()
+        .unwrap() = None;
+    params["ticket"] = json!(background.value().unwrap());
+    routes.push_origin(launch_origin(), Some(stamp.clone()));
+    let bound = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!bound.ok);
+    assert_eq!(
+        bound.data["reason"], "start_policy_missing",
+        "a bound route cannot authorize an uncaptured background ticket"
+    );
+    assert!(transport.calls().is_empty());
+    routes.origins.clear();
+    let mut reconnected = stamp;
+    reconnected.scope_epoch += 1;
+    routes.routes.clear();
+    routes.push("unconfirmed-post", Some(reconnected));
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["reason"], "start_policy_missing");
+    assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(answer.data["message"], "this command's bot-write permission cannot be verified (start_policy_missing); start the command again from a live session, and tell the operator if it repeats.");
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test]
+async fn posting_admission_never_serves_speech_without_a_subc_service() {
+    let root = tempfile::tempdir().unwrap();
+    crate::gh_shim_speech::service::record_service(root.path());
+    let stamp = delegating_stamp();
+    let live = background_ticket(root.path(), "standalone-post", &stamp);
+    let mut params = bot_params(live.value().unwrap(), "no-serving-mode");
+    params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
+    let routes = scopes_for("standalone-post", Some(stamp));
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["reason"], "not_serving_mode");
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test]
+async fn posting_admission_recorded_end_wins_over_live_rebind_and_partner_seams() {
+    let root = tempfile::tempdir().unwrap();
+    let relay_state = GhRelay::new(root.path().join("unused.json"));
+    let service = crate::gh_shim_speech::service::start(
+        root.path(),
+        &relay_state,
+        std::sync::Arc::new(|_| Box::pin(async { panic!("recorded end must not describe again") })),
+        "control-fixture".into(),
+        true,
+    );
+    let stamp = delegating_stamp();
+    let ended = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
+        status: subc_protocol::scope::ScopeStatus::Ended,
+        scope_epoch: Some(stamp.scope_epoch),
+        daemon_incarnation: "daemon-a".into(),
+        owner_synced: true,
+        owner_configured: true,
+        scope: None,
+    };
+    let proof = match crate::gh_shim_speech::scope::validate_scope_identity(
+        &stamp,
+        crate::gh_shim_speech::ScopeRole::Authority,
+        &ended,
+        "control-fixture",
+        "control-fixture",
+        0,
+    )
+    .unwrap()
+    {
+        crate::gh_shim_speech::scope::Answer::Ended(proof) => proof,
+        _ => panic!("expected end"),
+    };
+    service.record_end(&stamp, proof).unwrap();
+    let live = background_ticket(root.path(), "ended-rebind", &stamp);
+    let mut params = bot_params(live.value().unwrap(), "end-wins");
+    params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
+    let mut routes = scopes_for("ended-rebind", Some(stamp));
+    routes.speech = Some(service);
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert!(!answer.ok);
+    assert_eq!(answer.data["reason"], "ended_previously");
+    assert!(transport.calls().is_empty());
 }
 
 fn scopes_for(session: &str, stamp: Option<ScopeStamp>) -> RouteScopes {
@@ -892,6 +1154,8 @@ fn route_scopes_answer_only_when_the_sessions_routes_agree() {
 /// reply to every request.
 #[derive(Clone, Default)]
 struct DaemonScript {
+    reply: Option<Arc<dyn Fn(&Value, Option<&Value>) -> Value + Send + Sync>>,
+    scoped_open_pause: Option<Arc<LeaseTestPause>>,
     /// Refuse every route.open that carries a scope with this code.
     refuse_scoped_opens: Option<String>,
     /// Before writing each scoped route.open refusal, wait this long in real
@@ -923,16 +1187,25 @@ struct DaemonLog {
     closes: Vec<Value>,
     /// Every request body sent on an open route.
     requests: Vec<Value>,
+    connections_closed: usize,
 }
 
-struct FakeDaemon {
+struct DaemonConnection(Arc<Mutex<DaemonLog>>);
+
+impl Drop for DaemonConnection {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().connections_closed += 1;
+    }
+}
+
+pub(crate) struct FakeDaemon {
     log: Arc<Mutex<DaemonLog>>,
     connection_file: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl FakeDaemon {
-    fn opens(&self) -> Vec<Value> {
+    pub(crate) fn opens(&self) -> Vec<Value> {
         self.log.lock().unwrap().opens.clone()
     }
 
@@ -949,11 +1222,11 @@ impl FakeDaemon {
         self.log.lock().unwrap().closes.clone()
     }
 
-    fn requests(&self) -> Vec<Value> {
+    pub(crate) fn requests(&self) -> Vec<Value> {
         self.log.lock().unwrap().requests.clone()
     }
 
-    async fn transport(&self) -> SubcRelayTransport {
+    pub(crate) async fn transport(&self) -> SubcRelayTransport {
         self.transport_with_deadline(None).await
     }
 
@@ -1017,6 +1290,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
             let log = Arc::clone(&server_log);
             let script = script.clone();
             tokio::spawn(async move {
+                let _connection = DaemonConnection(log.clone());
                 if subc_transport::authenticate_server(
                     &mut stream,
                     &key,
@@ -1031,6 +1305,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                 }
                 let mut next_channel: u16 = 40;
                 let mut scoped_channels = Vec::new();
+                let mut route_scopes = std::collections::HashMap::new();
                 let mut scope_ended = false;
                 let mut held = None;
                 let mut deferred = Vec::new();
@@ -1075,13 +1350,12 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                 let scoped = scoped_channels.contains(&header.channel);
                                 let seen = {
                                     let mut log = log.lock().unwrap();
-                                    log.requests.push(body);
+                                    log.requests.push(body.clone());
                                     log.requests.len()
                                 };
-                                let reply = respond(json!({
-                                    "repo_binding_generation": 1,
-                                    "result": {"status": "completed"},
-                                }));
+                                let response = script.reply.as_ref().map(|reply| reply(&body,route_scopes.get(&header.channel)))
+                                    .unwrap_or_else(|| json!({"repo_binding_generation":1,"result":{"status":"completed"}}));
+                                let reply = respond(response);
                                 if script.hold_first_request && seen == 1 {
                                     held = Some(reply);
                                     continue;
@@ -1167,9 +1441,19 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                                 }
                                             }
                                             _ => {
+                                                if scoped {
+                                                    if let Some(pause) = &script.scoped_open_pause {
+                                                        pause.acquired.notify_one();
+                                                        pause.resume.notified().await;
+                                                    }
+                                                }
                                                 next_channel += 1;
                                                 if scoped {
                                                     scoped_channels.push(next_channel);
+                                                    route_scopes.insert(
+                                                        next_channel,
+                                                        body["scope"].clone(),
+                                                    );
                                                 }
                                                 replies.push(respond(json!({
                                                     "op": "route.open",
@@ -1255,7 +1539,7 @@ async fn relay_stamped(
     let params = bot_params(live.value().unwrap(), nonce);
     let scopes = scopes_for(session, Some(delegating_stamp()));
     let lines = Mutex::new(Vec::new());
-    let reply = relay(
+    let reply = relay_transport_contract(
         transport,
         RelayCall {
             operation: BOT_REQUEST_OPERATION,
@@ -1946,4 +2230,487 @@ async fn gh_shim_relay_cancellation_after_forwarding_closes_route() {
         transport.leases.holders.lock().await.is_empty(),
         "no canceled lease/map entry may remain"
     );
+}
+
+#[tokio::test]
+async fn worker_and_parented_ephemeral_writes_have_the_same_specific_refusal() {
+    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
+    let head = delegating_stamp();
+    for kind in [ScopeKind::Worker, ScopeKind::Ephemeral] {
+        let mut worker = head.clone();
+        worker.kind = kind;
+        if kind == ScopeKind::Ephemeral {
+            worker.scope_ref = "worker-run".into();
+            worker.parent = Some(ScopeParent::new(
+                head.owner.clone(),
+                head.scope_ref.clone(),
+                head.scope_epoch,
+            ));
+            worker.parent_state = Some(ParentState::Linked);
+        }
+        let ticket =
+            crate::bash_background::registry::with_scope_spawn(Some(worker.clone()), || {
+                crate::gh_shim_ticket::PendingTicket::issue("worker-run-post", "/project")
+            });
+        let mut params = bot_params(ticket.value().unwrap(), "worker-run-write");
+        params["request"]["metadata"]["agent_id"] = json!("agent-fixture");
+        let transport = FakeTransport::scoped();
+        let routes = scopes_for("worker-run-post", Some(worker));
+        let answer = relay(
+            &transport,
+            RelayCall {
+                operation: BOT_REQUEST_OPERATION,
+                params: &params,
+                first_party: true,
+                route_scopes: &routes,
+            },
+            &|_| {},
+        )
+        .await;
+        assert_eq!(
+            answer.data["refusal_code"],
+            crate::gh_shim_speech::WORKER_WRITE_CODE,
+            "{kind:?}"
+        );
+        assert_eq!(
+            answer.data["message"],
+            crate::gh_shim_speech::WORKER_WRITE_REFUSED
+        );
+        assert!(transport.calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
+    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
+    let head = delegating_stamp();
+    let run = ScopeStamp::new(head.owner.clone(), "codemode-run", 3, ScopeKind::Ephemeral)
+        .with_parent(Some(ScopeParent::new(
+            head.owner.clone(),
+            head.scope_ref.clone(),
+            head.scope_epoch,
+        )))
+        .with_parent_state(Some(ParentState::Linked))
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("agent-fixture".into()))
+                .with_run_id(Some("program-a".into())),
+        )
+        .with_owner_authorized(true)
+        .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000));
+    let launch = crate::gh_shim_speech::model::LaunchAuthority::codemode(
+        head.clone(),
+        run.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    for valid in [true, false] {
+        let mut launch = launch.clone();
+        if !valid {
+            launch.authority.owner_authorized = false;
+        }
+        let redeemed = crate::gh_shim_ticket::Redeemed {
+            session_id: "head-codemode".into(),
+            task_id: String::new(),
+            project_root: "/project".into(),
+            read_repository: None,
+            lifecycle_scope: Some(run.clone()),
+            launch: Some(launch),
+        };
+        let mut params = bot_params("not-used-by-this-admission-unit", "codemode-write");
+        params["request"]["metadata"]["agent_id"] = json!("agent-fixture");
+        let transport = FakeTransport::scoped();
+        let (answer, _) = bot_request(
+            &transport,
+            &redeemed,
+            Some(&head),
+            &params,
+            &RouteScopes::default(),
+            true,
+        )
+        .await;
+        if valid {
+            assert!(answer.ok);
+            assert_eq!(transport.calls().len(), 1);
+        } else {
+            assert_eq!(
+                answer.data["refusal_code"],
+                crate::gh_shim_speech::WORKER_WRITE_CODE
+            );
+            assert!(transport.calls().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_does_not_send_until_committed_and_releases_on_drop() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let body = github_call(
+        json!({"op":"bot_request","request_nonce":"reserved-before-send","request":{"action":"issue comment"}}),
+    );
+    let reservation = relay
+        .reserve_bot(
+            "/project",
+            "reserved-session",
+            &delegating_stamp(),
+            body,
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .expect("published SUBC 0.32.7 must reserve rather than return guard_unsupported");
+    assert!(
+        daemon.requests().is_empty(),
+        "reserving a writer slot must not enqueue the mutation"
+    );
+    assert_eq!(daemon.opens()[0]["scope"]["scope_epoch"], 7);
+    drop(reservation);
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert!(daemon.requests().is_empty());
+    let sent = relay
+        .reserve_bot(
+            "/project",
+            "reserved-session",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"reserved-committed"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(daemon.requests().is_empty());
+    let queued = sent.send().unwrap();
+    let reply = queued.response().await.unwrap();
+    assert_eq!(facade_reply(&reply)["result"]["status"], "completed");
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(
+        daemon.requests()[0]["arguments"]["request_nonce"],
+        "reserved-committed"
+    );
+    assert_eq!(daemon.closes(2).await.len(), 2);
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_names_scoped_route_end_before_any_send() {
+    let daemon = fake_daemon(DaemonScript {
+        refuse_scoped_opens: Some(subc_protocol::error_codes::SCOPE_ENDED.into()),
+        ..Default::default()
+    })
+    .await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let error = relay
+        .reserve_bot(
+            "/project",
+            "reserved-ended",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"reserved-ended"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .err()
+        .expect("an ended epoch-pinned route cannot reserve a mutation");
+    assert_eq!(
+        (error.code, error.reason.as_str()),
+        (crate::gh_shim_speech::Code::ScopeEnded, "ended")
+    );
+    assert!(daemon.requests().is_empty());
+    assert!(daemon.opens().iter().all(|open| !open["scope"].is_null()));
+}
+
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn fake_daemon_with_reply(
+    reply: Arc<dyn Fn(&Value, Option<&Value>) -> Value + Send + Sync>,
+) -> FakeDaemon {
+    fake_daemon(DaemonScript {
+        reply: Some(reply),
+        ..Default::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_expired_budget_names_timeout_without_enqueuing() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let error = relay
+        .reserve_bot(
+            "/project",
+            "reserved-timeout",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"expired"})),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.reason, "reservation_timeout");
+    assert_eq!(error.text(),"bot writes from background commands are briefly unavailable (reservation_timeout); retry in a few seconds.");
+    assert!(daemon.requests().is_empty());
+    assert!(daemon.opens().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_reply_drop_releases_its_scoped_lease_after_enqueue() {
+    let daemon = fake_daemon(DaemonScript {
+        hold_first_request: true,
+        ..Default::default()
+    })
+    .await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let slot = relay
+        .reserve_bot(
+            "/project",
+            "reserved-cancel",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"cancel-after-send"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let queued = slot.send().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while daemon.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(queued);
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert_eq!(
+        daemon.requests().len(),
+        1,
+        "dropping a reply cannot turn an already-dequeued mutation into a zero-send claim"
+    );
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_old_connection_cleanup_cannot_close_a_replacement_slot() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let old = relay
+        .reserve_bot(
+            "/project",
+            "same-session",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"old-unsent"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    // Keep the old socket alive so its GOODBYE proves lease cleanup rather
+    // than disappearing with the last consumer when the reservation drops.
+    let _old_consumer = relay.transport.consumer.lock().await.clone().unwrap();
+    let replacement = daemon.transport().await;
+    let consumer = replacement.consumer.lock().await.clone().unwrap();
+    *relay.transport.consumer.lock().await = Some(consumer);
+    let current = relay
+        .reserve_bot(
+            "/project",
+            "same-session",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"new-send"})),
+            tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    drop(old);
+    assert_eq!(
+        daemon.closes(1).await.len(),
+        1,
+        "the old generation is released without waiting for the new one"
+    );
+    let reply = current.send().unwrap().response().await.unwrap();
+    assert_eq!(facade_reply(&reply)["result"]["status"], "completed");
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(
+        daemon.requests()[0]["arguments"]["request_nonce"],
+        "new-send"
+    );
+    assert_eq!(daemon.closes(2).await.len(), 2);
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_deadline_bounds_waiting_for_the_consumer_slot() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let slot = relay.transport.consumer.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.reserve_bot(
+            "/project",
+            "consumer-slot-deadline",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request"})),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        ),
+    )
+    .await;
+    drop(slot);
+    let refusal = result
+        .expect("the reservation deadline must bound consumer-slot contention")
+        .err()
+        .expect("no reservation is possible while the consumer slot is locked");
+    assert_eq!(
+        refusal.code,
+        crate::gh_shim_speech::Code::AuthorityUnavailable
+    );
+    assert_eq!(refusal.reason, "reservation_timeout");
+    assert!(daemon.opens().is_empty());
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_deadline_bounds_waiting_for_a_route_lease() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let holders = relay.transport.leases.holders.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.reserve_bot(
+            "/project",
+            "lease-deadline",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request"})),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        ),
+    )
+    .await;
+    drop(holders);
+    let refusal = result
+        .expect("the reservation deadline must bound route-lease contention")
+        .err()
+        .expect("no reservation is possible while route leases are locked");
+    assert_eq!(refusal.reason, "reservation_timeout");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if Arc::strong_count(&relay.transport.leases) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the detached owner must release its expired lease");
+    assert!(relay.transport.leases.holders.lock().await.is_empty());
+    assert!(daemon.opens().is_empty());
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_deadline_during_open_retains_cleanup_ownership() {
+    let pause = Arc::new(LeaseTestPause::default());
+    let daemon = fake_daemon(DaemonScript {
+        scoped_open_pause: Some(pause.clone()),
+        ..Default::default()
+    })
+    .await;
+    let relay = GhRelay {
+        transport: daemon.transport().await,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.reserve_bot(
+            "/project",
+            "open-deadline",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request"})),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        ),
+    )
+    .await;
+    pause.resume.notify_one();
+    let refusal = result
+        .expect("the reservation deadline must bound a successful open still in flight")
+        .err()
+        .expect("the paused open must not produce a reservation before the deadline");
+    assert_eq!(refusal.reason, "reservation_timeout");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let cleaned = {
+                let log = daemon.log.lock().unwrap();
+                !log.closes.is_empty() || log.connections_closed > 0
+            };
+            if cleaned {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the timed-out open must release its route or close its original connection");
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn published_sdk_reservation_canceled_open_registers_and_releases_without_sending() {
+    let pause = Arc::new(LeaseTestPause::default());
+    let daemon = fake_daemon(DaemonScript {
+        scoped_open_pause: Some(pause.clone()),
+        ..Default::default()
+    })
+    .await;
+    let relay = Arc::new(GhRelay {
+        transport: daemon.transport().await,
+    });
+    let owner = relay.clone();
+    let request = tokio::spawn(async move {
+        owner
+            .reserve_bot(
+                "/project",
+                "open-canceled",
+                &delegating_stamp(),
+                github_call(json!({"op":"bot_request"})),
+                tokio::time::Instant::now() + RELAY_CALL_TIMEOUT,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), pause.acquired.notified())
+        .await
+        .unwrap();
+    request.abort();
+    assert!(request.await.err().unwrap().is_cancelled());
+    pause.resume.notify_one();
+    assert_eq!(daemon.closes(1).await.len(), 1);
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn never_issued_bot_ticket_is_unknown_before_serving_or_authority() {
+    let root = tempfile::tempdir().unwrap();
+    drop(crate::db::open(&root.path().join("aft.db")).unwrap());
+    let service = crate::gh_shim_speech::service::record_service(root.path());
+    assert!(!service.try_serve(), "the fixture has no serving runtime");
+    let mut routes = RouteScopes::default();
+    routes.speech = Some(service);
+    let params = bot_params("0123456789abcdef0123456789abcdef", "never-issued");
+    let transport = FakeTransport::scoped();
+    let answer = relay(
+        &transport,
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &routes,
+        },
+        &|_| {},
+    )
+    .await;
+    assert_eq!(answer.data["refusal_code"], "ticket_unknown");
+    assert_eq!(answer.data["stage"], "ticket");
+    assert!(transport.calls().is_empty());
 }

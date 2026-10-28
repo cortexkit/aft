@@ -15,6 +15,7 @@ pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
 mod temp_cleanup;
+pub(crate) mod viewed_task;
 pub mod watch_lines;
 pub mod watchdog;
 pub mod watches;
@@ -1121,6 +1122,8 @@ pub(crate) fn spawn_with_secrets(
         session_id,
         project_root.as_deref(),
     );
+    let _speech_ticket = crate::gh_shim_ticket::spawn_ticket_guard(gh_shim_ticket.value());
+    crate::gh_shim_ticket::mark_spawn_background(require_background_flag || pty);
     if let Err(error) = crate::agent_child_env::inject(
         config.as_ref(),
         &child_storage_root,
@@ -1129,6 +1132,11 @@ pub(crate) fn spawn_with_secrets(
     ) {
         return Response::error(request_id, "child_environment_unavailable", error);
     }
+    crate::gh_shim_speech::start_view::inject(
+        gh_shim_ticket.value(),
+        &mut env,
+        &child_storage_root,
+    );
     if worker_preset_active() {
         let worktree_root = project_root.as_deref().unwrap_or(&workdir);
         crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);

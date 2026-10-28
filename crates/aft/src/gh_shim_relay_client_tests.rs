@@ -15,6 +15,118 @@ use super::super::{
 };
 use super::*;
 
+fn assert_approved_background_refusal(
+    refusal: crate::gh_shim_speech::Refusal,
+    code: &str,
+    message: &str,
+) {
+    let wire = refusal.wire_data();
+    match daemon_refusal(
+        wire["refusal_code"].as_str().unwrap(),
+        wire["stage"].as_str().unwrap(),
+        wire["message"].as_str().unwrap(),
+    ) {
+        RouteOutcome::RelayRefusal { code: actual, text } => {
+            assert_eq!(actual, code);
+            assert_eq!(text, format!("{code}: {message}"));
+        }
+        _ => panic!("expected a typed background bot-write refusal"),
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "gh_shim::relay_client::tests::approved_background_render_probe",
+            "--nocapture",
+        ])
+        .env(
+            "AFT_TEST_RENDERED_REFUSAL",
+            serde_json::to_string(&wire).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("gh-shim: gh_shim_seam_refusal: {code}: {message}\n")
+    );
+}
+
+#[test]
+fn approved_background_render_probe() {
+    let Ok(wire) = std::env::var("AFT_TEST_RENDERED_REFUSAL") else {
+        return;
+    };
+    let wire: Value = serde_json::from_str(&wire).unwrap();
+    let outcome = daemon_refusal(
+        wire["refusal_code"].as_str().unwrap(),
+        wire["stage"].as_str().unwrap(),
+        wire["message"].as_str().unwrap(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(root.path().to_path_buf());
+    let binding = AgentBinding {
+        repo: "owner/repo".into(),
+        agent_id: "agent-a".into(),
+    };
+    std::process::exit(super::super::governed_outcome_status(
+        &paths, &binding, 0, outcome,
+    ));
+}
+
+#[test]
+fn approved_background_identity_text_is_preserved() {
+    assert_approved_background_refusal(
+        crate::gh_shim_speech::Refusal::new(crate::gh_shim_speech::Code::IdentityConflict, "binding_changed"),
+        "task_gh_identity_conflict",
+        "this command's bot identity no longer matches the repository's bot (binding_changed); start the command again from a live session.",
+    );
+}
+
+#[test]
+fn approved_background_policy_text_is_preserved() {
+    assert_approved_background_refusal(
+        crate::gh_shim_speech::Refusal::new(crate::gh_shim_speech::Code::PolicyDenied, "manifest_rollback"),
+        "task_gh_policy_denied",
+        "this GitHub write is not allowed by the routing policy the command started under, or by the current one (manifest_rollback); use a permitted operation, or ask the operator to update the policy and start the command again.",
+    );
+}
+
+#[test]
+fn approved_background_temporary_text_is_preserved() {
+    assert_approved_background_refusal(
+        crate::gh_shim_speech::Refusal::new(crate::gh_shim_speech::Code::AuthorityUnavailable, "serving_lock_unavailable"),
+        "task_gh_authority_unavailable",
+        "bot writes from background commands are briefly unavailable (serving_lock_unavailable); retry in a few seconds.",
+    );
+}
+
+#[test]
+fn approved_background_lasting_text_is_preserved() {
+    assert_approved_background_refusal(
+        crate::gh_shim_speech::Refusal::new(crate::gh_shim_speech::Code::AuthorityUnavailable, "snapshot_invalid"),
+        "task_gh_authority_unavailable",
+        "this command's bot-write permission cannot be verified (snapshot_invalid); start the command again from a live session, and tell the operator if it repeats.",
+    );
+}
+
+#[test]
+fn approved_background_ended_text_is_preserved() {
+    assert_approved_background_refusal(
+        crate::gh_shim_speech::Refusal::scoped(crate::gh_shim_speech::Code::ScopeEnded, "ended_previously", crate::gh_shim_speech::ScopeRole::Run),
+        "task_gh_scope_ended",
+        "the codemode program this command started from has ended (ended_previously), so it can no longer write as the bot; start the command again from a live session.",
+    );
+}
+
+#[test]
+fn approved_background_unknown_text_is_preserved() {
+    assert_approved_background_refusal(
+        crate::gh_shim_speech::Refusal::scoped(crate::gh_shim_speech::Code::ScopeUnknown, "not_synced", crate::gh_shim_speech::ScopeRole::Head),
+        "task_gh_scope_unknown",
+        "AFT could not confirm that the head session this command started from is still active (not_synced); retry in a minute.",
+    );
+}
+
 #[test]
 fn poisoned_diagnostic_stage_remains_readable_and_updateable() {
     let stage = Mutex::new(ProbeStage::CatalogList);
@@ -316,6 +428,40 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
         daemon_refusal("ticket_absent", "ticket", ""),
         RouteOutcome::NoAgentSession
     ));
+}
+
+#[test]
+fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
+    let vectors = super::super::plexus_contract_judge::load_reply_vectors();
+    assert_eq!(vectors.len(), 17);
+    for vector in vectors {
+        let name = vector["name"].as_str().unwrap();
+        let reply = &vector["reply"];
+        let result = &reply["result"];
+        let parsed = parse_reply(&ok_envelope(reply.clone()));
+        let generation = reply["repo_binding_generation"].as_u64();
+        let expected = match result["status"].as_str().unwrap() {
+            "refused" => Reply::Refused {
+                code: result["refusal_code"].as_str().unwrap().to_string(),
+                stage: PLEXUS_REPLY_STAGE.to_string(),
+                message: String::new(),
+                generation,
+            },
+            "completed" => Reply::Completed {
+                generation,
+                result: result["result"].clone(),
+            },
+            status => panic!("{name}: untested reply status {status}"),
+        };
+        assert_eq!(parsed, expected, "{name}");
+        if name == "resolve-thread-not-own" {
+            let code = result["refusal_code"].as_str().unwrap();
+            assert_eq!(result["transmission"], "not_sent");
+            assert_eq!(classify_code(code), CodeClass::Unknown);
+            assert_eq!(plexus_refusal_text(code, classify_code(code)),
+                "plexus refused the bot write with a code this shim does not know: review_thread_not_own; it was not retried");
+        }
+    }
 }
 
 #[test]

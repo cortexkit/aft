@@ -810,89 +810,67 @@ fn audit_repository_snapshot_survives_origin_rewrite_after_ticket_mint() {
     assert_eq!(calls[0]["arguments"]["repository"], "cortexkit/aft");
 }
 
+/// Worker scopes are read-only. This replaces the earlier policy that allowed
+/// worker bot speech through the relay while only native gh was forbidden.
 #[test]
-fn audit_worker_speech_still_uses_governed_relay_not_native_gh() {
-    use std::sync::Arc;
-    let fixture = Fixture::new(19);
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../tests/fixtures/gh_shim/v19-manifest.json"
-    ))
-    .unwrap();
-    let bindings: Vec<Value> = manifest
-        .bindings
-        .iter()
-        .map(|(repo, agent)| json!({"repository":repo,"agent_id":agent,"app_handle_id":"test"}))
-        .collect();
-    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(move |body| {
-        if body["op"] == crate::gh_shim_relay::BINDINGS_READ_OPERATION {
-            json!({"op":body["op"],"status":"ok","data":{"result":{"repo_binding_generation":1,"bindings":bindings}}})
-        } else {
-            assert_eq!(body["op"], crate::gh_shim_relay::BOT_REQUEST_OPERATION);
-            json!({"op":body["op"],"status":"ok","data":{"repo_binding_generation":1,"result":{"status":"completed","result":{"url":"https://github.com/cortexkit/aft/issues/7#issuecomment-1","id":1}}}})
+fn worker_stamp_never_posts_even_without_a_jail_or_with_a_head_route_rebound() {
+    struct NeverSend;
+    impl crate::gh_shim_relay::RelayTransport for NeverSend {
+        async fn plexus(
+            &self,
+            _root: &str,
+            _session: &str,
+            _scope: Option<&subc_protocol::scope::ScopeSelector>,
+            _body: Value,
+        ) -> Result<Value, crate::gh_shim_relay::TransportError> {
+            panic!("worker write reached the provider")
         }
-    }));
-    let file = fixture.home.path().join("connection.json");
-    daemon.write_connection_file(&file);
-    let relay = RelayContext {
-        worker_broker: None,
-        connection_file: Some(file),
-        ticket: Some("worker-ticket".into()),
-        transient_delays: [Duration::ZERO; 2],
-        relay_budget: Duration::from_secs(5),
-    };
-    let binding = AgentBinding {
-        repo: "cortexkit/aft".into(),
-        agent_id: manifest.bindings["cortexkit/aft"].clone(),
-    };
-    let argv = args(&[
-        "issue",
-        "comment",
-        "7",
-        "--body",
-        "hello",
-        "--repo",
-        "cortexkit/aft",
-    ]);
-    let rung = RungDetermination::r3(
-        unix_seconds(),
-        19,
-        &RungRecordProvenance {
-            image_path: "test".into(),
-            version: "test".into(),
-            repo_key: "cortexkit/aft".into(),
+        fn opens_scoped_routes(&self) -> bool {
+            true
+        }
+    }
+    let worker = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
         },
+        "worker-scope",
+        7,
+        subc_protocol::scope::ScopeKind::Worker,
     )
-    .record;
-    let status = dispatch_r3_with_relay_at(
-        &argv,
-        classify(&argv, &manifest, "linux"),
-        &manifest,
-        &fixture.paths,
-        &rung,
-        &binding,
-        unix_seconds(),
-        |forwarded| {
-            native_guard::dispatch_with(
-                forwarded,
-                &relay,
-                native_guard::ShellSignals {
-                    sandboxed: true,
-                    worker_marked: false,
-                },
-                |_| Ok(Some(true)),
-                |_| panic!("worker speech reached native gh"),
-            )
+    .with_attributes(
+        subc_protocol::scope::ScopeAttributes::new()
+            .with_agent_id(Some("agent-worker".into()))
+            .with_delegates(true),
+    )
+    .with_owner_authorized(true);
+    let pending = crate::bash_background::registry::with_scope_spawn(Some(worker.clone()), || {
+        crate::gh_shim_ticket::PendingTicket::issue("worker-policy", "/does-not-exist")
+    });
+    let mut head = worker;
+    head.kind = subc_protocol::scope::ScopeKind::Head;
+    head.scope_epoch = 99;
+    let mut scopes = crate::gh_shim_relay::RouteScopes::default();
+    scopes.push("worker-policy", Some(head));
+    let params = json!({"ticket":pending.value().unwrap(),"request_nonce":"worker-attempt","request":{"action":"issue comment","repository":"owner/repo","metadata":{"agent_id":"agent-worker"}}});
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let reply = runtime.block_on(crate::gh_shim_relay::relay(
+        &NeverSend,
+        crate::gh_shim_relay::RelayCall {
+            operation: crate::gh_shim_relay::BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            route_scopes: &scopes,
         },
-        &relay,
-        fixture.home.path(),
+        &|_| {},
+    ));
+    assert!(!reply.ok);
+    assert_eq!(
+        reply.data["refusal_code"],
+        crate::gh_shim_speech::WORKER_WRITE_CODE
     );
-    assert_eq!(status, 0);
-    assert!(daemon
-        .requests
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|request| request["op"] == crate::gh_shim_relay::BOT_REQUEST_OPERATION));
 }
 
 #[test]

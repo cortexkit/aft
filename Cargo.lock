@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aft-tokenizer"
-version = "0.62.0"
+version = "0.63.0"
 dependencies = [
  "criterion",
  "fancy-regex 0.18.0",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agent-file-tools"
-version = "0.62.0"
+version = "0.63.0"
 dependencies = [
  "aft-tokenizer",
  "agent-file-tools",
@@ -3981,9 +3981,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-client-rs"
-version = "0.31.0"
+version = "0.32.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07dfed2461efa31856082887b2ef94d7d56d8168cec5659ea5741afe2f7c633f"
+checksum = "1e44c9f59069019b1cf2ec6e508020a38068c0ea6c78f081a223761c0aac232b"
 dependencies = [
  "async-trait",
  "serde",

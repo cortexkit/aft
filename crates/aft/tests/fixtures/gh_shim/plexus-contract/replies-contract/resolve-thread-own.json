@@ -1,0 +1,94 @@
+{
+  "github_reads": [
+    {
+      "request_body": {
+        "query": "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { number repository { nameWithOwner } } } } }",
+        "variables": {
+          "threadId": "PRRT_kwDOAbc123"
+        }
+      },
+      "request_line": "POST /graphql HTTP/1.1",
+      "response": {
+        "data": {
+          "node": {
+            "id": "PRRT_kwDOAbc123",
+            "pullRequest": {
+              "number": 7,
+              "repository": {
+                "nameWithOwner": "org/repo"
+              }
+            }
+          }
+        }
+      },
+      "status": 200
+    },
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/pulls/7 HTTP/1.1",
+      "response": {
+        "base": {
+          "repo": {
+            "url": "https://api.github.com/repos/org/repo"
+          }
+        },
+        "html_url": "https://github.com/org/repo/pull/7",
+        "number": 7,
+        "user": {
+          "login": "app-fixture[bot]",
+          "type": "Bot"
+        }
+      },
+      "status": 200
+    }
+  ],
+  "github_writes": [
+    {
+      "request_body": {
+        "query": "mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }",
+        "variables": {
+          "threadId": "PRRT_kwDOAbc123"
+        }
+      },
+      "request_line": "POST /graphql HTTP/1.1",
+      "response": {
+        "data": {
+          "resolveReviewThread": {
+            "thread": {
+              "id": "PRRT_kwDOAbc123",
+              "isResolved": true
+            }
+          }
+        }
+      },
+      "status": 200
+    }
+  ],
+  "name": "resolve-thread-own",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "result": {
+        "id": "PRRT_kwDOAbc123",
+        "resolved": true
+      },
+      "status": "completed"
+    }
+  },
+  "request": {
+    "action": "graphql resolvereviewthread",
+    "body": {},
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "thread_id": "PRRT_kwDOAbc123"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-notes-0.63.0-final"
+  ],
+  "note": "Release notes only: folds the fragments merged after the v0.63.0 notes. No changed path matches RANKING_FENCE_PREFIXES."
+}

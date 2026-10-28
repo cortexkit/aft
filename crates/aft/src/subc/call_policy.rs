@@ -33,6 +33,8 @@ pub(super) fn with_tool_call_policy<T, R>(
         ctx.mark_standalone_plugin_host();
     }
     let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
+    let _grants =
+        crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(identity));
     crate::access_policy::with_scope(Some(access_grants::policy_scope_key(identity)), || {
         let run = || {
             finish(remote_policy::with_call_policy(

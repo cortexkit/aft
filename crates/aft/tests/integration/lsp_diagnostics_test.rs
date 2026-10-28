@@ -909,25 +909,66 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     let json = serde_json::to_value(&response).expect("response serializes");
     assert_eq!(json["success"], true, "move failed: {json}");
 
-    // Both notifications arrive asynchronously from the move; a loaded runner
-    // can deliver the second one well after 2 s, so wait generously for it.
-    let mut events = drain_watched_file_events_from_ctx(&ctx);
+    // Both watched events arrive asynchronously from the move; a loaded runner
+    // can deliver them well after 2 s, so wait generously for them. The two
+    // events may arrive as two notifications (one per watched-file call) or
+    // together in a single notification carrying two FileEvents: when the
+    // second event is queued while the first is still waiting for delivery,
+    // both are sent together. Count FileEvents across notifications,
+    // not notifications.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while events.len() < 2 && Instant::now() < deadline {
+    let mut all_changes: Vec<serde_json::Value> = Vec::new();
+    loop {
+        for params in drain_watched_file_events_from_ctx(&ctx) {
+            if let Some(changes) = params["changes"].as_array() {
+                all_changes.extend(changes.iter().cloned());
+            }
+        }
+        let has_deleted_src = all_changes.iter().any(|change| {
+            change["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/package.json") && !uri.contains("/moved/"))
+                && change["type"] == 3
+        });
+        let has_created_dst = all_changes.iter().any(|change| {
+            change["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/moved/package.json"))
+                && change["type"] == 1
+        });
+        if has_deleted_src && has_created_dst {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
         thread::sleep(Duration::from_millis(25));
-        events.extend(drain_watched_file_events_from_ctx(&ctx));
     }
     assert_eq!(
-        events.len(),
+        all_changes.len(),
         2,
-        "expected source and destination watched events"
+        "expected source and destination watched events, got: {all_changes:?}"
     );
-    let mut event_types = vec![
-        config_change_type(&events[0], "/package.json"),
-        config_change_type(&events[1], "/package.json"),
-    ];
-    event_types.sort_unstable();
-    assert_eq!(event_types, vec![1, 3]);
+    let has_deleted_src = all_changes.iter().any(|change| {
+        change["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/package.json") && !uri.contains("/moved/"))
+            && change["type"] == 3
+    });
+    let has_created_dst = all_changes.iter().any(|change| {
+        change["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/moved/package.json"))
+            && change["type"] == 1
+    });
+    assert!(
+        has_deleted_src,
+        "missing deleted event for the move source, got: {all_changes:?}"
+    );
+    assert!(
+        has_created_dst,
+        "missing created event for the move destination, got: {all_changes:?}"
+    );
 }
 
 #[test]

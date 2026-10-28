@@ -719,6 +719,7 @@ impl FamilyRegistry {
             registry: self.clone(),
             reader_id,
             label: label.to_owned(),
+            _pinned: None,
         })
     }
 
@@ -1239,9 +1240,40 @@ pub struct ReaderRegistration {
     registry: FamilyRegistry,
     reader_id: String,
     label: String,
+    /// The v3 generation a foreign reader opened, held for as long as this
+    /// registration lives so its read markers do (see
+    /// [`Self::for_v3_foreign_read`]).
+    _pinned: Option<Arc<super::snapshot::ComposedGeneration>>,
 }
 
 impl ReaderRegistration {
+    /// A reader for a v3 member's generation that
+    /// `base_refs::open_foreign_v3` opened. A v3-only family has no v2
+    /// reader table, so this writes no rows. Instead it holds `generation`,
+    /// and with it the read markers that protect the generation and the base
+    /// it composes, for as long as the registration lives. A generation that
+    /// is not a v3 publication, and so holds no such markers, is refused.
+    pub(crate) fn for_v3_foreign_read(
+        generation: &Arc<super::snapshot::ComposedGeneration>,
+        label: &str,
+    ) -> RegistryResult<Self> {
+        let route = generation.v3_route().ok_or_else(|| {
+            RegistryError::Incompatible("a v3 foreign reader needs a v3 generation".into())
+        })?;
+        let owner = current_owner();
+        Ok(Self {
+            registry: FamilyRegistry::open_v3(&route.storage, &route.family)?,
+            reader_id: format!(
+                "v3-{}-{}-{}",
+                owner.pid,
+                owner.start_time,
+                READER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            label: label.to_owned(),
+            _pinned: Some(Arc::clone(generation)),
+        })
+    }
+
     pub fn reader_id(&self) -> &str {
         &self.reader_id
     }

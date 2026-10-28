@@ -7617,6 +7617,9 @@ fn start_checkout_semantic_lane(
             max_batch: semantic.max_batch_size,
         },
         semantic,
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: ctx.config().search_index_max_file_size,
+        },
     };
     let weak_slot = Arc::downgrade(slot);
     let session_id = log_ctx::current_session();
@@ -7631,13 +7634,14 @@ fn start_checkout_semantic_lane(
                 // replaces it through the epoch check.
                 let _ = wait_for_semantic_artifact_start(&start_rx, &gate_root);
                 // A legacy (pre-view) set for this root is imported first, on
-                // this background thread, so the lane's first load seeds from
-                // it rather than embedding every file again.
+                // this background thread, into the family's v3 planes only, so
+                // the lane's fills find its vectors stored rather than
+                // embedding every file again.
                 let current = {
                     let slot = weak_slot.clone();
                     move || slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
                 };
-                crate::migration::per_checkout::import_for_semantic_lane(&config, &current);
+                import_legacy_set_into_v3(&config, &current);
                 let _pause_currency = crate::semantic_index::PauseRetryScope::new(
                     config.schedule.retry_initial,
                     config.schedule.retry_max,
@@ -7655,6 +7659,64 @@ fn start_checkout_semantic_lane(
             SemanticIndexStatus::Failed(format!("semantic: unavailable: worker thread: {error}"));
     }
     start_tx
+}
+
+/// Imports a root's legacy (pre-view) set into the family's v3 planes before
+/// its views-on semantic lane fills, through the v3 import ledger. Nothing is
+/// written to the v2 view registry or the v2 stores. A root with no legacy
+/// artifact, or whose v3 import already finished, returns at once; another
+/// process importing the same set is not waited for.
+fn import_legacy_set_into_v3(
+    config: &crate::views::semantic_runtime::WorkerConfig,
+    keep_going: &dyn Fn() -> bool,
+) {
+    let (storage, key) = (&config.storage.artifacts, &config.family);
+    if !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
+        || !keep_going()
+    {
+        return;
+    }
+    *config
+        .status
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+        stage: "migrating_legacy_index".to_string(),
+        files: None,
+        entries_done: None,
+        entries_total: None,
+    };
+    let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+        &config.schedule.limiter,
+        "legacy_import",
+        &config.root,
+        keep_going,
+    ) else {
+        return;
+    };
+    let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
+        storage.clone(),
+        key.clone(),
+        key.clone(),
+        config.root.clone(),
+        config.trigram_policy,
+        crate::migration::per_checkout::legacy_semantic_producer(storage, key, &config.semantic),
+    );
+    let started = Instant::now();
+    match crate::migration::v3_ledger::run_v3_import(&request, None) {
+        Ok(report) => slog_info!(
+            "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
+            config.root.display(),
+            key,
+            report.outcomes,
+            started.elapsed().as_millis()
+        ),
+        Err(error) => slog_warn!(
+            "legacy v3 import root={} key={} failed: {}",
+            config.root.display(),
+            key,
+            error
+        ),
+    }
 }
 
 /// Account for a finished artifact load at its hand-off to the receiver.
@@ -15111,8 +15173,9 @@ mod tests {
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(fills.next(), "settled");
         assert!(ctx.checkout_semantic_runtime().is_some());
-        assert!(cache.path().join("aft/views").is_dir());
-        assert!(cache.path().join("aft/blobs").is_dir());
+        // The semantic lane is a v3 member: its registration and stores live
+        // under the cache volume's v3 blob namespace, not a v2 view registry.
+        assert!(cache.path().join("aft/blobs/v3").is_dir());
         for domain in ["views", "blobs", "semantic"] {
             assert!(
                 !storage.path().join(domain).exists(),

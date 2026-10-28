@@ -2630,6 +2630,14 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
                 let entry = value.as_str().ok_or_else(|| {
                     invalid_request(format!("outline: target[{index}] must be a string"))
                 })?;
+                if is_http_url(entry) {
+                    if files_flag {
+                        return Err(invalid_request(
+                            "files mode requires directory targets; URLs aren't directories",
+                        ));
+                    }
+                    return Ok(Value::String(entry.to_string()));
+                }
                 let path = resolve_path_from_project_root(project_root, entry);
                 Ok(Value::String(path.to_string_lossy().into_owned()))
             })
@@ -2650,6 +2658,11 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     }
 
     if let Some(url) = target.as_str() {
+        if files_flag && is_http_url(url) {
+            return Err(invalid_request(
+                "files mode requires directory targets; URLs aren't directories",
+            ));
+        }
         if !files_flag && (is_http_url(url) || is_github_resource_target(url)) {
             out.insert("file".to_string(), Value::String(url.to_string()));
             return Ok(Translated {
@@ -5245,6 +5258,42 @@ mod zoom_batch_contract_tests {
 #[cfg(test)]
 mod outline_target_validation_tests {
     use super::*;
+
+    #[test]
+    fn outline_target_arrays_preserve_urls_and_resolve_only_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let first = "https://example.com/docs/first.html";
+        let second = "http://example.com/docs/second.html";
+        let translated = subc_translate_owned(
+            "outline",
+            serde_json::json!({"target": [first, "src/lib.rs", second]}),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(translated.command, "outline");
+        assert_eq!(
+            translated.args["files"],
+            serde_json::json!([first, root.path().join("src").join("lib.rs"), second])
+        );
+    }
+
+    #[test]
+    fn outline_files_mode_refuses_urls_as_non_directories() {
+        for target in [
+            serde_json::json!("https://example.com/docs"),
+            serde_json::json!(["https://example.com/docs"]),
+            serde_json::json!(["src", "http://example.com/docs"]),
+        ] {
+            let error = subc_translate_owned(
+                "outline",
+                serde_json::json!({"target": target, "files": true}),
+                Path::new("/project"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains("URLs aren't directories"));
+        }
+    }
 
     #[test]
     fn legacy_outline_rejects_every_non_string_target_with_its_index() {

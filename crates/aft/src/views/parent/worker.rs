@@ -658,21 +658,6 @@ fn start_semantic(session: &ParentSession) {
     };
 }
 
-/// Size and modification time of a view's pointer database and its WAL.
-fn pointer_stat(view_dir: &Path) -> Vec<u8> {
-    let mut stat = Vec::new();
-    for name in ["pointer.sqlite", "pointer.sqlite-wal"] {
-        if let Ok(metadata) = std::fs::metadata(view_dir.join(name)) {
-            stat.extend_from_slice(&metadata.len().to_le_bytes());
-            if let Ok(modified) = metadata.modified() {
-                stat.extend_from_slice(format!("{modified:?}").as_bytes());
-            }
-        }
-        stat.push(0);
-    }
-    stat
-}
-
 fn refresh_semantic(session: &ParentSession, child: &Child) {
     let semantic = match &*read(&session.semantic) {
         Plane::Ready(semantic) => Arc::clone(semantic),
@@ -682,75 +667,61 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
             return;
         }
     };
-    // Read the view's current-generation pointer first, without the family
-    // registry: an unchanged pointer means this session already serves the
-    // generation. Before even opening the pointer database, compare the size
-    // and mtime of it and its WAL with the last read: a publication commits
-    // through the WAL, so unchanged files mean an unchanged pointer, and the
-    // idle check costs two stats instead of opening SQLite.
-    let view_dir = super::super::registry::view_dir(&session.storage, &child.scope).ok();
-    let stat = view_dir.as_deref().map(pointer_stat);
-    if read(&child.semantic).ready().is_some()
-        && stat.is_some()
-        && *lock(&child.semantic_pointer_stat) == stat
-    {
-        return;
-    }
-    let current_name = view_dir
-        .and_then(super::super::ViewStore::existing_dir)
-        .and_then(|store| store.current_generation_read_only().ok().flatten());
-    let Some(current_name) = current_name else {
-        *write(&child.semantic) =
-            Plane::Gap("no semantic view has been published for this repository yet".into());
-        return;
+    // The child's semantic view is its v3 member `<scope>.semantic`. Opening
+    // it pins the member's published generation and the base it composes
+    // with read markers; the answers are as of that publication.
+    let family = match child.family(&session.storage) {
+        Ok(family) => family,
+        Err(error) => {
+            *write(&child.semantic) = Plane::Gap(error);
+            return;
+        }
     };
-    if read(&child.semantic)
-        .ready()
-        .is_some_and(|current| current.generation.name() == current_name)
-    {
-        *lock(&child.semantic_pointer_stat) = stat;
-        return;
-    }
-    let reader = match child.reader(&session.storage) {
-        Ok(Some(reader)) => reader,
+    let scope = super::super::semantic_runtime::view_scope(&child.scope);
+    let producers = Producers {
+        trigram: session.trigram_policy.fingerprint_hex(),
+        semantic: Some(semantic.producer_id.clone()),
+        callgraph: super::super::callgraph::PRODUCER.into(),
+    };
+    let generation = match super::super::base_refs::open_foreign_v3(
+        &session.storage,
+        family,
+        &scope,
+        &producers,
+    ) {
+        Ok(Some(generation)) => generation,
         Ok(None) => {
             *write(&child.semantic) =
                 Plane::Gap("no semantic view has been published for this repository yet".into());
             return;
         }
         Err(error) => {
+            *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
+            return;
+        }
+    };
+    // The same worker generation composed with the same base generation: the
+    // parent already serves it. (A base readiness successor keeps the worker's
+    // name but changes what it composes.)
+    if read(&child.semantic)
+        .ready()
+        .is_some_and(|current| current.generation.resident_key() == generation.resident_key())
+    {
+        return;
+    }
+    let reader = match super::super::registry::ReaderRegistration::for_v3_foreign_read(
+        &generation,
+        "parent-folder",
+    ) {
+        Ok(reader) => Arc::new(reader),
+        Err(error) => {
             *write(&child.semantic) = Plane::Gap(format!("semantic view unreadable: {error}"));
             return;
         }
     };
-    let members = reader.members().unwrap_or_default();
-    if !members.iter().any(|member| member.scope == child.scope) {
-        *write(&child.semantic) =
-            Plane::Gap("no semantic view has been published for this repository yet".into());
-        return;
-    }
-    let producers = Producers {
-        trigram: super::super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-        semantic: Some(semantic.producer_id.clone()),
-        callgraph: super::super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-    };
-    let generation =
-        match super::super::read::open_foreign_generation(&reader, &child.scope, &producers) {
-            Ok(Some(generation)) => generation,
-            Ok(None) => {
-                *write(&child.semantic) = Plane::Gap(
-                    "no semantic view has been published for this repository yet".into(),
-                );
-                return;
-            }
-            Err(error) => {
-                *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
-                return;
-            }
-        };
     let access = ViewAccess::Reader {
-        registration: Arc::clone(&reader),
-        scope: child.scope.clone(),
+        registration: reader,
+        scope,
     };
     child.loads.fetch_add(1, Ordering::SeqCst);
     // Admission decodes the generation's vectors once into the family's
@@ -761,7 +732,6 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         return;
     }
     let snapshot = LiveDelta::new(Arc::clone(&generation)).snapshot();
-    *lock(&child.semantic_pointer_stat) = stat;
     let previous = std::mem::replace(
         &mut *write(&child.semantic),
         Plane::Ready(Arc::new(SemanticChild {

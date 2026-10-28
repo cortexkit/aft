@@ -50,6 +50,7 @@ pub(super) struct RunOwner {
     /// keyed by route identity (grant scope, confinement key, frozen worker
     /// params) is read from it, never from the run route.
     pub(super) owner_route: RouteIdentity,
+    pub(super) owner_route_channel: RouteChannel,
     /// The run route the call arrived on, for audit lines.
     pub(super) run_route: RouteChannel,
     /// The run route's own principal. It grants nothing: the call runs with
@@ -416,7 +417,12 @@ fn resolve_owner(
         }
     }
     Ok(Admission::Owner(effective_identity(
-        run, owner, kind, run_id, route,
+        run,
+        owner,
+        kind,
+        run_id,
+        route,
+        **owner_channel,
     )))
 }
 
@@ -624,6 +630,7 @@ fn effective_identity(
     kind: RunKind,
     run_id: &str,
     route: RouteChannel,
+    owner_route_channel: RouteChannel,
 ) -> RouteIdentity {
     let run_scope = OnceLock::new();
     if let Some(scope) = run.run_scope.get() {
@@ -654,6 +661,7 @@ fn effective_identity(
             kind,
             run_id: run_id.to_owned(),
             owner_route: owner.clone(),
+            owner_route_channel,
             run_route: route,
             run_principal: run.spawn_principal.clone(),
         })),

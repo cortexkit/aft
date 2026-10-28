@@ -2,17 +2,17 @@
 //!
 //! With `views.enabled`, a root's semantic lane is served by its own
 //! per-checkout view instead of the resident legacy index: a
-//! [`CheckoutSemantic`] owns the checkout's registration in its family, the
-//! composite [`CheckoutDriver`] with the [`SemanticPlane`] registered as its
-//! only plane, and the sibling loader that installs the checkout's
+//! [`CheckoutSemantic`] owns the checkout's v3 member (`<scope>.semantic`),
+//! the composite [`CheckoutDriver`] with the trigram, semantic and call-graph
+//! planes registered, and the verified bind that installs the checkout's
 //! generation. Identical content is embedded once per family, so worktrees of
 //! one repository (and later sessions on them) reuse each other's vectors
 //! instead of calling the model again.
 //!
-//! The trigram and callgraph planes are not registered here: their views-on
-//! paths keep using the older content-addressed view, and their per-checkout
-//! activation is separate work. The manifest header therefore names them with
-//! [`UNREGISTERED_PRODUCER`], which no registered plane ever produces.
+//! A fresh member bootstraps a v3 base whose semantic entries start pending.
+//! The checkout that holds the base's build claim fills them on its fill
+//! worker and publishes a readiness successor of the base; every checkout of
+//! the base then serves those vectors. Until then they are reported pending.
 //!
 //! Loading, filling and folding run on the root's semantic view worker, never
 //! on the request path. Queries read the installed snapshot and name every
@@ -25,101 +25,19 @@ use std::time::{Duration, Instant};
 
 use crate::semantic_index::SemanticIndex;
 
-use super::contracts::{PlaneAdapter, PlaneLoader, ViewAccess};
+use super::contracts::{PlaneAdapter, ViewAccess};
 use super::first_load::{
     CheckoutDriver, CompositePlane, ConfiguredMembershipWalker, FirstLoadDriver, InstalledDriver,
-    MembershipWalker, SiblingLoader,
 };
 use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
-use super::registry::{FamilyRegistry, ViewRegistration};
+use super::registry::ViewRegistration;
 use super::semantic::{FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery};
-use super::snapshot::{ComposedGeneration, DiskState, LiveDelta, Snapshot};
+use super::snapshot::{DiskState, LiveDelta, Snapshot};
 
-/// Producer written into the manifest header for the trigram and callgraph
-/// planes, which this semantic-only runtime does not register.
+/// Producer written into a manifest header for a plane its view does not
+/// register (for example the call graph of a lexical-only view).
 pub const UNREGISTERED_PRODUCER: &str = "unregistered";
-
-const BASE_REF_ENV: &str = "AFT_VIEWS_BASE_REF_PROTOTYPE";
-
-fn base_ref_selected(storage: &Path) -> bool {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    let Some(value) = std::env::var_os(BASE_REF_ENV) else {
-        return false;
-    };
-    if value == "1" && storage.join("views-harness.marker").is_file() {
-        return true;
-    }
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        crate::slog_warn!("{BASE_REF_ENV} ignored: requires value 1 and views-harness.marker in the effective storage root");
-    }
-    false
-}
-
-/// An Arc is the prototype's only acquisition pin. No reference, pin or read
-/// marker is written for an adopter; a restart must use the strict loader.
-struct PrototypeBase {
-    storage: PathBuf,
-    family: String,
-    producer: String,
-    generation: Arc<ComposedGeneration>,
-}
-
-impl PrototypeBase {
-    fn compatible(&self, storage: &Path, family: &str, producer: &str) -> bool {
-        self.storage == storage && self.family == family && self.producer == producer
-    }
-}
-
-fn prototype_bases() -> &'static Mutex<Vec<Weak<PrototypeBase>>> {
-    static BASES: OnceLock<Mutex<Vec<Weak<PrototypeBase>>>> = OnceLock::new();
-    BASES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn base_ref_ready(snapshot: &Snapshot) -> bool {
-    use super::manifest_v2::EntryV2;
-    use super::readiness::PlaneState;
-    snapshot.generation().name() != "empty"
-        && snapshot.live_entries().next().is_none()
-        && snapshot.pending_intent().next().is_none()
-        && snapshot.generation().entries().all(|(path, entry)| {
-            matches!(entry, EntryV2::Regular { planes, .. }
-                if !super::semantic::applies_to(path)
-                    || matches!(planes.semantic, Some(PlaneState::Ready { .. })))
-        })
-}
-
-fn base_ref_stable(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (
-            before.dev(),
-            before.ino(),
-            before.len(),
-            before.mode(),
-            before.mtime(),
-            before.mtime_nsec(),
-            before.ctime(),
-            before.ctime_nsec(),
-        ) == (
-            after.dev(),
-            after.ino(),
-            after.len(),
-            after.mode(),
-            after.mtime(),
-            after.mtime_nsec(),
-            after.ctime(),
-            after.ctime_nsec(),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        // Change-sensitive file identity is not implemented on non-Unix targets.
-        let _ = (before, after);
-        false
-    }
-}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -161,16 +79,23 @@ pub fn shared_plane(storage: &Path, producer: SemanticProducer) -> Arc<SemanticP
     plane
 }
 
-/// One checkout's semantic view: registration, driver, loader and plane.
+/// The v3 member scope of a checkout's semantic view, beside its lexical
+/// (`scope`) and call-graph (`<scope>.callgraph`) members.
+pub(crate) fn view_scope(scope: &str) -> String {
+    format!("{scope}.semantic")
+}
+
+/// One checkout's semantic view: registration, driver and plane.
 pub struct CheckoutSemantic {
     root: PathBuf,
     owner: ViewRegistration,
+    /// The artifact storage root of the family's v3 namespace.
+    storage: PathBuf,
+    /// The producers this member's generations are published under.
+    producers: Producers,
     access: ViewAccess,
     driver: Arc<CheckoutDriver>,
-    loader: SiblingLoader,
     plane: Arc<SemanticPlane>,
-    base_ref_prototype: bool,
-    base_ref_pin: Mutex<Option<Arc<PrototypeBase>>>,
     /// Serializes reload, fill and fold, so two refreshes never interleave
     /// their publications.
     refresh: Mutex<()>,
@@ -181,6 +106,12 @@ pub struct CheckoutSemantic {
     /// the scheduled deadline when a transient refresh is being retried. Searches
     /// report it as `semantic: unavailable: <reason>`.
     unavailable: Mutex<Option<String>>,
+    /// Semantic searches answered from this view.
+    searches: AtomicU64,
+    /// Readiness successors this view published as its base's owner.
+    base_successors: AtomicU64,
+    #[cfg(test)]
+    before_bind_verify: Mutex<Option<Box<dyn Fn(&CheckoutSemantic) + Send + Sync>>>,
     /// Wakes the fill worker after an AFT write to this checkout. It is held
     /// here because the intent registry keeps only weak references.
     _wake_on_write: Arc<dyn WriteIntentListener>,
@@ -200,33 +131,63 @@ impl CheckoutSemantic {
         producer: SemanticProducer,
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
-        // The harness writes its marker into the storage directory it
-        // configures, which stays the durable root when `storage.cache_dir`
-        // moves the view registry onto another volume.
-        let base_ref_prototype = base_ref_selected(&storage.durable);
+        Self::with_trigram_policy(
+            storage,
+            family,
+            scope,
+            root,
+            producer,
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: crate::config::Config::default().search_index_max_file_size,
+            },
+            wake,
+        )
+    }
+
+    /// [`Self::new`] for a root whose lexical views use `policy`. The view is a
+    /// v3 member (`<scope>.semantic`) with all three planes registered, so its
+    /// base carries trigram and call-graph rows too and its publications go
+    /// to the v3 namespace only.
+    pub fn with_trigram_policy(
+        storage: &crate::root_cache::StoragePaths,
+        family: &str,
+        scope: &str,
+        root: &Path,
+        producer: SemanticProducer,
+        policy: crate::blob_store::v2::TrigramPolicy,
+        wake: Weak<CheckoutSemanticSlot>,
+    ) -> Result<Self, String> {
         let plane = shared_plane(&storage.artifacts, producer);
-        let registry =
-            FamilyRegistry::open(&storage.artifacts, family).map_err(|error| error.to_string())?;
-        let owner = registry
-            .register_view_with_storage(&storage.durable, scope, root)
-            .map_err(|error| error.to_string())?;
+        let producers = Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: Some(plane.semantic_producer().id()),
+            callgraph: super::callgraph::PRODUCER.into(),
+        };
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
+        let trigram = Arc::new(super::first_load::TrigramBridge::new(
+            storage.artifacts.clone(),
+            policy,
+        ));
+        let callgraph = Arc::new(super::first_load::CallgraphBridge::default());
+        let member_scope = view_scope(scope);
         let driver = Arc::new(
-            CheckoutDriver::new(
-                owner.clone(),
-                Producers {
-                    trigram: UNREGISTERED_PRODUCER.into(),
-                    semantic: Some(plane.semantic_producer().id()),
-                    callgraph: UNREGISTERED_PRODUCER.into(),
-                },
-                None,
+            CheckoutDriver::new_v3(
+                &storage.artifacts,
+                family,
+                &member_scope,
+                root,
+                producers.clone(),
                 Arc::new(ConfiguredMembershipWalker),
-                vec![composite],
+                vec![trigram, composite, callgraph],
             )
-            .with_adapters(vec![adapter.clone()]),
+            .map_err(|error| error.to_string())?
+            .with_adapters(vec![adapter]),
         );
-        let loader = SiblingLoader::new(driver.clone(), vec![adapter]);
+        driver.register_write_intent();
+        let ViewAccess::Owner(owner) = driver.access() else {
+            unreachable!("a checkout driver owns its view")
+        };
         let listener: Arc<dyn WriteIntentListener> = Arc::new(WakeOnWrite {
             root: root.to_path_buf(),
             slot: wake,
@@ -234,26 +195,22 @@ impl CheckoutSemantic {
         super::intent::register_listener(&listener);
         let access = ViewAccess::Owner(owner.clone());
         hold_view(plane.as_ref(), &access);
-        if base_ref_prototype {
-            super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
-            crate::slog_info!(
-                "{BASE_REF_ENV}=1: harness-only in-process semantic base references active root={}",
-                root.display()
-            );
-        }
         Ok(Self {
             root: root.to_path_buf(),
             access,
             owner,
+            storage: storage.artifacts.clone(),
+            producers,
             driver,
-            loader,
             plane,
-            base_ref_prototype,
-            base_ref_pin: Mutex::new(None),
             refresh: Mutex::new(()),
             unfolded: AtomicBool::new(false),
             refresh_attempts: AtomicUsize::new(0),
             unavailable: Mutex::new(None),
+            searches: AtomicU64::new(0),
+            base_successors: AtomicU64::new(0),
+            #[cfg(test)]
+            before_bind_verify: Mutex::new(None),
             _wake_on_write: listener,
         })
     }
@@ -274,154 +231,328 @@ impl CheckoutSemantic {
         &self.plane
     }
 
-    /// The snapshot queries currently read.
+    /// The snapshot queries currently read: the cut the last bind installed
+    /// after verifying it against the disk, plus the edits recorded since.
+    ///
+    /// It is read without the subscription check, as the lexical and
+    /// call-graph sources do. `installed_snapshot` marks a checkout without a
+    /// steady watcher subscription (every macOS checkout among them)
+    /// overflowed on each read; a query doing that between the worker's bind
+    /// and its fold would make the fold's install refuse, and every answer
+    /// would be unvouched. The fill worker applies the check once per refresh
+    /// instead (see `refresh_admitted`), so the next bind still walks the
+    /// whole checkout.
     pub fn installed(&self) -> Snapshot {
-        self.driver.installed_snapshot()
+        self.driver.installed_cut().0
     }
 
-    /// Strictly reconciles, publishes and installs the checkout's own generation.
-    /// The harness-only prototype may instead install a byte-verified in-process
-    /// base; any unsupported input uses the strict loader.
+    /// Verified-binds the checkout's v3 member, publishes its edits and
+    /// installs the result.
     pub fn load(&self) -> Result<Snapshot, String> {
-        if let Some(snapshot) = self.try_base_reference() {
-            return Ok(snapshot);
+        self.bind()
+    }
+
+    /// One verified bind of this member. The seed is the member's own
+    /// published generation composed with its base's current generation, so a
+    /// restart resumes from the last publication and a base readiness
+    /// successor is picked up; a fresh member bootstraps its base. Edits are
+    /// published as a new worker generation before the single install, as
+    /// the call-graph view does. Nothing is written outside the v3 namespace.
+    ///
+    /// The bind starts with the driver's subscription check. Without a steady
+    /// watcher subscription (every macOS checkout among them) the check marks
+    /// the checkout overflowed, so the verified bind below walks the whole
+    /// checkout and the install accepts its strictly reconciled cut. Checking
+    /// later, between the bind and its install, would bump the live epoch
+    /// under the cut and the install would refuse (`EpochChanged`): `install`
+    /// itself repeats the check, which is a no-op only on a checkout already
+    /// marked overflowed.
+    fn bind(&self) -> Result<Snapshot, String> {
+        self.bind_with_subscription_check(true)
+    }
+
+    fn bind_with_subscription_check(&self, check_subscription: bool) -> Result<Snapshot, String> {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("semantic_bind");
+        #[cfg(test)]
+        let seed_profile = crate::blob_store::v3::work_profile::span("bind_seed");
+        let installed = if check_subscription {
+            self.driver.installed_snapshot()
+        } else {
+            self.installed()
+        };
+        #[cfg(test)]
+        if let Some(hook) = &*lock(&self.before_bind_verify) {
+            hook(self);
         }
-        self.loader
-            .load(&self.access)
-            .map(|outcome| outcome.snapshot)
+        let seed = match super::base_refs::open_foreign_v3(
+            &self.storage,
+            self.owner.family(),
+            self.owner.scope(),
+            &self.producers,
+        ) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => installed.generation().clone(),
+            Err(error) => {
+                crate::slog_debug!(
+                    "semantic v3 seed unavailable; reconciling current tree: {}",
+                    error
+                );
+                installed.generation().clone()
+            }
+        };
+        #[cfg(test)]
+        drop(seed_profile);
+        #[cfg(test)]
+        let verify_profile = crate::blob_store::v3::work_profile::span("bind_verify");
+        let (mut snapshot, revision) = self
+            .driver
+            .verified_bind(&self.access, seed)
+            .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        drop(verify_profile);
+        if super::callgraph::has_unpublished_changes(&snapshot) {
+            #[cfg(test)]
+            let _profile = crate::blob_store::v3::work_profile::span("bind_own_generation");
+            let own = self
+                .driver
+                .build_own_generation(
+                    &self.access,
+                    &snapshot,
+                    super::first_load::DERIVED_CALLGRAPH_SEEDING,
+                )
+                .map_err(|error| error.to_string())?;
+            let cut = snapshot
+                .install_cut()
+                .cloned()
+                .ok_or("semantic view snapshot has no install cut")?;
+            let mut delta = LiveDelta::from_snapshot(&snapshot);
+            let draft = super::snapshot::derive_successor(
+                &delta.cut(),
+                own,
+                &super::snapshot::carry_disk_state_only,
+            );
+            delta
+                .replay_and_swap(draft, &super::snapshot::carry_disk_state_only)
+                .map_err(|error| format!("{error:?}"))?;
+            snapshot = delta
+                .snapshot()
+                .with_install_cut(cut.clone())
+                .with_reconciled_epoch(snapshot.reconciled_epoch().unwrap_or(cut.epoch));
+        }
+        if check_subscription {
+            self.driver.install(&self.access, &snapshot, revision)
+        } else {
+            self.driver
+                .install_without_subscription_check(&self.access, &snapshot)
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(self.driver.installed_cut().0)
+    }
+
+    /// Folds this checkout's fill completions into a newly published worker
+    /// generation and installs it, as `SiblingLoader::fold` does: the disk
+    /// facts the last bind verified are reused, so a fold walks and reads
+    /// nothing. The semantic plane marks every vector the store holds ready
+    /// when it materializes the generation.
+    ///
+    /// The install skips the driver's subscription check. The refresh applied
+    /// it once already; repeating it here would, on a checkout without a
+    /// steady watcher subscription, mark the healthy bundle the bind just
+    /// installed overflowed, bump the live epoch under this cut and refuse
+    /// every fold. The next refresh applies the check again; searches read
+    /// the installed cut without it. An edit recorded since the cut still
+    /// refuses the install, and the refresh retries the fold.
+    fn fold(&self) -> Result<(), String> {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("semantic_fold");
+        let (snapshot, revision) = self.driver.installed_cut();
+        self.driver
+            .validate_cut(&self.access, &snapshot, revision)
+            .map_err(|error| error.to_string())?;
+        let cut = snapshot
+            .install_cut()
+            .cloned()
+            .ok_or("semantic view snapshot has no install cut")?;
+        let own = self
+            .driver
+            .build_own_generation(
+                &self.access,
+                &snapshot,
+                super::first_load::DERIVED_CALLGRAPH_SEEDING,
+            )
+            .map_err(|error| error.to_string())?;
+        own.ensure_producers(&self.driver.producers(&self.access))
+            .map_err(|error| error.to_string())?;
+        // Rebase the verified disk facts, not the new manifest's claims.
+        let mut delta = LiveDelta::from_snapshot(&snapshot);
+        let draft = super::snapshot::derive_successor(
+            &delta.cut(),
+            own,
+            &super::snapshot::carry_disk_state_only,
+        );
+        delta
+            .replay_and_swap(draft, &super::snapshot::carry_disk_state_only)
+            .map_err(|error| format!("{error:?}"))?;
+        self.driver
+            .install_without_subscription_check(
+                &self.access,
+                &delta.snapshot().with_install_cut(cut),
+            )
             .map_err(|error| error.to_string())
     }
 
-    fn remember_base(&self) {
-        if !self.base_ref_prototype {
-            return;
-        }
+    /// Completes, as the base's owner, the semantic entries this checkout
+    /// inherits from its base while the base still has them pending. The base
+    /// build claim makes the owner single-flight across processes: a checkout
+    /// that cannot take it leaves the entries pending and searches report
+    /// them as pending. Embedding runs on the ordinary budgeted fill path,
+    /// the completed keys are published as one readiness successor of the
+    /// base, and the member is bound again so it composes that successor.
+    fn fill_base<F>(
+        &self,
+        budget: FillBudget,
+        embed: &mut F,
+        admit: &mut dyn FnMut(bool) -> Result<(), String>,
+    ) -> Result<FillReport, RefreshError>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        #[cfg(test)]
+        let _profile = crate::blob_store::v3::work_profile::span("base_fill");
         let snapshot = self.installed();
-        if !base_ref_ready(&snapshot) || snapshot.generation().name().starts_with("base-ref-") {
-            return;
+        let Some(header) = snapshot.generation().base_header().cloned() else {
+            return Ok(FillReport::default());
+        };
+        let pending = self.plane.inherited_pending(&snapshot);
+        if pending.is_empty() {
+            return Ok(FillReport::default());
         }
-        let name = format!(
-            "base-ref-{}-{}",
-            self.owner.scope(),
-            snapshot.generation().name()
-        );
-        if lock(&self.base_ref_pin)
-            .as_ref()
-            .is_some_and(|base| base.generation.name() == name)
-        {
-            return;
+        let claim = match super::base_builder::claim_base(
+            &self.storage,
+            self.owner.family(),
+            &header.scope,
+            None,
+        ) {
+            Ok(super::base_builder::ClaimOutcome::Claimed(claim)) => claim,
+            Ok(outcome) => {
+                crate::slog_debug!(
+                    "semantic base fill left to its owner root={} base={} outcome={:?}",
+                    self.root.display(),
+                    header.scope,
+                    outcome
+                );
+                return Ok(FillReport::default());
+            }
+            Err(error) => return Err(RefreshError::classify(error.to_string())),
+        };
+        let result = (|| {
+            // A base fill reads the files the base names, which on a first
+            // bind is the whole checkout: such a fill takes a cold slot. One
+            // within both SMALL_PREPARATION limits stays on the preparation
+            // lane, as a small fill of the checkout's own edits does.
+            if !small_work(&snapshot, pending.iter().map(|(path, _)| path)) {
+                admit(false).map_err(RefreshError::classify)?;
+            }
+            let mut delta = LiveDelta::from_snapshot(&snapshot);
+            for (path, content) in &pending {
+                delta.set_readiness(
+                    path.clone(),
+                    super::snapshot::PlanePatch {
+                        content: *content,
+                        planes: super::manifest_v2::EntryPlanes {
+                            semantic: Some(super::readiness::PlaneState::pending(
+                                "awaiting the base owner",
+                            )),
+                            ..Default::default()
+                        },
+                    },
+                );
+            }
+            let draft = delta.snapshot();
+            let driver = Arc::clone(&self.driver);
+            let report = self
+                .plane
+                .fill_admitted(
+                    &self.owner,
+                    &draft,
+                    budget,
+                    embed,
+                    &move || driver.installed_cut().0,
+                    &mut || {
+                        admit(false)?;
+                        crate::cold_build_limiter::progress::stage("embedding");
+                        Ok(())
+                    },
+                    // Read at most each file's recorded size plus one byte:
+                    // a file that grew is left for its checkout to reconcile.
+                    true,
+                )
+                .map_err(|error| RefreshError::classify(error.to_string()))?;
+            let keys = self
+                .plane
+                .completed_keys(&self.owner, &draft, &pending)
+                .map_err(|error| RefreshError::classify(error.to_string()))?;
+            if !keys.is_empty() {
+                #[cfg(test)]
+                let _profile = crate::blob_store::v3::work_profile::span("base_successor");
+                super::base_builder::publish_successor(
+                    &claim,
+                    |manifest| {
+                        for (path, content, key) in &keys {
+                            if let Some(super::manifest_v2::EntryV2::Regular {
+                                content: base_content,
+                                planes,
+                                ..
+                            }) = manifest.get_mut(path)
+                            {
+                                // Only the very bytes the base names, and only
+                                // an entry still waiting for its owner.
+                                if base_content == content
+                                    && planes
+                                        .semantic
+                                        .as_ref()
+                                        .is_some_and(super::readiness::PlaneState::is_pending)
+                                {
+                                    planes.semantic =
+                                        Some(super::readiness::PlaneState::ready(key));
+                                }
+                            }
+                        }
+                    },
+                    None,
+                )
+                .map_err(|error| RefreshError::classify(error.to_string()))?;
+                self.base_successors.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok((report, !keys.is_empty()))
+        })();
+        let released = claim.release();
+        let (report, published) = result?;
+        released.map_err(|error| RefreshError::classify(error.to_string()))?;
+        if published {
+            #[cfg(test)]
+            let _profile = crate::blob_store::v3::work_profile::span("base_rebind");
+            // The refresh checked subscription continuity before filling. A
+            // base readiness publication changes no source files, so repeating
+            // that check here would mark an unwatched checkout overflowed while
+            // its already-filled vectors are being served. Still verify-bind
+            // the successor and validate its cut; recorded edits and real
+            // watcher gaps must be reconciled before installation.
+            self.bind_with_subscription_check(false)
+                .map_err(RefreshError::classify)?;
         }
-        let mut manifest = snapshot
-            .generation()
-            .flatten()
-            .expect("valid composed generation");
-        // A worktree's .git file names its private administrative directory;
-        // unlike source or ignore files, those bytes never enter semantic keys.
-        manifest
-            .set(
-                super::RelPath::from_os_path(Path::new(".git")).unwrap(),
-                None,
-            )
-            .expect("removing an entry preserves manifest validity");
-        let base = Arc::new(PrototypeBase {
-            storage: self.owner.registry().storage().to_path_buf(),
-            family: self.owner.family().to_owned(),
-            producer: self.plane.semantic_producer().id(),
-            generation: Arc::new(ComposedGeneration::new(name, manifest, None)),
-        });
-        let mut bases = lock(prototype_bases());
-        bases.retain(|base| base.strong_count() > 0);
-        bases.push(Arc::downgrade(&base));
-        *lock(&self.base_ref_pin) = Some(base);
+        Ok(report)
     }
 
-    fn try_base_reference(&self) -> Option<Snapshot> {
-        if !self.base_ref_prototype || self.installed().generation().name() != "empty" {
-            return None;
-        }
-        let producer = self.plane.semantic_producer().id();
-        let base = lock(prototype_bases())
-            .iter()
-            .rev()
-            .filter_map(Weak::upgrade)
-            .find(|base| {
-                base.compatible(
-                    self.owner.registry().storage(),
-                    self.owner.family(),
-                    &producer,
-                )
-            })?;
-        let cut = self.driver.installed_snapshot().install_cut()?.clone();
-        let cut_epoch = cut.epoch;
-        let snapshot = LiveDelta::new(Arc::clone(&base.generation))
-            .snapshot()
-            .with_install_cut(cut);
-        if !base_ref_ready(&snapshot) {
-            return None;
-        }
-        let revision = self.driver.revision(&self.access);
-        if super::intent::active(&self.root) {
-            return None;
-        }
-        // No Git-derived or cached stat evidence proves content equality here.
-        // Hash each member with before/after metadata checks for read stability,
-        // but do not derive attachments or fold inherited-ready entries. Any
-        // delta or unsupported observation sends the whole bind strict.
-        let files = ConfiguredMembershipWalker.files(&self.root).ok()?;
-        let manifest = &base.generation;
-        let mut members = std::collections::BTreeSet::new();
-        for absolute in files {
-            let path =
-                super::RelPath::from_os_path(absolute.strip_prefix(&self.root).ok()?).ok()?;
-            if path.as_bytes() == b".git" {
-                continue;
-            }
-            let before = std::fs::symlink_metadata(&absolute).ok()?;
-            if !before.is_file() {
-                crate::slog_info!("semantic base reference strict fallback root={} path={path:?} reason=non_regular", self.root.display());
-                return None;
-            }
-            let bytes = match super::assembly::read_working_tree_file(&absolute) {
-                Ok(Some(bytes)) => bytes,
-                _ => {
-                    crate::slog_info!("semantic base reference strict fallback root={} path={path:?} reason=source_read", self.root.display());
-                    return None;
-                }
-            };
-            let after = std::fs::symlink_metadata(&absolute).ok()?;
-            if !base_ref_stable(&before, &after) {
-                return None;
-            }
-            if DiskState::of_bytes(&bytes) != base.generation.disk_state(&path) {
-                crate::slog_info!(
-                    "semantic base reference strict fallback root={} path={path:?} reason=content",
-                    self.root.display()
-                );
-                return None;
-            }
-            members.insert(path);
-        }
-        if members.len() != manifest.entries().count() || super::intent::active(&self.root) {
-            crate::slog_info!("semantic base reference strict fallback root={} reason=membership members={} base={}", self.root.display(), members.len(), manifest.entries().count());
-            return None;
-        }
-        // The stable content-and-membership walk above completes this cut's
-        // reconciliation; selecting a cached base alone would not establish it.
-        let snapshot = snapshot.with_reconciled_epoch(cut_epoch);
-        if let Err(error) = self.driver.install(&self.access, &snapshot, revision) {
-            crate::slog_info!(
-                "semantic base reference strict fallback root={} reason=install error={error}",
-                self.root.display()
-            );
-            return None;
-        }
-        *lock(&self.base_ref_pin) = Some(base);
-        crate::slog_info!(
-            "semantic base reference installed root={} generation={}",
-            self.root.display(),
-            snapshot.generation().name()
-        );
-        Some(snapshot)
+    /// Semantic searches this view answered.
+    pub fn search_count(&self) -> u64 {
+        self.searches.load(Ordering::Relaxed)
+    }
+
+    /// Readiness successors this view published as its base's owner.
+    pub fn base_successor_count(&self) -> u64 {
+        self.base_successors.load(Ordering::Relaxed)
     }
 
     /// Brings the checkout's vectors up to date within `budget`.
@@ -460,7 +591,11 @@ impl CheckoutSemantic {
         let _serial = lock(&self.refresh);
         let mutex_wait = mutex_started.elapsed();
         self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
-        let mut snapshot = self.installed();
+        // The refresh's first subscription check: without a steady watcher
+        // subscription it marks the checkout overflowed, so the bind below
+        // walks the whole checkout. Each bind repeats the check before it
+        // verifies the tree.
+        let mut snapshot = self.driver.installed_snapshot();
         // A first load, or unreconciled edits that are many or large, takes
         // cold admission before reconciling (see `needs_cold_reconcile`). A few
         // edits reconcile on the preparation lane, and a queue within both
@@ -473,27 +608,18 @@ impl CheckoutSemantic {
         crate::cold_build_limiter::progress::stage("preparing");
         let reconcile_started = Instant::now();
         if needs_reload(&snapshot) {
-            lock(&self.base_ref_pin).take();
             snapshot = if snapshot.generation().name() == "empty" {
                 self.load().map_err(RefreshError::classify)?
             } else {
-                self.loader
-                    .refresh(&self.access, Arc::clone(snapshot.generation()))
-                    .map_err(|error| RefreshError::classify(error.to_string()))?
+                self.bind().map_err(RefreshError::classify)?
             };
         }
         let reconcile = reconcile_started.elapsed();
-        if lock(&self.base_ref_pin)
-            .as_ref()
-            .is_some_and(|base| Arc::ptr_eq(&base.generation, snapshot.generation()))
-        {
-            // Even an empty ordinary fill creates a durable LivePin. Inherited
-            // ready entries need no fill; their prototype pin must stay an Arc.
-            let mut report = FillReport::default();
-            report.timing.mutex_wait = mutex_wait;
-            report.timing.reconcile = reconcile;
-            report.timing.queue_setup = queue_setup;
-            return Ok(report);
+        // Inherited base entries first: once their successor is published,
+        // every checkout of the base serves them, not only this one.
+        let base_report = self.fill_base(budget, embed, admit)?;
+        if base_report != FillReport::default() {
+            snapshot = self.installed();
         }
         // The size probe runs on the reconciled snapshot, so it counts the
         // work the edits actually left. It also runs under the process-wide
@@ -517,7 +643,7 @@ impl CheckoutSemantic {
                 &snapshot,
                 budget,
                 embed,
-                &move || driver.installed_snapshot(),
+                &move || driver.installed_cut().0,
                 &mut || {
                     admit(false)?;
                     crate::cold_build_limiter::progress::stage("embedding");
@@ -529,40 +655,49 @@ impl CheckoutSemantic {
         report.timing.mutex_wait = mutex_wait;
         report.timing.reconcile = reconcile;
         report.timing.queue_setup += queue_setup;
-        if report.installed > 0 || report.failed > 0 {
+        // Only this checkout's own completions are folded into its worker
+        // generation; the base's were published as a base successor.
+        let own_progress = report.installed > 0 || report.failed > 0;
+        // One report for the round: the base owner's fill and this
+        // checkout's own fill together.
+        report.queued += base_report.queued;
+        report.deferred += base_report.deferred;
+        report.moved += base_report.moved;
+        report.resident_hits += base_report.resident_hits;
+        report.stored_hits += base_report.stored_hits;
+        report.shared_waits += base_report.shared_waits;
+        report.embedded_keys += base_report.embedded_keys;
+        report.embedded_texts += base_report.embedded_texts;
+        report.model_calls += base_report.model_calls;
+        report.chunks += base_report.chunks;
+        report.chunk_reused += base_report.chunk_reused;
+        report.chunk_resident_hits += base_report.chunk_resident_hits;
+        report.source_reads += base_report.source_reads;
+        report.source_bytes += base_report.source_bytes;
+        report.installed += base_report.installed;
+        report.dropped += base_report.dropped;
+        report.failed += base_report.failed;
+        report.errors.extend(base_report.errors);
+        report.store_errors.extend(base_report.store_errors);
+        if own_progress {
             self.unfolded.store(true, Ordering::SeqCst);
         }
         let caught_up = report.deferred == 0 || (report.installed == 0 && report.failed == 0);
         if caught_up && self.unfolded.swap(false, Ordering::SeqCst) {
             let fold_started = Instant::now();
             crate::cold_build_limiter::progress::phase("publishing", None);
-            let (snapshot, revision) = self.driver.installed_cut();
-            if let Err(error) = self.loader.fold(&self.access, &snapshot, revision) {
+            if let Err(error) = self.fold() {
                 self.unfolded.store(true, Ordering::SeqCst);
-                return Err(RefreshError::classify(error.to_string()));
+                return Err(RefreshError::classify(error));
             }
             report.timing.fold = fold_started.elapsed();
         }
-        self.remember_base();
         Ok(report)
     }
 
     fn small_preparation(&self, snapshot: &Snapshot) -> bool {
         let items = self.plane.pending_work(&self.access, snapshot);
-        if items.len() > SMALL_PREPARATION_FILES {
-            return false;
-        }
-        let mut bytes = 0u64;
-        for item in items {
-            let DiskState::Present { size, .. } = snapshot.disk_state(&item.rel_path) else {
-                return false;
-            };
-            bytes = bytes.saturating_add(size);
-            if bytes > SMALL_PREPARATION_BYTES {
-                return false;
-            }
-        }
-        true
+        small_work(snapshot, items.iter().map(|item| &item.rel_path))
     }
 
     /// How many times `refresh` has run, successful or not.
@@ -609,6 +744,7 @@ impl CheckoutSemantic {
             )
             .map_err(|error| error.to_string())?;
         answer.unavailable = self.unavailable_reason();
+        self.searches.fetch_add(1, Ordering::Relaxed);
         Ok(answer)
     }
 
@@ -681,9 +817,6 @@ impl CheckoutSemantic {
 
 impl Drop for CheckoutSemantic {
     fn drop(&mut self) {
-        if self.base_ref_prototype {
-            super::io::BASE_REF_PROTOTYPE_USERS.fetch_sub(1, Ordering::Relaxed);
-        }
         // A lane restarted with the same producer shares this plane and view
         // (same family and scope). Only the last checkout runtime of a view
         // releases its state, or a superseded worker exiting would wipe the
@@ -748,6 +881,27 @@ fn release_view(plane: &SemanticPlane, access: &ViewAccess) -> bool {
 pub struct CheckoutSemanticMemory {
     pub family_arena: u64,
     pub private: u64,
+}
+
+/// Whether fill work on `paths` is within both SMALL_PREPARATION limits.
+fn small_work<'a>(
+    snapshot: &Snapshot,
+    paths: impl ExactSizeIterator<Item = &'a super::RelPath>,
+) -> bool {
+    if paths.len() > SMALL_PREPARATION_FILES {
+        return false;
+    }
+    let mut bytes = 0u64;
+    for path in paths {
+        let DiskState::Present { size, .. } = snapshot.disk_state(path) else {
+            return false;
+        };
+        bytes = bytes.saturating_add(size);
+        if bytes > SMALL_PREPARATION_BYTES {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether the installed snapshot has edits a strict reconcile must resolve
@@ -828,9 +982,12 @@ impl WriteIntentListener for WakeOnWrite {
             return;
         }
         let touches = match change {
-            WriteIntent::Paths(paths) => paths.iter().any(|path| path.starts_with(&self.root)),
+            WriteIntent::Paths(paths) => paths
+                .iter()
+                .any(|path| super::intent::relative_to_root(path, &self.root).is_some()),
             WriteIntent::Directory(directory) => {
-                directory.starts_with(&self.root) || self.root.starts_with(directory)
+                super::intent::relative_to_root(directory, &self.root).is_some()
+                    || super::intent::relative_to_root(&self.root, directory).is_some()
             }
         };
         if touches {
@@ -1103,6 +1260,9 @@ pub(crate) struct WorkerConfig {
     pub family: String,
     pub scope: String,
     pub semantic: crate::config::SemanticBackendConfig,
+    /// The trigram policy of the root's lexical views; the semantic member's
+    /// base carries trigram rows under it.
+    pub trigram_policy: crate::blob_store::v2::TrigramPolicy,
     /// The root's semantic status, which every status and readiness surface
     /// reads. The worker keeps it in step with the lane.
     pub status: Arc<RwLock<crate::context::SemanticIndexStatus>>,
@@ -1455,12 +1615,13 @@ pub(crate) fn run_worker(
     if !is_current(&slot, epoch) {
         return;
     }
-    let runtime = match CheckoutSemantic::new(
+    let runtime = match CheckoutSemantic::with_trigram_policy(
         &config.storage,
         &config.family,
         &config.scope,
         &config.root,
         producer,
+        config.trigram_policy,
         slot.clone(),
     ) {
         Ok(runtime) => Arc::new(runtime),

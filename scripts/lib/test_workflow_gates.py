@@ -662,6 +662,14 @@ class UnitShardPartitionCountTests(unittest.TestCase):
 
 
 class MacOSUnitWorkflowTests(unittest.TestCase):
+    def test_macos_conformance_job_has_room_for_a_cold_build(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        job = suite["jobs"]["unit-macos-conformance"]
+        # A cold-cache build alone has taken 15 minutes on this runner, and
+        # 30-minute runs were cancelled while their tests were still passing.
+        self.assertEqual(job["timeout-minutes"], "45")
+
     def test_libtest_codegen_is_split_without_rebuilding_dependencies(self) -> None:
         root = Path(__file__).resolve().parents[2]
         suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))

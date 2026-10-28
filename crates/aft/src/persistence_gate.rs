@@ -26,6 +26,9 @@ pub(crate) fn classification(name: &str) -> Option<bool> {
         | "undo_preview" | "edit_history" | "checkpoint" | "checkpoint_paths"
         | "list_checkpoints" | "restore_checkpoint" | "safety_purge" | "safety_purge_paths"
         | "snapshot" => Some(true),
+        // This wire operation installs an in-memory subscription, even while
+        // the root's database is still opening.
+        "bg_events" => Some(false),
         "configure"
         | "ping"
         | "version"

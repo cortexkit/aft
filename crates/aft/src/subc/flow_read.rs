@@ -491,10 +491,12 @@ fn read_as_parent_with_hooks(
         })
     };
     let initial = snapshot()?;
+    let grant_denial = access_grants::scope_grants_denial_for_parent(identity, Some(parent));
     let storage = ctx.storage_dir();
     let read_storage = storage.clone();
     let root = parent.project_root.clone();
     let read = timed_io(stamp, deadline, &parent.project_root, move |_| {
+        let _grants = crate::access_policy::scope_grants_guard(grant_denial);
         let policy = initial.resolve(&read_storage);
         file_read_exact::read_exact(&path, &root, &policy, hooks)
     })?;
@@ -503,6 +505,7 @@ fn read_as_parent_with_hooks(
     // Each snapshot releases its database lock before its filesystem work starts.
     let current = snapshot()?;
     let allowed = timed_io(stamp, deadline, &read.resolved, move |resolved| {
+        let _grants = crate::access_policy::scope_grants_guard(grant_denial);
         Ok(current
             .resolve(&storage)
             .decide(AccessOperation::Read, &resolved, false))

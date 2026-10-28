@@ -422,7 +422,7 @@ struct CheckoutCallgraphSource {
 /// True when the snapshot's live entries differ from its published
 /// generation: a graph opened for that generation would answer for older
 /// bytes than the checkout holds.
-fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
+pub(super) fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
     snapshot
         .live_entries()
         .any(|(path, entry)| entry.disk != snapshot.generation().disk_state(path))

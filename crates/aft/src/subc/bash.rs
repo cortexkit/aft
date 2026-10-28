@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct BashWaitCancel {
+    pub(super) speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     pub(super) run_scope: Option<Arc<super::run_scope::RunScope>>,
     pub(super) scope: Option<subc_protocol::scope::ScopeStamp>,
     pub(super) late_results: bool,
@@ -519,6 +520,7 @@ mod frame_loop_lock_tests {
                 Some((Instant::now(), 0)),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
+                    speech_seed: None,
                     run_scope: None,
                     scope: None,
                     late_results: false,
@@ -1715,6 +1717,7 @@ pub(super) fn submit_deferred_bash(
     let spawn_timing_for_test = timing_for_test.clone();
     let run_scope = cancel.run_scope.clone();
     let scope_stamp = cancel.scope.clone();
+    let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
     let secret_scopes = secret_identity
         .as_ref()
@@ -1725,6 +1728,7 @@ pub(super) fn submit_deferred_bash(
     // relayed before the client's deadline. OpenCode and Pi extend their reply
     // deadlines for runon calls to allow input capture after task registration.
     let grant_scope = crate::access_policy::current_scope();
+    let grant_denial = crate::access_policy::scope_grants_denial();
     let ask_route = crate::access_policy::current_ask_route();
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
@@ -2119,6 +2123,7 @@ pub(super) fn submit_deferred_bash(
                             let _secret_identity = super::secret_consent::SecretIdentityGuard::install_optional(secret_identity);
                             let _secret_scopes = super::secret_consent::SecretScopeGuard::install(secret_scopes);
                             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+                            let _grants = crate::access_policy::scope_grants_guard(grant_denial);
                             let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                             crate::sandbox_spawn::with_worker_jail(worker_jail, || {
                             crate::bash_background::with_call_key(call_key, || {
@@ -2137,7 +2142,7 @@ pub(super) fn submit_deferred_bash(
                                                                 &remote_source,
                                                             ),
                                                          || {
-                                                              crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || {
+                                                              crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || crate::gh_shim_speech::service::with_launch(speech_seed.clone(),&ctx.storage_dir(),|| {
                                                                   let run_dispatch = || {
                                                                       crate::bash_rewrite::with_rewrites_off(run_scoped, || {
                                                                            crate::bash_background::with_call_requester(task_requester, || {
@@ -2159,7 +2164,7 @@ pub(super) fn submit_deferred_bash(
                                                                       ctx.bash_background().kill_scope_if_revoked(scope);
                                                                   }
                                                                   response
-                                                              })
+                                                              }))
                                                          },
                                                         ),
                                                     )
@@ -4093,6 +4098,7 @@ mod grant_path_tests {
             json!({"command": "echo hello; while [ ! -f release ]; do sleep 0.1; done", "wait": true}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -4255,6 +4261,7 @@ mod grant_path_tests {
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 run_scope: None,
+                speech_seed: None,
                 scope: None,
                 late_results: false,
                 ledger_carrier: None,
@@ -4387,6 +4394,7 @@ mod grant_path_tests {
                     json!({"command":"echo '{{ck-secret:test}}'", "scope":{"ref":"forged-head"}}),
                     crate::subc_format::FormatContext::default(),
                     BashWaitCancel {
+                        speech_seed: None,
                         run_scope: None,
                         scope: stamped.then(|| stamp.clone()),
                         late_results: false,
@@ -4549,6 +4557,7 @@ mod grant_path_tests {
                 json!({"command": "printf 'quick-output\\n'; exit 7", "background": background, "pty": pty}),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
+                    speech_seed: None,
                     run_scope: None,
                     scope: None,
                     late_results: false,
@@ -4992,6 +5001,7 @@ mod grant_path_tests {
             json!({"command":"echo test","timeout":5000}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: true,
@@ -5069,6 +5079,7 @@ mod grant_path_tests {
                     json!({"command":"echo test","timeout":5000}),
                     crate::subc_format::FormatContext::default(),
                     BashWaitCancel {
+                        speech_seed: None,
                         run_scope: None,
                         scope: None,
                         late_results: false,
@@ -5148,6 +5159,7 @@ mod grant_path_tests {
             json!({"command":"sleep 2","timeout":10000,"foreground_orchestrate":true,"block_to_completion":true}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: Some(scope),
                 late_results: false,
@@ -5239,6 +5251,7 @@ mod grant_path_tests {
                 json!({"command":"sleep 0.2", "timeout":5000,"background":background,"pty":pty,"foreground_orchestrate":true,"block_to_completion":true}),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
+                    speech_seed: None,
                     run_scope: None,
                     scope: None,
                     late_results: false,
@@ -5399,6 +5412,7 @@ mod grant_path_tests {
             false,
             metrics,
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -5908,6 +5922,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     fn capture_cancel() -> BashWaitCancel {
         BashWaitCancel {
+            speech_seed: None,
             run_scope: None,
             scope: None,
             late_results: false,
@@ -6224,6 +6239,7 @@ mod grant_path_tests {
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedAcceptance).await;
         let metrics = Arc::new(DispatchPathMetrics::new());
         let cancel = BashWaitCancel {
+            speech_seed: None,
             run_scope: None,
             scope: None,
             late_results: false,
@@ -6320,6 +6336,7 @@ mod grant_path_tests {
                 capture_fixture(Script::GatedAcceptance).await;
             let metrics = Arc::new(DispatchPathMetrics::new());
             let cancel = BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -6478,6 +6495,7 @@ mod grant_path_tests {
             json!({"command":"uname -s", "runon":"linux", "timeout":10000}),
             timing.clone(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -6571,6 +6589,7 @@ mod grant_path_tests {
             ctx.update_config(|config| config.foreground_wait_window_ms = 600_000);
             let metrics = Arc::new(DispatchPathMetrics::new());
             let cancel = BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -7498,6 +7517,7 @@ mod grant_path_tests {
             args,
             timing.clone(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -7566,15 +7586,13 @@ mod grant_path_tests {
                     let script = if refused { Script::AcceptedThenRefused } else { Script::Plain };
                     let (_daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
                     let timing = BashTimingForTest::new(Instant::now());
-                    let cancel = BashWaitCancel {
-                        run_scope: None,
-                        scope: None,
-                        late_results: false,
-                        ledger_carrier: None,
-                        connection: PersistentCancelSignal::new(),
-                        route: PersistentCancelSignal::new(),
-                        drain: drain::ModuleDrainWindow::default(),
-                    };
+                    let cancel = BashWaitCancel { speech_seed: None, run_scope: None,
+                    scope: None,
+                    late_results: false,
+                    ledger_carrier: None,
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(), };
                     let (mut rx, task_id) = held_capture_call(
                         &executor,
                         &root,
@@ -7664,6 +7682,7 @@ mod grant_path_tests {
                         Some(Duration::from_millis(1));
                 }
                 let cancel = BashWaitCancel {
+                    speech_seed: None,
                     run_scope: None,
                     scope: None,
                     late_results: false,
@@ -7780,6 +7799,7 @@ mod grant_path_tests {
                 Arc::get_mut(&mut timing).unwrap().capture_wait = Some(Duration::from_millis(1));
             }
             let cancel = BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -8378,6 +8398,7 @@ mod grant_path_tests {
                 }),
                 format_context: crate::subc_format::FormatContext::default(),
                 cancel: BashWaitCancel {
+                    speech_seed: None,
                     run_scope: None,
                     scope: None,
                     late_results: false,
@@ -9177,6 +9198,7 @@ mod grant_path_tests {
                         worker_session,
                         Arc::new(DispatchPathMetrics::new()),
                         BashWaitCancel {
+                            speech_seed: None,
                             run_scope: None,
                             scope: None,
                             late_results: false,
@@ -9544,6 +9566,7 @@ mod grant_path_tests {
                 }),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
+                    speech_seed: None,
                     run_scope: None,
                     scope: None,
                     late_results: false,
@@ -9719,6 +9742,7 @@ mod grant_path_tests {
             }),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -9829,6 +9853,7 @@ mod run_tests {
             json!({"command":command,"timeout":timeout}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                speech_seed: None,
                 run_scope: Some(scope),
                 scope: None,
                 late_results: false,

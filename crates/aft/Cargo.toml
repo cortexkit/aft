@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.62.0"
+version = "0.63.0"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -179,7 +179,7 @@ oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.62.0" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.0" }
 # The placeholder grammar, key-location rules and audit record AFT's vault
 # seam speaks. AFT owns the crate; basal links it later.
 secret-rules = { path = "../secret-rules", version = "0.1.0" }
@@ -248,7 +248,7 @@ cortexkit-agent-identity = "=0.1.1"
 jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.33.5"
 subc-transport = "=0.14.0"
-subc-client-rs = "=0.31.0"
+subc-client-rs = "=0.32.7"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.

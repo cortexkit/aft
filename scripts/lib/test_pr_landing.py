@@ -256,7 +256,13 @@ if '/protection/required_status_checks' in endpoint:
 if endpoint.endswith('/rules/branches/main'):
     if s.get('rules_failure'): raise SystemExit('HTTP 403: rules unavailable')
     answer(s.get('branch_rules', []))
-if '/pulls?' in endpoint: answer([[pr()] if s.get('exists') else []] if slurp else [pr()])
+if '/pulls?' in endpoint:
+    listed = [pr()] if s.get('exists') else []
+    if s.get('abandoned') and 'state=all' in endpoint:
+        listed = [{'number': 6, 'state': 'closed', 'merged_at': None,
+                   'head': {'sha': '0' * 40, 'ref': s['branch'], 'repo': {'full_name': 'example/repo'}},
+                   'base': {'ref': 'main', 'repo': {'full_name': 'example/repo'}}}] + listed
+    answer([listed] if slurp else [pr()])
 if endpoint.endswith('/comments'):
     if s.get('fail_comments'): raise SystemExit('HTTP 502')
     answer([{'created_at': '2025-01-01T00:00:00Z'}] if s.get('findings') else [])
@@ -956,6 +962,13 @@ sys.exit(2)
         disable_index = next(i for i, args in enumerate(calls) if "disablePullRequestAutoMerge" in " ".join(args))
         merge_index = next(i for i, args in enumerate(calls) if args[:2] == ["pr", "merge"])
         self.assertLess(disable_index, merge_index)
+
+    def test_pr_closed_unmerged_at_another_head_is_superseded_by_a_new_pr(self) -> None:
+        self.write_state(abandoned=True)
+        result = self.run_script("land-pr.sh", "delivery", "--title", "second attempt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("already closed or merged", result.stderr)
+        self.assertTrue(any(call["args"][:2] == ["pr", "create"] for call in self.calls()))
 
     def test_new_pr_receives_title_and_body_at_creation(self) -> None:
         body_file = Path(self.temp.name) / "body.md"

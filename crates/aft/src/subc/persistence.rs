@@ -249,6 +249,24 @@ impl DatabaseWaits {
         if carrier_precheck_failed(identity, body) {
             return Err(decoded);
         }
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
+            // Worker role and confinement both depend on the policy route's
+            // preset row. Do not let the carrier's disables or preset reject
+            // the call before that row can be read.
+            if identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
+                && ctx.database_runtime_initializing()
+            {
+                let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
+                return self.wait(decoded, route, &ctx, "tool.call".into(), deadline_ms, true);
+            }
+            return Err(decoded);
+        }
         // A scoped worker's saved confinement lives in aft.db, and the bind
         // reply goes out while that database may still be opening. Its
         // catalog fetch and tool calls wait for the open rather than be
@@ -378,6 +396,13 @@ impl DatabaseWaits {
             return Err(decoded);
         };
         if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
+        // V1 carrier policy is resolved on its executor job, including saved
+        // confinement. Legacy calls still need the ordinary pre-admission read.
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+        {
             return Err(decoded);
         }
         // Catalog fetches and the other provider operations run on the
@@ -510,6 +535,23 @@ impl DatabaseWaits {
             } else {
                 ctx.wait_for_database_runtime(&name, deadline).await;
             }
+            #[cfg(feature = "test-timing-hooks")]
+            if name == "bg_events" {
+                // Pause a resumed subscription without holding configure's
+                // maintenance job, so route reclamation can finish first.
+                if let Some(gate) = std::env::var_os("AFT_TEST_BG_EVENTS_DATABASE_RESUME_GATE")
+                    .map(std::path::PathBuf::from)
+                {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while gate.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "bg_events resume gate not released"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
             decoded
         });
         if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
@@ -637,6 +679,50 @@ mod tests {
         assert_eq!(body["code"], "module_reloading");
         assert!(waits.pending.is_empty());
         assert!(waits.cancel(route, 7).is_none());
+    }
+
+    #[tokio::test]
+    async fn bg_events_subscriptions_skip_database_initialization() {
+        let (_dir, root) = test_support::test_root("bg-events-database-waits");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let routes = [121, 122]
+            .into_iter()
+            .map(|channel| {
+                (
+                    route_key(channel, 1),
+                    test_support::route_identity(&root, "session"),
+                )
+            })
+            .collect();
+        let mut waits = DatabaseWaits::default();
+        for channel in [121, 122] {
+            let decoded = DecodedFrame {
+                parsed_body: Default::default(),
+                confinement: None,
+                launch_restore: None,
+                codemode_policies: None,
+                frame: Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    channel,
+                    1,
+                    950,
+                    serde_json::to_vec(&json!({"op": "bg_events"})).unwrap(),
+                )
+                .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            };
+            assert!(
+                waits.defer(decoded, &routes, &executor).is_err(),
+                "bg_events on channel {channel} must reach its inline subscription handler"
+            );
+        }
+        assert!(waits.is_empty());
+        assert!(ctx.database_runtime_initializing());
+        assert!(ctx.database_runtime_pending("unclassified_test_operation"));
     }
 
     #[tokio::test]

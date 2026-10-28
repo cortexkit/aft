@@ -2,15 +2,88 @@
 //! shared planes across checkouts, embed counts across sessions, and edits
 //! reaching the fill through both the watcher and AFT's own writes.
 
+use super::super::first_load::MembershipWalker;
+use super::super::snapshot::ComposedGeneration;
 use super::*;
 use crate::semantic_index::{
     EmbedTextCaps, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex, SemanticResult,
 };
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 
-/// Store rows a filled one-chunk file leaves: its file run, its chunk-vector
-/// row, and the marker row saying the run's vector matches that chunk row.
-const ROWS_PER_ONE_CHUNK_FILE: u64 = 3;
+/// Store rows a filled one-chunk file leaves in the family's v3 semantic
+/// plane: its file run and its chunk-vector row. (Verified-run marker rows
+/// are a v2 optimization the v3 store does not write.)
+const ROWS_PER_ONE_CHUNK_FILE: u64 = 2;
+
+/// Row usage of the family's v3 semantic plane store, read through its own
+/// read-only connection.
+struct SemanticRows {
+    storage: PathBuf,
+    family: String,
+    path: PathBuf,
+}
+
+struct SemanticRowUsage {
+    rows: u64,
+    payload_bytes: u64,
+}
+
+impl SemanticRows {
+    fn of(runtime: &CheckoutSemantic) -> Self {
+        let family = runtime.owner.family().to_owned();
+        Self {
+            path: crate::blob_store::v3::plane_path(
+                &runtime.storage,
+                &family,
+                crate::blob_store::v2::FamilyPlane::Semantic,
+            )
+            .unwrap(),
+            storage: runtime.storage.clone(),
+            family,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn usage(&self) -> Result<SemanticRowUsage, String> {
+        if !self.path.exists() {
+            return Ok(SemanticRowUsage {
+                rows: 0,
+                payload_bytes: 0,
+            });
+        }
+        rusqlite::Connection::open_with_flags(
+            &self.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
+                [],
+                |row| {
+                    Ok(SemanticRowUsage {
+                        rows: row.get(0)?,
+                        payload_bytes: row.get(1)?,
+                    })
+                },
+            )
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn get(&self, key: &crate::blob_store::v2::FamilyKey) -> Result<Option<Vec<u8>>, String> {
+        crate::blob_store::v3::PlaneReader::open_existing(
+            &self.storage,
+            &self.family,
+            crate::blob_store::v2::FamilyPlane::Semantic,
+        )
+        .and_then(|reader| reader.get(key))
+        .map_err(|error| error.to_string())
+    }
+}
 
 #[test]
 fn reconciled_delta_does_not_request_another_source_walk() {
@@ -127,10 +200,7 @@ fn composition_no_marker_boundary_record() {
             refresh(&runtime, &Model::default());
             let result = query(&runtime, "alpha cache");
             assert!(result.complete(), "{result:?}");
-            let rows = rows(&root, &result.results);
-            let registry = super::super::registry::FamilyRegistry::open(&storage, &family).unwrap();
-            super::super::eviction::enforce(&registry, Default::default()).unwrap();
-            rows
+            rows(&root, &result.results)
         } else {
             cold(&root, "alpha cache").0
         };
@@ -166,13 +236,19 @@ fn composition_no_marker_boundary_record() {
             std::fs::read(storage.join("reader-floor.json")).unwrap(),
             floor_before
         );
-        assert!(!storage.join("views-harness.marker").exists());
-        assert!(
-            !storage.join("blobs/v3").exists(),
-            "an unrouted entrypoint wrote v3 without the marker"
-        );
         let floor = std::fs::read_to_string(storage.join("reader-floor.json")).unwrap();
-        assert!(!floor.contains("views_v3"));
+        if views {
+            // The views-on semantic view is a v3 member and writes nothing to
+            // the v2 namespace.
+            assert!(storage.join("blobs/v3").exists());
+            assert!(!storage.join("blobs/v2").exists());
+        } else {
+            assert!(
+                !storage.join("blobs/v3").exists(),
+                "a views-off entrypoint wrote v3"
+            );
+            assert!(!floor.contains("views_v3"));
+        }
         eprintln!(
             "COMPOSITION_BOUNDARY_RECORD {}",
             serde_json::json!({ "views": views, "answers": answer, "v3_files": v3, "floor": floor })
@@ -373,6 +449,9 @@ fn lane_paused_view_fingerprint_waits_before_checkout_preparation() {
                 family: "family".into(),
                 scope: "paused-fingerprint".into(),
                 semantic: semantic.clone(),
+                trigram_policy: crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: crate::config::Config::default().search_index_max_file_size,
+                },
                 status: Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled)),
                 drivers: InstalledDriver::default(),
                 schedule: fast_schedule(root.path()),
@@ -697,6 +776,9 @@ fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
                 family: "family".into(),
                 scope: "paused-activation".into(),
                 semantic: crate::config::SemanticBackendConfig::default(),
+                trigram_policy: crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: crate::config::Config::default().search_index_max_file_size,
+                },
                 status: Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled)),
                 drivers: InstalledDriver::default(),
                 schedule: fast_schedule(&root),
@@ -1060,898 +1142,6 @@ fn query(runtime: &CheckoutSemantic, text: &str) -> SemanticQuery {
     runtime.search(&vector(text), 100, &|_| true).unwrap()
 }
 
-#[test]
-fn base_ref_selection_child() {
-    let Ok(mode) = std::env::var("AFT_BASE_REF_SELECTION_CHILD") else {
-        return;
-    };
-    let _ = env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Warn)
-        .try_init();
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    write_tree(root.path(), FILES);
-    if mode == "marked" || mode == "default" {
-        std::fs::write(storage.path().join("views-harness.marker"), b"test\n").unwrap();
-    }
-    let first = CheckoutSemantic::new(
-        &crate::root_cache::StoragePaths::same(storage.path()),
-        "family",
-        "first",
-        root.path(),
-        producer(),
-        Weak::new(),
-    )
-    .unwrap();
-    let second = CheckoutSemantic::new(
-        &crate::root_cache::StoragePaths::same(storage.path()),
-        "family",
-        "second",
-        root.path(),
-        producer(),
-        Weak::new(),
-    )
-    .unwrap();
-    assert_eq!(first.base_ref_prototype, mode == "marked");
-    assert_eq!(second.base_ref_prototype, mode == "marked");
-    assert_eq!(first.installed().generation().name(), "empty");
-    assert_eq!(second.installed().generation().name(), "empty");
-    let active = super::super::io::work_snapshot()["base_ref_prototype"]
-        .as_bool()
-        .unwrap_or(false);
-    assert_eq!(
-        active,
-        mode == "marked",
-        "prototype selection must be reported"
-    );
-    first.load().unwrap();
-    refresh(&first, &Model::default());
-    second.load().unwrap();
-    assert_eq!(
-        second
-            .installed()
-            .generation()
-            .name()
-            .starts_with("base-ref-"),
-        mode == "marked" && cfg!(unix)
-    );
-    if mode != "marked" {
-        assert!(lock(&first.base_ref_pin).is_none());
-        assert!(lock(&second.base_ref_pin).is_none());
-    }
-}
-
-fn base_ref_selection(mode: &str, enabled: bool) -> std::process::Output {
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-    child
-        .args([
-            "--exact",
-            "views::semantic_runtime::tests::base_ref_selection_child",
-            "--nocapture",
-        ])
-        .env("AFT_BASE_REF_SELECTION_CHILD", mode);
-    if enabled {
-        child.env("AFT_VIEWS_BASE_REF_PROTOTYPE", "1");
-    } else {
-        child.env_remove("AFT_VIEWS_BASE_REF_PROTOTYPE");
-    }
-    child
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = child.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            panic!("selection child exceeded 30 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().unwrap();
-    if output.status.success() {
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "selection child did not execute its exact test"
-        );
-    }
-    output
-}
-
-#[test]
-fn base_ref_marker_and_variable_are_required() {
-    let output = base_ref_selection("marked", true);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let output = base_ref_selection("default", false);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-}
-
-#[test]
-fn base_ref_unmarked_storage_warns_exactly_once() {
-    let output = base_ref_selection("unmarked", true);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let warnings = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        warnings.matches("AFT_VIEWS_BASE_REF_PROTOTYPE").count(),
-        1,
-        "{warnings}"
-    );
-}
-
-#[cfg(unix)]
-fn base_ref_runtime(storage: &Path, scope: &str, root: &Path) -> CheckoutSemantic {
-    let mut runtime = CheckoutSemantic::new(
-        &crate::root_cache::StoragePaths::same(storage),
-        "family",
-        scope,
-        root,
-        producer(),
-        Weak::new(),
-    )
-    .unwrap();
-    if !runtime.base_ref_prototype {
-        runtime.base_ref_prototype = true;
-        super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
-    }
-    runtime.driver().register_write_intent();
-    runtime.load().unwrap();
-    runtime
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_top_k_matches_strict_including_prebind_edit() {
-    let storage = tempfile::tempdir().unwrap();
-    let main = tempfile::tempdir().unwrap();
-    let worker = tempfile::tempdir().unwrap();
-    write_tree(main.path(), FILES);
-    write_tree(worker.path(), FILES);
-    let model = Model::default();
-    let base = base_ref_runtime(storage.path(), "main", main.path());
-    refresh(&base, &model);
-    for modified in [false, true] {
-        if modified {
-            std::fs::write(
-                worker.path().join("src/alpha.rs"),
-                "pub fn distinct_worker_value() -> u64 { 9981 }\n",
-            )
-            .unwrap();
-        }
-        let suffix = if modified { "edited" } else { "clean" };
-        let prototype = base_ref_runtime(
-            storage.path(),
-            &format!("prototype-{suffix}"),
-            worker.path(),
-        );
-        assert_eq!(
-            prototype
-                .installed()
-                .generation()
-                .name()
-                .starts_with("base-ref-"),
-            !modified
-        );
-        if !modified {
-            assert_eq!(prototype.driver().take_reconcile_work().walks, 0);
-        }
-        refresh(&prototype, &model);
-        let strict = open(storage.path(), &format!("strict-{suffix}"), worker.path());
-        refresh(&strict, &model);
-        for text in [
-            "alpha total",
-            "beta cache insert",
-            "gamma parse",
-            "distinct worker value",
-        ] {
-            for top_k in [1, 3, 100] {
-                let expected = strict.search(&vector(text), top_k, &|_| true).unwrap();
-                let actual = prototype.search(&vector(text), top_k, &|_| true).unwrap();
-                assert!(actual.complete());
-                assert_eq!(
-                    rows(worker.path(), &actual.results),
-                    rows(worker.path(), &expected.results)
-                );
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_membership_changes_take_strict_path() {
-    for change in ["add", "delete", "symlink"] {
-        let storage = tempfile::tempdir().unwrap();
-        let main = tempfile::tempdir().unwrap();
-        let worker = tempfile::tempdir().unwrap();
-        write_tree(main.path(), FILES);
-        write_tree(worker.path(), FILES);
-        let base = base_ref_runtime(storage.path(), "main", main.path());
-        refresh(&base, &Model::default());
-        match change {
-            "add" => std::fs::write(worker.path().join("new.rs"), "fn added() {}\n").unwrap(),
-            "delete" => std::fs::remove_file(worker.path().join("src/alpha.rs")).unwrap(),
-            _ => {
-                std::fs::remove_file(worker.path().join("src/alpha.rs")).unwrap();
-                std::os::unix::fs::symlink(
-                    main.path().join("src/alpha.rs"),
-                    worker.path().join("src/alpha.rs"),
-                )
-                .unwrap();
-            }
-        }
-        let runtime = base_ref_runtime(storage.path(), "worker", worker.path());
-        assert!(
-            !runtime
-                .installed()
-                .generation()
-                .name()
-                .starts_with("base-ref-"),
-            "{change}"
-        );
-        assert!(runtime.driver().take_reconcile_work().walks > 0, "{change}");
-    }
-}
-
-#[test]
-fn base_ref_pending_is_not_ready() {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    write_tree(root.path(), FILES);
-    let runtime = open(storage.path(), "main", root.path());
-    assert!(!base_ref_ready(&runtime.installed()));
-    refresh(&runtime, &Model::default());
-    assert!(base_ref_ready(&runtime.installed()));
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_does_not_inherit_private_git_administration() {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    write_tree(root.path(), FILES);
-    let runtime = base_ref_runtime(storage.path(), "builder", root.path());
-    refresh(&runtime, &Model::default());
-    let mut manifest = runtime.installed().generation().flatten().unwrap().clone();
-    let git = super::super::RelPath::from_os_path(Path::new(".git")).unwrap();
-    let bytes = b"gitdir: /private/checkout/administration\n";
-    manifest
-        .insert(
-            git.clone(),
-            super::super::manifest_v2::EntryV2::regular(
-                crate::blob_store::v2::ContentHash::of(bytes),
-                bytes.len() as u64,
-                super::super::manifest_v2::EntryPlanes::default(),
-            ),
-        )
-        .unwrap();
-    let snapshot = LiveDelta::new(Arc::new(ComposedGeneration::new(
-        "git-file-builder",
-        manifest,
-        None,
-    )))
-    .snapshot()
-    .with_install_cut(runtime.installed().install_cut().unwrap().clone());
-    runtime
-        .driver()
-        .install(
-            runtime.access(),
-            &snapshot,
-            runtime.driver().revision(runtime.access()),
-        )
-        .unwrap();
-    runtime.remember_base();
-    let pin = lock(&runtime.base_ref_pin).as_ref().cloned().unwrap();
-    assert!(pin.generation.flatten().unwrap().get(&git).is_none());
-    assert!(pin
-        .generation
-        .flatten()
-        .unwrap()
-        .get(&super::super::RelPath::from_os_path(Path::new("src/alpha.rs")).unwrap())
-        .is_some());
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_changed_stat_is_not_stable() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("source.rs");
-    std::fs::write(&path, "fn before() {}\n").unwrap();
-    let before = std::fs::metadata(&path).unwrap();
-    assert!(base_ref_stable(&before, &before));
-    std::fs::write(&path, "fn after_and_larger() {}\n").unwrap();
-    assert!(!base_ref_stable(
-        &before,
-        &std::fs::metadata(&path).unwrap()
-    ));
-}
-
-#[test]
-fn base_ref_is_not_a_configuration_key() {
-    assert!(!include_str!("../../../../assets/aft.schema.json").contains("base_ref_prototype"));
-    let defaults = serde_json::to_value(crate::config::Config::default()).unwrap();
-    assert!(defaults.get("base_ref_prototype").is_none());
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_identity_mismatch_takes_strict_path() {
-    let storage = tempfile::tempdir().unwrap();
-    let other_storage = tempfile::tempdir().unwrap();
-    let main = tempfile::tempdir().unwrap();
-    let worker = tempfile::tempdir().unwrap();
-    write_tree(main.path(), FILES);
-    write_tree(worker.path(), FILES);
-    let base = base_ref_runtime(storage.path(), "main", main.path());
-    refresh(&base, &Model::default());
-    let pin = lock(&base.base_ref_pin).as_ref().cloned().unwrap();
-    assert!(pin.compatible(storage.path(), "family", &producer().id()));
-    for mismatch in ["storage", "family", "producer"] {
-        assert!(
-            !pin.compatible(
-                if mismatch == "storage" {
-                    other_storage.path()
-                } else {
-                    storage.path()
-                },
-                if mismatch == "family" {
-                    "other"
-                } else {
-                    "family"
-                },
-                &if mismatch == "producer" {
-                    SemanticProducer::current("other-model", EmbedTextCaps::default()).id()
-                } else {
-                    producer().id()
-                },
-            ),
-            "{mismatch}"
-        );
-        let mut runtime = CheckoutSemantic::new(
-            &crate::root_cache::StoragePaths::same(if mismatch == "storage" {
-                other_storage.path()
-            } else {
-                storage.path()
-            }),
-            if mismatch == "family" {
-                "other"
-            } else {
-                "family"
-            },
-            mismatch,
-            worker.path(),
-            if mismatch == "producer" {
-                SemanticProducer::current("other-model", EmbedTextCaps::default())
-            } else {
-                producer()
-            },
-            Weak::new(),
-        )
-        .unwrap();
-        runtime.base_ref_prototype = true;
-        super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
-        runtime.load().unwrap();
-        assert!(
-            !runtime
-                .installed()
-                .generation()
-                .name()
-                .starts_with("base-ref-"),
-            "{mismatch}"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_edit_invalidates_and_refreshes_strictly() {
-    let storage = tempfile::tempdir().unwrap();
-    let main = tempfile::tempdir().unwrap();
-    let worker = tempfile::tempdir().unwrap();
-    write_tree(main.path(), FILES);
-    write_tree(worker.path(), FILES);
-    let model = Model::default();
-    let base = base_ref_runtime(storage.path(), "main", main.path());
-    refresh(&base, &model);
-    let runtime = base_ref_runtime(storage.path(), "worker", worker.path());
-    assert!(runtime
-        .installed()
-        .generation()
-        .name()
-        .starts_with("base-ref-"));
-    let path = worker.path().join("src/alpha.rs");
-    std::fs::write(&path, "pub fn changed_after_bind() -> u32 { 29 }\n").unwrap();
-    runtime.driver().record_absolute_change(&path);
-    assert!(!query(&runtime, "alpha").complete());
-    refresh(&runtime, &model);
-    assert!(!runtime
-        .installed()
-        .generation()
-        .name()
-        .starts_with("base-ref-"));
-    assert_eq!(
-        rows(
-            worker.path(),
-            &query(&runtime, "changed after bind").results
-        ),
-        cold(worker.path(), "changed after bind").0
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_active_prebind_write_waits_even_without_begin_notification() {
-    let storage = tempfile::tempdir().unwrap();
-    let main = tempfile::tempdir().unwrap();
-    let worker = tempfile::tempdir().unwrap();
-    write_tree(main.path(), FILES);
-    write_tree(worker.path(), FILES);
-    let base = base_ref_runtime(storage.path(), "main", main.path());
-    refresh(&base, &Model::default());
-    // The root already exists, but its new semantic driver is not listening
-    // when the write begins. The root-wide active count must still fence bind.
-    let delta = Arc::new(Mutex::new(LiveDelta::new(Arc::clone(
-        base.installed().generation(),
-    ))));
-    super::super::intent::register(worker.path(), &delta);
-    let path = worker.path().join("src/alpha.rs");
-    let writing = super::super::intent::record_paths([path.as_path()]);
-    assert!(super::super::intent::active(worker.path()));
-    let mut runtime = CheckoutSemantic::new(
-        &crate::root_cache::StoragePaths::same(storage.path()),
-        "family",
-        "worker",
-        worker.path(),
-        producer(),
-        Weak::new(),
-    )
-    .unwrap();
-    runtime.base_ref_prototype = true;
-    super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
-    runtime.driver().register_write_intent();
-    assert!(
-        runtime.load().is_err(),
-        "an active write was declared ready"
-    );
-    assert_eq!(runtime.installed().generation().name(), "empty");
-    drop(writing);
-    assert!(!super::super::intent::active(worker.path()));
-    runtime.load().unwrap();
-    assert!(runtime
-        .installed()
-        .generation()
-        .name()
-        .starts_with("base-ref-"));
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_kill_child() {
-    let Ok(subject) = std::env::var("AFT_BASE_REF_KILL_SUBJECT") else {
-        return;
-    };
-    let subject = PathBuf::from(subject);
-    let storage = subject.join("storage");
-    std::fs::create_dir_all(&storage).unwrap();
-    std::fs::write(storage.join("views-harness.marker"), b"test\n").unwrap();
-    let main = subject.join("main");
-    let worker = subject.join("worker");
-    write_tree(&main, FILES);
-    write_tree(&worker, FILES);
-    let model = Model::default();
-    let base = open(&storage, "main", &main);
-    refresh(&base, &model);
-    let runtime = open(&storage, "worker", &worker);
-    refresh(&runtime, &model);
-    let borrowed = runtime
-        .installed()
-        .generation()
-        .name()
-        .starts_with("base-ref-");
-    assert_eq!(borrowed, std::env::var(BASE_REF_ENV).as_deref() == Ok("1"));
-    let answer = query(&runtime, "beta cache insert");
-    assert!(answer.complete());
-    assert!(!answer.results.is_empty());
-    std::fs::write(subject.join("ready"), b"semantic query served\n").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-        std::hint::black_box((&base, &runtime, &answer));
-    }
-    panic!("kill-test parent did not send SIGKILL within 30 seconds");
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct BaseRefKilledInventory {
-    registry: std::collections::BTreeMap<String, usize>,
-    protections: std::collections::BTreeMap<String, usize>,
-    worker_files: Vec<PathBuf>,
-}
-
-#[cfg(unix)]
-fn base_ref_normalize(value: &mut serde_json::Value, subject: &Path) {
-    match value {
-        serde_json::Value::Object(fields) => {
-            for (name, value) in fields {
-                if [
-                    "owner_pid",
-                    "owner_start",
-                    "pid",
-                    "start_time",
-                    "hostname",
-                    "created_at",
-                    "renewed_at",
-                    "created_at_ms",
-                    "registered_at_ms",
-                    "last_bind_ms",
-                    "last_publish_ms",
-                    "opened_at_ms",
-                    "acquired_at_ms",
-                    "measured_at_ms",
-                    "reader_id",
-                    "session_id",
-                    "generation",
-                ]
-                .contains(&name.as_str())
-                {
-                    *value = serde_json::json!("<run-specific>");
-                } else {
-                    base_ref_normalize(value, subject);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                base_ref_normalize(item, subject);
-            }
-        }
-        serde_json::Value::String(text) => {
-            *text = text.replace(subject.to_str().unwrap(), "<subject>");
-        }
-        _ => {}
-    }
-}
-
-#[cfg(unix)]
-fn base_ref_files(path: &Path) -> Vec<PathBuf> {
-    if !path.exists() {
-        return Vec::new();
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(path).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            files.extend(base_ref_files(&entry.path()));
-        } else {
-            files.push(entry.path());
-        }
-    }
-    files.sort();
-    files
-}
-
-#[cfg(unix)]
-fn base_ref_killed_inventory(subject: &Path, prototype: bool) -> BaseRefKilledInventory {
-    use std::os::unix::process::ExitStatusExt;
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command
-        .args([
-            "--exact",
-            "views::semantic_runtime::tests::base_ref_kill_child",
-            "--nocapture",
-        ])
-        .env("AFT_BASE_REF_KILL_SUBJECT", subject);
-    if prototype {
-        command.env(BASE_REF_ENV, "1");
-    } else {
-        command.env_remove(BASE_REF_ENV);
-    }
-    let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !subject.join("ready").exists() {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "kill-test child exited before serving a query"
-        );
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            panic!("kill-test child did not become ready within 30 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    child.kill().unwrap();
-    assert_eq!(child.wait().unwrap().signal(), Some(9));
-    // Open only after SIGKILL, before any recovery or GC pass. This never
-    // inspects a live SQLite file through a second descriptor.
-    let connection = rusqlite::Connection::open_with_flags(
-        subject.join("storage/blobs/v2/family/members.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let tables = connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
-        .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-    let mut registry = std::collections::BTreeMap::new();
-    for table in tables {
-        registry.insert(format!("table:{table}"), 1);
-        let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
-        let mut statement = connection.prepare(&sql).unwrap();
-        let columns = statement
-            .column_names()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect::<Vec<_>>();
-        let rows = statement
-            .query_map([], |row| {
-                let mut fields = serde_json::Map::new();
-                for (index, name) in columns.iter().enumerate() {
-                    use rusqlite::types::ValueRef;
-                    let value = match row.get_ref(index)? {
-                        ValueRef::Null => serde_json::Value::Null,
-                        ValueRef::Integer(value) => serde_json::json!(value),
-                        ValueRef::Real(value) => serde_json::json!(value),
-                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-                            match std::str::from_utf8(bytes) {
-                                Ok(text) => serde_json::json!(text),
-                                Err(_) => serde_json::json!(bytes),
-                            }
-                        }
-                    };
-                    fields.insert(name.clone(), value);
-                }
-                Ok(serde_json::Value::Object(fields))
-            })
-            .unwrap();
-        for row in rows {
-            let mut row = row.unwrap();
-            // Publication timestamps may be NULL for a reference adopter,
-            // which intentionally never publishes a worker generation.
-            base_ref_normalize(&mut row, subject);
-            *registry
-                .entry(format!("{table}:{}", serde_json::to_string(&row).unwrap()))
-                .or_insert(0) += 1;
-        }
-    }
-    drop(connection);
-    let storage = subject.join("storage");
-    BaseRefKilledInventory {
-        registry,
-        protections: base_ref_protection_inventory(&storage),
-        worker_files: base_ref_files(
-            &super::super::registry::view_dir(&storage, "worker").unwrap(),
-        ),
-    }
-}
-
-#[cfg(unix)]
-fn base_ref_protection_inventory(storage: &Path) -> std::collections::BTreeMap<String, usize> {
-    let mut inventory = std::collections::BTreeMap::new();
-    for scope in std::fs::read_dir(storage.join("views/v2")).unwrap() {
-        let scope = scope.unwrap();
-        if !scope.file_type().unwrap().is_dir() {
-            continue;
-        }
-        let name = scope.file_name().to_string_lossy().into_owned();
-        for kind in ["pins", "readers"] {
-            let directory = scope.path().join(kind);
-            for file in base_ref_files(&directory) {
-                let relative = file.strip_prefix(&directory).unwrap();
-                let filename = file.file_name().unwrap().to_string_lossy();
-                let temporary = filename.starts_with('.') || filename.contains(".tmp.");
-                let canonical_path = if kind == "readers" && !temporary {
-                    format!("{name}/readers/<generation>/<holder>.json")
-                } else if kind == "pins" && filename.starts_with("live-") && !temporary {
-                    format!(
-                        "{name}/pins/<live>.{}",
-                        file.extension().unwrap().to_string_lossy()
-                    )
-                } else {
-                    format!("{name}/{kind}/{}", relative.display())
-                };
-                let bytes = std::fs::read(&file).unwrap();
-                let canonical = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    Ok(mut value) => {
-                        base_ref_normalize(&mut value, storage.parent().unwrap());
-                        serde_json::to_vec(&value).unwrap()
-                    }
-                    Err(_) => bytes,
-                };
-                let key = format!("{canonical_path}:{}", blake3::hash(&canonical).to_hex());
-                *inventory.entry(key).or_insert(0) += 1;
-            }
-        }
-    }
-    inventory
-}
-
-#[cfg(unix)]
-fn base_ref_no_extra_protection(
-    control: &std::collections::BTreeMap<String, usize>,
-    candidate: &std::collections::BTreeMap<String, usize>,
-) -> bool {
-    candidate
-        .iter()
-        .all(|(key, count)| *count <= control.get(key).copied().unwrap_or(0))
-        && !candidate.keys().any(|key| key.starts_with("worker/"))
-}
-
-#[cfg(unix)]
-#[test]
-fn base_ref_sigkill_leaves_no_extra_rows_or_protection() {
-    let control = tempfile::tempdir().unwrap();
-    let prototype = tempfile::tempdir().unwrap();
-    let control_inventory = base_ref_killed_inventory(control.path(), false);
-    let prototype_inventory = base_ref_killed_inventory(prototype.path(), true);
-    let members = |inventory: &BaseRefKilledInventory| {
-        inventory
-            .registry
-            .iter()
-            .filter(|(key, _)| key.starts_with("members:"))
-            .map(|(key, count)| (key.clone(), *count))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
-    assert_eq!(members(&prototype_inventory), members(&control_inventory));
-    assert!(prototype_inventory.registry.iter().all(|(key, count)| *count <= control_inventory.registry.get(key).copied().unwrap_or(0)), "control={control_inventory:?} prototype={prototype_inventory:?}");
-    assert!(
-        base_ref_no_extra_protection(
-            &control_inventory.protections,
-            &prototype_inventory.protections
-        ),
-        "control={control_inventory:?} prototype={prototype_inventory:?}"
-    );
-    assert!(
-        prototype_inventory.worker_files.is_empty(),
-        "the reference adopter wrote durable files: {:?}",
-        prototype_inventory.worker_files
-    );
-    assert!(!prototype.path().join("storage/blobs/v3").exists());
-    let pins = super::super::registry::view_dir(&prototype.path().join("storage"), "worker")
-        .unwrap()
-        .join("pins");
-    std::fs::create_dir_all(&pins).unwrap();
-    // A synthetic extra pin must fail the same inventory comparison used
-    // immediately after the real process kill.
-    std::fs::write(pins.join("leaked.json"), b"leaked reference\n").unwrap();
-    let leaked = base_ref_protection_inventory(&prototype.path().join("storage"));
-    assert!(
-        !base_ref_no_extra_protection(&control_inventory.protections, &leaked),
-        "a deliberately leaked pin escaped detection"
-    );
-}
-
-/// Real-model parity reuses a quiescent harness store, never a live daemon's
-/// SQLite files. Only the small pre-bind edit may need a new embedding.
-#[cfg(unix)]
-#[test]
-#[ignore = "requires the pinned corpus and real-model cache from the performance harness"]
-fn base_ref_real_model_parity_including_prebind_edit() {
-    let _ = env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
-    let required = |name| PathBuf::from(std::env::var(name).expect(name));
-    let storage = required("AFT_VIEWS_PARITY_STORAGE");
-    let main = required("AFT_VIEWS_PARITY_MAIN");
-    let worker = required("AFT_VIEWS_PARITY_WORKER");
-    let family = std::env::var("AFT_VIEWS_PARITY_FAMILY").unwrap();
-    let config = crate::config::SemanticBackendConfig::default();
-    let mut model = crate::semantic_index::EmbeddingModel::from_config(&config).unwrap();
-    let fingerprint = model.fingerprint_for_view(&config).unwrap();
-    let producer = SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps);
-    let open = |scope: &str, root: &Path, prototype: bool| {
-        let mut runtime = CheckoutSemantic::new(
-            &crate::root_cache::StoragePaths::same(&storage),
-            &family,
-            scope,
-            root,
-            producer.clone(),
-            Weak::new(),
-        )
-        .unwrap();
-        if prototype && !runtime.base_ref_prototype {
-            runtime.base_ref_prototype = true;
-            super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
-        }
-        runtime.driver().register_write_intent();
-        runtime.load().unwrap();
-        runtime
-    };
-    let base = open("real-parity-main", &main, true);
-    assert!(
-        base.plane()
-            .pending_work(base.access(), &base.installed())
-            .is_empty(),
-        "the real-model store must be prewarmed under the same producer"
-    );
-    base.refresh(FillBudget::default(), &mut |texts| model.embed(texts))
-        .unwrap();
-    assert!(
-        lock(&base.base_ref_pin).is_some(),
-        "the prewarmed strict snapshot was not remembered as a ready prototype base"
-    );
-    struct RestoreFile(PathBuf, Vec<u8>);
-    impl Drop for RestoreFile {
-        fn drop(&mut self) {
-            std::fs::write(&self.0, &self.1).unwrap();
-        }
-    }
-    let probe = worker.join("views_perf_probe.rs");
-    let restore = RestoreFile(probe.clone(), std::fs::read(&probe).unwrap());
-    let mut comparisons = 0;
-    for modified in [false, true] {
-        let suffix = if modified { "edited" } else { "clean" };
-        if modified {
-            let changed = String::from_utf8(restore.1.clone()).unwrap().replace(
-                "{ probe_alpha() } // TODO VIEWS_PERF_STATE_ALPHA",
-                "{ probe_beta() } // TODO VIEWS_PERF_STATE_BETA",
-            );
-            assert_ne!(changed.as_bytes(), restore.1);
-            std::fs::write(&probe, changed).unwrap();
-        }
-        let strict = open(&format!("real-strict-{suffix}"), &worker, false);
-        assert!(
-            strict
-                .plane()
-                .pending_work(strict.access(), &strict.installed())
-                .len()
-                <= 1
-        );
-        strict
-            .refresh(FillBudget::default(), &mut |texts| model.embed(texts))
-            .unwrap();
-        let prototype = open(&format!("real-prototype-{suffix}"), &worker, true);
-        assert_eq!(
-            prototype
-                .installed()
-                .generation()
-                .name()
-                .starts_with("base-ref-"),
-            !modified
-        );
-        assert!(
-            prototype
-                .plane()
-                .pending_work(prototype.access(), &prototype.installed())
-                .len()
-                <= 1
-        );
-        prototype
-            .refresh(FillBudget::default(), &mut |texts| model.embed(texts))
-            .unwrap();
-        for text in [
-            "function probe_entry in views_perf_probe.rs",
-            "how are view generations published",
-            "how does semantic vector search score candidates",
-        ] {
-            let query_vector = model.embed(vec![text.to_owned()]).unwrap().remove(0);
-            for top_k in [1, 3, 20] {
-                let expected = strict.search(&query_vector, top_k, &|_| true).unwrap();
-                let actual = prototype.search(&query_vector, top_k, &|_| true).unwrap();
-                assert!(expected.complete() && actual.complete());
-                assert_eq!(
-                    rows(&worker, &actual.results),
-                    rows(&worker, &expected.results),
-                    "state={suffix} query={text} top_k={top_k}"
-                );
-                comparisons += 1;
-            }
-        }
-    }
-    assert_eq!(comparisons, 18);
-    eprintln!("REAL_MODEL_BASE_REF_PARITY: 18 exact top-k comparisons passed on one worker, including a pre-bind edit");
-}
-
-use super::super::first_load::MembershipWalker;
-
 /// Two worktrees of one family with identical content embed each chunk once
 /// between them; a later session on the same worktrees embeds nothing and
 /// ranks exactly like a legacy build of the same content.
@@ -1992,6 +1182,31 @@ fn two_worktrees_two_sessions_embed_each_chunk_once() {
     }
 }
 
+/// Every entry's content and semantic plane state in `runtime`'s installed
+/// generation.
+fn semantic_states(
+    runtime: &CheckoutSemantic,
+) -> Vec<(
+    super::super::RelPath,
+    Option<crate::blob_store::v2::ContentHash>,
+    Option<super::super::readiness::PlaneState>,
+)> {
+    runtime
+        .installed()
+        .generation()
+        .entries()
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                entry.content(),
+                entry
+                    .plane_state(crate::blob_store::v2::FamilyPlane::Semantic)
+                    .cloned(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let storage = tempfile::tempdir().unwrap();
@@ -2012,12 +1227,7 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
         assert_eq!((report.embedded_keys, report.installed), (1, 1));
     });
     let report = refresh(&a, &model);
-    let usage = a
-        .owner
-        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-        .unwrap()
-        .usage()
-        .unwrap();
+    let usage = SemanticRows::of(&a).usage().unwrap();
     eprintln!(
         "completed claim race: texts={} calls={} outer_embedded={} stored_rows={}",
         model.texts(),
@@ -2040,20 +1250,10 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     // One canonical file run, one reusable chunk vector, and the marker row
     // that vouches for the run's vectors matching that chunk row.
     assert_eq!(usage.rows, ROWS_PER_ONE_CHUNK_FILE);
-    assert_eq!(
-        a.installed()
-            .generation()
-            .flatten()
-            .unwrap()
-            .to_json_bytes()
-            .unwrap(),
-        b.installed()
-            .generation()
-            .flatten()
-            .unwrap()
-            .to_json_bytes()
-            .unwrap()
-    );
+    // Both checkouts name the same content with the same semantic key. Their
+    // manifests differ only in what is checkout-specific (the base each one
+    // composes and its own publication frontier).
+    assert_eq!(semantic_states(&a), semantic_states(&b));
     assert_eq!(
         rows(first.path(), &query(&a, "one chunk").results),
         rows(second.path(), &query(&b, "one chunk").results)
@@ -2088,10 +1288,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
             }
         })
         .unwrap();
-    let store = runtime
-        .owner
-        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-        .unwrap();
+    let store = SemanticRows::of(&runtime);
     eprintln!(
         "later batch failure: texts={} calls={} embedded_keys={} installed={} rows={}",
         model.texts(),
@@ -2127,6 +1324,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
 
 #[test]
 fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     // Eight 64-text batches still cross the seventh-call failure boundary;
     // keep all three siblings and eight edit rounds in both workloads.
     let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
@@ -2147,10 +1345,7 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
         .enumerate()
         .map(|(i, root)| open(storage.path(), &format!("flaky-worktree-{i}"), root.path()))
         .collect();
-    let store = runtimes[0]
-        .owner
-        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-        .unwrap();
+    let store = SemanticRows::of(&runtimes[0]);
     let model = Model::default();
     let completed = std::cell::RefCell::new(std::collections::HashSet::new());
     let successful_texts = std::cell::Cell::new(0usize);
@@ -2187,7 +1382,7 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
         ..FillBudget::default()
     };
     let mut new_keys = 0;
-    for runtime in &runtimes {
+    for (i, runtime) in runtimes.iter().enumerate() {
         let before = model.calls();
         for attempt in 0..64 {
             let report = runtime.refresh(budget, &mut embed).unwrap();
@@ -2198,7 +1393,8 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
             assert!(attempt < 63, "fixture failed to settle");
         }
         assert!(query(runtime, "item").complete());
-        if runtime.access.scope() != "flaky-worktree-0" {
+        // The first worktree embeds; its siblings reuse.
+        if i > 0 {
             assert_eq!(
                 model.calls(),
                 before,
@@ -2262,6 +1458,7 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
 
 #[test]
 fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     // Two batches retain cross-batch reuse in the default run. Nightly stress
     // keeps the original 32-batch workload; siblings and edit rounds are equal.
     let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
@@ -2299,19 +1496,9 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
         assert_eq!(report.embedded_keys, if i == 0 { files } else { 0 });
         assert_eq!(report.model_calls, if i == 0 { files / 64 } else { 0 });
     }
-    let store = runtimes[0]
-        .owner
-        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-        .unwrap();
+    let store = SemanticRows::of(&runtimes[0]);
     for runtime in &runtimes[1..] {
-        assert_eq!(
-            runtime
-                .owner
-                .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-                .unwrap()
-                .path(),
-            store.path()
-        );
+        assert_eq!(SemanticRows::of(&runtime).path(), store.path());
     }
     for round in 0..8 {
         // Each revision must change embedded text, not only whole-file bytes.
@@ -2330,7 +1517,11 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
                 .refresh(budget, &mut |texts| model.embed(texts))
                 .unwrap();
             embedded_keys += report.embedded_keys;
-            assert_eq!(report.embedded_keys, usize::from(i == 0));
+            assert_eq!(
+                report.embedded_keys,
+                usize::from(i == 0),
+                "round={round} worktree={i} report={report:?}"
+            );
             assert_eq!(report.model_calls, usize::from(i == 0));
             assert_eq!(
                 model.texts() - before,
@@ -2362,10 +1553,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
     let file = roots[0].path().join("file_0000.rs");
     std::fs::write(&file, source).unwrap();
     a.driver.record_absolute_change(&file);
-    let snapshot = a
-        .loader
-        .refresh(&a.access, Arc::clone(a.installed().generation()))
-        .unwrap();
+    let snapshot = a.bind().unwrap();
     let path = super::super::RelPath::new(b"file_0000.rs".to_vec()).unwrap();
     let mut moved = super::super::snapshot::LiveDelta::new(Arc::clone(snapshot.generation()));
     moved.apply(
@@ -2509,18 +1697,19 @@ fn large_pin_fixture() -> (tempfile::TempDir, tempfile::TempDir, CheckoutSemanti
     (storage, root, runtime)
 }
 
+/// Fills every file of a large fixture in one round. With
+/// `large_pin_fixture` every file is inherited from the checkout's base, so
+/// this is the base owner's fill; with `large_own_pin_fixture` it is the
+/// checkout's own fill.
 fn fill_large(runtime: &CheckoutSemantic) {
+    let model = Model::default();
     let report = runtime
-        .plane()
-        .fill(
-            &runtime.owner,
-            &runtime.installed(),
+        .refresh(
             FillBudget {
                 max_files: 4096,
                 ..FillBudget::default()
             },
-            &mut |texts| Model::default().embed(texts),
-            &|| runtime.installed(),
+            &mut |texts| model.embed(texts),
         )
         .unwrap();
     assert_eq!(
@@ -2558,20 +1747,42 @@ fn large_semantic_fill_batches_pin_writes() {
     assert_eq!(key_file_bytes() - bytes, 2048 * 2 * 65);
 }
 
+/// The large fixture with every file rewritten after the first bind, so the
+/// 2048 entries are the checkout's own rather than inherited from its base:
+/// their completions are folded into the checkout's worker generation, not
+/// published as a base successor.
+fn large_own_pin_fixture() -> (tempfile::TempDir, tempfile::TempDir, CheckoutSemantic) {
+    let (storage, root, runtime) = large_pin_fixture();
+    let paths: Vec<_> = (0..2048)
+        .map(|i| root.path().join(format!("file_{i:04}.rs")))
+        .collect();
+    {
+        let _intent = crate::views::intent::record_paths(paths.iter().map(PathBuf::as_path));
+        for (i, path) in paths.iter().enumerate() {
+            std::fs::write(path, format!("pub fn own_item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
+        }
+    }
+    (storage, root, runtime)
+}
+
 #[test]
 fn large_semantic_materialization_batches_pins_and_touches() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     use crate::pins::work_counters::{key_file_bytes, key_file_work};
-    let (_storage, root, runtime) = large_pin_fixture();
+    let (_storage, root, runtime) = large_own_pin_fixture();
+    let publications = crate::blob_store::v3::work_profile::count("semantic_put_publication");
     fill_large(&runtime);
+    let publications =
+        crate::blob_store::v3::work_profile::count("semantic_put_publication") - publications;
+    assert!(
+        publications <= 128,
+        "2048 file and chunk rows need model batches, not {publications} per-key publications"
+    );
     let answer = query(&runtime, "item");
     let (writes, syncs) = key_file_work();
     let bytes = key_file_bytes();
     crate::blob_store::v2::take_touch_transactions();
-    let (snapshot, revision) = runtime.driver.installed_cut();
-    runtime
-        .loader
-        .fold(&runtime.access, &snapshot, revision)
-        .unwrap();
+    runtime.fold().unwrap();
     let after = key_file_work();
     let transactions = crate::blob_store::v2::take_touch_transactions();
     let written_bytes = key_file_bytes() - bytes;
@@ -2593,16 +1804,14 @@ fn large_semantic_materialization_batches_pins_and_touches() {
         .unwrap()
         .to_json_bytes()
         .unwrap();
-    let store = runtime
-        .owner
-        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-        .unwrap();
+    let store = SemanticRows::of(&runtime);
     let blobs: Vec<_> = runtime
         .installed()
         .generation()
         .flatten()
         .unwrap()
         .ready_keys()
+        .filter(|key| key.plane() == crate::blob_store::v2::FamilyPlane::Semantic)
         .map(|key| (key, store.get(&key).unwrap().unwrap()))
         .collect();
     runtime.load().unwrap();
@@ -2619,8 +1828,11 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     for (key, payload) in blobs {
         assert_eq!(store.get(&key).unwrap().unwrap(), payload);
     }
+    // One key-list write each for the trigram and semantic planes.
     assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
-    assert_eq!(written_bytes, 2048 * 65 * 2);
+    // The semantic plane's file and chunk-vector keys plus the trigram
+    // plane's keys for the same 2048 entries, each plane in one write.
+    assert_eq!(written_bytes, 2048 * 65 * 3);
     // Every key was just stored in this epoch, so folding needs no writer.
     assert_eq!(transactions, 0);
 }
@@ -2691,15 +1903,13 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         .unwrap()
         .to_json_bytes()
         .unwrap();
-    let store = runtime
-        .owner
-        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
-        .unwrap();
+    let store = SemanticRows::of(&runtime);
     let blobs: Vec<_> = snapshot
         .generation()
         .flatten()
         .unwrap()
         .ready_keys()
+        .filter(|key| key.plane() == crate::blob_store::v2::FamilyPlane::Semantic)
         .map(|key| (key, store.get(&key).unwrap().unwrap()))
         .collect();
     runtime.load().unwrap();
@@ -2731,7 +1941,9 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
             "unchanged files should cost a stat, not a source read"
         );
         assert_eq!(work.content_hash_bytes, changed.len());
-        assert_eq!(work.attachments, 1);
+        // One attachment per registered plane (trigram, semantic and call
+        // graph) for the one file read.
+        assert_eq!(work.attachments, 3);
         assert_eq!(
             work.stats, 2049,
             "one stat per member plus a post-read stability stat"
@@ -2743,7 +1955,7 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
 /// at once but publishes them in one fold at the end, because every fold
 /// re-walks the whole checkout.
 #[test]
-fn budgeted_rounds_fold_once_when_caught_up() {
+fn budgeted_rounds_publish_base_successors_and_never_fold_the_worker_for_base_work() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     write_tree(root.path(), FILES);
@@ -2758,18 +1970,25 @@ fn budgeted_rounds_fold_once_when_caught_up() {
         .refresh(one_file, &mut |texts| model.embed(texts))
         .unwrap();
     assert_eq!((first.installed, first.deferred), (1, 2));
+    // Every file is inherited from the base, so each budgeted round is base
+    // owner work: it publishes one readiness successor of the base, and the
+    // checkout's own worker generation is never republished for it.
     let generation = runtime.installed().generation().name().to_owned();
-    assert_eq!(pending_semantic(&runtime), 3, "folded before catching up");
+    assert_eq!(runtime.base_successor_count(), 1);
+    assert_eq!(pending_semantic(&runtime), 2);
     assert_eq!(query(&runtime, "alpha").pending.len(), 2);
     runtime
         .refresh(one_file, &mut |texts| model.embed(texts))
         .unwrap();
     assert_eq!(runtime.installed().generation().name(), generation);
+    assert_eq!(pending_semantic(&runtime), 1);
     let last = runtime
         .refresh(one_file, &mut |texts| model.embed(texts))
         .unwrap();
     assert_eq!((last.installed, last.deferred), (1, 0));
-    assert_eq!(pending_semantic(&runtime), 0, "caught up but never folded");
+    assert_eq!(runtime.base_successor_count(), 3);
+    assert_eq!(runtime.installed().generation().name(), generation);
+    assert_eq!(pending_semantic(&runtime), 0);
     assert!(query(&runtime, "alpha").complete());
 }
 
@@ -2791,6 +2010,7 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
     let root = tempfile::tempdir().unwrap();
     let source = "pub fn reused() -> u8 { 1 }\n";
     write_tree(root.path(), &[("file.rs", source)]);
+    let _watcher = steady_watcher(root.path());
     let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
     let model = Arc::new(Model::default());
     refresh(&runtime, &model);
@@ -2855,7 +2075,12 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
         (0, 0),
         "fold repeated source reconciliation: {work:?}"
     );
-    assert_eq!(runtime.plane().take_source_reads().get(&path), Some(&1));
+    // The v3 owner uses a canonical root, which has a verbatim prefix on
+    // Windows. Compare the entire map under that identity so extra reads of
+    // this file or any other file cannot go unnoticed.
+    let source_reads = runtime.plane().take_source_reads();
+    let canonical_path = std::fs::canonicalize(&path).unwrap();
+    assert_eq!(source_reads, BTreeMap::from([(canonical_path, 1)]));
     let summary = lines
         .iter()
         .find(|line| line.contains("INFO semantic view fill"))
@@ -2876,7 +2101,7 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
         "lookup delay was not attributed: {summary}"
     );
     eprintln!(
-        "{summary}; reconcile_walks={} reconcile_reads={} fill_reads=1",
+        "{summary}; reconcile_walks={} reconcile_reads={} fill_sources={source_reads:?}",
         work.walks, work.reads
     );
 }
@@ -2971,6 +2196,7 @@ fn unreconciled_reuse_only_edit_completes_with_cold_cap_held() {
 /// cold-build slot before the reconcile starts, as a first load does.
 #[test]
 fn many_unreconciled_edits_take_cold_slot_before_reconciling() {
+    let _profile = crate::blob_store::v3::work_profile::Report;
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let files: Vec<(std::path::PathBuf, String)> = (0..=SMALL_PREPARATION_FILES)
@@ -3195,9 +2421,10 @@ fn small_missing_vectors_wait_for_cold_slot_and_stay_pending() {
     assert!(queued);
     assert_eq!(calls_while_held, 0, "queued fill called the model");
     assert_eq!(pending_while_held, 1, "queued fill was reported as ready");
+    let canonical_path = std::fs::canonicalize(root.path().join("file.rs")).unwrap();
     assert_eq!(
-        reads_while_held.get(&root.path().join("file.rs")),
-        Some(&1),
+        reads_while_held,
+        BTreeMap::from([(canonical_path, 1)]),
         "small preparation did not reach the vector miss"
     );
     assert_eq!(model.calls(), 1);
@@ -3270,6 +2497,9 @@ fn small_preparation_bounds_reads_when_queued_file_grows() {
     let root = tempfile::tempdir().unwrap();
     let source = "pub fn small_input() {}\n";
     write_tree(root.path(), &[("file.rs", source)]);
+    // With a steady subscription the refresh does not rebind, so the file
+    // grows after the size probe saw it small, which is the case under test.
+    let _watcher = steady_watcher(root.path());
     let (_slot, _epoch, _wake, runtime) = served_lane(storage.path(), root.path());
     let report = runtime
         .refresh_admitted(
@@ -3582,6 +2812,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     write_tree(root.path(), FILES);
+    let _watcher = steady_watcher(root.path());
     let mut backend = RecoveringBackend::offline();
     // A previous session already stored every vector. Retrying identity must
     // reuse these vectors, not re-embed the checkout when the backend returns.
@@ -3617,6 +2848,9 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
         family: "family".into(),
         scope: "scope".into(),
         semantic: backend.config(),
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: crate::config::Config::default().search_index_max_file_size,
+        },
         status: Arc::clone(&status),
         drivers: drivers.clone(),
         schedule: fast_schedule(root.path()),
@@ -3702,6 +2936,9 @@ fn permanent_fingerprint_failure_does_not_retry() {
         family: "family".into(),
         scope: "scope".into(),
         semantic: backend.config(),
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: crate::config::Config::default().search_index_max_file_size,
+        },
         status: Arc::clone(&status),
         drivers: InstalledDriver::default(),
         schedule: fast_schedule(root.path()),
@@ -3825,6 +3062,7 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     write_tree(root.path(), FILES);
+    let _watcher = steady_watcher(root.path());
     let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
     let model = Arc::new(Model::default());
     refresh(&runtime, &model);
@@ -3866,7 +3104,9 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
     runtime.driver().take_reconcile_work();
     runtime.plane().take_source_reads();
     online.store(true, Ordering::SeqCst);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // A loaded Windows runner can take more than 5 s to reach the next retry
+    // and finish the fill; a fill that never settles still fails here.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let settled = loop {
         match observer.rx.recv_deadline(deadline) {
             Ok("retry") => continue,
@@ -3883,9 +3123,10 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
         "retry repeated source work: {work:?}"
     );
     let reads = runtime.plane().take_source_reads();
+    let canonical_target = std::fs::canonicalize(&target).unwrap();
     assert_eq!(
         reads.keys().collect::<Vec<_>>(),
-        vec![&target],
+        vec![&canonical_target],
         "retry read an unchanged, already-embedded source: {reads:?}"
     );
     assert_eq!(
@@ -4090,6 +3331,20 @@ fn served_lane(
     (slot, epoch, wake, runtime)
 }
 
+/// A steady, complete watcher subscription for `root`, as a running watcher
+/// keeps on Linux and Windows. With one, a verified bind of an unchanged
+/// checkout reads only the paths the watcher or an AFT write reported instead
+/// of walking the whole checkout, which the source-work assertions of the
+/// tests that take one rely on. Without one (macOS, or no watcher) every bind
+/// walks the checkout; `no_subscription_refresh_installs_and_answers_complete`
+/// covers that case.
+fn steady_watcher(root: &Path) -> crate::watcher_backend::subscription::Subscription {
+    crate::watcher_backend::subscription::start(
+        &std::fs::canonicalize(root).unwrap(),
+        crate::watcher_backend::InitialCoverage::Complete,
+    )
+}
+
 /// A fill that fails because the embedding backend is down is retried on a
 /// backoff: with no edit, wake or reconfigure, the view becomes complete once
 /// the backend answers again.
@@ -4220,7 +3475,10 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
     runtime
         .driver()
         .record_absolute_change(&root.path().join("src/gamma.rs"));
-    let view_dir = crate::views::registry::view_dir(storage.path(), "scope").unwrap();
+    // The view's v3 member directory, where its worker generations publish.
+    let view_dir =
+        crate::blob_store::v3::view_dir(storage.path(), "family", &super::view_scope("scope"))
+            .unwrap();
     let original = std::fs::metadata(&view_dir).unwrap().permissions();
     std::fs::set_permissions(&view_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let worker = {
@@ -4252,7 +3510,9 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
         answer
             .unavailable
             .as_deref()
-            .is_some_and(|reason| reason.contains("Permission denied")),
+            // The v3 member publishes through its SQLite store, which reports
+            // the read-only directory as a read-only database.
+            .is_some_and(|reason| reason.contains("readonly database")),
         "{answer:?}"
     );
 }
@@ -4299,6 +3559,11 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
     let (new_epoch, _new_wake) = slot.begin();
     let new = lane("new-model", &slot, new_epoch);
     new.load().unwrap();
+    // An edit only the old lane sees gives its final bind a generation to
+    // publish; a bind with nothing new publishes nothing.
+    let edited = root.path().join("src/gamma.rs");
+    std::fs::write(&edited, "pub fn gamma_superseded() {}\n").unwrap();
+    old.driver().record_absolute_change(&edited);
     release.send(()).unwrap();
     let refused = final_fold.join().unwrap();
 
@@ -4307,16 +3572,32 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
         error.contains(super::super::first_load::SUPERSEDED_PUBLISH),
         "{error}"
     );
-    let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
-    let view = registry
-        .register_view_with_storage(registry.storage(), "scope", root.path())
-        .unwrap();
-    let store = view.view_store().unwrap();
-    let current = store.current_generation().unwrap().unwrap();
-    let manifest = store.load_manifest_v2(&current).unwrap();
-    assert_eq!(
-        manifest.header().producers.semantic.as_deref(),
-        Some(new.plane().semantic_producer().id().as_str()),
+    // The member's published generation is still the replacement's.
+    let producers = |model: &str| Producers {
+        trigram: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: crate::config::Config::default().search_index_max_file_size,
+        }
+        .fingerprint_hex(),
+        semantic: Some(SemanticProducer::current(model, EmbedTextCaps::default()).id()),
+        callgraph: super::super::callgraph::PRODUCER.into(),
+    };
+    let member = super::view_scope("scope");
+    assert!(super::super::base_refs::open_foreign_v3(
+        storage.path(),
+        "family",
+        &member,
+        &producers("new-model")
+    )
+    .unwrap()
+    .is_some());
+    assert!(
+        super::super::base_refs::open_foreign_v3(
+            storage.path(),
+            "family",
+            &member,
+            &producers("old-model")
+        )
+        .is_err(),
         "the view names the superseded producer"
     );
 }
@@ -4415,4 +3696,200 @@ fn report_resident_memory() {
         memory.private,
         legacy.estimated_memory().estimated_bytes.unwrap_or(0)
     );
+}
+
+/// Every file under `path`, relative to it, for a writer-stop inventory.
+fn files_under(path: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry = entry.path();
+            if entry.is_dir() {
+                stack.push(entry);
+            } else {
+                found.push(entry.strip_prefix(path).unwrap().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The semantic view is a v3 member: its first bind bootstraps a base whose
+/// semantic entries are pending, the checkout holding the base's claim fills
+/// them and publishes a readiness successor, and every later checkout of the
+/// same bytes (and a restart) serves those vectors without embedding again.
+/// Nothing is written to the v2 view registry or v2 stores.
+#[test]
+fn semantic_member_base_owner_fills_its_base_and_writes_nothing_outside_v3() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let first_root = std::fs::canonicalize({
+        let root = temp.path().join("first");
+        write_tree(&root, FILES);
+        root
+    })
+    .unwrap();
+    let second_root = std::fs::canonicalize({
+        let root = temp.path().join("second");
+        write_tree(&root, FILES);
+        root
+    })
+    .unwrap();
+    let model = Model::default();
+    let (expected, unique_texts) = cold(&first_root, "alpha total");
+
+    let first = open(&storage, "first", &first_root);
+    assert!(
+        first.installed().generation().base_header().is_some(),
+        "a v3 member composes a base"
+    );
+    // Before the owner fills, the inherited files are pending, never absent.
+    let before = query(&first, "alpha total");
+    assert!(!before.pending.is_empty(), "{before:?}");
+    assert!(!before.complete(), "{before:?}");
+    assert!(!first
+        .plane()
+        .inherited_pending(&first.installed())
+        .is_empty());
+
+    refresh(&first, &model);
+    assert_eq!(first.base_successor_count(), 1);
+    assert!(first
+        .plane()
+        .inherited_pending(&first.installed())
+        .is_empty());
+    assert_eq!(model.texts(), unique_texts, "each chunk is embedded once");
+    let filled = query(&first, "alpha total");
+    assert!(filled.complete(), "{filled:?}");
+    assert_eq!(rows(&first_root, &filled.results), expected);
+    assert!(first.search_count() >= 2);
+
+    // A second checkout of the same bytes reuses the stored vectors: its
+    // base (another root has another base identity) is filled from the
+    // family's rows without calling the model.
+    let second = open(&storage, "second", &second_root);
+    refresh(&second, &model);
+    assert_eq!(model.texts(), unique_texts, "the second checkout embedded");
+    assert!(second
+        .plane()
+        .inherited_pending(&second.installed())
+        .is_empty());
+    let answer = query(&second, "alpha total");
+    assert!(answer.complete(), "{answer:?}");
+    assert_eq!(rows(&second_root, &answer.results), expected);
+
+    // A restart resumes from the published member and the filled base.
+    drop(first);
+    let restarted = open(&storage, "first", &first_root);
+    refresh(&restarted, &model);
+    assert_eq!(model.texts(), unique_texts, "the restart embedded");
+    let answer = query(&restarted, "alpha total");
+    assert!(answer.complete(), "{answer:?}");
+    assert_eq!(rows(&first_root, &answer.results), expected);
+
+    // Writer stop: no v2 view, v2 store or legacy import ledger.
+    let outside_v3 = files_under(&storage)
+        .into_iter()
+        .filter(|path| {
+            !Path::new(path).starts_with(Path::new("blobs").join("v3"))
+                && !path.ends_with("reader-floor.json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outside_v3, Vec::<String>::new());
+}
+
+#[test]
+fn base_successor_rebind_keeps_filled_answers_vouched_without_a_subscription() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    assert!(crate::watcher_backend::subscription::current(root.path()).is_none());
+    let runtime = open(storage.path(), "scope", root.path());
+    let binds = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&binds);
+    *lock(&runtime.before_bind_verify) = Some(Box::new(move |runtime| {
+        // The first bind reconciles the refresh's subscription check. The
+        // second only picks up the base readiness successor after filling.
+        if observed.fetch_add(1, Ordering::SeqCst) == 1 {
+            let answer = query(runtime, "alpha");
+            assert!(
+                answer.complete(),
+                "base rebind invalidated filled vectors: {answer:?}"
+            );
+            assert_eq!(
+                rows(runtime.root(), &answer.results),
+                cold(runtime.root(), "alpha").0
+            );
+            // Skipping a redundant check must not hide an actual delivery gap.
+            runtime.driver().record_watcher_overflow();
+            assert!(query(runtime, "alpha").unvouched);
+        }
+    }));
+    let report = refresh(&runtime, &Model::default());
+    assert_eq!(report.deferred, 0, "{report:?}");
+    assert_eq!(binds.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.base_successor_count(), 1);
+    assert!(query(&runtime, "alpha").complete());
+}
+
+/// A checkout without a steady watcher subscription (macOS, or a root whose
+/// watcher is not running) is the case where the driver's subscription check
+/// marks the checkout overflowed on every check. Searches read the installed
+/// cut without that check, so reading answers neither bumps the live epoch nor
+/// leaves every answer unvouched, and a refresh after searches and an edit
+/// still installs: its bind applies the check once, before it verifies the
+/// tree, and its fold installs without repeating it.
+#[test]
+fn no_subscription_refresh_installs_and_answers_complete() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    assert!(crate::watcher_backend::subscription::current(
+        &std::fs::canonicalize(root.path()).unwrap()
+    )
+    .is_none());
+    let runtime = open(storage.path(), "scope", root.path());
+    let model = Model::default();
+    let first = refresh(&runtime, &model);
+    assert_eq!(first.deferred, 0);
+    let epoch = runtime.installed().epoch();
+    for _ in 0..3 {
+        let answer = query(&runtime, "alpha");
+        assert!(answer.complete(), "{answer:?}");
+        assert_eq!(
+            rows(root.path(), &answer.results),
+            cold(root.path(), "alpha").0
+        );
+    }
+    assert_eq!(
+        runtime.installed().epoch(),
+        epoch,
+        "a search marked the checkout overflowed"
+    );
+    let target = root.path().join("src/gamma.rs");
+    std::fs::write(
+        &target,
+        "pub fn gamma_rewritten(input: &str) -> usize {\n    input.len()\n}\n",
+    )
+    .unwrap();
+    runtime.driver().record_absolute_change(&target);
+    // Searches between the edit and the refresh must not make the refresh's
+    // installs refuse their cut.
+    let _ = query(&runtime, "gamma");
+    let second = refresh(&runtime, &model);
+    assert_eq!(second.deferred, 0);
+    assert!(second.installed > 0, "{second:?}");
+    let answer = query(&runtime, "gamma rewritten");
+    assert!(answer.complete(), "{answer:?}");
+    assert_eq!(
+        rows(root.path(), &answer.results),
+        cold(root.path(), "gamma rewritten").0
+    );
+    assert_eq!(pending_semantic(&runtime), 0);
 }

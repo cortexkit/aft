@@ -129,7 +129,11 @@ pub(crate) fn handle_with_observation_only(
         ctx.bash_background().has_erased_watch_reference(&task_id)
     };
     if erased {
-        return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
+        return if observation_only {
+            Response::error(&req.id, "task_not_found", "The viewed task was not found.")
+        } else {
+            Response::error(&req.id, "task_erased", format_erased_task_message(&task_id))
+        };
     }
     // Settled: a kill in flight is waited out (bounded) so callers that stop
     // polling at the first non-running status see its terminal outcome.
@@ -166,6 +170,11 @@ pub(crate) fn handle_with_observation_only(
     let mut worker_owner = None;
     let snapshot = own_snapshot
         .or_else(|| {
+            // An observation-only read is restricted to the request's session;
+            // ordinary reads may also resolve a delegated worker's task.
+            if observation_only {
+                return None;
+            }
             worker_owner = ctx
                 .bash_background()
                 .readable_worker_task_owner(&task_id, &storage_dir);
@@ -372,6 +381,13 @@ pub(crate) fn handle_with_observation_only(
             }
         }
         None => {
+            if observation_only {
+                return Response::error(
+                    &req.id,
+                    "task_not_found",
+                    "The viewed task was not found.",
+                );
+            }
             // Replay records a refusal before returning no snapshot. Consult
             // both supported layouts so this task names the reader mismatch
             // rather than pretending its record was lost.

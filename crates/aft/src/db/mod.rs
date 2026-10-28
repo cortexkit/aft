@@ -21,6 +21,7 @@ pub mod call_ledger;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub(crate) mod contention_probe;
+pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
@@ -34,7 +35,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+pub const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -58,6 +59,8 @@ const MIGRATION_VERSIONS: &[u32] = &[
     19,
     rich_ui::SCHEMA_VERSION,
     21,
+    22,
+    23,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1019,6 +1022,8 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         19 => call_ledger::migrate_result_source(conn),
         rich_ui::SCHEMA_VERSION => conn.execute_batch(rich_ui::MIGRATION),
         21 => apply_migration_v21(conn),
+        22 => conn.execute_batch(gh_speech::MIGRATION),
+        23 => conn.execute_batch(gh_speech::LEGACY_DISPATCH_MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1055,6 +1060,70 @@ fn apply_migration_v21(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_twenty_one_upgrade_adds_speech_authority_without_a_gap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=21 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(current_schema_version(&conn).unwrap(), 21);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 23);
+        for table in [
+            "gh_speech_authorities",
+            "gh_speech_task_revocations",
+            "gh_speech_scope_ends",
+            "gh_speech_policy_versions",
+            "gh_speech_policy_watermarks",
+            "gh_speech_requests",
+            "gh_speech_legacy_dispatch",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}");
+        }
+        assert_eq!(MIGRATION_VERSIONS, (1..=23).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn schema_twenty_two_upgrade_preserves_revocations_and_adds_dispatch_outcomes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=22 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES('old-task','cancelled',1)", []).unwrap();
+        let absent: bool = conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name='gh_speech_legacy_dispatch')", [], |row| row.get(0)).unwrap();
+        assert!(
+            absent,
+            "schema 22 must not silently acquire schema 23 tables"
+        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), 23);
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM gh_speech_task_revocations WHERE incarnation='old-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "cancelled");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM gh_speech_legacy_dispatch",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
     use rusqlite::params;
     use tempfile::tempdir;
 
@@ -1472,7 +1541,9 @@ mod tests {
         .unwrap();
         assert!(crate::reader_floor::prepare(dir.path()).is_empty());
         let conn = open(&path).unwrap();
-        assert_eq!(schema_version(&conn), 21);
+        // Opening migrates through every later version too, so the result is
+        // the current schema; the v21 columns below must still be present.
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         let columns = conn
             .prepare("PRAGMA table_info(bash_pattern_watches)")
             .unwrap()
@@ -1499,7 +1570,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .get(crate::persisted_format::PersistedStore::AftDb),
-            Some(21)
+            Some(u64::from(CURRENT_SCHEMA_VERSION))
         );
     }
 

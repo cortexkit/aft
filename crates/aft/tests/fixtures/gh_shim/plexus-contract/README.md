@@ -224,13 +224,16 @@ directory fails the test too.
  "reply": { <the facade's full reply> }}
 ```
 
-These are the refusals that happen after a GitHub pre-read, which `map` alone
-cannot reach. `tests/it/github_facade_vendor_band/v22.rs`
+These are replies after a GitHub pre-read, which `map` alone cannot reach.
+`tests/it/github_facade_vendor_band/v22.rs`
 (`v22_reply_contract_files_match_the_facade`) sends each request through the
 real facade (`bot_request_scoped`) with a fake GitHub server answering the
-reads in `github_reads` order, then compares the rendered file to the stored
-one byte for byte. `request_line` and `request_body` are what the facade sent;
-no write is ever sent in these cases. The bound repository in this harness is
+reads in `github_reads` order, followed by any writes in the optional
+`github_writes` array, then compares the rendered file to the stored one byte
+for byte. `request_line` and `request_body` are what the facade sent; the
+refusal cases in this directory send no writes. `resolve-thread-own.json`
+records an accepted resolve and its mutation in `github_writes`. The bound
+repository in this harness is
 `org/repo` and the bot is `app-fixture[bot]`.
 
 `reply` is exactly what the facade returns:
@@ -241,6 +244,9 @@ refusals, `code` and `detail`:
 - `pr_edit_not_own`: `detail.message`;
 - `stack_pr_not_own`: `detail.number`, `detail.author_login`,
   `detail.message`.
+- `review_thread_not_own`: `detail.number`, `detail.author_login`,
+  `detail.message`. Resolve refuses PRs the bot did not open; unresolve still
+  goes to GitHub without a PR ownership check.
 
 `pr ready` (and its draft form) refuses a pull request the bot did not open
 with a bare `refusal_code: "pr_edit_not_own"` and no `code` or `detail`; see

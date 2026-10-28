@@ -551,7 +551,7 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "inspect_scope_topk", tool_name: "inspect", agent_args: { sections: ["diagnostics"], scope: ["src", "docs"], topK: 5 } },
   { name: "inspect_invalid_topk", tool_name: "inspect", expected_error: "topK must be an integer between 1 and 100", agent_args: { topK: 1.5 } },
   { name: "outline_url", tool_name: "outline", agent_args: { target: "https://example.com/doc" } },
-  { name: "outline_url_files_mode", tool_name: "outline", agent_args: { target: "https://example.com/doc", files: true } },
+  { name: "outline_url_files_mode", tool_name: "outline", agent_args: { target: "https://example.com/doc", files: true }, expected_error: "files mode requires directory targets; URLs aren't directories" },
   { name: "outline_array_files", tool_name: "outline", agent_args: { target: ["src", "docs"], files: true } },
   { name: "outline_directory_json_mode", tool_name: "outline", agent_args: { target: "src" } },
   { name: "outline_directory_include_tests", tool_name: "outline", agent_args: { target: "src", includeTests: true } },

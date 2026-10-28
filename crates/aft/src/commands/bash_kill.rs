@@ -78,15 +78,50 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 .kill_relaxed_typed(&task_id, project_root, &storage_dir)
         });
 
+    let warning = crate::gh_shim_speech::service::revocation_pending(req.session(), &task_id);
+    let mut warnings = Vec::new();
+    if warning {
+        warnings.push(crate::gh_shim_speech::REVOCATION_NOT_DURABLE.to_string());
+    }
+    let queued = ctx
+        .bash_background()
+        .queued_bot_writes(req.session(), &task_id);
+    match queued {
+        Some(count) if count > 0 => warnings.push(queued_writes_warning(count)),
+        None => warnings.push("bot_writes_already_queued: writes already queued for this command may still post; the pending count could not be read.".to_string()),
+        _ => {},
+    }
+    let warning_text = (!warnings.is_empty()).then(|| warnings.join("\n"));
     match result {
-        Ok(snapshot) => Response::success(&req.id, json!(snapshot)),
+        Ok(snapshot) => {
+            let mut data = json!(snapshot);
+            if let Some(warning) = &warning_text {
+                data["bot_write_revocation_warning"] = json!(warning);
+            }
+            if queued.is_some_and(|count| count > 0) {
+                data["bot_writes_already_queued"] = json!(queued.unwrap());
+            }
+            Response::success(&req.id, data)
+        }
         Err(message) if message.is_missing_task() => Response::error(
             &req.id,
             "task_not_found",
             format_unknown_polled_task_message(&task_id, req.host_tool_names().shell()),
         ),
-        Err(message) => Response::error(&req.id, "kill_failed", message.to_string()),
+        Err(message) => Response::error(
+            &req.id,
+            "kill_failed",
+            if let Some(warning) = warning_text {
+                format!("{message}\n{warning}")
+            } else {
+                message.to_string()
+            },
+        ),
     }
+}
+
+pub(crate) fn queued_writes_warning(count: u64) -> String {
+    format!("bot_writes_already_queued: {count} writes already queued for this command may still post; cancellation cannot unsend them.")
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@ mod read_policy_cache {
         context: usize,
         request: String,
         scope: Option<ScopeKey>,
+        scope_grants_denial: Option<crate::access_policy::ScopeGrantsDenial>,
         route_generation: u64,
         policy: RefCell<Option<Arc<AccessPolicy>>>,
         unrestored: RefCell<Option<Vec<crate::context::launch_grants::UnrestoredGrant>>>,
@@ -69,6 +70,7 @@ mod read_policy_cache {
                 .as_ref()
                 .filter(|entry| {
                     let authority_matches = crate::access_policy::scope_matches(&entry.scope)
+                        && entry.scope_grants_denial == crate::access_policy::scope_grants_denial()
                         && entry.route_generation == crate::access_policy::ask_route_generation();
                     if !authority_matches {
                         entry.clear();
@@ -92,6 +94,7 @@ mod read_policy_cache {
             context,
             request: request.to_owned(),
             scope: crate::access_policy::current_scope(),
+            scope_grants_denial: crate::access_policy::scope_grants_denial(),
             route_generation: crate::access_policy::ask_route_generation(),
             policy: RefCell::new(None),
             unrestored: RefCell::new(None),
@@ -102,6 +105,7 @@ mod read_policy_cache {
             // A nested call under another authority must not revive the outer
             // call's old grants when its cache slot is restored on return.
             if !crate::access_policy::scope_matches(&previous.scope)
+                || previous.scope_grants_denial != crate::access_policy::scope_grants_denial()
                 || previous.route_generation != crate::access_policy::ask_route_generation()
             {
                 previous.clear();
@@ -16183,7 +16187,9 @@ impl AppContext {
         // refusals that the admitted route applies.
         let guarded = standalone || self.missing_plugin_route();
         let temp_override = crate::access_policy::temp::roots_override();
+        let scope_grants_denial = crate::access_policy::scope_grants_denial();
         let build = move || {
+            let _grants = crate::access_policy::scope_grants_guard(scope_grants_denial);
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
             policy.standalone_main_roots = main_roots;
             if guarded {
@@ -16715,7 +16721,7 @@ impl AppContext {
                     original.display()
                 ),
             )),
-            AccessDecision::Deny(AccessDenial::OutsideRoots) => {
+            AccessDecision::Deny(AccessDenial::OutsideRoots | AccessDenial::ScopeGrants(_)) => {
                 let root = self
                     .config()
                     .project_root

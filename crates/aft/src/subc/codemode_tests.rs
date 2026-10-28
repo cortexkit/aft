@@ -575,6 +575,7 @@ fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
             },
             run_id: "earlier-run".into(),
             owner_route: other,
+            owner_route_channel: channel(2),
             run_route: channel(5),
             run_principal: other_principal,
         }));
@@ -1314,9 +1315,11 @@ fn worker_runs_shell_has_no_bot_identity_to_speak_as() {
     ));
     // The gh relay finds a shell's scope by the session its ticket names: a
     // worker run's shell runs in the worker's session, so it gets the
-    // worker's stamp, which names no agent to act as. Bot writes are refused
-    // (`bot_write_requires_scope`) exactly as for the worker's own shell.
-    let scopes = gh_relay_route_scopes(&f.routes);
+    // worker's stamp, which names no agent to act as. Neither stamp grants
+    // the Head authority required for bot writes.
+    let storage = tempfile::tempdir().unwrap();
+    let speech = crate::gh_shim_speech::service::record_service(storage.path());
+    let scopes = gh_relay_route_scopes(&f.routes, &speech);
     let stamp = scopes
         .for_session(&effective.session)
         .expect("the worker session has one stamp");

@@ -22,6 +22,84 @@ fn seed(storage: &Path, family: &str) {
     })
     .unwrap();
 }
+
+#[test]
+fn put_batch_keeps_conflict_winners_and_commits_other_rows_in_one_transaction() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let next = FamilyKey::new(FamilyPlane::Semantic, [8; 32]);
+    let rows = vec![
+        (key(), b"different".to_vec()),
+        (next, b"new row".to_vec()),
+        (key(), b"v3 data".to_vec()),
+        (next, b"new row".to_vec()),
+        (next, b"different new row".to_vec()),
+    ];
+    work_profile::take();
+    let outcomes = publish(root.path(), A, 1 << 20, None, |p| {
+        p.put_or_touch_batch(FamilyPlane::Semantic, &rows, 1)
+    })
+    .unwrap();
+    assert!(matches!(
+        outcomes[0],
+        Err(Error::Refused("payload_mismatch"))
+    ));
+    assert!(matches!(outcomes[1], Ok(true)));
+    assert!(matches!(outcomes[2], Ok(false)));
+    assert!(matches!(outcomes[3], Ok(false)));
+    assert!(matches!(
+        outcomes[4],
+        Err(Error::Refused("payload_mismatch"))
+    ));
+    assert_eq!(work_profile::count("put_transaction"), 1);
+    let reader = PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic).unwrap();
+    assert_eq!(reader.get(&key()).unwrap().unwrap(), b"v3 data");
+    assert_eq!(reader.get(&next).unwrap().unwrap(), b"new row");
+}
+
+#[test]
+fn publication_survives_a_sidecar_disappearing_during_accounting() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    // A detached sidecar stands in for one removed by a closing SQLite handle.
+    // Do not unlink a sidecar that an active database connection still uses.
+    let sidecar = family_dir(root.path(), A)
+        .unwrap()
+        .join("closed.sqlite-wal");
+    fs::write(&sidecar, b"transient WAL bytes").unwrap();
+    let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = std::rc::Rc::clone(&removed);
+    WALK_BEFORE_STAT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            if path == sidecar {
+                fs::remove_file(path).unwrap();
+                observed.set(true);
+            }
+        }));
+    });
+    let chunk = FamilyKey::new(FamilyPlane::Semantic, [8; 32]);
+    let run = FamilyKey::new(FamilyPlane::Semantic, [9; 32]);
+    let rows = vec![(chunk, b"chunk".to_vec()), (run, b"run".to_vec())];
+    let result = publish(root.path(), A, 1 << 20, None, |publication| {
+        publication.put_or_touch_batch(FamilyPlane::Semantic, &rows, 1)
+    });
+    WALK_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+
+    assert!(
+        removed.get(),
+        "the accounting walk did not reach the sidecar"
+    );
+    let outcomes = result.unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes
+        .into_iter()
+        .all(|outcome| matches!(outcome, Ok(true))));
+    let reader = PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic).unwrap();
+    assert_eq!(reader.get(&chunk).unwrap().unwrap(), b"chunk");
+    assert_eq!(reader.get(&run).unwrap().unwrap(), b"run");
+}
 #[cfg(unix)]
 pub(super) fn inventory(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;

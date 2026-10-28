@@ -2,7 +2,7 @@
   "github_reads": [
     {
       "request_body": {
-        "query": "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { repository { nameWithOwner } } } } }",
+        "query": "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { number repository { nameWithOwner } } } } }",
         "variables": {
           "threadId": "PRRT_kwDOAbc123"
         }
@@ -13,6 +13,7 @@
           "node": {
             "id": "PRRT_kwDOAbc123",
             "pullRequest": {
+              "number": 7,
               "repository": {
                 "nameWithOwner": "foreign/repo"
               }

@@ -33,6 +33,8 @@ use aft::migration::prune_legacy::{
     prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneObserver, PruneOptions,
     OPERATOR_CONTRACT, PRUNE_DIR_PREFIX,
 };
+use aft::migration::v3_import::LegacyArtifact;
+use aft::migration::v3_ledger::{run_v3_import, ArtifactOutcome, V3ImportRequest, V3Ledger};
 use aft::search_index::SearchIndex;
 use aft::semantic_index::{EmbedTextCaps, SemanticIndex, SemanticIndexFingerprint};
 use aft::views::first_load::{ConfiguredMembershipWalker, MembershipWalker};
@@ -710,8 +712,27 @@ fn migrated_planes_equal_a_cold_rebuild() {
 
     let storage = base.path().join("storage");
     write_legacy_set(&storage, &root, KEY, POLICY.max_file_size);
-    let report = run_import(&lane_request(&storage, &root, KEY), None).unwrap();
-    assert_eq!(report.semantic_files, FILES.len(), "{report:?}");
+    // The views-on lane is a v3 member, so its legacy set is imported into
+    // the family's v3 planes, as views-on configure does.
+    let report = run_v3_import(
+        &V3ImportRequest::full_plane(
+            storage.clone(),
+            KEY.to_owned(),
+            KEY.to_owned(),
+            root.clone(),
+            POLICY,
+            Some(producer()),
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report.outcomes.get(&LegacyArtifact::Semantic),
+            Some(ArtifactOutcome::Done { skipped: 0, .. })
+        ),
+        "{report:?}"
+    );
     let (embedded, rows) = lane_fill(&storage, &root, KEY, query);
     assert_eq!(
         embedded, 0,
@@ -1565,9 +1586,15 @@ mod production {
             "{during:#}"
         );
         assert_ne!(during["complete"], true, "{during:#}");
-        let ledger = ImportLedger::open_existing(&storage, &key).unwrap();
+        // The views-on lane imports into the family's v3 planes through the
+        // v3 ledger (the family is the legacy key).
+        let ledger = V3Ledger::new(&storage, &key).unwrap();
         assert!(
-            ledger.is_none_or(|ledger| !ledger.status().unwrap().complete),
+            ledger
+                .rows()
+                .unwrap()
+                .iter()
+                .all(|row| row.state != ImportState::Done),
             "the import ran before it was admitted"
         );
 
@@ -1584,14 +1611,17 @@ mod production {
             legacy_texts,
             "the views-on lane re-embedded content the legacy index already held"
         );
-        let status = ImportLedger::read_status(&storage, &key).unwrap().unwrap();
-        assert!(status.complete, "{status:?}");
-        let semantic = status
-            .rows
+        let rows = ledger.rows().unwrap();
+        let semantic = rows
             .iter()
-            .find(|row| row.artifact == Artifact::Semantic)
+            .find(|row| row.key.artifact == LegacyArtifact::Semantic)
             .unwrap();
         assert_eq!(semantic.state, ImportState::Done, "{semantic:?}");
+        // Writer stop: the views-on lane no longer imports through the v2
+        // import ledger into the v2 family stores.
+        assert!(ImportLedger::open_existing(&storage, &key)
+            .unwrap()
+            .is_none());
         let after = search(&ctx, "evict the oldest cache entry");
         assert!(
             after["results"]

@@ -1038,18 +1038,28 @@ impl PinnedDir {
         }
     }
 
-    pub(crate) fn repair_directory_identities(
+    /// Read-only identity census. Every durable descendant is needed because a
+    /// cache being removed may contain an alias of a nested durable directory.
+    pub(crate) fn directory_identities(
         &self,
         output: &mut Vec<(u64, u64)>,
         budget: &mut RepairBudget,
+        examined: &mut IdentityCensus,
     ) -> io::Result<()> {
-        self.repair_identities(output, budget, &mut std::collections::HashSet::new(), 0)
+        self.collect_directory_identities(
+            output,
+            budget,
+            examined,
+            &mut std::collections::HashSet::new(),
+            0,
+        )
     }
 
-    fn repair_identities(
+    fn collect_directory_identities(
         &self,
         output: &mut Vec<(u64, u64)>,
         budget: &mut RepairBudget,
+        examined: &mut IdentityCensus,
         seen: &mut std::collections::HashSet<(u64, u64)>,
         depth: usize,
     ) -> io::Result<()> {
@@ -1059,20 +1069,47 @@ impl PinnedDir {
             return Ok(());
         }
         output.push(id);
+        examined.directories += 1;
         let mount = self.repair_mount_identity()?;
-        let names = self.repair_names(budget)?;
-        #[cfg(test)]
-        REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook(self.path());
+        #[cfg(unix)]
+        let mut entries = self.unix_entries()?;
+        #[cfg(windows)]
+        let mut entries = self
+            .repair_names(budget)?
+            .into_iter()
+            .map(|name| Ok::<_, io::Error>((name, true)));
+        loop {
+            // Check before advancing the iterator, not after collecting a whole
+            // directory. Also check while processing leaves, not just recursion.
+            budget.enter(depth)?;
+            #[cfg(unix)]
+            budget.entry()?;
+            let Some(entry) = entries.next() else { break };
+            let (name, may_be_directory) = entry?;
+            examined.entries += 1;
+            #[cfg(test)]
+            REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook(self.path());
+                }
+            });
+            // dirent types avoid opening every task artifact as a directory.
+            // Unknown types must still be probed, and opens remain no-follow.
+            if !may_be_directory {
+                continue;
             }
-        });
-        for name in names {
+            examined.directory_probes += 1;
             match self.repair_child(&name) {
                 Ok(child) => {
                     let child_id = child.directory_identity()?;
                     if child_id.0 == id.0 && child.repair_mount_identity()? == mount {
-                        child.repair_identities(output, budget, seen, depth + 1)?;
+                        child.collect_directory_identities(
+                            output,
+                            budget,
+                            examined,
+                            seen,
+                            depth + 1,
+                        )?;
                     } else {
                         // Without the mounted subtree's identities a bind alias
                         // elsewhere cannot be ruled out. Never use a partial census.
@@ -1284,6 +1321,18 @@ impl PinnedDir {
 
     #[cfg(unix)]
     fn unix_names(&self, mut admit: impl FnMut() -> io::Result<()>) -> io::Result<Vec<OsString>> {
+        let mut entries = self.unix_entries()?;
+        let mut names = Vec::new();
+        loop {
+            admit()?;
+            let Some(entry) = entries.next() else { break };
+            names.push(entry?.0);
+        }
+        Ok(names)
+    }
+
+    #[cfg(unix)]
+    fn unix_entries(&self) -> io::Result<DirectoryEntries> {
         let dot = b".\0";
         let fresh = unsafe {
             libc::openat(
@@ -1301,50 +1350,11 @@ impl PinnedDir {
             unsafe { libc::close(fresh) };
             return Err(error);
         }
-        let mut names = Vec::new();
-        loop {
-            let errno = repair_errno_location();
-            if errno.is_null() {
-                unsafe { libc::closedir(directory) };
-                return Err(io::Error::other(
-                    "directory enumeration errno is unavailable",
-                ));
-            }
-            unsafe { *errno = 0 };
+        Ok(DirectoryEntries {
+            directory,
             #[cfg(test)]
-            let fail = REPAIR_READDIR_FAIL_AFTER
-                .with(|limit| limit.get().is_some_and(|limit| names.len() >= limit));
-            #[cfg(not(test))]
-            let fail = false;
-            let entry = if fail {
-                unsafe { *errno = libc::EIO };
-                std::ptr::null_mut()
-            } else {
-                unsafe { libc::readdir(directory) }
-            };
-            if entry.is_null() {
-                let error = unsafe { *errno };
-                if error != 0 {
-                    unsafe { libc::closedir(directory) };
-                    return Err(io::Error::from_raw_os_error(error));
-                }
-                break;
-            }
-            let bytes = unsafe {
-                std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
-                    .to_bytes()
-                    .to_vec()
-            };
-            if bytes != b"." && bytes != b".." {
-                if let Err(error) = admit() {
-                    unsafe { libc::closedir(directory) };
-                    return Err(error);
-                }
-                names.push(OsString::from_vec(bytes));
-            }
-        }
-        unsafe { libc::closedir(directory) };
-        Ok(names)
+            emitted: 0,
+        })
     }
 
     pub fn list_names(&self) -> io::Result<Vec<OsString>> {
@@ -1985,7 +1995,7 @@ impl PersistedTask {
         compressed: bool,
     ) -> Self {
         let call_key = Some(super::call_key_for_new_task(&task_id));
-        Self {
+        let metadata = Self {
             schema_version: SCHEMA_VERSION,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
             task_id,
@@ -2038,7 +2048,9 @@ impl PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
-        }
+        };
+        crate::gh_shim_ticket::capture_spawn(&metadata);
+        metadata
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -2066,6 +2078,7 @@ impl PersistedTask {
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
         self.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        crate::gh_shim_ticket::seal_spawn(self);
     }
 
     pub fn mark_terminal(
@@ -3720,6 +3733,75 @@ pub(crate) struct RepairBudget {
     deadline: std::time::Instant,
     cancelled: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct IdentityCensus {
+    pub entries: usize,
+    pub directories: usize,
+    pub directory_probes: usize,
+}
+
+/// Owns a fresh stream opened relative to a pinned directory, so traversal does
+/// not depend on a pathname staying attached to the same directory.
+#[cfg(unix)]
+struct DirectoryEntries {
+    directory: *mut libc::DIR,
+    #[cfg(test)]
+    emitted: usize,
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryEntries {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.directory) };
+    }
+}
+
+#[cfg(unix)]
+impl Iterator for DirectoryEntries {
+    type Item = io::Result<(OsString, bool)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let errno = repair_errno_location();
+            if errno.is_null() {
+                return Some(Err(io::Error::other(
+                    "directory enumeration errno is unavailable",
+                )));
+            }
+            unsafe { *errno = 0 };
+            #[cfg(test)]
+            let fail = REPAIR_READDIR_FAIL_AFTER
+                .with(|limit| limit.get().is_some_and(|limit| self.emitted >= limit));
+            #[cfg(not(test))]
+            let fail = false;
+            let entry = if fail {
+                unsafe { *errno = libc::EIO };
+                std::ptr::null_mut()
+            } else {
+                unsafe { libc::readdir(self.directory) }
+            };
+            if entry.is_null() {
+                let error = unsafe { *errno };
+                return (error != 0).then(|| Err(io::Error::from_raw_os_error(error)));
+            }
+            let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes() };
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.emitted += 1;
+            }
+            let kind = unsafe { (*entry).d_type };
+            return Some(Ok((
+                OsString::from_vec(bytes.to_vec()),
+                kind == libc::DT_DIR || kind == libc::DT_UNKNOWN,
+            )));
+        }
+    }
+}
+
 impl RepairBudget {
     pub(crate) fn limited(&self, entries: usize) -> Self {
         Self {
@@ -3885,7 +3967,11 @@ fn repair_census_propagates_late_readdir_failure() {
     }
     let pinned = PinnedDir::open(temp.path()).unwrap();
     REPAIR_READDIR_FAIL_AFTER.with(|limit| limit.set(Some(1)));
-    let result = pinned.repair_directory_identities(&mut Vec::new(), &mut RepairBudget::new());
+    let result = pinned.directory_identities(
+        &mut Vec::new(),
+        &mut RepairBudget::new(),
+        &mut IdentityCensus::default(),
+    );
     REPAIR_READDIR_FAIL_AFTER.with(|limit| limit.set(None));
     assert_eq!(
         result
@@ -3893,6 +3979,86 @@ fn repair_census_propagates_late_readdir_failure() {
             .raw_os_error(),
         Some(libc::EIO)
     );
+}
+
+#[test]
+fn identity_census_stops_processing_leaves_at_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    for entry in 0..100 {
+        fs::write(
+            temp.path().join(format!("artifact-{entry}")),
+            b"task output",
+        )
+        .unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            std::thread::sleep(
+                deadline.saturating_duration_since(std::time::Instant::now())
+                    + Duration::from_millis(1),
+            );
+        }));
+    });
+    let mut budget = RepairBudget::until(deadline, std::sync::Arc::new(|| false));
+    let mut examined = IdentityCensus::default();
+    let result = PinnedDir::open(temp.path()).unwrap().directory_identities(
+        &mut Vec::new(),
+        &mut budget,
+        &mut examined,
+    );
+    REPAIR_CENSUS_AFTER_NAMES.with(|hook| hook.borrow_mut().take());
+    assert!(is_repair_budget_stop(
+        &result.expect_err("expired leaf walk must stop")
+    ));
+    assert_eq!(
+        examined.entries, 1,
+        "the iterator must stop at the deadline"
+    );
+}
+
+#[test]
+fn identity_census_is_read_only_and_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let child = temp.path().join("task");
+    fs::create_dir(&child).unwrap();
+    let artifact = child.join("task.json");
+    fs::write(&artifact, b"finished task").unwrap();
+    let original_permissions = fs::metadata(&child).unwrap().permissions();
+    let mut read_only = original_permissions.clone();
+    read_only.set_readonly(true);
+    fs::set_permissions(&child, read_only.clone()).unwrap();
+    let before = fs::metadata(&child).unwrap().modified().unwrap();
+    let artifact_before = fs::metadata(&artifact).unwrap().modified().unwrap();
+    let pinned = PinnedDir::open(temp.path()).unwrap();
+    work_counts::reset();
+    let mut identities = Vec::new();
+    let mut examined = IdentityCensus::default();
+    pinned
+        .directory_identities(&mut identities, &mut RepairBudget::new(), &mut examined)
+        .unwrap();
+    assert_eq!(examined.directories, 2);
+    assert_eq!(examined.entries, 2);
+    assert_eq!(fs::read(&artifact).unwrap(), b"finished task");
+    assert_eq!(fs::metadata(&child).unwrap().modified().unwrap(), before);
+    assert_eq!(fs::metadata(&child).unwrap().permissions(), read_only);
+    assert_eq!(
+        fs::metadata(&artifact).unwrap().modified().unwrap(),
+        artifact_before
+    );
+    assert_eq!(work_counts::get().syncs, 0);
+    assert_eq!(work_counts::get().renames, 0);
+    assert_eq!(fs::read_dir(&child).unwrap().count(), 1);
+    let error = pinned
+        .directory_identities(
+            &mut Vec::new(),
+            &mut RepairBudget::with_entries(1),
+            &mut IdentityCensus::default(),
+        )
+        .expect_err("a partial census must not authorize deletion");
+    assert!(is_repair_budget_stop(&error));
+    assert!(artifact.exists());
+    fs::set_permissions(&child, original_permissions).unwrap();
 }
 
 /// Live storage creates and removes files all the time (atomic-write
@@ -3923,7 +4089,11 @@ fn repair_census_skips_an_entry_removed_after_listing() {
     });
     let pinned = PinnedDir::open(temp.path()).unwrap();
     let mut identities = Vec::new();
-    let result = pinned.repair_directory_identities(&mut identities, &mut RepairBudget::new());
+    let result = pinned.directory_identities(
+        &mut identities,
+        &mut RepairBudget::new(),
+        &mut IdentityCensus::default(),
+    );
     REPAIR_CENSUS_AFTER_NAMES.with(|hook| hook.borrow_mut().take());
     result.expect("an entry removed after listing must not fail the census");
     assert_eq!(*listed.borrow(), vec![temp.path().to_path_buf()]);
@@ -5829,6 +5999,7 @@ fn windows_repair_names(file: &File, budget: &mut RepairBudget) -> io::Result<Ve
     let mut result = Vec::new();
     let mut restart = 1u8;
     loop {
+        budget.enter(0)?;
         let mut bytes = vec![0u8; 64 * 1024];
         let mut io_status = std::mem::MaybeUninit::<WindowsIoStatusBlock>::uninit();
         // FileNamesInformation is a sequence of length-checked UTF-16 records.

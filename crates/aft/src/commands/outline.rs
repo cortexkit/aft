@@ -132,8 +132,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
-            &req.id,
-            req.session(),
+            req,
             project_root.as_deref(),
             &excluded,
             MultiFileBudget {
@@ -150,7 +149,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let mut body = serde_json::json!({
             "text": rendered.text,
             "discovered": true,
-            "complete": !skipped_files.iter().any(|file| file.reason == "denied_floor") && !walk_incomplete && !rendered.truncated && !rendered.cut_short,
+            "complete": !skipped_files.iter().any(|file| file.reason == "denied_floor") && !walk_incomplete && !rendered.truncated && !rendered.cut_short && !rendered.content_incomplete,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -176,8 +175,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
-            &req.id,
-            req.session(),
+            req,
             project_root.as_deref(),
             &excluded,
             MultiFileBudget {
@@ -197,7 +195,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         // left unexamined by the file cap, output budget or deadline.
         let mut body = serde_json::json!({
             "text": rendered.text,
-            "complete": skipped_files.is_empty() && !rendered.truncated && !rendered.cut_short,
+            "complete": skipped_files.is_empty() && !rendered.truncated && !rendered.cut_short && !rendered.content_incomplete,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -228,6 +226,12 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    outline_single_target(req, ctx, file)
+}
+
+/// Resolve and outline one target, sharing URL fetching and rendering between
+/// single-target calls and entries in a batch.
+fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Response {
     if is_github_read_target(file) {
         return handle_github_outline(req, ctx, file);
     }
@@ -1576,6 +1580,13 @@ fn handle_outline_files_mode(
     let mut skipped_files = Vec::new();
 
     for target in targets {
+        if is_http_url(&target) {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "files mode requires directory targets; URLs aren't directories",
+            );
+        }
         let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&target)) {
             Ok(path) => path,
             Err(response) if multiple_targets && response.data["code"] == "denied_floor" => {
@@ -2609,8 +2620,7 @@ pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
 fn outline_many_files(
     files: &[String],
     ctx: &AppContext,
-    req_id: &str,
-    session_id: &str,
+    req: &RawRequest,
     project_root: Option<&Path>,
     excluded: &HashSet<PathBuf>,
     budget: MultiFileBudget,
@@ -2620,10 +2630,14 @@ fn outline_many_files(
     // Keep request indices so denied leaves and parse failures share one list.
     let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
     for (index, file) in files.iter().enumerate() {
-        match ctx.validate_read_path(req_id, session_id, Path::new(file)) {
+        if is_http_url(file) {
+            admitted_files.push((index, file, None));
+            continue;
+        }
+        match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
             Ok(path) => {
-                paths.push(path);
-                admitted_files.push((index, file));
+                paths.push(path.clone());
+                admitted_files.push((index, file, Some(path)));
             }
             Err(response) if response.data["code"] == "denied_floor" => {
                 skipped_files.push((index, SkippedFile::new(file, "denied_floor")));
@@ -2640,9 +2654,11 @@ fn outline_many_files(
     // their request order) so that the budget check below can stop early.
     let mut ordered = admitted_files
         .into_iter()
-        .zip(paths)
-        .map(|((index, file), path)| {
-            let rel_path = display_path(&path, file, display_root.as_deref());
+        .map(|(index, file, path)| {
+            let rel_path = path
+                .as_deref()
+                .map(|path| display_path(path, file, display_root.as_deref()))
+                .unwrap_or_else(|| file.to_string());
             (index, file, path, rel_path)
         })
         .collect::<Vec<_>>();
@@ -2664,13 +2680,40 @@ fn outline_many_files(
     let mut fallback_parser = FileParser::new();
 
     for (examined, (index, file, path, rel_path)) in ordered.into_iter().enumerate() {
-        if is_read_excluded(excluded, &path) {
+        if path
+            .as_deref()
+            .is_some_and(|path| is_read_excluded(excluded, path))
+        {
             continue;
         }
         if outline_batch_deadline_reached(examined) {
             writer.stop_at_deadline();
             break;
         }
+        let Some(path) = path else {
+            let response = outline_single_target(req, ctx, file);
+            if !response.success {
+                let code = response.data["code"].as_str().unwrap_or("error");
+                let reason = response.data["message"]
+                    .as_str()
+                    .map(|message| format!("{code}: {message}"))
+                    .unwrap_or_else(|| code.to_string());
+                skipped_files.push((index, SkippedFile::new(file, reason)));
+                continue;
+            }
+            writer.content_incomplete |= response.data["complete"] == false;
+            if !writer.push_text(
+                response.data["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                Vec::new(),
+                None,
+            ) {
+                break;
+            }
+            continue;
+        };
         if crate::bounded_io::metadata(&path).is_err() {
             skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
             continue;
@@ -2686,14 +2729,19 @@ fn outline_many_files(
 
         let structure = match batch_parser.as_mut() {
             Some(parser) => {
-                let structure = batch_file_structure(&path, parser, ctx, req_id, session_id);
+                let structure = batch_file_structure(&path, parser, ctx, &req.id, req.session());
                 // Extraction and test classification share the validated parse tree.
                 parser.evict_parse_tree(&path);
                 structure
             }
             None => {
-                let structure =
-                    fallback_file_structure(&path, &mut fallback_parser, ctx, req_id, session_id);
+                let structure = fallback_file_structure(
+                    &path,
+                    &mut fallback_parser,
+                    ctx,
+                    &req.id,
+                    req.session(),
+                );
                 fallback_parser.evict_parse_tree(&path);
                 structure
             }
@@ -3521,6 +3569,8 @@ struct RenderedOutline {
     cut_short: bool,
     /// Outlining stopped because the request deadline was close.
     deadline_reached: bool,
+    /// A shown URL was incomplete even though its outline fit the batch budget.
+    content_incomplete: bool,
     shown: usize,
     footer: String,
     /// The files whose outlines were rendered, as a sorted set like every
@@ -3559,11 +3609,12 @@ struct MultiFileTreeWriter {
     files_capped: bool,
     /// Outlining stopped near the request deadline.
     deadline_reached: bool,
+    content_incomplete: bool,
     files_shown: usize,
     content_files: BTreeSet<PathBuf>,
     /// Where each shown file's text starts in `output`, and its path, so a
     /// longer deadline footer can take back the last file if it must.
-    shown_blocks: Vec<(usize, PathBuf)>,
+    shown_blocks: Vec<(usize, Option<PathBuf>)>,
     /// Path components of the last shown file, for directory grouping.
     prev_parts: Vec<String>,
     max_bytes: usize,
@@ -3572,7 +3623,7 @@ struct MultiFileTreeWriter {
     trailer_reserve: usize,
     /// A rendered file that fits only if no trailer follows it, which is
     /// known only once no later file is offered.
-    pending: Option<(String, Vec<String>, PathBuf)>,
+    pending: Option<(String, Vec<String>, Option<PathBuf>)>,
 }
 
 impl MultiFileTreeWriter {
@@ -3592,6 +3643,7 @@ impl MultiFileTreeWriter {
             truncated: false,
             files_capped: budget.files_capped,
             deadline_reached: false,
+            content_incomplete: false,
             files_shown: 0,
             content_files: BTreeSet::new(),
             shown_blocks: Vec::new(),
@@ -3619,15 +3671,6 @@ impl MultiFileTreeWriter {
     /// spent: this file and every later one would not be shown, so the
     /// caller stops outlining files.
     fn push(&mut self, fo: &FileOutline) -> bool {
-        if self.truncated {
-            return false;
-        }
-        if self.pending.take().is_some() {
-            // The held file was not the last one, so it needed room for the
-            // trailer and does not fit.
-            self.truncated = true;
-            return false;
-        }
         let mut file_output = String::new();
         let parts: Vec<&str> = fo.path.split('/').collect();
         let file_name = parts.last().copied().unwrap_or(&fo.path);
@@ -3662,24 +3705,45 @@ impl MultiFileTreeWriter {
         );
 
         let parts = parts.iter().map(|part| part.to_string()).collect();
+        self.push_text(file_output, parts, Some(fo.absolute_path.clone()))
+    }
+
+    /// URL blocks use their single-target rendering and have no local read manifest.
+    fn push_text(
+        &mut self,
+        file_output: String,
+        parts: Vec<String>,
+        path: Option<PathBuf>,
+    ) -> bool {
+        if self.truncated {
+            return false;
+        }
+        if self.pending.take().is_some() {
+            // The held file was not the last one, so it needed room for the
+            // trailer and does not fit.
+            self.truncated = true;
+            return false;
+        }
         let used = self.output.len() + file_output.len();
         if used + self.trailer_reserve <= self.max_bytes {
-            self.accept(file_output, parts, fo.absolute_path.clone());
+            self.accept(file_output, parts, path);
             return true;
         }
         if !self.walk_incomplete && !self.cut_short() && used <= self.max_bytes {
             // Fits only as the last file; keep looking for a later one.
-            self.pending = Some((file_output, parts, fo.absolute_path.clone()));
+            self.pending = Some((file_output, parts, path));
             return true;
         }
         self.truncated = true;
         false
     }
 
-    fn accept(&mut self, file_output: String, parts: Vec<String>, path: PathBuf) {
+    fn accept(&mut self, file_output: String, parts: Vec<String>, path: Option<PathBuf>) {
         self.shown_blocks.push((self.output.len(), path.clone()));
         self.output.push_str(&file_output);
-        self.content_files.insert(path);
+        if let Some(path) = path {
+            self.content_files.insert(path);
+        }
         self.files_shown += 1;
         self.prev_parts = parts;
     }
@@ -3694,7 +3758,12 @@ impl MultiFileTreeWriter {
         // A `files` list can name the same file twice. The read manifest must
         // keep a path while any block still shown in the text came from it,
         // or a host checking read rules against the manifest would miss it.
-        if !self.shown_blocks.iter().any(|(_, shown)| *shown == path) {
+        if let Some(path) = path.filter(|path| {
+            !self
+                .shown_blocks
+                .iter()
+                .any(|(_, shown)| shown.as_ref() == Some(path))
+        }) {
             self.content_files.remove(&path);
         }
         self.files_shown -= 1;
@@ -3743,6 +3812,7 @@ impl MultiFileTreeWriter {
             truncated: self.truncated,
             cut_short: self.files_capped || self.deadline_reached,
             deadline_reached: self.deadline_reached,
+            content_incomplete: self.content_incomplete,
             shown: self.files_shown,
             footer,
             content_files: self.content_files,
@@ -3768,6 +3838,28 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 mod tests {
     use super::*;
     use crate::symbols::SymbolKind;
+
+    #[test]
+    fn outline_files_mode_refuses_raw_url_array_targets() {
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "url-directories",
+            "command": "outline",
+            "files": true,
+            "target": ["https://example.com/docs"]
+        }))
+        .unwrap();
+        let response = handle_outline(&req, &ctx);
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "invalid_request");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("URLs aren't directories"));
+    }
 
     fn navigation_fixture() -> (tempfile::TempDir, Vec<PathBuf>, AppContext) {
         let temp = tempfile::tempdir().unwrap();
@@ -5324,8 +5416,7 @@ mod tests {
         let (rendered, _) = outline_many_files(
             &files,
             &ctx,
-            "budget",
-            "budget-session",
+            &files_request(&files),
             None,
             &HashSet::new(),
             MultiFileBudget {
@@ -5637,7 +5728,7 @@ mod tests {
             .collect()
     }
 
-    fn files_request(files: &[PathBuf]) -> RawRequest {
+    fn files_request(files: &[impl serde::Serialize]) -> RawRequest {
         serde_json::from_value(serde_json::json!({
             "id": "files-bound", "command": "outline", "files": files,
         }))
@@ -5781,8 +5872,7 @@ mod tests {
             let (rendered, _) = outline_many_files(
                 &files,
                 &ctx,
-                "deadline-footer",
-                "deadline-session",
+                &files_request(&files),
                 None,
                 &HashSet::new(),
                 MultiFileBudget {
@@ -5828,8 +5918,7 @@ mod tests {
             let (rendered, _) = outline_many_files(
                 files,
                 ctx,
-                "deadline-manifest",
-                "deadline-session",
+                &files_request(files),
                 None,
                 &HashSet::new(),
                 MultiFileBudget {
@@ -6240,8 +6329,7 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         let (rendered, skipped) = outline_many_files(
             &files,
             &ctx,
-            "outline-fixture",
-            "fixture-session",
+            &files_request(&files),
             None,
             &HashSet::new(),
             MultiFileBudget {

@@ -586,6 +586,10 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
         },
         run_id: "secret-run".into(),
         owner_route: head.clone(),
+        owner_route_channel: super::RouteChannel {
+            channel: 1,
+            epoch: 1,
+        },
         run_route: super::RouteChannel {
             channel: 7,
             epoch: 1,

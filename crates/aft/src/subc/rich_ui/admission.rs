@@ -23,7 +23,7 @@ impl Operation {
     ) -> Result<Value, ErrorBody> {
         let mut arguments = self.arguments.clone();
         match self.entry["id"].as_str() {
-            Some("bash_status") => {
+            Some("bash_status" | "bash_output") => {
                 arguments = serde_json::json!({"taskId":task_id.ok_or_else(|| chunks::refusal("task_not_found"))?});
             }
             Some("bash_watch") => {

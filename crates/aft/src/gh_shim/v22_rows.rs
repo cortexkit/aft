@@ -150,6 +150,7 @@ pub(super) fn canonicalize_pr_edit_from<R: Read>(
         repository,
         manifest_version,
         edit_last: false,
+        invocation: None,
         author_scope: Some("own".to_string()),
     })
 }
@@ -246,6 +247,7 @@ fn canonicalize_review_reply<R: Read>(
         repository: Some(repository),
         manifest_version,
         edit_last: false,
+        invocation: None,
         author_scope: None,
     })
 }
@@ -289,6 +291,7 @@ fn canonicalize_pull_edit<R: Read>(
         repository: Some(repository),
         manifest_version,
         edit_last: false,
+        invocation: None,
         author_scope: Some("own".to_string()),
     })
 }
@@ -595,6 +598,7 @@ fn canonicalize_stack_write<R: Read>(
         repository: Some(repository),
         manifest_version,
         edit_last: false,
+        invocation: None,
         author_scope: None,
     })
 }
@@ -689,6 +693,7 @@ pub(super) fn canonicalize_review_thread(
         repository,
         manifest_version,
         edit_last: false,
+        invocation: None,
         author_scope: None,
     })
 }

@@ -1641,6 +1641,28 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("bash_kill preserves its outcome and appends the durable-revocation warning", async () => {
+    const warning =
+      "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
+    const { killTool } = makeCtx(() => ({
+      success: true,
+      status: "killed",
+      bot_write_revocation_warning: warning,
+    }));
+    expect(await killTool.execute({ taskId: "bash-warning" }, createMockSdkContext())).toBe(
+      `Task bash-warning: killed\n${warning}`,
+    );
+    const signaled = makeCtx(() => ({
+      success: true,
+      kill_signaled: true,
+      kill_reached: 2,
+      bot_write_revocation_warning: warning,
+    }));
+    expect(
+      await signaled.killTool.execute({ taskId: "bash-warning" }, createMockSdkContext()),
+    ).toBe(`Task bash-warning: kill_signaled · reached 2 live descendants\n${warning}`);
+  });
+
   test("failed bash_status includes a task's spawn reason", async () => {
     const reason = "failed to spawn background bash command: No such file or directory";
     const { statusTool } = makeCtx(() => ({

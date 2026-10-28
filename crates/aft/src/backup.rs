@@ -1235,7 +1235,7 @@ impl BackupStore {
     }
 
     #[cfg(test)]
-    fn fail_next_disk_write_for_tests(&mut self) {
+    pub(crate) fn fail_next_disk_write_for_tests(&mut self) {
         self.fail_next_disk_write = true;
     }
 
@@ -3446,6 +3446,23 @@ impl BackupStore {
         op_id: &str,
         path: &Path,
     ) {
+        if let Err(error) = self.try_discard_latest_operation_entry_for_path(session, op_id, path) {
+            crate::slog_warn!(
+                "failed to discard latest operation backup for {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    /// Discard one known rollback snapshot without discovering the session's
+    /// other stacks. Callers that report rollback success must also check
+    /// whether removal from undo history succeeded.
+    pub(crate) fn try_discard_latest_operation_entry_for_path(
+        &mut self,
+        session: &str,
+        op_id: &str,
+        path: &Path,
+    ) -> Result<(), AftError> {
         let budget = BackupIoBudget::rollback_cleanup();
         let key = canonicalize_key(path);
         if let Some(skips) = self.skipped_backups.get_mut(session) {
@@ -3454,14 +3471,7 @@ impl BackupStore {
                 self.skipped_backups.remove(session);
             }
         }
-        if let Err(error) =
-            self.discard_operation_entries_for_path(session, op_id, &key, false, budget)
-        {
-            crate::slog_warn!(
-                "failed to discard latest operation backup for {}: {error}",
-                key.display()
-            );
-        }
+        self.discard_operation_entries_for_path(session, op_id, &key, false, budget)
     }
 
     fn discard_operation_entries_for_path(

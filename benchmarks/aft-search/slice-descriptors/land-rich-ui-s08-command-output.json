@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rich-ui-s08-command-output"
+  ],
+  "note": "Rich UI slice 8: the phone view reads a viewed command's status and output (bash_status, bash_output) through the carrier admission and session-policy seam, with exact viewed-task resolution. Publication stays off. No changed path matches RANKING_FENCE_PREFIXES."
+}

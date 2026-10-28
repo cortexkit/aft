@@ -1307,21 +1307,30 @@ fn format_bash_status(
 // consumers show the model the same text.
 fn format_bash_kill(data: &Value) -> String {
     let task_id = bash_task_id(data);
-    if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
+    let outcome = if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
         let reached = data
             .get("kill_reached")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        return format!("Task {task_id}: kill_signaled · reached {reached} live descendants");
-    }
-    let status = data
-        .get("status")
+        format!("Task {task_id}: kill_signaled · reached {reached} live descendants")
+    } else {
+        let status = data
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("killed");
+        if let Some(cancel) = data.get("remote_cancel").and_then(Value::as_str) {
+            format!("Task {task_id}: {status} · {cancel}")
+        } else {
+            format!("Task {task_id}: {status}")
+        }
+    };
+    match data
+        .get("bot_write_revocation_warning")
         .and_then(Value::as_str)
-        .unwrap_or("killed");
-    if let Some(cancel) = data.get("remote_cancel").and_then(Value::as_str) {
-        return format!("Task {task_id}: {status} · {cancel}");
+    {
+        Some(warning) => format!("{outcome}\n{warning}"),
+        None => outcome,
     }
-    format!("Task {task_id}: {status}")
 }
 
 // Formats a PTY write result exactly as the OpenCode tool does
@@ -5539,5 +5548,24 @@ mod watch_line_format_tests {
         batch.first_dropped_stream = Some("stderr".into());
         assert_eq!(format_watch_line_batch("task", &batch),
             "7 matching lines dropped. 2 lines longer than 64 KiB were skipped, so the scan is incomplete. Read them with bash_status({ task_id: \"task\", stderr_offset: 18240 }).");
+    }
+}
+
+#[cfg(test)]
+mod bot_kill_warning_tests {
+    use super::*;
+    #[test]
+    fn kill_warning_keeps_the_reported_kill_outcome_first() {
+        let text = format_bash_kill(
+            &serde_json::json!({"task_id":"bash-warning","status":"killed","bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
+        );
+        assert_eq!(
+            text,
+            format!(
+                "Task bash-warning: killed\n{}",
+                crate::gh_shim_speech::REVOCATION_NOT_DURABLE
+            )
+        );
+        assert!(!text.contains("clean cancellation"));
     }
 }

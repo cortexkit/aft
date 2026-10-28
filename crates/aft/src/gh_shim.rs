@@ -540,8 +540,7 @@ const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable 
 /// carries a read broker, never a write ticket, so no write can ever be
 /// spoken from it: the text names the permanent condition and tells the agent
 /// where to take the write instead of suggesting a retry.
-const WORKER_WRITE_REFUSED_TEXT: &str =
-    "workers cannot write to GitHub; report what should be posted to your parent instead";
+const WORKER_WRITE_REFUSED_TEXT: &str = crate::gh_shim_speech::WORKER_WRITE_REFUSED;
 /// Human-readable text for a local discovery-probe deadline expiry. A deadline
 /// that expires on a loaded host does not mean the daemon is unreachable, so
 /// this arm must not say "unreachable". The classification stays
@@ -611,7 +610,7 @@ impl RefusalCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WorkerNativeGh => "gh_shim_worker_native_gh",
-            Self::WorkerWriteRefused => "gh_shim_worker_write_refused",
+            Self::WorkerWriteRefused => crate::gh_shim_speech::WORKER_WRITE_CODE,
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
@@ -769,6 +768,16 @@ fn run_with(
         print_self_report(&paths);
         return 0;
     }
+    if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
+        .as_deref()
+        == Some("1")
+        && speech_protected_without_view(args)
+    {
+        return refuse(
+            RefusalCode::WorkerWriteRefused,
+            crate::gh_shim_speech::WORKER_WRITE_REFUSED,
+        );
+    }
 
     let now = unix_seconds();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -815,6 +824,15 @@ fn run_with(
     {
         return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
     }
+    if crate::gh_shim_speech::start_view::protected(args) {
+        return run_captured_protected(
+            args,
+            &paths,
+            &TargetRepository::from_invocation(args),
+            &cwd,
+            now,
+        );
+    }
 
     // Presence-based regressed-manifest arm. Decide from the installed artifact
     // BEFORE any rung probe so a governed refusal never depends on daemon
@@ -841,6 +859,12 @@ fn run_with(
     }
 
     let target = TargetRepository::from_invocation(args);
+    // Probing can publish captured context after the initial check. Recheck at
+    // every later passthrough boundary without changing unprovisioned fallback.
+    let captured_now = || {
+        crate::gh_shim_speech::start_view::protected(args)
+            .then(|| run_captured_protected(args, &paths, &target, &cwd, now))
+    };
     // A write aimed at a repository no signed binding covers cannot be spoken
     // by any bot, and upstream `gh` would run it under the operator's own
     // login. Decide that before the rung probe: the answer does not depend on
@@ -907,6 +931,9 @@ fn run_with(
                 "destructive GitHub operations are not available through the shim",
             ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
                 match invalid_manifest_problem.as_ref() {
                     Some(problem) => {
                         delegate_after_invalid_manifest_notice(args, problem, delegate)
@@ -924,22 +951,40 @@ fn run_with(
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
+            if let Some(status) = captured_now() {
+                return status;
+            }
             return match regressed_disposition(args, &manifest, current_platform(), &problem) {
                 RegressedDisposition::Passthrough => {
                     delegate_after_invalid_manifest_notice(args, &problem, delegate)
                 }
                 RegressedDisposition::Refuse { code, text } => refuse(code, &text),
-            }
+            };
         }
         ManifestResolution::Invalid(problem) => {
-            return delegate_after_invalid_manifest_notice(args, &problem, delegate)
+            if let Some(status) = captured_now() {
+                return status;
+            }
+            return delegate_after_invalid_manifest_notice(args, &problem, delegate);
         }
-        ManifestResolution::Dormant => return delegate(args),
+        ManifestResolution::Dormant => {
+            if let Some(status) = captured_now() {
+                return status;
+            }
+            return delegate(args);
+        }
     };
     let classification = classify(args, &manifest, current_platform());
     let Some(agent_binding) = governing_binding(&classification, &manifest, &target, &cwd) else {
+        if let Some(status) = captured_now() {
+            return status;
+        }
         return delegate(args);
     };
+
+    if let Some(status) = captured_now() {
+        return status;
+    }
 
     dispatch_r3(
         args,
@@ -2225,7 +2270,8 @@ fn governed_outcome_status(
             eprint!("{output}");
             0
         }
-        RouteOutcome::StateAppliedCommentFailed(output) => {
+        RouteOutcome::StateAppliedCommentFailed(output)
+        | RouteOutcome::PartiallyApplied(output) => {
             print!("{output}");
             UPSTREAM_FAILURE_EXIT_STATUS
         }
@@ -2255,6 +2301,10 @@ fn governed_outcome_status(
         }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
         RouteOutcome::NoAgentSession => refuse(RefusalCode::UnboundIdentity, NO_AGENT_SESSION_TEXT),
+        RouteOutcome::WorkerWriteRefused => refuse(
+            RefusalCode::WorkerWriteRefused,
+            crate::gh_shim_speech::WORKER_WRITE_REFUSED,
+        ),
         RouteOutcome::RelayRefusal { text, .. } => refuse(RefusalCode::SeamRefusal, &text),
         RouteOutcome::OutcomeUndetermined(text) => {
             refuse_outcome_unknown_with_text(paths, agent_binding, now, &text)
@@ -4173,7 +4223,7 @@ fn load_manifest_with_trust_set(
     if manifest.manifest_version > newest_accepted {
         write_version_high_water(paths, manifest.manifest_version);
     }
-    write_last_valid_manifest(paths, &manifest);
+    write_last_valid_manifest(paths, &manifest, &bytes);
     // Retain the exact verified bytes for later reproducibility checks. The
     // signature already verified above; the admission filter re-checks that the
     // version inside the verified payload matches the filing name. This never
@@ -4464,15 +4514,18 @@ enum RegressedDisposition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LastValidManifest {
     manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signed_envelope: Vec<u8>,
 }
 
 fn read_last_valid_manifest(paths: &StatePaths) -> Option<LastValidManifest> {
     serde_json::from_slice(&fs::read(&paths.last_valid_manifest).ok()?).ok()
 }
 
-fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
+fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest, signed_envelope: &[u8]) {
     let record = LastValidManifest {
         manifest: manifest.clone(),
+        signed_envelope: signed_envelope.to_vec(),
     };
     let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
@@ -5153,6 +5206,294 @@ struct GovernedRequest {
     manifest_version: u64,
     edit_last: bool,
     author_scope: Option<String>,
+    invocation: Option<crate::gh_shim_speech::invocation::Invocation>,
+}
+
+fn attach_invocation(
+    args: &[OsString],
+    tuple: &str,
+    mut request: GovernedRequest,
+    inputs: BTreeMap<String, String>,
+) -> Result<GovernedRequest, CanonicalizeError> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    let denied = || {
+        CanonicalizeError::typed(
+            RefusalCode::SeamRefusal,
+            Refusal::new(Code::PolicyDenied, "payload_denied").agent_text(),
+        )
+    };
+    let mut frozen_args = args
+        .iter()
+        .map(|value| value.to_str().map(str::to_string).ok_or_else(denied))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !is_api_tuple(tuple) && explicit_repo(args).is_none() {
+        if let Some(repository) = request.repository.as_ref() {
+            frozen_args.push("--repo".into());
+            frozen_args.push(repository.clone());
+        }
+    }
+    let invocation = crate::gh_shim_speech::invocation::Invocation {
+        args: frozen_args,
+        body_inputs: inputs,
+    };
+    invocation
+        .validate()
+        .map_err(|error| CanonicalizeError::typed(RefusalCode::SeamRefusal, error.agent_text()))?;
+    request.invocation = Some(invocation);
+    Ok(request)
+}
+
+pub(crate) fn capture_speech_policy() -> Result<
+    Option<(
+        crate::gh_shim_speech::model::PolicySnapshot,
+        BTreeMap<String, String>,
+        u64,
+    )>,
+    crate::gh_shim_speech::Refusal,
+> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    use sha2::Digest;
+    let paths = StatePaths::from_process();
+    if !paths.manifest.exists()
+        && !paths.last_valid_manifest.exists()
+        && !paths.version_high_water.exists()
+    {
+        return Ok(None);
+    }
+    let high: VersionHighWater = fs::read(&paths.version_high_water)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(|high: &VersionHighWater| high.newest_accepted_version > 0)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "manifest_rollback"))?;
+    let accepted: LastValidManifest = fs::read(&paths.last_valid_manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let bytes = accepted.signed_envelope;
+    let current = fs::read(&paths.manifest)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let manifest = verified_speech_manifest(&bytes)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    if manifest.manifest_version != high.newest_accepted_version {
+        return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+    }
+    if bytes != current
+        || serde_json::to_value(&accepted.manifest).ok() != serde_json::to_value(&manifest).ok()
+    {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "current_manifest_unverifiable",
+        ));
+    }
+    Ok(Some((
+        crate::gh_shim_speech::model::PolicySnapshot {
+            artifact_id: manifest.artifact_id.clone(),
+            version: manifest.manifest_version,
+            digest: sha2::Sha256::digest(&bytes).to_vec(),
+            signed_envelope: bytes,
+        },
+        manifest.bindings,
+        high.newest_accepted_version,
+    )))
+}
+
+fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
+    let envelope: SignedManifest = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    if envelope.artifact_id != MANIFEST_ARTIFACT_ID || envelope.envelope_version != ENVELOPE_VERSION
+    {
+        return Err(invalid());
+    }
+    let verified = verify_manifest_envelope(&envelope, compiled_manifest_trust_set())
+        .map_err(|_| invalid())?;
+    let manifest = verified.manifest;
+    manifest.validate().map_err(|_| invalid())?;
+    if manifest.schema_floor < SCHEMA_FLOOR
+        || manifest.issued_at_unix_secs > unix_seconds() + ISSUED_AT_FUTURE_SKEW.as_secs()
+    {
+        return Err(invalid());
+    }
+    Ok(manifest)
+}
+
+pub(crate) fn speech_start_classification(
+    snapshot: &crate::gh_shim_speech::model::PolicySnapshot,
+    args: &[OsString],
+) -> Result<bool, crate::gh_shim_speech::Refusal> {
+    use sha2::Digest;
+    let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+    if snapshot.version != manifest.manifest_version
+        || snapshot.artifact_id != manifest.artifact_id
+        || snapshot.digest.as_slice() != sha2::Sha256::digest(&snapshot.signed_envelope).as_slice()
+    {
+        return Err(crate::gh_shim_speech::Refusal::new(
+            crate::gh_shim_speech::Code::PolicyDenied,
+            "manifest_rollback",
+        ));
+    }
+    Ok(!matches!(
+        classify(args, &manifest, current_platform()),
+        Classification::Mechanical
+    ) || unbound_write(
+        args,
+        &manifest,
+        current_platform(),
+        &TargetRepository::from_invocation(args),
+        &std::env::current_dir().unwrap_or_default(),
+    )
+    .is_some()
+        || operator_credential_use(args).is_some())
+}
+
+fn mutation_semantics(request: &GovernedRequest) -> Value {
+    json!({"action":request.action,"repository":request.repository,"target":request.target,"body":request.body,"edit_last":request.edit_last,"author_scope":request.author_scope})
+}
+
+fn wire_mutation_semantics(request: &Value) -> Option<Value> {
+    let object = request.as_object()?;
+    if object.get("operation").and_then(Value::as_str) != Some(ROUTING_OPERATION)
+        || object.get("gh_route_schema").and_then(Value::as_u64) != Some(1)
+    {
+        return None;
+    }
+    let metadata = object.get("metadata")?.as_object()?;
+    if metadata
+        .keys()
+        .any(|key| !matches!(key.as_str(), "agent_id" | "pid"))
+    {
+        return None;
+    }
+    let action = object
+        .get("action")
+        .or_else(|| object.get("verb"))?
+        .as_str()?;
+    let state = V12_GOVERNED_TUPLES.contains(&action) || action == "pr ready";
+    let allowed = if state {
+        &[
+            "operation",
+            "gh_route_schema",
+            "verb",
+            "repository",
+            "number",
+            "manifest_version",
+            "rung_as_of_unix_secs",
+            "metadata",
+            "undo",
+            "reason",
+            "comment",
+        ][..]
+    } else {
+        &[
+            "operation",
+            "gh_route_schema",
+            "action",
+            "repository",
+            "target",
+            "body",
+            "manifest_version",
+            "rung_as_of_unix_secs",
+            "metadata",
+            "author_scope",
+            "edit_last",
+        ][..]
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return None;
+    }
+    let edit_last = match object.get("edit_last") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return None,
+    };
+    let (target, body) = if state {
+        let mut body = Map::new();
+        for field in ["undo", "reason", "comment"] {
+            if let Some(value) = object.get(field) {
+                body.insert(field.into(), value.clone());
+            }
+        }
+        (json!({"number":object.get("number")?}), Value::Object(body))
+    } else {
+        (object.get("target")?.clone(), object.get("body")?.clone())
+    };
+    Some(
+        json!({"action":action,"repository":object.get("repository")?,"target":target,"body":body,"edit_last":edit_last,"author_scope":object.get("author_scope").cloned().unwrap_or(Value::Null)}),
+    )
+}
+
+pub(crate) fn validate_speech_policy(
+    start: &crate::gh_shim_speech::model::PolicySnapshot,
+    current: &crate::gh_shim_speech::model::PolicySnapshot,
+    request: &Value,
+    invocation: &crate::gh_shim_speech::invocation::Invocation,
+) -> Result<(), crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    use sha2::Digest;
+    invocation.validate()?;
+    let actual = wire_mutation_semantics(request)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "payload_denied"))?;
+    let args: Vec<OsString> = invocation.args.iter().map(OsString::from).collect();
+    let mut previous = None;
+    for snapshot in [start, current] {
+        if snapshot.digest.as_slice() != sha2::Sha256::digest(&snapshot.signed_envelope).as_slice()
+        {
+            return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+        }
+        let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+        if manifest.manifest_version != snapshot.version
+            || manifest.artifact_id != snapshot.artifact_id
+            || current.version < start.version
+        {
+            return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+        }
+        let Classification::Governed { tuple, canonical } =
+            classify(&args, &manifest, current_platform())
+        else {
+            return Err(Refusal::new(Code::PolicyDenied, "classification_changed"));
+        };
+        if previous.as_ref().is_some_and(|old| old != &tuple) {
+            return Err(Refusal::new(Code::PolicyDenied, "classification_changed"));
+        }
+        previous = Some(tuple.clone());
+        let parsed = crate::gh_shim_speech::invocation::replay(invocation, || {
+            let mut stdin = io::Cursor::new(Vec::<u8>::new());
+            if is_api_tuple(&tuple) {
+                canonicalize_governed_api_from(
+                    &args,
+                    &tuple,
+                    &canonical,
+                    manifest.manifest_version,
+                    &mut stdin,
+                )
+            } else {
+                canonicalize_governed_from(
+                    &args,
+                    &tuple,
+                    &canonical,
+                    manifest.manifest_version,
+                    &mut stdin,
+                )
+            }
+        })?
+        .map_err(|_| Refusal::new(Code::PolicyDenied, "canonicalization_changed"))?;
+        if mutation_semantics(&parsed) != actual {
+            return Err(Refusal::new(Code::PolicyDenied, "canonicalization_changed"));
+        }
+        let repo = parsed
+            .repository
+            .as_deref()
+            .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
+        if manifest.bindings.get(repo).map(String::as_str)
+            != request
+                .get("metadata")
+                .and_then(|v| v.get("agent_id"))
+                .and_then(Value::as_str)
+        {
+            return Err(Refusal::new(Code::IdentityConflict, "binding_changed"));
+        }
+    }
+    Ok(())
 }
 
 /// The normalized GitHub resource changed by a structured governed request.
@@ -5199,6 +5540,7 @@ fn invalidate_successful_github_read_mutation_at(
         RouteOutcome::Result(_)
             | RouteOutcome::ResultStderr(_)
             | RouteOutcome::StateAppliedCommentFailed(_)
+            | RouteOutcome::PartiallyApplied(_)
     ) {
         return;
     }
@@ -5225,13 +5567,16 @@ fn canonicalize_governed(
     canonical: &Canonicalization,
     manifest_version: u64,
 ) -> Result<GovernedRequest, CanonicalizeError> {
-    canonicalize_governed_from(
-        args,
-        tuple,
-        canonical,
-        manifest_version,
-        &mut io::stdin().lock(),
-    )
+    let (result, inputs) = crate::gh_shim_speech::invocation::record(|| {
+        canonicalize_governed_from(
+            args,
+            tuple,
+            canonical,
+            manifest_version,
+            &mut io::stdin().lock(),
+        )
+    });
+    attach_invocation(args, tuple, result?, inputs)
 }
 
 fn canonicalize_governed_from<R: Read>(
@@ -5570,6 +5915,7 @@ fn canonicalize_governed_from<R: Read>(
         manifest_version,
         edit_last,
         author_scope: (tuple == "issue edit").then(|| "own".to_string()),
+        invocation: None,
     })
 }
 
@@ -5746,6 +6092,7 @@ fn canonicalize_pr_create_from<R: Read>(
         manifest_version,
         edit_last: false,
         author_scope: None,
+        invocation: None,
     })
 }
 
@@ -5803,13 +6150,16 @@ fn canonicalize_governed_api(
     canonical: &Canonicalization,
     manifest_version: u64,
 ) -> Result<GovernedRequest, CanonicalizeError> {
-    canonicalize_governed_api_from(
-        args,
-        tuple,
-        canonical,
-        manifest_version,
-        &mut io::stdin().lock(),
-    )
+    let (result, inputs) = crate::gh_shim_speech::invocation::record(|| {
+        canonicalize_governed_api_from(
+            args,
+            tuple,
+            canonical,
+            manifest_version,
+            &mut io::stdin().lock(),
+        )
+    });
+    attach_invocation(args, tuple, result?, inputs)
 }
 
 fn canonicalize_governed_api_from<R: Read>(
@@ -5851,6 +6201,7 @@ fn canonicalize_governed_api_from<R: Read>(
         manifest_version,
         edit_last: false,
         author_scope: Some("own".to_string()),
+        invocation: None,
     })
 }
 
@@ -6171,6 +6522,9 @@ fn declared_reason_value(
 }
 
 fn read_body_file_from<R: Read>(path: &Path, stdin: &mut R) -> Result<String, String> {
+    if let Some(captured) = crate::gh_shim_speech::invocation::captured(path) {
+        return captured;
+    }
     let mut body = String::new();
     // When the path is '-', upstream gh reads the body from standard input.
     // Do the same here so callers can provide stdin through this shim instead
@@ -6183,6 +6537,7 @@ fn read_body_file_from<R: Read>(path: &Path, stdin: &mut R) -> Result<String, St
         body = fs::read_to_string(path)
             .map_err(|error| format!("could not read body file {}: {error}", path.display()))?;
     }
+    crate::gh_shim_speech::invocation::remember(path, &body)?;
     Ok(body)
 }
 
@@ -6836,10 +7191,12 @@ fn parse_thread_target(target: &str, segment: &str) -> Option<(Option<String>, u
 
 #[derive(Debug)]
 enum RouteOutcome {
+    WorkerWriteRefused,
     Result(String),
     /// Native close/reopen confirmations go to stderr, as upstream gh does.
     ResultStderr(String),
     StateAppliedCommentFailed(String),
+    PartiallyApplied(String),
     UpstreamError(String),
     Refusal(String),
     UnboundIdentity,
@@ -6906,6 +7263,7 @@ fn route_governed(
         RouteOutcome::Result(_)
             | RouteOutcome::ResultStderr(_)
             | RouteOutcome::StateAppliedCommentFailed(_)
+            | RouteOutcome::PartiallyApplied(_)
     ) && determination.rung == Rung::R3
     {
         let mut updated = determination.clone();
@@ -8084,7 +8442,7 @@ mod tests {
         }
     }
 
-    fn fixture_manifest() -> Manifest {
+    pub(super) fn fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!(
             "../tests/fixtures/gh_shim/initial-manifest-v1.json"
         ))
@@ -8208,7 +8566,7 @@ mod tests {
         }
     }
 
-    fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
+    pub(super) fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
         let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("test key");
         assert_eq!(key.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
         signed_with(
@@ -9619,6 +9977,7 @@ mod tests {
             manifest_version: 1,
             edit_last: false,
             author_scope: None,
+            invocation: None,
         };
         let determination = RungDetermination::r3(7, 1, &test_rung_provenance());
         let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
@@ -10911,6 +11270,10 @@ mod tests {
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
         assert_eq!(RefusalCode::ALL.len(), 21);
         assert_eq!(
+            RefusalCode::WorkerWriteRefused.as_str(),
+            crate::gh_shim_speech::WORKER_WRITE_CODE
+        );
+        assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
             "gh_shim_worker_native_gh"
         );
@@ -11092,7 +11455,7 @@ mod tests {
     /// v14 payload adds. Built here rather than read from the assembled
     /// payload, which lives under the gitignored `.alfonso/` and is absent on a
     /// clean checkout.
-    fn v14_manifest() -> Manifest {
+    pub(super) fn v14_manifest() -> Manifest {
         let mut manifest = v12_fixture_manifest();
         manifest.manifest_version = 14;
         manifest
@@ -16048,6 +16411,7 @@ mod github_read_mutation_tests {
             manifest_version: 1,
             edit_last: false,
             author_scope: None,
+            invocation: None,
         }
     }
 
@@ -16193,3 +16557,79 @@ mod github_read_mutation_tests {
         );
     }
 }
+
+fn run_captured_protected(
+    args: &[OsString],
+    paths: &StatePaths,
+    target: &TargetRepository,
+    cwd: &Path,
+    now: u64,
+) -> i32 {
+    use crate::gh_shim_speech::{Code, Refusal};
+    let (manifest, classification, binding, rung) =
+        match captured_plan(args, paths, target, cwd, now) {
+            Ok(plan) => plan,
+            Err(error) => return refuse(RefusalCode::SeamRefusal, &error.agent_text()),
+        };
+    // Protected invocations never hand native gh the operator's credentials.
+    dispatch_r3(
+        args,
+        classification,
+        &manifest,
+        paths,
+        &rung,
+        &binding,
+        now,
+        |_| {
+            refuse(
+                RefusalCode::SeamRefusal,
+                &Refusal::new(Code::PolicyDenied, "not_r3").agent_text(),
+            )
+        },
+    )
+}
+
+fn captured_plan(
+    args: &[OsString],
+    paths: &StatePaths,
+    target: &TargetRepository,
+    cwd: &Path,
+    now: u64,
+) -> Result<(Manifest, Classification, AgentBinding, RungRecord), crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    if shim_disabled_by_operator() {
+        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
+    }
+    if operator_bypass_requested() || operator_credential_use(args).is_some() {
+        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
+    }
+    load_manifest(paths, now)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let (snapshot, _, _) = capture_speech_policy()?
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let manifest = verified_speech_manifest(&snapshot.signed_envelope)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let classification = classify(args, &manifest, current_platform());
+    if !matches!(&classification, Classification::Governed { .. }) {
+        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
+    }
+    let binding = governing_binding(&classification, &manifest, target, cwd)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
+    let determination = determine_rung(paths, target, cwd, now);
+    if determination.record.rung != Rung::R3 {
+        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
+    }
+    Ok((manifest, classification, binding, determination.record))
+}
+
+pub(crate) fn speech_protected_without_view(args: &[OsString]) -> bool {
+    !is_unbound_safe(args)
+}
+
+#[cfg(test)]
+#[path = "gh_shim_speech/policy_tests.rs"]
+mod speech_policy_tests;
+
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[path = "gh_shim_speech/dispatch_tests.rs"]
+mod speech_dispatch_tests;

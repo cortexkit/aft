@@ -1,0 +1,1 @@
+- GitHub bot writes from a background command keep the bot identity and repositories captured when the command started, across a session reconnect, and stop when its scope ends; a write AFT can't verify is refused with the reason.

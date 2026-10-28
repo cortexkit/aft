@@ -110,6 +110,7 @@ pub mod fuzzy_match;
 pub mod gc;
 pub mod gh_shim;
 pub mod gh_shim_relay;
+pub(crate) mod gh_shim_speech;
 pub mod gh_shim_ticket;
 pub(crate) mod gh_shim_worker_broker;
 #[cfg(unix)]

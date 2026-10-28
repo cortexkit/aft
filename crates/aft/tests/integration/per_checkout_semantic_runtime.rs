@@ -346,11 +346,23 @@ fn wait_legacy_ready(ctx: &AppContext) {
 }
 
 fn search(ctx: &AppContext, query: &str) -> Value {
-    serde_json::to_value(aft::commands::semantic_search::handle_semantic_search(
+    let started = Instant::now();
+    let answer = serde_json::to_value(aft::commands::semantic_search::handle_semantic_search(
         &request(json!({ "id": "views-semantic-search", "command": "search", "query": query })),
         ctx,
     ))
-    .unwrap()
+    .unwrap();
+    eprintln!(
+        "semantic search query={query:?} elapsed={:?} status={} complete={}\n{}",
+        started.elapsed(),
+        answer["status"],
+        answer["complete"],
+        answer["text"]
+    );
+    if answer["complete"] != true {
+        eprintln!("incomplete semantic search reply: {answer:#}");
+    }
+    answer
 }
 
 #[test]

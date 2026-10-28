@@ -548,6 +548,155 @@ pub fn load_vectors() -> Vec<ContractVector> {
         .collect()
 }
 
+/// Load the native facade replies separately from the request-map decisions.
+/// GitHub pre-reads belong to Plexus, not to the shim's request-shape judge.
+pub fn load_reply_vectors() -> Vec<Value> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gh_shim/plexus-contract/replies-contract");
+    let mut paths: Vec<_> = std::fs::read_dir(&directory)
+        .expect("reply contract directory")
+        .map(|entry| entry.expect("reply contract entry").path())
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "reply contract directory is empty");
+    paths
+        .iter()
+        .map(|path| {
+            assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("json"));
+            let vector: Value = serde_json::from_slice(&std::fs::read(path).expect("reply vector"))
+                .expect("reply vector JSON");
+            assert_eq!(
+                vector["name"].as_str(),
+                path.file_stem().and_then(|s| s.to_str())
+            );
+            assert_reply_contract(&vector);
+            vector
+        })
+        .collect()
+}
+
+/// Check the upstream exchange recorded by a reply vector before feeding its
+/// native reply to the loopback holder. AFT does not execute these GitHub legs;
+/// Plexus's fixture tests do. Pinning their shapes here makes a stale thread
+/// pre-read or a write in a refusal case fail rather than silently go unused.
+pub fn assert_reply_contract(vector: &Value) {
+    let name = vector["name"].as_str().expect("reply vector name");
+    let request = &vector["request"];
+    let kind = judge(request).unwrap_or_else(|code| panic!("{name}: request refused: {code}"));
+    let reads = vector["github_reads"].as_array().expect("GitHub pre-reads");
+    assert!(!reads.is_empty(), "{name}: reply requires a pre-read");
+    let writes = vector.get("github_writes").and_then(Value::as_array);
+    for leg in reads.iter().chain(writes.into_iter().flatten()) {
+        assert!(leg["request_line"].is_string(), "{name}");
+        assert!(leg.get("request_body").is_some(), "{name}");
+        assert!(leg["status"].is_u64(), "{name}");
+        assert!(leg.get("response").is_some(), "{name}");
+    }
+    let result = &vector["reply"]["result"];
+    match result["status"].as_str() {
+        Some("refused") => {
+            assert!(result["refusal_code"].is_string(), "{name}");
+            assert!(result["retry_same_nonce"].is_boolean(), "{name}");
+            assert!(
+                writes.is_none_or(Vec::is_empty),
+                "{name}: refusal sent a write"
+            );
+        }
+        Some("completed") => assert!(writes.is_some_and(|w| !w.is_empty()), "{name}"),
+        other => panic!("{name}: unknown reply status {other:?}"),
+    }
+    if !matches!(kind, "resolve_thread" | "unresolve_thread") {
+        return;
+    }
+
+    let thread = &request["target"]["thread_id"];
+    assert_eq!(reads[0]["request_line"], "POST /graphql HTTP/1.1", "{name}");
+    assert_eq!(reads[0]["status"], 200, "{name}");
+    assert_eq!(
+        reads[0]["request_body"],
+        serde_json::json!({
+            "query": "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { number repository { nameWithOwner } } } } }",
+            "variables": {"threadId": thread},
+        }),
+        "{name}"
+    );
+    let response = &reads[0]["response"];
+    let pr = &response["data"]["node"]["pullRequest"];
+    if !response["data"]["node"].is_null() {
+        assert!(pr["number"].as_u64().is_some_and(|n| n > 0), "{name}");
+    }
+    let early_code = if response.get("errors").is_some() {
+        Some("vendor_rejected{status: 422}")
+    } else if response["data"]["node"].is_null() {
+        Some("not_present")
+    } else if pr["repository"]["nameWithOwner"] != request["repository"] {
+        Some("agent_repository_conflict")
+    } else {
+        None
+    };
+    if let Some(code) = early_code {
+        assert_eq!(reads.len(), 1, "{name}: refused before PR ownership read");
+        assert_eq!(result["refusal_code"], code, "{name}");
+        return;
+    }
+
+    let number = pr["number"].as_u64().expect("thread's PR number");
+    assert_eq!(
+        kind, "resolve_thread",
+        "{name}: unresolve needs no ownership read"
+    );
+    assert_eq!(reads.len(), 2, "{name}: resolve reads the PR author");
+    assert_eq!(
+        reads[1]["request_line"],
+        format!(
+            "GET /repos/{}/pulls/{number} HTTP/1.1",
+            request["repository"].as_str().unwrap()
+        ),
+        "{name}"
+    );
+    assert_eq!(reads[1]["request_body"], Value::Null, "{name}");
+    assert_eq!(reads[1]["status"], 200, "{name}");
+    let author = &reads[1]["response"]["user"]["login"];
+    if author != "app-fixture[bot]" {
+        assert_eq!(result["status"], "refused", "{name}");
+        assert_eq!(result["code"], "review_thread_not_own", "{name}");
+        assert_eq!(result["refusal_code"], "review_thread_not_own", "{name}");
+        assert_eq!(result["retry_same_nonce"], false, "{name}");
+        assert_eq!(result["transmission"], "not_sent", "{name}");
+        assert_eq!(result["detail"]["number"], number, "{name}");
+        assert_eq!(result["detail"]["author_login"], *author, "{name}");
+        assert!(result["detail"]["message"].is_string(), "{name}");
+    } else {
+        let writes = writes.expect("own resolve writes its mutation");
+        assert_eq!(writes.len(), 1, "{name}");
+        assert_eq!(
+            writes[0]["request_line"], "POST /graphql HTTP/1.1",
+            "{name}"
+        );
+        assert_eq!(
+            writes[0]["request_body"],
+            serde_json::json!({
+                "query": "mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }",
+                "variables": {"threadId": thread},
+            }),
+            "{name}"
+        );
+        assert_eq!(writes[0]["status"], 200, "{name}");
+        assert_eq!(
+            writes[0]["response"]["data"]["resolveReviewThread"]["thread"],
+            serde_json::json!({"id": thread, "isResolved": true}),
+            "{name}"
+        );
+        assert_eq!(
+            result,
+            &serde_json::json!({
+                "status": "completed", "result": {"id": thread, "resolved": true},
+            }),
+            "{name}"
+        );
+    }
+}
+
 /// The discriminant that selects a request kind: the `action` or `verb` value
 /// plus whether `edit_last` is true. Refused vectors that pin a rule share
 /// their kind's accepted discriminant; only unmapped-kind vectors do not.

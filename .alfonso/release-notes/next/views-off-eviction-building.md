@@ -1,1 +1,0 @@
-- With views off, the first search after an idle project's semantic index was unloaded now says the index is building, instead of claiming it is ready while answering from text search only.
