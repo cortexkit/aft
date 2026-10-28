@@ -5836,7 +5836,9 @@ where
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
-                        if let Err(error) = handle_control_request(
+                        // Keep the control future on the heap so it does not enlarge
+                        // the loop's poll stack frame, including for tool requests.
+                        if let Err(error) = heap_module_future(|| handle_control_request(
                             &a0.writer,
                             &writer_tx,
                             &a0,
@@ -5870,7 +5872,7 @@ where
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
-                        )
+                        ))
                         .await
                         {
                             break Err(error);
@@ -6099,9 +6101,8 @@ where
                             )
                             .await
                         } else {
-                            // Isolate construction as well as storage of the large
-                            // tool-call future: Box::pin at this callsite leaves a
-                            // temporary on the small native Windows main stack.
+                            // Keep construction of the large tool-call future out
+                            // of the loop's poll stack as well as its stored state.
                             heap_module_future(|| handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
