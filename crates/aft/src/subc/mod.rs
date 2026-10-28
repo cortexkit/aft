@@ -6099,10 +6099,10 @@ where
                             )
                             .await
                         } else {
-                            // The tool-call future is polled on this loop's
-                            // thread, so it is boxed to keep its own frame on
-                            // the heap instead of widening this loop's frame.
-                            Box::pin(handle_tool_call_with_capabilities(
+                            // Isolate construction as well as storage of the large
+                            // tool-call future: Box::pin at this callsite leaves a
+                            // temporary on the small native Windows main stack.
+                            heap_module_future(|| handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
                                 parsed_body,
