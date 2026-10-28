@@ -5796,16 +5796,16 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
-                        // A flow has a non-empty flow_id in its bound scope, not
-                        // merely an ephemeral kind or a parent head. Basal's
-                        // per-call read routes have no flow_id and keep their
-                        // existing read admission. Refuse other flow requests
-                        // before provider reads or tool admission can do work.
-                        let scope = routes.get(&route).and_then(|identity| identity.scope.as_ref())
-                            .or_else(|| management_routes.get(&route).and_then(|identity| identity.scope.as_ref()));
+                        // A flow has a non-empty flow_id in its bound scope. On a
+                        // management route it may call only diagnostics.findings;
+                        // refuse every other management op before it can read
+                        // stores. Flow-scoped tool routes are governed by the
+                        // call-mode contract instead (reads served, writes
+                        // refused), so they are not checked here.
+                        let scope = management_routes.get(&route).and_then(|identity| identity.scope.as_ref());
                         if let Some(error) = flow_scope_refusal(scope) {
                             let result = match decoded.body() {
-                                Ok(body) if management_routes.contains_key(&route) && diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
+                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
                                     &writer_tx, &dispatch_path_metrics, &decoded.frame,
                                     scope, body, &health_rollup_cache, &executor,
                                 ).await,
@@ -8084,16 +8084,6 @@ async fn handle_control_request(
             role_versions,
             call_mode,
         } => {
-            // Management routes admit only diagnostics.findings at request ingress.
-            // Refuse flow tool binds before workdir probes or actor setup.
-            let bind_trust = trust_for_bind(&identity.harness, &principal);
-            if !matches!(&target, RouteTarget::ManagementSurface { module_id } if module_id == "aft")
-                || !matches!(bind_trust, BindTrust::FirstParty)
-            {
-                if let Some(refusal) = flow_scope_refusal(scope.as_ref()) {
-                    return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
-                }
-            }
             let route_id = route_key(route_channel, epoch);
             bind_log::consumer_capabilities(
                 &principal,
@@ -8135,6 +8125,7 @@ async fn handle_control_request(
                 }
             };
 
+            let bind_trust = trust_for_bind(&identity.harness, &principal);
             if installed_route_epochs
                 .get(&route_channel)
                 .is_some_and(|installed| *installed >= epoch)
@@ -9585,7 +9576,7 @@ fn flow_scope_refusal(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Optio
         .map(|_| {
             ErrorBody::new(
                 "flow_scope_not_supported",
-                "flow scopes may call only diagnostics.findings through an AFT management route",
+                "a flow may call only diagnostics.findings on an AFT management route",
             )
         })
 }
@@ -10353,9 +10344,6 @@ async fn handle_tool_call(
         return send_reliable_writer_frame(tx, metrics, error, "unbound or reclaimed route error")
             .await;
     };
-    if let Some(error) = flow_scope_refusal(identity.scope.as_ref()) {
-        return send_provider_error(tx, metrics, frame, error).await;
-    }
     let envelope = match parsed_body.unwrap_or_else(|| serde_json::from_slice::<Value>(&frame.body))
     {
         Ok(envelope) => envelope,

@@ -545,23 +545,6 @@ async fn wire(identity: RouteIdentity, body: Value) -> Value {
 }
 
 #[tokio::test]
-async fn flow_scoped_tool_call_refused_before_dispatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut flow = stamp();
-    flow["attributes"] = json!({"flow_id": "fleet-self-diagnosis"});
-    let route = identity(dir.path(), flow, "reserved:basal");
-    for body in [
-        json!({"name": "read", "arguments": {"path": "secret"}}),
-        json!({"op": "tool.call", "name": "read", "arguments": {"path": "secret"}}),
-        json!({"method": "diagnostics.findings", "params": {}}),
-    ] {
-        assert_eq!(
-            wire(route.clone(), body).await["code"],
-            "flow_scope_not_supported"
-        );
-    }
-}
-#[tokio::test]
 async fn flow_read_other_operations_refused() {
     let dir = tempfile::tempdir().unwrap();
     for op in [

@@ -931,43 +931,8 @@ mod tests {
             assert_eq!(error.code, "flow_scope_not_supported");
         }
 
-        for (channel, target, role_versions) in [
-            (
-                44,
-                RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                None,
-            ),
-            (
-                45,
-                RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                Some(std::collections::BTreeMap::from([(
-                    "tool-provider".into(),
-                    "v1".into(),
-                )])),
-            ),
-            (
-                46,
-                RouteTarget::ManagementSurface {
-                    module_id: "other".into(),
-                },
-                None,
-            ),
-        ] {
-            let answer = request(
-                &mut daemon,
-                0,
-                u64::from(channel),
-                serde_json::to_value(bind(channel, target, role_versions)).unwrap(),
-            )
-            .await;
-            assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
-            let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
-            assert_eq!(error.code, "flow_scope_not_supported");
-        }
+        // Flow-scoped tool-provider binds follow the call-mode contract
+        // (reads served, writes refused), covered in scope_revocation_test.
         drop(daemon);
         module_thread.join().unwrap().unwrap();
         assert!(
