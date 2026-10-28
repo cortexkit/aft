@@ -778,6 +778,37 @@ mod tests {
             .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == OPERATION))));
     }
 
+    #[test]
+    fn diagnostics_findings_serving_replies_match_vector_shape_and_windows() {
+        let cache = super::super::HealthRollupCache::new();
+        let executor = crate::executor::Executor::new();
+        let head = scope(ScopeKind::Head);
+        let mut flow = scope(ScopeKind::Ephemeral);
+        flow.attributes.agent_id = None;
+        flow.attributes.flow_id = Some("fleet-self-diagnosis".to_owned());
+        for stamp in [&head, &flow] {
+            for (bytes, expected_window) in
+                VECTORS[..3]
+                    .iter()
+                    .zip([DEFAULT_WINDOW_MS, 60_000, MAX_WINDOW_MS])
+            {
+                let request = serde_json::from_str(bytes).unwrap();
+                let body = reply(Some(stamp), &request, &cache, &executor).unwrap();
+                let result: Findings = serde_json::from_value(body["result"].clone()).unwrap();
+                assert_eq!(result.window_ms, expected_window);
+                assert!(result.generated_at_ms > 1_000_000_000_000);
+                assert!(result
+                    .findings
+                    .iter()
+                    .all(|f| f.count > 0 && f.samples.len() <= 5));
+                assert!(
+                    result.findings.iter().any(|f| f.check == "health_snapshot"),
+                    "an unmeasured cache is not healthy"
+                );
+            }
+        }
+    }
+
     const VECTORS: [&str; 6] = [
         include_str!("../../tests/fixtures/diagnostics-findings-v1/request-empty.json"),
         include_str!("../../tests/fixtures/diagnostics-findings-v1/request-window.json"),

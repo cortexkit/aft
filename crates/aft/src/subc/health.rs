@@ -2221,7 +2221,21 @@ impl HealthRollupCache {
         now_ms: u64,
         window_ms: u64,
     ) -> Vec<super::diagnostics_findings::Finding> {
-        let (snapshot, age_ms) = self.snapshot();
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => Arc::clone(&snapshot),
+            Err(_) => {
+                return super::diagnostics_findings::from_health(
+                    &Value::Null,
+                    None,
+                    Some("cache_contended_or_poisoned"),
+                    now_ms,
+                    window_ms,
+                )
+            }
+        };
+        let age_ms = snapshot
+            .generated_at_ms
+            .map(|generated| self.now_ms().saturating_sub(generated));
         let reason = if self.census_contended(&snapshot) {
             Some("executor_contended")
         } else {
@@ -2675,6 +2689,24 @@ impl HealthRollupCache {
     #[cfg(test)]
     fn census_builds_for_test(&self) -> u64 {
         self.census_builds.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod findings_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_findings_contended_cache_returns_unknown_without_fallback_probes() {
+        let cache = HealthRollupCache::new();
+        let _held = cache.snapshot.write().unwrap();
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert_eq!(findings.as_array().unwrap().len(), 1);
+        assert_eq!(findings[0]["severity"], "error");
+        assert_eq!(
+            findings[0]["samples"][0]["reason"],
+            "cache_contended_or_poisoned"
+        );
     }
 }
 
