@@ -267,6 +267,7 @@ fn retry_classes_cover_plexus_closed_codes_one_row_per_class() {
         }
     }
     assert_eq!(classify_code("brand_new_code"), CodeClass::Unknown);
+    assert_eq!(classify_code("module_warming"), CodeClass::Transient);
     assert_eq!(
         classify_code("handle_credential_unresolvable{class: transient}"),
         CodeClass::Transient
@@ -519,8 +520,8 @@ fn refusal_explanation_names_already_sent_steps() {
 
 #[test]
 fn refusal_explanation_table_covers_bot_request_codes() {
-    // Current bot-request refusal codes. Failures from the retired signed-assertion
-    // identity flow (for example, assertion_absent) keep the unknown-code fallback.
+    // Known refusal codes need a default explanation in addition to any
+    // detail-specific entries.
     for code in [
         "agent_grant_absent",
         "agent_grant_excludes_request",
@@ -548,6 +549,7 @@ fn refusal_explanation_table_covers_bot_request_codes() {
         "handle_disabled",
         "invalid_request",
         "module_grant_absent",
+        "module_warming",
         "nonce_in_flight",
         "nonce_payload_mismatch",
         "not_present",
@@ -1433,6 +1435,275 @@ fn nonces(harness: &Harness) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum WarmingArrival {
+    ErrorFrame,
+    PlexusBody,
+}
+
+struct WarmingIo {
+    arrival: WarmingArrival,
+    code: &'static str,
+    warming_left: std::cell::Cell<usize>,
+    warm_operation: &'static str,
+    now: std::cell::Cell<Instant>,
+    attempts: std::cell::RefCell<Vec<(Duration, Value)>>,
+    sleeps: std::cell::RefCell<Vec<Duration>>,
+    stand_in_sends: std::cell::RefCell<Vec<Value>>,
+}
+
+impl ExchangeIo for WarmingIo {
+    fn now(&self) -> Instant {
+        self.now.get()
+    }
+
+    async fn sleep(&self, delay: Duration) {
+        self.sleeps.borrow_mut().push(delay);
+        self.now.set(self.now() + delay);
+    }
+
+    async fn request(&self, bytes: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError> {
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        if body["op"] == self.warm_operation {
+            self.attempts
+                .borrow_mut()
+                .push((options.timeout, body.clone()));
+            if self.warming_left.get() > 0 {
+                self.warming_left.set(self.warming_left.get() - 1);
+                return match self.arrival {
+                    WarmingArrival::ErrorFrame => {
+                        // The SDK delivers an Error frame through CallError::Module.
+                        let mut error = serde_json::to_value(subc_protocol::ErrorBody::new(
+                            self.code,
+                            "module is starting",
+                        ))
+                        .unwrap();
+                        error["retryable"] = json!(true);
+                        Err(CallError::Module(serde_json::from_value(error).unwrap()))
+                    }
+                    WarmingArrival::PlexusBody => Ok(serde_json::to_vec(&json!({
+                        "op": body["op"], "status": "error", "data": {
+                            "refusal_code": self.code, "stage": "plexus",
+                            "message": "module is starting", "retryable": true,
+                        },
+                    }))
+                    .unwrap()),
+                };
+            }
+        }
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+        }
+        // Only accepted bot requests reach the downstream stand-in.
+        assert_eq!(body["op"], BOT_REQUEST_OPERATION);
+        self.stand_in_sends.borrow_mut().push(body);
+        Ok(serde_json::to_vec(&plexus_completed()).unwrap())
+    }
+}
+
+struct WarmingRun {
+    io: WarmingIo,
+    body: Value,
+    status: i32,
+    refusal: Option<(String, String)>,
+    elapsed: Duration,
+}
+
+fn run_warming(
+    arrival: WarmingArrival,
+    warming_replies: usize,
+    budget: Duration,
+    warm_bindings: bool,
+    code: &'static str,
+) -> WarmingRun {
+    let started = Instant::now();
+    let io = WarmingIo {
+        arrival,
+        code,
+        warming_left: std::cell::Cell::new(warming_replies),
+        warm_operation: if warm_bindings {
+            BINDINGS_READ_OPERATION
+        } else {
+            BOT_REQUEST_OPERATION
+        },
+        now: std::cell::Cell::new(started),
+        attempts: Default::default(),
+        sleeps: Default::default(),
+        stand_in_sends: Default::default(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(temp.path().join("state"));
+    let manifest = v12_manifest();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let timing = Exchange {
+        io: &io,
+        ticket: "test-ticket",
+        stage: &stage,
+        started,
+        budget,
+    };
+    let body = json!({"op": BOT_REQUEST_OPERATION, "params": {
+        "ticket": "test-ticket", "request_nonce": "same-nonce",
+        "request": {"repository": "cortexkit/aft", "action": "issue comment", "body": "hi"},
+    }});
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            [Duration::from_secs(5), Duration::from_secs(10)],
+        ));
+    let refusal = match &outcome {
+        RouteOutcome::RelayRefusal { code, text } => Some((code.clone(), text.clone())),
+        RouteOutcome::Result(_) => None,
+        other => panic!("unexpected warming outcome: {other:?}"),
+    };
+    let status = super::super::governed_outcome_status(&paths, &binding, TEST_NOW, outcome);
+    let elapsed = io.now() - started;
+    WarmingRun {
+        io,
+        body,
+        status,
+        refusal,
+        elapsed,
+    }
+}
+
+fn assert_warming_recovers(arrival: WarmingArrival) {
+    for warm_bindings in [false, true] {
+        let run = run_warming(
+            arrival,
+            1,
+            Duration::from_secs(30),
+            warm_bindings,
+            "module_warming",
+        );
+        assert_eq!(run.status, 0);
+        assert_eq!(run.refusal, None);
+        assert_eq!(*run.io.sleeps.borrow(), [Duration::from_secs(5)]);
+        assert_eq!(run.elapsed, Duration::from_secs(5));
+        let attempts = run.io.attempts.borrow();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].1, attempts[1].1);
+        assert_eq!(attempts[0].0, Duration::from_secs(30));
+        assert_eq!(attempts[1].0, Duration::from_secs(25));
+        let sent = run.io.stand_in_sends.borrow();
+        assert_eq!(
+            sent.len(),
+            1,
+            "warming must refuse before forwarding a write"
+        );
+        assert_eq!(sent[0], run.body);
+        if !warm_bindings {
+            assert_eq!(
+                attempts[0].1, run.body,
+                "retry must keep the whole body and nonce"
+            );
+        }
+    }
+}
+
+fn assert_warming_exhausts(arrival: WarmingArrival, expected: &str) {
+    for warm_bindings in [false, true] {
+        let run = run_warming(
+            arrival,
+            usize::MAX,
+            Duration::from_secs(30),
+            warm_bindings,
+            "module_warming",
+        );
+        assert_eq!(run.status, REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            run.refusal,
+            Some(("module_warming".into(), expected.into()))
+        );
+        assert!(run.io.stand_in_sends.borrow().is_empty());
+        assert_eq!(
+            *run.io.sleeps.borrow(),
+            [Duration::from_secs(5), Duration::from_secs(10)]
+        );
+        assert_eq!(run.elapsed, Duration::from_secs(15));
+        let attempts = run.io.attempts.borrow();
+        assert_eq!(attempts.len(), 3);
+        for ((timeout, sent), remaining) in attempts.iter().zip([30, 25, 15]) {
+            assert_eq!(*timeout, Duration::from_secs(remaining));
+            assert_eq!(sent, &attempts[0].1);
+        }
+        if !warm_bindings {
+            assert_eq!(attempts[0].1, run.body);
+        }
+    }
+}
+
+#[test]
+fn module_warming_error_frame_then_success_forwards_one_write() {
+    assert_warming_recovers(WarmingArrival::ErrorFrame);
+}
+
+#[test]
+fn module_warming_plexus_body_then_success_forwards_one_write() {
+    assert_warming_recovers(WarmingArrival::PlexusBody);
+}
+
+#[test]
+fn module_warming_error_frame_exhaustion_is_safe_refusal_exit_86() {
+    assert_warming_exhausts(WarmingArrival::ErrorFrame, "AFT refused the bot write: module_warming. The module is still starting. Nothing reached GitHub. Rerunning the command is safe.");
+}
+
+#[test]
+fn module_warming_plexus_body_exhaustion_is_safe_refusal_exit_86() {
+    assert_warming_exhausts(WarmingArrival::PlexusBody, "Plexus refused the bot write: module_warming. The module is still starting. Nothing reached GitHub. Rerunning the command is safe.");
+}
+
+#[test]
+fn module_warming_retry_cannot_extend_the_shared_budget() {
+    for arrival in [WarmingArrival::ErrorFrame, WarmingArrival::PlexusBody] {
+        let run = run_warming(
+            arrival,
+            usize::MAX,
+            Duration::from_secs(4),
+            false,
+            "module_warming",
+        );
+        assert_eq!(run.status, REFUSAL_EXIT_STATUS);
+        assert!(run.io.sleeps.borrow().is_empty());
+        assert_eq!(run.io.attempts.borrow().len(), 1);
+        assert!(run.io.stand_in_sends.borrow().is_empty());
+        assert_eq!(run.elapsed, Duration::ZERO);
+        let (_, text) = run.refusal.unwrap();
+        assert!(text.ends_with("Nothing reached GitHub. Rerunning the command is safe."));
+    }
+}
+
+#[test]
+fn other_retryable_daemon_codes_do_not_gain_not_sent_retries() {
+    for arrival in [WarmingArrival::ErrorFrame, WarmingArrival::PlexusBody] {
+        let run = run_warming(
+            arrival,
+            1,
+            Duration::from_secs(30),
+            false,
+            "other_daemon_code",
+        );
+        assert_eq!(run.status, REFUSAL_EXIT_STATUS);
+        assert!(run.io.sleeps.borrow().is_empty());
+        assert_eq!(run.io.attempts.borrow().len(), 1);
+        assert!(run.io.stand_in_sends.borrow().is_empty());
+        let (code, text) = run.refusal.unwrap();
+        assert_eq!(code, "other_daemon_code");
+        assert!(!text.contains("Nothing reached GitHub"));
+        assert!(!text.contains("Rerunning the command is safe"));
+    }
 }
 
 #[test]

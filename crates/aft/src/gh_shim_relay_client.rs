@@ -145,6 +145,7 @@ fn code_detail(code: &str) -> &str {
 pub(super) fn classify_code(code: &str) -> CodeClass {
     match code_prefix(code) {
         "nonce_in_flight"
+        | "module_warming"
         | "assertion_key_unavailable"
         | "store_failure"
         | "pre_dispatch_read_incomplete" => CodeClass::Transient,
@@ -250,6 +251,7 @@ const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &
     ("handle_disabled", "", "The bot handle is disabled.", GithubReach::Never, RefusalActor::Operator),
     ("invalid_request", "", "The request has an invalid field or shape.", GithubReach::Never, RefusalActor::Agent),
     ("module_grant_absent", "", "The calling module has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
+    ("module_warming", "", "The module is still starting.", GithubReach::Never, RefusalActor::Nobody),
     ("nonce_in_flight", "", "Another worker is still handling this request nonce.", GithubReach::Maybe, RefusalActor::Nobody),
     ("nonce_payload_mismatch", "", "This nonce already belongs to a different request.", GithubReach::Maybe, RefusalActor::Agent),
     ("not_present", "", "The GitHub target was not found.", GithubReach::ReadsOnly, RefusalActor::Agent),
@@ -432,6 +434,10 @@ pub(super) enum Reply {
         code: String,
         facts: RefusalFacts,
     },
+    /// The daemon refused before forwarding to a module that is still starting.
+    Warming {
+        origin: &'static str,
+    },
     Malformed(String),
 }
 
@@ -525,6 +531,9 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     ))
                 }
             }
+        }
+        Some("error") if data["refusal_code"] == "module_warming" && data["stage"] == "plexus" => {
+            Reply::Warming { origin: "Plexus" }
         }
         Some("error") => match data.get("refusal_code").and_then(Value::as_str) {
             Some(code) => Reply::Refused {
@@ -894,7 +903,64 @@ struct Exchange<'a, Io> {
     budget: Duration,
 }
 
+enum SendFailure {
+    Outcome(RouteOutcome),
+    Module { code: String, message: String },
+}
+
+impl SendFailure {
+    fn into_outcome(self) -> RouteOutcome {
+        match self {
+            Self::Outcome(outcome) => outcome,
+            Self::Module { code, .. } if code == "module_warming" => RouteOutcome::RelayRefusal {
+                text: refusal_text(
+                    "AFT",
+                    &code,
+                    &RefusalFacts {
+                        not_sent: true,
+                        ..RefusalFacts::default()
+                    },
+                    None,
+                ),
+                code,
+            },
+            Self::Module { code, message } => RouteOutcome::RelayRefusal {
+                text: format!("the AFT daemon refused the relay request: {code}: {message}"),
+                code,
+            },
+        }
+    }
+}
+
 impl<Io: ExchangeIo> Exchange<'_, Io> {
+    async fn retry_warming(&self, delays: &[Duration; 2], retries: &mut usize) -> bool {
+        let Some(delay) = delays.get(*retries) else {
+            return false;
+        };
+        if self.io.now() + *delay >= self.deadline() {
+            return false;
+        }
+        self.io.sleep(*delay).await;
+        *retries += 1;
+        true
+    }
+
+    async fn check_bindings_with_warming_retry(
+        &self,
+        agent_id: &str,
+        manifest: &Manifest,
+        delays: &[Duration; 2],
+        retries: &mut usize,
+    ) -> Result<BindingsCheck, RouteOutcome> {
+        loop {
+            match self.check_bindings(agent_id, manifest).await {
+                Err(RouteOutcome::RelayRefusal { code, .. })
+                    if code == "module_warming" && self.retry_warming(delays, retries).await => {}
+                result => return result,
+            }
+        }
+    }
+
     fn deadline(&self) -> Instant {
         self.started + self.budget
     }
@@ -906,17 +972,18 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
     /// Each attempt gets only what is left of the exchange's budget. With
     /// nothing left the request is not sent at all, which is a known
     /// not-sent outcome rather than an unknown one.
-    async fn send(&self, body: &Value) -> Result<Vec<u8>, RouteOutcome> {
+    async fn send(&self, body: &Value) -> Result<Vec<u8>, SendFailure> {
         *lock_probe_stage(self.stage) = ProbeStage::Request;
-        let bytes = serde_json::to_vec(body)
-            .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
+        let bytes = serde_json::to_vec(body).map_err(|error| {
+            SendFailure::Outcome(RouteOutcome::SchemaMismatch(error.to_string()))
+        })?;
         let now = self.io.now();
         let remaining = self.deadline().saturating_duration_since(now);
         if remaining.is_zero() {
-            return Err(RouteOutcome::Unavailable(format!(
+            return Err(SendFailure::Outcome(RouteOutcome::Unavailable(format!(
                 "the gh relay's {} ms budget ran out before the request could be sent; nothing was sent",
                 self.budget_ms()
-            )));
+            ))));
         }
         let options = CallOptions {
             timeout: remaining,
@@ -932,24 +999,23 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
         }
         match self.io.request(bytes, options).await {
             Ok(bytes) => Ok(bytes),
-            Err(CallError::NotSent(_)) => Err(RouteOutcome::GovernanceUnavailable),
-            Err(CallError::Module(body)) => Err(RouteOutcome::RelayRefusal {
+            Err(CallError::NotSent(_)) => {
+                Err(SendFailure::Outcome(RouteOutcome::GovernanceUnavailable))
+            }
+            Err(CallError::Module(body)) => Err(SendFailure::Module {
                 code: body.code.clone(),
-                text: format!(
-                    "the AFT daemon refused the relay request: {}: {}",
-                    body.code, body.message
-                ),
+                message: body.message.clone(),
             }),
             // Reported as the time the whole exchange waited, which is what
             // the caller experienced; it never exceeds the budget.
-            Err(_) => Err(RouteOutcome::OutcomeUnknown {
+            Err(_) => Err(SendFailure::Outcome(RouteOutcome::OutcomeUnknown {
                 elapsed_ms: self
                     .io
                     .now()
                     .saturating_duration_since(self.started)
                     .min(self.budget)
                     .as_millis() as u64,
-            }),
+            })),
         }
     }
 
@@ -967,14 +1033,18 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
             // so a daemon from before this change keeps answering.
             "params": {"ticket": self.ticket, "agent_id": agent_id,"purpose":"speech"},
         });
-        let bytes = self.send(&body).await.map_err(|outcome| match outcome {
-            // A read cannot have written anything, so an unanswered read is
-            // simply unavailable rather than an unknown write outcome.
-            RouteOutcome::OutcomeUnknown { .. } => RouteOutcome::Unavailable(
-                "plexus's repository bindings could not be read for the version check".to_string(),
-            ),
-            other => other,
-        })?;
+        let bytes = self
+            .send(&body)
+            .await
+            .map_err(|error| match error.into_outcome() {
+                // A read cannot have written anything, so an unanswered read is
+                // simply unavailable rather than an unknown write outcome.
+                RouteOutcome::OutcomeUnknown { .. } => RouteOutcome::Unavailable(
+                    "plexus's repository bindings could not be read for the version check"
+                        .to_string(),
+                ),
+                other => other,
+            })?;
         let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
             RouteOutcome::SchemaMismatch("the bindings read reply was not JSON".to_string())
         })?;
@@ -1043,11 +1113,17 @@ async fn exchange(
     body: &Value,
     transient_delays: [Duration; 2],
 ) -> RouteOutcome {
+    let mut transient_retries = 0_usize;
     let mut confirmed =
         load_check(paths).filter(|check| check.manifest_version == manifest.manifest_version);
     if confirmed.is_none() {
         match exchange
-            .check_bindings(&agent_binding.agent_id, manifest)
+            .check_bindings_with_warming_retry(
+                &agent_binding.agent_id,
+                manifest,
+                &transient_delays,
+                &mut transient_retries,
+            )
             .await
         {
             Ok(check) => {
@@ -1057,15 +1133,16 @@ async fn exchange(
             Err(outcome) => return outcome,
         }
     }
-    let mut transient_retries = 0_usize;
     let mut reminted = false;
     let mut sent_steps = Vec::new();
     loop {
-        let bytes = match exchange.send(body).await {
-            Ok(bytes) => bytes,
-            Err(outcome) => return outcome,
+        let mut reply = match exchange.send(body).await {
+            Ok(bytes) => parse_reply(&bytes),
+            Err(SendFailure::Module { code, .. }) if code == "module_warming" => {
+                Reply::Warming { origin: "AFT" }
+            }
+            Err(error) => return error.into_outcome(),
         };
-        let mut reply = parse_reply(&bytes);
         if let Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } = &mut reply {
             // An early gate on a later retry may not know which steps an
             // earlier attempt sent. Keep those steps in the final warning.
@@ -1078,7 +1155,7 @@ async fn exchange(
         }
         let reply_generation = match &reply {
             Reply::Completed { generation, .. } | Reply::Refused { generation, .. } => *generation,
-            Reply::Malformed(_) | Reply::ModuleRefused { .. } => None,
+            Reply::Malformed(_) | Reply::ModuleRefused { .. } | Reply::Warming { .. } => None,
         };
         // A new binding generation means plexus's bindings changed since the
         // last check; compare again before trusting the next write.
@@ -1089,7 +1166,12 @@ async fn exchange(
                 .is_none_or(|check| check.repo_binding_generation != generation)
             {
                 match exchange
-                    .check_bindings(&agent_binding.agent_id, manifest)
+                    .check_bindings_with_warming_retry(
+                        &agent_binding.agent_id,
+                        manifest,
+                        &transient_delays,
+                        &mut transient_retries,
+                    )
                     .await
                 {
                     Ok(check) => {
@@ -1125,6 +1207,25 @@ async fn exchange(
             retry_budget_ms = Some(exchange.budget_ms());
         }
         match reply {
+            Reply::Warming { origin } => {
+                if exchange
+                    .retry_warming(&transient_delays, &mut transient_retries)
+                    .await
+                {
+                    continue;
+                }
+                // module_warming is refused before forwarding. Do not infer
+                // the same guarantee for other daemon or transport errors.
+                let facts = RefusalFacts {
+                    not_sent: true,
+                    legs_sent: sent_steps,
+                    ..RefusalFacts::default()
+                };
+                return RouteOutcome::RelayRefusal {
+                    code: "module_warming".to_string(),
+                    text: refusal_text(origin, "module_warming", &facts, None),
+                };
+            }
             Reply::Completed { result, .. } => {
                 let outcome = if let Some(output) =
                     render_thread_state_confirmation(&result, &body["params"]["request"])
