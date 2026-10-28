@@ -767,6 +767,11 @@ mod tests {
         manifest.validate_flow_operations().unwrap();
         assert_eq!(manifest.flow_operations.as_ref().unwrap(), &[OPERATION]);
         let manifest = serde_json::to_value(manifest).unwrap();
+        assert!(manifest["capabilities"]["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == subc_protocol::scope::FLOW_SCOPES_CAPABILITY));
         let providers = manifest["provides"].as_array().unwrap();
         assert!(providers
             .iter()
@@ -776,6 +781,187 @@ mod tests {
         assert!(!providers.iter().any(|p| p["tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == OPERATION))));
+    }
+
+    #[tokio::test]
+    async fn flow_scoped_route_serves_only_diagnostics_findings() {
+        use super::super::*;
+
+        async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = read_frame(daemon).await.unwrap().unwrap();
+                    if frame.header.channel == channel && frame.header.corr == corr {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("flow route response timed out")
+        }
+
+        async fn request(
+            daemon: &mut tokio::io::DuplexStream,
+            channel: u16,
+            corr: u64,
+            body: Value,
+        ) -> Frame {
+            let frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                channel,
+                u32::from(channel != 0),
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            write_frame(daemon, &frame).await.unwrap();
+            receive(daemon, channel, corr).await
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("no-project-setup");
+        let module_root = root.clone();
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let module_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (read, write) = tokio::io::split(module);
+            runtime.block_on(run_module_loop(
+                read,
+                write,
+                &module_root.join("absent-connection.json"),
+                App::default_shared(),
+                Arc::new(Executor::new()),
+                |_, _| panic!("flow scope must not execute commands"),
+                None,
+                false,
+                usize::MAX,
+                None,
+                &module_root.join("storage"),
+                QuiescedLsp::ReapInBackground,
+                None,
+                None,
+            ))
+        });
+        assert_eq!(
+            receive(&mut daemon, 0, HELLO_CORR).await.header.ty,
+            FrameType::Hello
+        );
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut flow = scope(ScopeKind::Ephemeral);
+        flow.attributes.agent_id = None;
+        flow.attributes.flow_id = Some("fleet-self-diagnosis".into());
+        let bind = |channel, target, role_versions| ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target,
+            identity: subc_protocol::BindIdentity::new(&root, "alfonso", "flow-diagnostics"),
+            principal: Some(Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: Some(flow.clone()),
+            role_versions,
+            call_mode: Some(subc_protocol::call_mode::CallMode::Flow),
+        };
+        let ack = request(
+            &mut daemon,
+            0,
+            41,
+            serde_json::to_value(bind(
+                41,
+                RouteTarget::ManagementSurface {
+                    module_id: "aft".into(),
+                },
+                None,
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+        assert!(matches!(
+            serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
+            ModuleControlResponse::RouteBindAck {}
+        ));
+
+        let findings = request(
+            &mut daemon,
+            41,
+            42,
+            json!({"method": OPERATION, "params": {}}),
+        )
+        .await;
+        assert_eq!(findings.header.ty, FrameType::Response, "{findings:?}");
+        let findings: Value = serde_json::from_slice(&findings.body).unwrap();
+        assert!(findings["result"]["findings"].is_array(), "{findings}");
+
+        // Include provider reads and unknown operations: none may fall through
+        // to a database read or a general tool just because it lacks a method.
+        for body in [
+            json!({"method": "memory.census", "params": {}}),
+            json!({"op": "tool.call", "name": "read", "arguments": {"path": "secret"}}),
+            json!({"name": "read", "arguments": {"path": "secret"}}),
+            json!({"op": "tool.list"}),
+            json!({"method": "unknown.operation"}),
+        ] {
+            let answer = request(&mut daemon, 41, 43, body).await;
+            assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
+            let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
+            assert_eq!(error.code, "flow_scope_not_supported");
+        }
+
+        for (channel, role_versions) in [
+            (44, None),
+            (
+                45,
+                Some(std::collections::BTreeMap::from([(
+                    "tool-provider".into(),
+                    "v1".into(),
+                )])),
+            ),
+        ] {
+            let answer = request(
+                &mut daemon,
+                0,
+                u64::from(channel),
+                serde_json::to_value(bind(
+                    channel,
+                    RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    role_versions,
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
+            let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
+            assert_eq!(error.code, "flow_scope_not_supported");
+        }
+        drop(daemon);
+        module_thread.join().unwrap().unwrap();
+        assert!(
+            !root.exists(),
+            "flow admission must not initialize a project or database"
+        );
     }
 
     #[test]

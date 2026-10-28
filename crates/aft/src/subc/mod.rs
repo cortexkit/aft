@@ -5796,6 +5796,26 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // A flow has a non-empty flow_id in its bound scope, not
+                        // merely an ephemeral kind or a parent head. Basal's
+                        // per-call read routes have no flow_id and keep their
+                        // existing read admission. Refuse other flow requests
+                        // before provider reads or tool admission can do work.
+                        let scope = routes.get(&route).and_then(|identity| identity.scope.as_ref())
+                            .or_else(|| management_routes.get(&route).and_then(|identity| identity.scope.as_ref()));
+                        if let Some(error) = flow_scope_refusal(scope) {
+                            let result = match decoded.body() {
+                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    scope, body, &health_rollup_cache, &executor,
+                                ).await,
+                                _ => send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await,
+                            };
+                            if let Err(error) = result {
+                                break Err(error);
+                            }
+                            continue;
+                        }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
                             // Rich-UI chunk queries are provider reads that name no
                             // session or tool, so they are answered here, before the
@@ -8064,6 +8084,13 @@ async fn handle_control_request(
             role_versions,
             call_mode,
         } => {
+            // Management routes admit only diagnostics.findings at request ingress.
+            // Refuse flow tool binds before workdir probes or actor setup.
+            if !matches!(&target, RouteTarget::ManagementSurface { .. }) {
+                if let Some(refusal) = flow_scope_refusal(scope.as_ref()) {
+                    return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
+                }
+            }
             let route_id = route_key(route_channel, epoch);
             bind_log::consumer_capabilities(
                 &principal,
@@ -9544,6 +9571,23 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         })
 }
 
+fn flow_scope_refusal(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Option<ErrorBody> {
+    scope
+        .filter(|stamp| {
+            stamp
+                .attributes
+                .flow_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+        })
+        .map(|_| {
+            ErrorBody::new(
+                "flow_scope_not_supported",
+                "flow scopes may call only diagnostics.findings through an AFT management route",
+            )
+        })
+}
+
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
 /// bare form with no `op` whose `name` is not a provider operation.
 fn route_request_is_tool_call(envelope: &Value) -> bool {
@@ -10307,6 +10351,9 @@ async fn handle_tool_call(
         return send_reliable_writer_frame(tx, metrics, error, "unbound or reclaimed route error")
             .await;
     };
+    if let Some(error) = flow_scope_refusal(identity.scope.as_ref()) {
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
     let envelope = match parsed_body.unwrap_or_else(|| serde_json::from_slice::<Value>(&frame.body))
     {
         Ok(envelope) => envelope,

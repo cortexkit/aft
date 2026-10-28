@@ -332,6 +332,10 @@ async fn flow_read_daemon_parent_confirmation() {
         (None, Some("Route not admitted: parent: the daemon scope.describe request for the parent scope failed.")),
     ] {
         let child = identity(&basal_root, stamp(), "reserved:basal");
+        let child_scope = child.scope.as_ref().unwrap();
+        assert_eq!(child_scope.kind, ScopeKind::Ephemeral);
+        assert!(child_scope.parent.is_some());
+        assert!(child_scope.attributes.flow_id.is_none());
         let routes = HashMap::from([
             (route_key(41, 1), child.clone()),
             (route_key(42, 1), parent.clone()),
@@ -360,15 +364,39 @@ async fn flow_read_daemon_parent_confirmation() {
         )
         .unwrap();
         let active = Arc::default();
-        dispatch(
+        let (bash, _) = mpsc::channel(8);
+        let (touch, _) = mpsc::channel(8);
+        let (entries, _) = mpsc::unbounded_channel();
+        handle_tool_call(
             &writer,
-            &metrics,
             &frame,
-            child,
-            body,
+            Some(Ok(body)),
+            None,
+            PhaseTrace::new(Instant::now()),
             &routes,
+            &HashMap::new(),
+            &ReclaimedRoutes::default(),
+            &mut HashMap::new(),
             &executor,
             &active,
+            &Arc::new(PendingDeferredSetups::default()),
+            &Arc::new(Notify::new()),
+            &PersistentCancelSignal::new(),
+            &bash,
+            &touch,
+            &metrics,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut 1,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |_, _| panic!("flow-read must not dispatch a general tool"),
+            &DeferredResponseSender { entries, wake: Default::default() },
+            false,
+            2 * 1024 * 1024,
+            &drain::ModuleDrainWindow::default(),
             Some(&control),
         )
         .await
@@ -514,6 +542,23 @@ async fn wire(identity: RouteIdentity, body: Value) -> Value {
     let answer = replies.recv().await.unwrap();
     assert_eq!(answer.header.ty, FrameType::Error);
     serde_json::from_slice(&answer.body).unwrap()
+}
+
+#[tokio::test]
+async fn flow_scoped_tool_call_refused_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut flow = stamp();
+    flow["attributes"] = json!({"flow_id": "fleet-self-diagnosis"});
+    let route = identity(dir.path(), flow, "reserved:basal");
+    for body in [
+        json!({"name": "read", "arguments": {"path": "secret"}}),
+        json!({"op": "tool.call", "name": "read", "arguments": {"path": "secret"}}),
+    ] {
+        assert_eq!(
+            wire(route.clone(), body).await["code"],
+            "flow_scope_not_supported"
+        );
+    }
 }
 #[tokio::test]
 async fn flow_read_other_operations_refused() {
