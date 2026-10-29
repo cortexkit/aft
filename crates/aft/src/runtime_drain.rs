@@ -7024,7 +7024,7 @@ mod tests {
         );
         ctx.set_canonical_cache_root(root.clone());
         *ctx.semantic_index_status().write().unwrap() =
-            crate::semantic_index::SemanticIndexStatus::Disabled;
+            crate::context::SemanticIndexStatus::Disabled;
         *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
         let request = serde_json::from_value(serde_json::json!({
             "id": "exact-memo-publication",
