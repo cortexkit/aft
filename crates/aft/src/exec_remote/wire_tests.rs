@@ -1246,8 +1246,8 @@ async fn outage_daemon_with_started_job(started: bool) -> OutageDaemon {
                                             replies.push(record(job_record));
                                         }
                                     }
-                                    // The provider restarts: its route closes with the job
-                                    // still queued or running, and stays away until restored.
+                                    // The provider restarts while the job is still queued or running.
+                                    // Its route closes, and the provider stays unavailable until restored.
                                     up.store(false, Ordering::SeqCst);
                                     drop_route = true;
                                 }
