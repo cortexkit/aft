@@ -22,8 +22,8 @@ struct StartupSource {
 #[cfg(target_os = "macos")]
 static SOURCE: OnceLock<Result<StartupSource, String>> = OnceLock::new();
 
-/// Capture the startup source without creating a persistent pin; even
-/// metadata-only CLI modes may call this.
+/// On macOS, hold the startup executable open without creating a persistent
+/// pin. Metadata-only CLI modes may call this; other platforms need no handle.
 pub fn capture_at_startup() {
     #[cfg(target_os = "macos")]
     SOURCE.get_or_init(|| {
@@ -67,7 +67,7 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    // Never follow a redirected run domain outside the private storage root.
+    // Require the storage `run` path to be a directory, not a symlink.
     if !std::fs::symlink_metadata(&run)?.file_type().is_dir() {
         return Err(io::Error::other(
             "AFT storage run domain is not a directory",
