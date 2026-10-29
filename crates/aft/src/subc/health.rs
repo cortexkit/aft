@@ -1969,7 +1969,8 @@ fn retention_report_totals(
 }
 
 fn ordinary_ready_health_root(root: &Value) -> bool {
-    root["standing"] != true
+    root["abbreviated"] != true
+        && root["standing"] != true
         && !root["standing_refusal"].is_string()
         && root["cache_unavailable_reason"].is_null()
         && root["state"] == "ready"
@@ -1999,6 +2000,90 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
                     .get("callgraph_readiness_deferred")
                     .is_none_or(Value::is_null)
         })
+}
+
+fn abbreviated_health_path(path: &str) -> String {
+    if path.len() <= 160 {
+        return path.to_owned();
+    }
+    let basename = path
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path);
+    let label = basename.chars().take(64).collect::<String>();
+    // Keep a digest of the entire identity: roots with the same basename must
+    // remain distinguishable after their parent directories are hidden.
+    format!(
+        "<blake3:{}>/{label}",
+        blake3::hash(path.as_bytes()).to_hex()
+    )
+}
+
+fn abbreviated_health_refusal(refusal: &str) -> String {
+    if refusal.len() <= 256 {
+        return refusal.to_owned();
+    }
+    if refusal.starts_with("resolved-path-drift refusal") {
+        let field = [
+            "resolved_target",
+            "resolved_git_toplevel",
+            "scoped_relative_path",
+        ]
+        .into_iter()
+        .find(|field| refusal.contains(&format!(": {field} changed from ")))
+        .unwrap_or("resolved path");
+        return format!("resolved-path-drift refusal: {field} changed (details abbreviated)");
+    }
+    // Resolution errors start with their refusal category. Keep that prefix,
+    // but bound the error's user-controlled paths and nested detail.
+    let prefix = refusal.chars().take(160).collect::<String>();
+    format!(
+        "{prefix}… <blake3:{}>",
+        blake3::hash(refusal.as_bytes()).to_hex()
+    )
+}
+
+fn abbreviate_health_root(root: &mut Value) -> bool {
+    let Some(row) = root.as_object_mut() else {
+        return false;
+    };
+    if row.get("abbreviated") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    // The final actionable row is a summary, not an omitted root. Preserve its
+    // identity, readiness and refusal codes while yielding optional telemetry.
+    row.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "project_root"
+                | "root_id"
+                | "state"
+                | "status"
+                | "standing"
+                | "standing_entry"
+                | "standing_refusal"
+                | "cache_unavailable_reason"
+                | "search_index"
+                | "semantic_index"
+                | "callgraph_store"
+                | "tier2"
+        )
+    });
+    for field in ["project_root", "root_id", "standing_entry"] {
+        if let Some(Value::String(path)) = row.get_mut(field) {
+            *path = abbreviated_health_path(path);
+        }
+    }
+    if let Some(Value::String(refusal)) = row.get_mut("standing_refusal") {
+        *refusal = abbreviated_health_refusal(refusal);
+    }
+    for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
+        if let Some(Value::Object(component)) = row.get_mut(component) {
+            component.retain(|key, _| key == "status");
+        }
+    }
+    row.insert("abbreviated".into(), Value::Bool(true));
+    true
 }
 
 fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
@@ -2082,7 +2167,15 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
                 let index = roots
                     .iter()
                     .rposition(ordinary_ready_health_root)
-                    .unwrap_or(roots.len() - 1);
+                    .or_else(|| (roots.len() > 1).then(|| roots.len() - 1));
+                let Some(index) = index else {
+                    // A degraded headline without its last actionable root is
+                    // misleading. Abbreviating that row does not omit a root.
+                    if abbreviate_health_root(&mut roots[0]) {
+                        continue;
+                    }
+                    return;
+                };
                 roots.remove(index);
                 let omitted = metrics
                     .get("root_details_omitted")
@@ -9440,9 +9533,10 @@ mod tests {
         let parent = tempfile::tempdir().expect("standing fixture parent");
         let mut base = parent.path().to_path_buf();
         if long_paths {
-            // Repeated paths must exhaust the public budget even with a short
-            // system temp directory. Each component stays below NAME_MAX and
-            // the complete paths stay below macOS's PATH_MAX.
+            // Repeated directory paths must force abbreviation under the health
+            // metrics byte budget, even with a short system temp directory.
+            // Each component stays below NAME_MAX and complete paths stay below
+            // macOS's PATH_MAX.
             while base.as_os_str().len() < 700 {
                 base.push("standing-health-resolved-path-drift-".repeat(2));
             }
