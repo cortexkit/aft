@@ -16605,11 +16605,20 @@ fn run_captured_protected(
             return status;
         }
     }
-    let (manifest, classification, binding, rung) =
-        match captured_plan(args, paths, target, cwd, now) {
-            Ok(plan) => plan,
-            Err(error) => return refuse(RefusalCode::SeamRefusal, &error.agent_text()),
-        };
+    let (manifest, classification, binding, rung) = match captured_plan(
+        args, paths, target, cwd, now,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let mut text = error.agent_text();
+            // run_with refuses worker writes before this head-shell path.
+            // Do not put operator-bypass advice in shared refusal text.
+            if error.code == Code::PolicyDenied && error.reason == "not_governed" {
+                text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
+            }
+            return refuse(RefusalCode::SeamRefusal, &text);
+        }
+    };
     // Protected invocations never hand native gh the operator's credentials.
     dispatch_r3(
         args,
