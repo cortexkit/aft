@@ -7600,6 +7600,7 @@ fn start_checkout_semantic_lane(
     };
     let lifecycle = ctx.subc_lifecycle_admission();
     let strict_lifecycle = lifecycle.clone();
+    let import_binding = ctx.views_import_control();
     let config = crate::views::semantic_runtime::WorkerConfig {
         root: root.to_path_buf(),
         storage: ctx.storage_paths(),
@@ -7639,9 +7640,8 @@ fn start_checkout_semantic_lane(
                 // embedding every file again.
                 let current: crate::migration::v3_ledger::ImportControl = {
                     let slot = weak_slot.clone();
-                    let lifecycle = strict_lifecycle.clone();
                     Arc::new(move || {
-                        lifecycle.is_bound()
+                        import_binding()
                             && slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
                     })
                 };
