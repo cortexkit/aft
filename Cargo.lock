@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aft-secret-rules"
-version = "0.63.2"
+version = "0.63.3"
 dependencies = [
  "idna",
  "serde",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aft-tokenizer"
-version = "0.63.2"
+version = "0.63.3"
 dependencies = [
  "criterion",
  "fancy-regex 0.18.0",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "agent-file-tools"
-version = "0.63.2"
+version = "0.63.3"
 dependencies = [
  "aft-secret-rules",
  "aft-tokenizer",
