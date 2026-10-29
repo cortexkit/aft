@@ -75,19 +75,26 @@ function spawnHarness(
   mkdirSync(binDir, { recursive: true });
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(join(configDir, "cortexkit"), { recursive: true });
-  // A stand-in for npm that records its pid and then just sits there, so the
-  // LSP install is guaranteed to still be running when the session ends.
+  // Only the install should sleep and record its PID. A stalled version probe
+  // could overwrite the marker and make shutdown assertions check the wrong child.
   linkCachedExecutable(
     join(binDir, "npm"),
-    '#!/bin/sh\necho $$ > "$HARNESS_NPM_MARKER"\nexec sleep 60\n',
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo 10.9.2; exit 0; fi',
+      'if [ "$1" != "install" ]; then exit 0; fi',
+      'echo $$ > "$HARNESS_NPM_MARKER"',
+      "exec sleep 60",
+      "",
+    ].join("\n"),
   );
   // A TypeScript project makes typescript-language-server relevant; pinning
-  // its version skips the registry probe so no network is needed.
+  // its version and disabling the other relevant servers avoids registry lookups.
   writeFileSync(join(projectDir, "a.ts"), "export const a = 1;\n");
   writeFileSync(join(projectDir, "package.json"), '{ "name": "headless-exit" }\n');
   writeFileSync(
     join(configDir, "cortexkit", "aft.jsonc"),
-    '{ "indexes": { "semantic": true }, "lsp": { "versions": { "typescript-language-server": "4.3.3" } } }\n',
+    '{ "indexes": { "semantic": true }, "lsp": { "disabled": ["typescript-sdk", "biome"], "versions": { "typescript-language-server": "4.3.3" } } }\n',
   );
 
   const env: Record<string, string> = {};
@@ -307,6 +314,7 @@ describe.skipIf(process.platform === "win32")(
     test("the in-flight npm install is stopped with the session instead of left running", async () => {
       const run = await runHarness();
       expect(run.npmPid).not.toBeNull();
+      expect(run.events.map((event) => event.name)).toContain("npm-stopped");
       expect(isAlive(run.npmPid ?? -1)).toBe(false);
     }, 70_000);
   },
@@ -323,8 +331,9 @@ describe.skipIf(process.platform === "win32")("SIGTERM ends a Pi host running th
     expect(run.killedAsHung).toBe(false);
     expect({ code: run.exitCode, signal: run.exitSignal }).toEqual({ code: 143, signal: null });
     expect(run.exitedAfterSignalMs ?? Number.POSITIVE_INFINITY).toBeLessThan(SIGTERM_EXIT_BOUND_MS);
-    // The plugin's own cleanup still ran: the in-flight npm install is gone.
+    // The real terminator confirmed the install's exit before the host exited.
     expect(run.npmPid).not.toBeNull();
+    expect(run.events).toContain("npm-stopped");
     expect(isAlive(run.npmPid ?? -1)).toBe(false);
   }, 70_000);
 });
