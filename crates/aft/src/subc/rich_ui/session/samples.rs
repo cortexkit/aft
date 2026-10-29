@@ -16,7 +16,7 @@ async fn capture() -> Value {
     for (id, args) in [
         (
             "read",
-            json!({"path":"main.rs", "startLine":1, "endLine":2}),
+            json!({"path":f.policy.project_root.join("main.rs"), "startLine":1, "endLine":2}),
         ),
         ("outline", json!({"target":"main.rs"})),
         (
@@ -111,6 +111,7 @@ fn normalize_value(value: &mut Value, root: &str) {
         }
         Value::String(text) => {
             *text = text
+                .replace(&format!("{root}\\"), "${FIXTURE_ROOT}/")
                 .replace(root, "${FIXTURE_ROOT}")
                 .replace(&root.replace('\\', "/"), "${FIXTURE_ROOT}")
                 .replace(TASK, "bash-SAMPLE")
@@ -195,5 +196,12 @@ fn rich_ui_samples_normalize_only_volatile_values() {
             "waited":{"elapsed_ms":0, "limit_ms":20000, "reason":"exit"},
             "exitCode":42, "bytes":4, "running":false, "next":null,
         })
+    );
+
+    let mut windows_paths = json!([r"C:\fixture\main.rs", "C:/fixture/main.rs"]);
+    normalize_value(&mut windows_paths, r"C:\fixture");
+    assert_eq!(
+        windows_paths,
+        json!(["${FIXTURE_ROOT}/main.rs", "${FIXTURE_ROOT}/main.rs"])
     );
 }
