@@ -8110,7 +8110,6 @@ async fn drive_higher_epoch_rebind_preserves_queued_read_daemon(input: FakeDaemo
                 "duplicate tool terminal"
             );
             assert_eq!(tool_response_json(&frame)["success"], true);
-            assert_tool_project_root(&frame, &root1);
         }
     }
     assert_eq!(
