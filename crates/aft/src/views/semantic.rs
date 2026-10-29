@@ -1935,7 +1935,7 @@ impl SemanticPlane {
                             )?;
                             if owned.is_none() {
                                 report.pending = Some(FillPending::LocalContention);
-                                return Err(super::semantic_batch_lease::PENDING_REASON.into());
+                                return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
                             }
                             *lock(&claim.holder) = owned;
                         }
@@ -2324,7 +2324,7 @@ impl SemanticPlane {
             let wait_started = Instant::now();
             let Some(gate) = arena.try_chunk_batch() else {
                 report.pending = Some(FillPending::LocalContention);
-                return Err(super::semantic_batch_lease::PENDING_REASON.into());
+                return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
             };
             report.timing.chunk_wait += wait_started.elapsed();
             let lookup_started = Instant::now();
@@ -2364,13 +2364,13 @@ impl SemanticPlane {
                     // Collection may have removed a cached row since preflight.
                     // Re-prepare outside the claims rather than acquire capacity.
                     report.pending = Some(FillPending::AdmissionChanged);
-                    return Err(super::semantic_batch_lease::PENDING_REASON.into());
+                    return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
                 }
                 match super::semantic_batch_lease::try_acquire(&self.storage, family, &identity) {
                     Ok(Some(owner)) => lease = Some(owner),
                     Ok(None) => {
                         report.pending = Some(FillPending::Contended);
-                        return Err(super::semantic_batch_lease::PENDING_REASON.into());
+                        return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
                     }
                     Err(error) => {
                         report.pending = Some(FillPending::LeaseError(error.clone()));

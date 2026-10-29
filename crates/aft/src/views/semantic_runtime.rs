@@ -98,7 +98,7 @@ pub(crate) enum CoordinationState {
     },
     Error {
         failure: LeaseError,
-        retry_scheduled: bool,
+        retry_in: Option<Duration>,
     },
 }
 
@@ -2034,7 +2034,7 @@ fn serve_fills_with_status<F>(
                 schedule_retry(
                     slot,
                     epoch,
-                    super::semantic_batch_lease::PENDING_REASON,
+                    super::semantic_batch_lease::PENDING_CONTROL,
                     wait,
                     schedule.retry_initial,
                 );
@@ -2073,17 +2073,17 @@ fn serve_fills_with_status<F>(
             }
             FillOutcome::LeaseError(failure) => {
                 lease_error_attempts += 1;
-                let retry_scheduled =
-                    failure.retryable && lease_error_attempts <= LEASE_ERROR_RETRIES;
-                if retry_scheduled {
+                let retry_in = (failure.retryable && lease_error_attempts <= LEASE_ERROR_RETRIES)
+                    .then_some(backoff);
+                if let Some(wait) = retry_in {
                     schedule_retry(
                         slot,
                         epoch,
-                        super::semantic_batch_lease::ERROR_REASON,
-                        backoff,
+                        super::semantic_batch_lease::ERROR_CONTROL,
+                        wait,
                         schedule.retry_initial,
                     );
-                    retry_after = Some((backoff, true));
+                    retry_after = Some((wait, true));
                     backoff = (backoff * 2).min(schedule.retry_max);
                 } else {
                     clear_retry(slot, epoch);
@@ -2096,7 +2096,7 @@ fn serve_fills_with_status<F>(
                     runtime.clear_unavailable();
                     runtime.set_coordination(Some(CoordinationState::Error {
                         failure: failure.clone(),
-                        retry_scheduled,
+                        retry_in,
                     }));
                 }
                 // The loaded vectors remain usable. Only coordination failed;
@@ -2112,7 +2112,7 @@ fn serve_fills_with_status<F>(
                 crate::slog_warn!(
                     "semantic batch lease error retry_count={} retry_scheduled={} error={}",
                     lease_error_attempts,
-                    retry_scheduled,
+                    retry_in.is_some(),
                     failure
                 );
                 #[cfg(test)]
@@ -2378,7 +2378,7 @@ where
                 runtime.set_coordination(report.pending.as_ref().map(|pending| match pending {
                     super::semantic::FillPending::LeaseError(failure) => CoordinationState::Error {
                         failure: failure.clone(),
-                        retry_scheduled: false,
+                        retry_in: None,
                     },
                     super::semantic::FillPending::BaseBusy { owner_pid, attempt } => {
                         CoordinationState::BaseBusy {

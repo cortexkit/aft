@@ -17,6 +17,115 @@ use std::sync::atomic::AtomicUsize;
 const ROWS_PER_ONE_CHUNK_FILE: u64 = 2;
 
 #[test]
+fn semantic_batch_lease_error_state_keeps_the_scheduled_wait_before_backoff_doubles() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn retry_vector() {}\n")]);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let lease_path = super::super::semantic_batch_lease::path(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    );
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let mut schedule = fast_schedule(root.path());
+        schedule.retry_initial = Duration::from_secs(4);
+        schedule.retry_max = Duration::from_secs(80);
+        std::thread::spawn(move || {
+            let mut first = true;
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts| {
+                if first {
+                    first = false;
+                    std::fs::remove_file(&lease_path).unwrap();
+                } else {
+                    // Block the next provider attempt until the test has read
+                    // the first retry's coordination state, even if its reader is delayed.
+                    let _ = release_rx.recv();
+                }
+                Model::default().embed(texts)
+            });
+        })
+    };
+    let event = observer.next();
+    let state = runtime.coordination_state();
+    slot.clear();
+    let _ = release_tx.try_send(());
+    worker.join().unwrap();
+    assert_eq!(event, "lease_error");
+    assert!(
+        matches!(state, Some(CoordinationState::Error {
+        retry_in: Some(wait), ..
+    }) if wait == Duration::from_secs(4)),
+        "{state:?}"
+    );
+}
+
+#[test]
+fn semantic_batch_lease_operator_copy_never_enters_finalized_agent_replies() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("read.rs", "pub fn read_result() {\n}\n")]);
+    let (_lane_slot, _lane_epoch, _lane_wake, runtime) = served_lane(storage.path(), root.path());
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().to_path_buf());
+    config.storage_dir = Some(storage.path().to_path_buf());
+    config.views.enabled = true;
+    config.indexes.semantic = true;
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let (epoch, _wake) = ctx.checkout_semantic().begin();
+    assert!(ctx.checkout_semantic().install(epoch, Arc::clone(&runtime)));
+    *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::ready();
+    for state in [
+        CoordinationState::Contended,
+        CoordinationState::BaseBusy {
+            owner_pid: 42,
+            attempt: 3,
+        },
+        CoordinationState::Error {
+            failure: LeaseError {
+                kind: super::super::semantic::LeaseErrorKind::Storage(std::io::ErrorKind::Other),
+                detail: "coordination denied".into(),
+                retryable: true,
+            },
+            retry_in: Some(Duration::from_secs(4)),
+        },
+        CoordinationState::Error {
+            failure: LeaseError {
+                kind: super::super::semantic::LeaseErrorKind::Storage(std::io::ErrorKind::Other),
+                detail: "coordination denied".into(),
+                retryable: false,
+            },
+            retry_in: None,
+        },
+    ] {
+        runtime.set_coordination(Some(state));
+        for tool in ["read", "search", "inspect", "bash"] {
+            let mut response =
+                crate::protocol::Response::success("agent-reply", serde_json::json!({}));
+            let mut text = "ordinary tool result".to_owned();
+            crate::response_finalize::finalize_tool_response(
+                &mut response,
+                &mut text,
+                &ctx,
+                "session",
+                tool,
+                false,
+            );
+            let visible = format!("{text}\n{}", serde_json::to_string(&response).unwrap());
+            assert!(!visible.contains("Waiting for another AFT process that is embedding the same new code; results will follow."), "{visible}");
+            assert!(
+                !visible.contains("Can't coordinate embedding with other AFT processes"),
+                "{visible}"
+            );
+        }
+    }
+}
+
+#[test]
 fn semantic_batch_lease_permanent_error_is_visible_without_a_retry_timer() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
@@ -308,7 +417,7 @@ fn semantic_batch_lease_transient_errors_back_off_then_park_visibly() {
                 retryable: true,
                 ..
             },
-            retry_scheduled: false
+            retry_in: None
         })
     ));
     assert_eq!(model.texts(), 5);

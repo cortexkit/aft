@@ -10,9 +10,9 @@ use std::{fmt, io};
 
 use crate::fs_lock::{self, AcquireError, LockGuard};
 
-// Placeholder reason for pending semantic work, not a backend failure.
-pub(crate) const PENDING_REASON: &str = "SEMANTIC_BATCH_PENDING_APPROVAL";
-pub(crate) const ERROR_REASON: &str = "SEMANTIC_BATCH_COORDINATION_ERROR_APPROVAL";
+// Internal fill/retry control markers; operator copy belongs only to status views.
+pub(crate) const PENDING_CONTROL: &str = "semantic chunk coordination pending";
+pub(crate) const ERROR_CONTROL: &str = "semantic chunk coordination failed";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LeaseErrorKind {
