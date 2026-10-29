@@ -347,8 +347,14 @@ fn user_name(uid: u32) -> String {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct SystemdScopeLauncher {
+    path: PathBuf,
+    supports_expand_environment: bool,
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn systemd_scope_argv(
-    systemd_run: &Path,
+    launcher: &SystemdScopeLauncher,
     executable: &Path,
     args: &[OsString],
 ) -> (PathBuf, Vec<OsString>) {
@@ -356,22 +362,29 @@ pub(crate) fn systemd_scope_argv(
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
+    if launcher.supports_expand_environment {
+        wrapped.push(OsString::from("--expand-environment=no"));
+    }
     wrapped.push(executable.as_os_str().to_os_string());
     wrapped.extend_from_slice(args);
-    (systemd_run.to_path_buf(), wrapped)
+    (launcher.path.clone(), wrapped)
 }
 
 #[cfg(target_os = "linux")]
 fn select_systemd_scope_launcher_with(
     find: impl FnOnce() -> Option<PathBuf>,
-    probe: impl FnOnce(&Path) -> bool,
-) -> Option<PathBuf> {
-    let launcher = find()?;
-    probe(&launcher).then_some(launcher)
+    probe: impl FnOnce(&Path) -> Option<bool>,
+) -> Option<SystemdScopeLauncher> {
+    let path = find()?;
+    let supports_expand_environment = probe(&path)?;
+    Some(SystemdScopeLauncher {
+        path,
+        supports_expand_environment,
+    })
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn select_systemd_scope_launcher() -> Option<PathBuf> {
+pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
     select_systemd_scope_launcher_with(
         || which::which("systemd-run").ok(),
         |launcher| probe_systemd_scope(launcher, Duration::from_secs(1)),
@@ -379,10 +392,36 @@ pub(crate) fn select_systemd_scope_launcher() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
+fn probe_systemd_scope(launcher: &Path, limit: Duration) -> Option<bool> {
+    let deadline = Instant::now() + limit;
+    if probe_systemd_scope_with(launcher, true, deadline) {
+        return Some(true);
+    }
+    // Pre-254 systemd lacks this option but passes scope argv through literally.
+    // Never escape dollars on that path: doing so would change the shell's input.
+    probe_systemd_scope_with(launcher, false, deadline).then_some(false)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_systemd_scope_with(
+    launcher: &Path,
+    supports_expand_environment: bool,
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let (_, args) = systemd_scope_argv(
+        &SystemdScopeLauncher {
+            path: launcher.to_path_buf(),
+            supports_expand_environment,
+        },
+        Path::new("/bin/true"),
+        &[],
+    );
     let mut command = std::process::Command::new(launcher);
     command
-        .args(["--user", "--scope", "--collect", "--quiet", "/bin/true"])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -390,7 +429,6 @@ fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
     let Ok(mut child) = command.spawn() else {
         return false;
     };
-    let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if Instant::now() < deadline => return status.success(),
@@ -1140,28 +1178,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_scope_argv_wraps_the_tool_shell() {
-        let args = vec![OsString::from("-c"), OsString::from("printf ready")];
-        let (program, wrapped) = systemd_scope_argv(
-            Path::new("/usr/bin/systemd-run"),
-            Path::new("/bin/sh"),
-            &args,
-        );
-        assert_eq!(program, PathBuf::from("/usr/bin/systemd-run"));
-        assert_eq!(
-            wrapped,
-            vec![
-                "--user",
-                "--scope",
-                "--collect",
-                "--quiet",
-                "/bin/sh",
-                "-c",
-                "printf ready",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
-        );
+        let command = "X=inner; echo ${X} $X $$; cd /usr; echo ${PWD}";
+        let args = vec![OsString::from("-c"), OsString::from(command)];
+        for supports_expand_environment in [true, false] {
+            let launcher = SystemdScopeLauncher {
+                path: PathBuf::from("/usr/bin/systemd-run"),
+                supports_expand_environment,
+            };
+            let (program, wrapped) = systemd_scope_argv(&launcher, Path::new("/bin/sh"), &args);
+            assert_eq!(program, launcher.path);
+            let mut expected = vec!["--user", "--scope", "--collect", "--quiet"];
+            if supports_expand_environment {
+                expected.push("--expand-environment=no");
+            }
+            expected.extend(["/bin/sh", "-c", command]);
+            assert_eq!(
+                wrapped,
+                expected.into_iter().map(OsString::from).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1172,10 +1207,10 @@ mod tests {
             || Some(PathBuf::from("/usr/bin/systemd-run")),
             |_| {
                 probes.set(probes.get() + 1);
-                false
+                None
             },
         );
-        assert_eq!(selected, None);
+        assert!(selected.is_none());
         assert_eq!(probes.get(), 1);
     }
 
@@ -1568,7 +1603,7 @@ fn lifecycle_scope_probe_deadline_falls_back() {
     crate::executable_cache::write_executable(&launcher, b"#!/bin/sh\nsleep 0.1\nexit 0\n")
         .unwrap();
     assert!(
-        !probe_systemd_scope(&launcher, Duration::ZERO),
+        probe_systemd_scope(&launcher, Duration::ZERO).is_none(),
         "expired probe still reported availability"
     );
 }
