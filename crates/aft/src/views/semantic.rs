@@ -1698,16 +1698,30 @@ impl SemanticPlane {
         // claim before blocking for final cold admission, then reacquire and
         // recheck file results. Cache-only fills never acquire a cold slot.
         let identity = self.producer.chunk_identity();
+        let checked_at = store.deletion_epoch().ok().flatten();
+        let mut prepared_vectors = Vec::new();
         let mut needs_cold = false;
-        for chunk in chunks.iter().flatten() {
-            let key = self.producer.chunk_key(&chunk.embed_text);
-            if arena.chunk_vector(&key).is_none()
-                && load_chunk(&store, &arena, &key, &identity, &chunk.embed_text)
-                    .map_err(plane_error)?
-                    .is_none()
+        for (position, chunk) in chunks.iter().flatten().enumerate() {
+            if legacy_reuse
+                .as_ref()
+                .and_then(|plan| plan.get(position))
+                .is_some_and(|(_, vector)| vector.is_some())
             {
-                needs_cold = true;
-                break;
+                continue;
+            }
+            let key = self.producer.chunk_key(&chunk.embed_text);
+            if arena.chunk_vector(&key).is_none() {
+                match load_chunk(&store, &arena, &key, &identity, &chunk.embed_text)
+                    .map_err(|error| plane_error(error.to_string()))?
+                {
+                    Some(vector) => {
+                        prepared_vectors.push(arena.remember_chunk(key, vector, checked_at))
+                    }
+                    None => {
+                        needs_cold = true;
+                        break;
+                    }
+                }
             }
         }
         if needs_cold {
