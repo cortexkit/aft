@@ -99,10 +99,10 @@ impl EmbeddingGate {
         }
     }
 
-    fn wait_for_two(&self) -> Vec<Vec<String>> {
+    fn wait_for_first(&self) -> Vec<Vec<String>> {
         let mut state = self.state.lock().unwrap();
         let deadline = Instant::now() + DEADLINE;
-        while state.0.len() < 2 {
+        while state.0.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
@@ -602,11 +602,10 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
     );
 }
 
-/// Holds both HTTP responses so neither process can publish the new chunk
-/// before the other process has sent it to the paid-provider boundary.
+/// Holds the owner's response until the other process acknowledges contention.
+/// A second provider arrival is a failure, never a condition for releasing it.
 #[test]
-#[ignore = "known cross-process duplicate embedding; durable claim design must be reviewed before fixing"]
-fn views_on_two_processes_reproduce_duplicate_checkout_chunk() {
+fn views_on_two_processes_single_flight_checkout_chunk() {
     let _settings = crate::test_helpers::without_storage_override();
     let gate = Arc::new(EmbeddingGate::default());
     let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
@@ -642,29 +641,92 @@ fn views_on_two_processes_reproduce_duplicate_checkout_chunk() {
         linked.pid(),
         storage.path().display()
     );
-    for (process, root) in [(&mut main, &repo.main), (&mut linked, &repo.linked)] {
-        let configured = process.send(
-            &configure_payload(root, storage.path(), &server, true, MODEL, 120_000).to_string(),
-        );
-        assert_eq!(configured["success"], true, "{configured:?}");
-    }
-    let requests = gate.wait_for_two();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests[0], requests[1],
-        "processes must request identical text"
+    let configured = main.send(
+        &configure_payload(&repo.main, storage.path(), &server, true, MODEL, 120_000).to_string(),
     );
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let requests = gate.wait_for_first();
     assert_eq!(requests[0].len(), 1, "one new function is one chunk");
+    let configured = linked.send(
+        &configure_payload(&repo.linked, storage.path(), &server, true, MODEL, 120_000).to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let status = linked.send(r#"{"id":"contention","command":"status"}"#);
+        assert_eq!(
+            server.texts() - chunks,
+            1,
+            "contender duplicated provider work"
+        );
+        if status
+            .to_string()
+            .contains("SEMANTIC_BATCH_PENDING_APPROVAL")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no positive contention acknowledgement: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(gate.state.lock().unwrap().0.len(), 1);
+    gate.release();
+    for process in [&mut main, &mut linked] {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let status = process.send(r#"{"id":"ready","command":"status"}"#);
+            if status.to_string().contains("semantic: ready") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic worker never became ready: {status}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    drop(main);
+    drop(linked);
+    let reopened_main = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&reopened_main);
+    let reopened_linked = configure(&repo.linked, storage.path(), &server, true);
+    wait_views_filled(&reopened_linked);
+    let query = vector(&format!("{MODEL}\u{0}{}", requests[0][0]));
+    let left = reopened_main
+        .checkout_semantic_runtime()
+        .unwrap()
+        .search(&query, 100, &|_| true)
+        .unwrap();
+    let right = reopened_linked
+        .checkout_semantic_runtime()
+        .unwrap()
+        .search(&query, 100, &|_| true)
+        .unwrap();
+    assert!(left.complete() && right.complete());
+    let rows = |root: &Path, results: Vec<aft::semantic_index::SemanticResult>| {
+        results
+            .into_iter()
+            .map(|row| {
+                (
+                    row.file.strip_prefix(root).unwrap().to_path_buf(),
+                    row.name,
+                    row.start_line,
+                    row.score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&repo.main, left.results),
+        rows(&repo.linked, right.results)
+    );
     assert_eq!(
         server.texts() - chunks,
-        2,
-        "known bug: both processes embedded the same chunk"
+        1,
+        "reopen must reuse durable chunks"
     );
-    eprintln!(
-        "two-process duplicate: baseline={chunks} total={} new_inputs=2 unique_new_inputs=1",
-        server.texts()
-    );
-    gate.release();
 }
 
 /// The model fingerprint of the root's served semantic view, if any.
