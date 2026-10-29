@@ -1033,6 +1033,31 @@ fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
     assert_eq!(response.data["message"], expected, "{response:?}");
 }
 
+#[tokio::test]
+async fn runon_pre_acceptance_refusal_ends_standalone_foreground_wait_promptly() {
+    let daemon = daemon(Script::Refused, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let (response, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        orchestrated_reply_with_probe(
+            &ctx,
+            &daemon,
+            serde_json::json!({
+                "command": "printf must-not-run",
+                "runon": "linux",
+                "wait": true,
+                "foreground_orchestrate": true,
+                "compressed": false,
+            }),
+            |_| true,
+        ),
+    )
+    .await
+    .expect("a pre-start refusal must not consume the thirty-minute wait budget");
+    assert_runon_refusal(&response, "future_refusal");
+}
+
 #[test]
 fn refusal_detail_is_sanitized_and_truncated_at_utf8_boundary() {
     let detail = format!("first\nsecond\t{}", "é".repeat(510));
