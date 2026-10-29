@@ -5860,9 +5860,8 @@ impl ProjectIndex<'_> {
             |file| self.file_index(file),
         )
     }
-    /// The crate-wide lookup memo, or `None` for an index that loads stored
-    /// files on demand: its file set is not all in memory, so those lookups
-    /// keep scanning.
+    /// The eager crate-wide memo. Lazy indexes build their parent map
+    /// separately; their inline-scoped target lookup still scans stored paths.
     fn crate_scans(&self) -> Option<&CrateScanMemo> {
         #[cfg(test)]
         if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
@@ -32178,10 +32177,13 @@ mod crate_scan_memo_tests {
                 stats.elapsed_ms, profile.report(),
             );
             if let Some((expected_cold, expected_refresh)) = &baseline {
-                assert_eq!(&cold_edges, expected_cold, "whole-crate cold edge rows");
-                assert_eq!(
-                    &refreshed_edges, expected_refresh,
-                    "whole-crate refreshed edge rows"
+                assert!(
+                    &cold_edges == expected_cold,
+                    "whole-crate cold edge rows differ"
+                );
+                assert!(
+                    &refreshed_edges == expected_refresh,
+                    "whole-crate refreshed edge rows differ"
                 );
                 println!("RUST_MODULE_PATHS whole-crate edge rows identical before and after edit");
             } else {
