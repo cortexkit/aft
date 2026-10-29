@@ -218,7 +218,10 @@ fn views_import_public_grep_search_outline_zoom_match_fresh_builds() {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match ctx.lexical_view_snapshot("bind").expect("views must route") {
-                Ok(_) => break,
+                Ok(snapshot) => {
+                    spawn_symbol_view_prewarm(ctx, &snapshot);
+                    break;
+                }
                 Err(error)
                     if crate::views::trigram::bind_is_busy(&error) && Instant::now() < deadline =>
                 {
@@ -226,6 +229,10 @@ fn views_import_public_grep_search_outline_zoom_match_fresh_builds() {
                 }
                 Err(error) => panic!("{error}"),
             }
+        }
+        while ctx.symbol_view_route_count() == 0 {
+            assert!(Instant::now() < deadline, "symbol prewarm did not finish");
+            thread::sleep(Duration::from_millis(10));
         }
     }
     type Handler = fn(&crate::protocol::RawRequest, &AppContext) -> crate::protocol::Response;
