@@ -205,6 +205,14 @@ fn completed_scoped_dead_code_waiters_share_projection_and_rollup() {
             );
         }
     });
+    crate::callgraph_store::take_projection_work();
+    let direct = manager.tier2_run_with_reuse(snapshot.clone(), job.category, scope.clone(), None);
+    assert_eq!(fresh_payload(direct), expected);
+    assert_eq!(
+        crate::callgraph_store::take_projection_work(),
+        (0, 0),
+        "synchronous scoped completions must reuse the same projection"
+    );
     assert!(
         Arc::ptr_eq(
             &rollup,
