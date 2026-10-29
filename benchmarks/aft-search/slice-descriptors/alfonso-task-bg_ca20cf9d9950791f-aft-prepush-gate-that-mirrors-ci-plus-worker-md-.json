@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["prepush-ci-parity"],
+  "note": "CI-parity gate scripts, worker guidance, and formatting-fixture path normalization only; no ranking behavior changes."
+}
