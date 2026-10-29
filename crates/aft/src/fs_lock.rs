@@ -190,11 +190,18 @@ fn is_transient_create_contention(error: &io::Error) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) enum MalformedOwnerPolicy {
+    RecoverAfterGrace,
+    FailClosed,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct LockConfig {
     heartbeat_interval_ms: u64,
     stale_heartbeat_ms: u64,
     live_owner_warn_ms: u64,
     poll_interval_ms: u64,
+    malformed_owner: MalformedOwnerPolicy,
 }
 
 impl LockConfig {
@@ -210,6 +217,7 @@ impl Default for LockConfig {
             stale_heartbeat_ms: STALE_HEARTBEAT_MS,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: POLL_INTERVAL_MS,
+            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 }
@@ -274,6 +282,22 @@ pub(crate) fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGu
 /// the existing guarded reclaim path is tried.
 pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
     try_acquire(path, Duration::ZERO)
+}
+
+/// Select malformed-owner recovery per lease. Paid external work must not infer
+/// that an owner exited from damaged metadata, even after a stable grace read.
+pub(crate) fn try_acquire_once_with_policy(
+    path: &Path,
+    malformed_owner: MalformedOwnerPolicy,
+) -> Result<LockGuard, AcquireError> {
+    acquire_with_config(
+        path,
+        Some(Duration::ZERO),
+        LockConfig {
+            malformed_owner,
+            ..LockConfig::default()
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -653,6 +677,10 @@ fn acquire_with_deadline(
                     }
                     Err(ReadLockError::Io(error)) => return Err(error.into()),
                     Err(ReadLockError::Malformed(_)) => {}
+                }
+                if matches!(config.malformed_owner, MalformedOwnerPolicy::FailClosed) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("filesystem lease owner metadata is malformed; cannot prove the owner exited: {error}")).into());
                 }
                 slog_warn!(
                     "removing malformed filesystem lock at {}: {}",
@@ -2867,6 +2895,7 @@ mod tests {
             stale_heartbeat_ms: 2_000,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: 10,
+            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 

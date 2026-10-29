@@ -41,7 +41,7 @@ pub(crate) fn try_acquire(
         .map_err(|error| format!("semantic batch lease directory: {error}"))?;
     // Recover only this requested, unowned/stale lease via the existing
     // incarnation-aware protocol. Never sweep or expire a live owner's lease.
-    match fs_lock::try_acquire_once(&path) {
+    match fs_lock::try_acquire_once_with_policy(&path, fs_lock::MalformedOwnerPolicy::FailClosed) {
         Ok(guard) => Ok(Some(BatchLease {
             guard,
             started: Instant::now(),
@@ -90,6 +90,26 @@ impl Drop for BatchLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_batch_lease_malformed_live_owner_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = try_acquire(root.path(), "family", "producer")
+            .unwrap()
+            .unwrap();
+        owner.verify().unwrap();
+        // Keep the owner alive, but stop automatic repair so the deliberately
+        // damaged bytes remain unchanged throughout the contender's grace read.
+        owner.guard.stop_heartbeat_for_removal();
+        let path = path(root.path(), "family", "producer");
+        let damaged = b"deliberately damaged owner metadata";
+        std::fs::write(&path, damaged).unwrap();
+        let result = try_acquire(root.path(), "family", "producer");
+        assert!(result.is_err(), "malformed live-owner metadata must be unusable, never a new owner or ordinary contention");
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        assert!(crate::fs_lock::process_alive(std::process::id()));
+        drop(owner);
+    }
 
     #[test]
     fn semantic_batch_lease_child_owner() {
