@@ -1,5 +1,6 @@
 //! Durable file commits use the platform's full sync, including F_FULLFSYNC on
-//! macOS. Rebuildable and process-lifetime stores deliberately do not call these
+//! Apple targets. Filesystems that reject full sync fall back to fsync with a warning.
+//! Rebuildable and process-lifetime stores deliberately do not call these
 //! sync helpers. Atomic writes select their durability explicitly. The test
 //! ledger observes the real calls, never substitutes for them.
 
@@ -91,7 +92,7 @@ pub(crate) fn before_temp_create(path: &Path) {
 }
 
 pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
-    file.sync_all()?;
+    sync_handle(file, path)?;
     record(EventKind::FileSync, path);
     Ok(())
 }
@@ -116,7 +117,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        File::open(path)?.sync_all()?;
+        sync_handle(&File::open(path)?, path)?;
         record(EventKind::DirectorySync, path);
     }
     // Windows cannot open a directory as a regular File. Its rename uses
@@ -124,6 +125,98 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+fn sync_handle(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(any(target_vendor = "apple", all(test, unix)))]
+    {
+        full_sync::sync(file, path)
+    }
+    #[cfg(not(any(target_vendor = "apple", all(test, unix))))]
+    {
+        let _ = path;
+        file.sync_all()
+    }
+}
+
+// Unix tests exercise the same fallback through atomic_write, even off Apple.
+#[cfg(any(target_vendor = "apple", all(test, unix)))]
+mod full_sync {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    pub(super) fn sync(file: &File, path: &Path) -> io::Result<()> {
+        match full_sync(file) {
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTTY | libc::ENOTSUP | libc::EINVAL)
+                ) =>
+            {
+                #[cfg(target_vendor = "apple")]
+                warn_once(file, path, &error);
+                #[cfg(not(target_vendor = "apple"))]
+                let _ = path;
+                #[cfg(test)]
+                FALLBACK_CALLS.with(|calls| calls.set(calls.get() + 1));
+                // The descriptor is borrowed from a live File for this call.
+                result(unsafe { libc::fsync(file.as_raw_fd()) })
+            }
+            result => result,
+        }
+    }
+
+    fn full_sync(file: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(errno) = FORCED_ERROR.with(|error| error.get()) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            // F_FULLFSYNC also flushes device caches where the filesystem supports it.
+            // The descriptor is borrowed from a live File; this command takes no argument.
+            result(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        file.sync_all()
+    }
+
+    fn result(code: libc::c_int) -> io::Result<()> {
+        if code == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn warn_once(file: &File, path: &Path, error: &io::Error) {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // fstatfs initializes stat on success; the open descriptor identifies the
+            // actual filesystem even when path names a not-yet-published destination.
+            let filesystem = if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } == 0 {
+                let stat = unsafe { stat.assume_init() };
+                // Darwin's f_fstypename is a NUL-terminated filesystem type name.
+                unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                format!("unknown ({})", io::Error::last_os_error())
+            };
+            log::warn!(
+                "F_FULLFSYNC unsupported on filesystem {filesystem} for {} ({error}); falling back to fsync (device-cache flush unavailable)",
+                path.display()
+            );
+        });
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static FORCED_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+        pub(super) static FALLBACK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,4 +263,80 @@ pub(crate) fn sync_count(events: &[(EventKind, std::path::PathBuf)]) -> usize {
         .iter()
         .filter(|(kind, _)| matches!(kind, EventKind::FileSync | EventKind::DirectorySync))
         .count()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    struct FullSyncError;
+
+    impl FullSyncError {
+        fn inject(errno: i32) -> Self {
+            full_sync::FORCED_ERROR.with(|error| error.set(Some(errno)));
+            full_sync::FALLBACK_CALLS.with(|calls| calls.set(0));
+            take();
+            Self
+        }
+    }
+
+    impl Drop for FullSyncError {
+        fn drop(&mut self) {
+            full_sync::FORCED_ERROR.with(|error| error.set(None));
+        }
+    }
+
+    #[test]
+    fn atomic_write_falls_back_when_full_sync_is_unsupported() {
+        for errno in [libc::ENOTTY, libc::ENOTSUP, libc::EINVAL] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state");
+            fs::write(&path, b"old").unwrap();
+            let _injection = FullSyncError::inject(errno);
+
+            atomic_write(&path, b"committed", AtomicWriteDurability::FileAndDirectory).unwrap();
+
+            assert_eq!(fs::read(&path).unwrap(), b"committed");
+            // Both the temporary file and its parent must really reach fsync.
+            assert_eq!(full_sync::FALLBACK_CALLS.with(|calls| calls.get()), 2);
+            assert_eq!(
+                take(),
+                vec![
+                    (EventKind::FileSync, path.clone()),
+                    (EventKind::AtomicReplace, path),
+                    (EventKind::DirectorySync, directory.path().to_path_buf()),
+                ]
+            );
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn atomic_write_does_not_fall_back_on_full_sync_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state");
+        fs::write(&path, b"old").unwrap();
+        let _injection = FullSyncError::inject(libc::EIO);
+
+        let error =
+            atomic_write(&path, b"new", AtomicWriteDurability::FileAndDirectory).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(full_sync::FALLBACK_CALLS.with(|calls| calls.get()), 0);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert!(take().is_empty());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn directory_sync_does_not_fall_back_on_full_sync_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let _injection = FullSyncError::inject(libc::EIO);
+
+        let error = sync_dir(directory.path()).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(full_sync::FALLBACK_CALLS.with(|calls| calls.get()), 0);
+        assert!(take().is_empty());
+    }
 }
