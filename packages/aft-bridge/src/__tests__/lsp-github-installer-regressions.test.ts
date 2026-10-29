@@ -105,7 +105,11 @@ async function withTarPrecheckDiagnostics(operation: () => Promise<void>): Promi
     command: string,
     args: string[],
     options: childProcess.ExecFileOptionsWithStringEncoding,
-    callback: (error: childProcess.ExecFileException | null, stdout: string, stderr: string) => void,
+    callback: (
+      error: childProcess.ExecFileException | null,
+      stdout: string,
+      stderr: string,
+    ) => void,
   ) => {
     const child = original(command, args, options, callback);
     const observed = {
