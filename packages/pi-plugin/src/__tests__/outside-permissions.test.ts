@@ -330,18 +330,17 @@ describe("outside-access batches", () => {
 });
 
 /**
- * A scripted engine for one outside path whose first `expiries` approvals
- * arrive after their token expired: each such retry is asked again, marked
- * `approval_expired`, as the engine does.
+ * A scripted engine that invalidates the first approvals for one outside path.
+ * Each invalidated retry gets the supplied reason (expiry by default).
  */
-function expiringEngine(expiries: number, reason: string | null = "approval_expired") {
+function invalidatingEngine(invalidations: number, reason: string | null = "approval_expired") {
   const sends: Array<Record<string, unknown>> = [];
   let issued = 0;
   const send = async (args: Record<string, unknown>) => {
     sends.push(structuredClone(args));
     const granted = (args.permissions_granted as string[] | undefined) ?? [];
     const latest = `outside:late-${issued}`;
-    if (granted.includes(latest) && issued >= expiries)
+    if (granted.includes(latest) && issued >= invalidations)
       return { success: true, text: "written" } as Record<string, unknown>;
     const presented = granted.includes(latest);
     if (presented) issued++;
@@ -362,9 +361,9 @@ function expiringEngine(expiries: number, reason: string | null = "approval_expi
   return { send, sends };
 }
 
-describe("outside-access approvals that expire", () => {
+describe("outside-access approvals invalidated before retry", () => {
   test("an approval that arrives after its token expired is asked once more", async () => {
-    const engine = expiringEngine(1);
+    const engine = invalidatingEngine(1);
     const confirm = mock(async () => true);
     const result = await withOutsidePermissions({}, context(confirm), engine.send);
     expect(result.success).toBe(true);
@@ -373,7 +372,7 @@ describe("outside-access approvals that expire", () => {
   });
 
   test("an approval refused again without expiry still stalls", async () => {
-    const engine = expiringEngine(1, null);
+    const engine = invalidatingEngine(1, null);
     const confirm = mock(async () => true);
     await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
       code: "outside_permission_stalled",
@@ -382,7 +381,7 @@ describe("outside-access approvals that expire", () => {
   });
 
   test("route replacement asks for a fresh approval", async () => {
-    const engine = expiringEngine(1, "approval_route_replaced");
+    const engine = invalidatingEngine(1, "approval_route_replaced");
     const confirm = mock(async () => true);
     const result = await withOutsidePermissions({}, context(confirm), engine.send);
     expect(result.success).toBe(true);
@@ -391,8 +390,19 @@ describe("outside-access approvals that expire", () => {
     expect(engine.sends[2]?.permissions_granted).toEqual(["outside:late-1"]);
   });
 
+  test("denying the replacement route's prompt never sends its token", async () => {
+    const engine = invalidatingEngine(1, "approval_route_replaced");
+    let decisions = 0;
+    const confirm = mock(async () => ++decisions === 1);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(engine.sends).toHaveLength(2);
+  });
+
   test("repeated route replacement stops after one re-ask", async () => {
-    const engine = expiringEngine(10, "approval_route_replaced");
+    const engine = invalidatingEngine(10, "approval_route_replaced");
     const confirm = mock(async () => true);
     await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
       code: "outside_permission_stalled",
@@ -402,7 +412,7 @@ describe("outside-access approvals that expire", () => {
   });
 
   test("a path that keeps expiring stops at the re-ask limit", async () => {
-    const engine = expiringEngine(10);
+    const engine = invalidatingEngine(10);
     const confirm = mock(async () => true);
     await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
       code: "outside_permission_stalled",

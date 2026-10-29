@@ -355,18 +355,17 @@ describe("outside-access batches", () => {
 });
 
 /**
- * A scripted engine for one outside path whose first `expiries` approvals
- * arrive after their token expired: each such retry is asked again, marked
- * `approval_expired`, as the engine does.
+ * A scripted engine that invalidates the first approvals for one outside path.
+ * Each invalidated retry gets the supplied reason (expiry by default).
  */
-function expiringEngine(expiries: number, reason: string | null = "approval_expired") {
+function invalidatingEngine(invalidations: number, reason: string | null = "approval_expired") {
   const sends: Array<Record<string, unknown>> = [];
   let issued = 0;
   const send = async (args: Record<string, unknown>) => {
     sends.push(structuredClone(args));
     const granted = (args.permissions_granted as string[] | undefined) ?? [];
     const latest = `outside:late-${issued}`;
-    if (granted.includes(latest) && issued >= expiries)
+    if (granted.includes(latest) && issued >= invalidations)
       return { success: true, text: "written" } as Record<string, unknown>;
     const presented = granted.includes(latest);
     if (presented) issued++;
@@ -389,7 +388,7 @@ function expiringEngine(expiries: number, reason: string | null = "approval_expi
   return { send, sends };
 }
 
-describe("outside-access approvals that expire", () => {
+describe("outside-access approvals invalidated before retry", () => {
   for (const hostVersion of [1, 2] as const) {
     const runtime = (prompt: (ask: unknown) => Promise<void>) => ({
       ask: prompt,
@@ -397,7 +396,7 @@ describe("outside-access approvals that expire", () => {
     });
 
     test(`OpenCode ${hostVersion}: an approval that arrives after its token expired is asked once more`, async () => {
-      const engine = expiringEngine(1);
+      const engine = invalidatingEngine(1);
       const prompt = mock(async (_ask: unknown) => {});
       const result = await withOutsidePermissions(runtime(prompt), {}, engine.send, false, "write");
       expect(result.success).toBe(true);
@@ -406,7 +405,7 @@ describe("outside-access approvals that expire", () => {
     });
 
     test(`OpenCode ${hostVersion}: an approval refused again without expiry still stalls`, async () => {
-      const engine = expiringEngine(1, null);
+      const engine = invalidatingEngine(1, null);
       const prompt = mock(async (_ask: unknown) => {});
       await expect(
         withOutsidePermissions(runtime(prompt), {}, engine.send, false, "write"),
@@ -415,7 +414,7 @@ describe("outside-access approvals that expire", () => {
     });
 
     test(`OpenCode ${hostVersion}: route replacement asks for a fresh approval`, async () => {
-      const engine = expiringEngine(1, "approval_route_replaced");
+      const engine = invalidatingEngine(1, "approval_route_replaced");
       const prompt = mock(async (_ask: unknown) => {});
       const result = await withOutsidePermissions(runtime(prompt), {}, engine.send, false, "grep");
       expect(result.success).toBe(true);
@@ -425,7 +424,7 @@ describe("outside-access approvals that expire", () => {
     });
 
     test(`OpenCode ${hostVersion}: repeated route replacement stops after one re-ask`, async () => {
-      const engine = expiringEngine(10, "approval_route_replaced");
+      const engine = invalidatingEngine(10, "approval_route_replaced");
       const prompt = mock(async (_ask: unknown) => {});
       await expect(
         withOutsidePermissions(runtime(prompt), {}, engine.send, false, "grep"),
@@ -435,7 +434,7 @@ describe("outside-access approvals that expire", () => {
     });
 
     test(`OpenCode ${hostVersion}: a path that keeps expiring stops at the re-ask limit`, async () => {
-      const engine = expiringEngine(10);
+      const engine = invalidatingEngine(10);
       const prompt = mock(async (_ask: unknown) => {});
       await expect(
         withOutsidePermissions(runtime(prompt), {}, engine.send, false, "write"),

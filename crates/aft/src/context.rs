@@ -16514,12 +16514,13 @@ impl AppContext {
                 "grant_id": id, "path": identity, "operation": operation,
                 "parentDir": if is_dir { identity } else { identity.parent().unwrap_or(identity) },
             });
-            // The host sent an approval for this exact operation and path,
-            // but its token had expired (the prompt stayed open too long).
-            // Saying so lets the host ask again instead of treating the
-            // repeated ask as an approval the engine refused.
-            if scope.presented_expired(&grant) {
-                ask["reason"] = serde_json::json!("approval_expired");
+            // Expiry and route replacement invalidate the old approval, not
+            // the request. The host can ask again for the new route's token.
+            if let Some(reason) = scope.retry_refusal_reason(&grant, !once.is_empty()) {
+                scope.log_retry_refusal(operation, identity, reason);
+                if matches!(reason, "approval_expired" | "approval_route_replaced") {
+                    ask["reason"] = serde_json::json!(reason);
+                }
             }
             return Err(crate::protocol::Response::error_with_data(
                 req_id,
@@ -16699,6 +16700,20 @@ impl AppContext {
                 "access_route_missing",
                 "plugin filesystem access requires its admitted permission route",
             ));
+        }
+        if let AccessDecision::Deny(denial) = decision {
+            if let crate::access_policy::AskRoute::Plugin { scope, .. } =
+                crate::access_policy::current_ask_route()
+            {
+                let reason = match denial {
+                    AccessDenial::Floor => "denied_floor",
+                    AccessDenial::OutsideRoots => "outside_roots_denied",
+                    AccessDenial::ReadOnly => "access_read_only",
+                    AccessDenial::UnsafeTemp => "unsafe_temp_path",
+                    AccessDenial::ScopeGrants(_) => "scope_grants_denied",
+                };
+                scope.log_retry_refusal(operation, &identity, reason);
+            }
         }
         // Preserve the existing path_outside_root response when root restriction
         // already denied this path. The protected path is still rejected; changing
