@@ -9194,6 +9194,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         assert_eq!(report.status, HealthStatus::Degraded);
+        let report_summary = format!("status={:?} detail={:?}", report.status, report.detail);
         let metrics = report.metrics.expect("health metrics");
         let root_row = metrics["roots"]
             .as_array()
@@ -9201,7 +9202,13 @@ mod tests {
                 rows.iter()
                     .find(|row| row["standing_entry"] == json!(literal_path))
             })
-            .expect("drifted standing health row");
+            .unwrap_or_else(|| {
+                panic!(
+                    "drifted standing health row: {report_summary} row_count={:?} roots={} metrics={metrics}",
+                    metrics["roots"].as_array().map(Vec::len),
+                    metrics["roots"],
+                )
+            });
         assert_eq!(root_row["standing"], true);
         let refusal = root_row["standing_refusal"]
             .as_str()
