@@ -988,7 +988,13 @@ Check "no plugin crash" {
 }
 # Every successful binary-resolution path records its source and final executable.
 Check "plugin loaded" { LogContains $PluginLog "Resolved binary from .+: " }
-Check "bridge spawned" { LogContains $PluginLog "started, pid" }
+# The bridge logs "Spawning binary" to the plugin log; the engine's own
+# "started, pid" line lives only in its aft-<pid>.log.
+Check "bridge spawned" {
+    $logs = Get-AftLogPaths
+    if (-not $logs) { return $false }
+    [bool] (Select-String -Path $logs -Pattern "Spawning binary|started, pid" -Quiet -ErrorAction SilentlyContinue)
+}
 WarnCheck "search index started" {
     $logs = Get-AftLogPaths
     if (-not $logs) { return $false }
