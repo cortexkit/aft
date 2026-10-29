@@ -264,6 +264,8 @@ pub(crate) mod watch_delivery;
 mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
+#[cfg(test)]
+mod stack_budget_tests;
 #[cfg(all(test, unix))]
 pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
@@ -4229,7 +4231,8 @@ enum ModuleLoopExit {
 }
 
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
-/// owns an isolated current-thread tokio runtime for the async transport.
+/// owns an isolated current-thread tokio runtime on a dedicated, explicitly
+/// sized stack for the async transport. The caller joins that thread.
 /// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
 /// fall back to the standalone loop, to avoid split-brain index state.
 pub fn run_subc_mode(
@@ -4307,7 +4310,52 @@ fn run_subc_mode_with_probe(
     )
 }
 
+// A current-thread runtime polls its root future on the thread calling
+// block_on. Windows gives the process main thread only a 1 MiB stack; the
+// module loop and its callees need headroom even with their futures boxed.
+const MODULE_RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn with_module_runtime_stack<T: Send>(run: impl FnOnce() -> T + Send) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("aft-subc-runtime".to_string())
+            .stack_size(MODULE_RUNTIME_STACK_BYTES)
+            .spawn_scoped(scope, run)?;
+        match worker.join() {
+            Ok(result) => Ok(result),
+            // Keep the original panic payload and unwind the caller, rather
+            // than turning a module panic into a clean stop or a new panic.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 fn run_subc_mode_inner(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
+) -> Result<(), SubcError> {
+    with_module_runtime_stack(move || {
+        run_subc_mode_on_runtime_thread(
+            connection_file_path,
+            ctx,
+            executor,
+            dispatch,
+            user_config_path,
+            allow_native_passthrough,
+            tool_response_body_limit,
+            lifecycle_probe,
+        )
+    })
+    .map_err(SubcError::RuntimeThread)?
+}
+
+fn run_subc_mode_on_runtime_thread(
     connection_file_path: &Path,
     ctx: Arc<AppContext>,
     executor: Arc<Executor>,
