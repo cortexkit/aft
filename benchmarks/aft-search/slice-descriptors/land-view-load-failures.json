@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "readiness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "view-load-failures"
+  ],
+  "note": "With views on, a checkout view that fails to load now fails glob as it already failed grep and aft_search, instead of answering from a fallback walk; health counts each failed text and call-graph view load by plane and cause and marks the project degraded until the next successful load. Views are off by default. No ranking, lane selection or query routing changes."
+}
