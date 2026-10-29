@@ -4563,6 +4563,48 @@ mod tests {
     }
 
     #[test]
+    fn health_budget_abbreviates_last_oversized_degraded_root() {
+        let path = format!("/{}project", "long-directory/".repeat(2000));
+        let mut metrics = json!({
+            "root_count": 3, "root_details_omitted": 2,
+            "roots": [{
+                "project_root": path, "state": "ready", "standing": true,
+                "standing_entry": format!("{path}/standing-link"),
+                "standing_refusal": format!(
+                    "resolved-path-drift refusal for {path:?}: resolved_target changed from {path:?} to {path:?}"
+                ),
+                "semantic_index": {"status": "degraded", "detail": "x".repeat(20000)},
+                "cache_unavailable_reason": "resolved_path_drift"
+            }]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        let roots = metrics["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "the last actionable root must survive");
+        let root = &roots[0];
+        assert_eq!(root["abbreviated"], true);
+        let identity = root["project_root"].as_str().unwrap();
+        assert!(identity.contains(blake3::hash(path.as_bytes()).to_hex().as_str()));
+        assert!(identity.ends_with("/project"));
+        assert_eq!(root["state"], "ready");
+        assert_eq!(root["semantic_index"]["status"], "degraded");
+        assert_eq!(root["standing"], true);
+        assert_eq!(root["cache_unavailable_reason"], "resolved_path_drift");
+        let refusal = root["standing_refusal"].as_str().unwrap();
+        assert!(refusal.contains("resolved-path-drift refusal"));
+        assert!(refusal.contains("resolved_target"));
+        assert_eq!(metrics["root_count"], 3);
+        assert_eq!(metrics["root_details_omitted"], 2);
+        assert_eq!(
+            metrics["metrics_bytes"],
+            serde_json::to_vec(&metrics).unwrap().len()
+        );
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+    }
+
+    #[test]
     fn health_budget_drops_healthy_roots_before_degraded_refused_and_standing_rows() {
         for (detail_bytes, expected) in [
             (
@@ -9384,21 +9426,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn standing_health_names_resolved_path_drift_without_re_recording() {
-        assert_standing_health_names_resolved_path_drift(".tmp");
+        assert_standing_health_names_resolved_path_drift(false);
     }
 
     #[cfg(unix)]
     #[test]
     fn standing_health_names_resolved_path_drift_with_long_temp_paths() {
-        assert_standing_health_names_resolved_path_drift("standing-health-resolved-path-drift-");
+        assert_standing_health_names_resolved_path_drift(true);
     }
 
     #[cfg(unix)]
-    fn assert_standing_health_names_resolved_path_drift(prefix: &str) {
+    fn assert_standing_health_names_resolved_path_drift(long_paths: bool) {
+        let parent = tempfile::tempdir().expect("standing fixture parent");
+        let mut base = parent.path().to_path_buf();
+        if long_paths {
+            // Repeated paths must exhaust the public budget even with a short
+            // system temp directory. Each component stays below NAME_MAX and
+            // the complete paths stay below macOS's PATH_MAX.
+            while base.as_os_str().len() < 700 {
+                base.push("standing-health-resolved-path-drift-".repeat(2));
+            }
+            std::fs::create_dir_all(&base).expect("long standing fixture parent");
+        }
         let directory = || {
             tempfile::Builder::new()
-                .prefix(prefix)
-                .tempdir()
+                .tempdir_in(&base)
                 .expect("standing directory")
         };
         let storage = directory();
@@ -9439,7 +9491,7 @@ mod tests {
             .as_array()
             .and_then(|rows| {
                 rows.iter()
-                    .find(|row| row["standing_entry"] == json!(literal_path))
+                    .find(|row| row["standing"] == true)
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -9449,6 +9501,21 @@ mod tests {
                 )
             });
         assert_eq!(root_row["standing"], true);
+        if root_row["abbreviated"] == true {
+            let identity = root_row["standing_entry"].as_str().unwrap();
+            assert!(identity.contains(blake3::hash(literal_path.as_bytes()).to_hex().as_str()));
+            assert!(identity.ends_with("/standing-link"));
+        } else {
+            assert_eq!(root_row["standing_entry"], literal_path);
+        }
+        if long_paths {
+            assert_eq!(
+                root_row["abbreviated"], true,
+                "fixture must exhaust the budget"
+            );
+        }
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
         let refusal = root_row["standing_refusal"]
             .as_str()
             .expect("named drift refusal");
