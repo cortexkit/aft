@@ -1,12 +1,12 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "flake-batch-25"
   ],
-  "note": "Test-only: the semantic view reconnect-grace test waits through legitimate transient fill retries until settlement within one deadline, and adds a deterministic backend-503 recovery case. No search, indexing, query routing or ranking code changes."
+  "note": "Test-only. The ranking-fenced rerank/remote.rs change touches only a test's deadlines (the 401 refusal case gets 10 s; the slow-reply case keeps 100 ms). The semantic view reconnect-grace test waits through transient fill retries until settlement. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
 }
