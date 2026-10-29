@@ -141,6 +141,20 @@ fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
         crate::cold_build_limiter::global_limiter(),
     )
     .is_none());
+    let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
+        storage.path().to_path_buf(),
+        KEY.into(),
+        KEY.into(),
+        root.clone(),
+        policy,
+        None,
+    );
+    assert!(matches!(
+        crate::migration::v3_ledger::run_v3_import(&request, None),
+        Err(crate::migration::v3_import::V3ImportError::Store(
+            crate::blob_store::v3::Error::Refused("legacy_import_borrow_only")
+        ))
+    ));
     crate::root_cache::configure_artifact_access(&root, KEY, false);
     assert!(crate::migration::views_background::BackgroundImport::start(
         storage.path(),

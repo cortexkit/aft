@@ -997,11 +997,20 @@ pub(crate) fn run_v3_import_while(
     }
     validate_legacy_key(&request.legacy_key)
         .map_err(|_| V3ImportError::InvalidKey(request.legacy_key.clone()))?;
+    let ledger = V3Ledger::new(&request.storage, &request.family)?;
+    if !crate::root_cache::ArtifactAccess::for_root(&request.root).allows_write(
+        &request.family,
+        &request.storage.join("blobs/v3").join(&request.family),
+    ) {
+        return Err(V3ImportError::Store(v3::Error::Refused(
+            "legacy_import_borrow_only",
+        )));
+    }
     let owner = ClaimOwner::new();
     let _active = ActiveClaim::register(&owner);
     let mut run = Run {
         request,
-        ledger: V3Ledger::new(&request.storage, &request.family)?,
+        ledger,
         owner,
         dir: staging_dir(&request.storage, &request.family, &request.legacy_key),
         observer,

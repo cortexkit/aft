@@ -644,7 +644,7 @@ impl CallgraphView {
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
-        policy: TrigramPolicy,
+        policy: crate::blob_store::v2::TrigramPolicy,
         current: crate::migration::v3_ledger::ImportControl,
         limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
     ) -> Result<Self, CallgraphViewError> {
