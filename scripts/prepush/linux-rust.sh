@@ -12,6 +12,7 @@ export NEXTEST_TEST_THREADS=num-cpus AFT_UNIT_TEST_RUNNER=nextest
 export AFT_GATE_SKIP_RELEASE_STORM=1 AFT_TEST_REQUIRE_RUST_ANALYZER=1
 export AFT_GATE_LOG_DIR="$log_dir"
 prepush_step tool-versions bash -c 'set -euo pipefail; cargo --version; rustc --version; cargo nextest --version; bun --version; printf "HOME=%s TMPDIR=%s\n" "$HOME" "${TMPDIR:-}"'
+prepush_step sandbox-capability python3 scripts/prepush/linux-capabilities.py
 prepush_step rust-analyzer rustup component add rust-analyzer
 prepush_step dependencies bun install --frozen-lockfile
 prepush_step pyright npm install --prefix target/prepush-pyright --no-save pyright@1.1.411
@@ -35,6 +36,7 @@ done
 unset AFT_NEXTEST_ARCHIVE_FILE
 prepush_step debug-binary cargo build -p agent-file-tools || true
 prepush_step native-schemas bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check || true
+prepush_step native-drift bash scripts/prepush/native-drift.sh || true
 prepush_step watcher-conformance env AFT_GATE_PHASES=watcher,conformance bash scripts/rust-test-gate.sh || true
 prepush_step linux-contracts bash scripts/prepush/linux-contracts.sh || true
 prepush_step storm-build cargo test --profile ci-storm --locked -p agent-file-tools --test integration --no-run --timings || true

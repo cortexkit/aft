@@ -11,6 +11,7 @@ export CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-ta
 export NEXTEST_TEST_THREADS=4 AFT_UNIT_TEST_RUNNER=nextest AFT_GATE_SKIP_RELEASE_STORM=1
 export AFT_GATE_LOG_DIR="$log_dir"
 prepush_step tool-versions bash -c 'set -euo pipefail; cargo --version; rustc --version; cargo nextest --version; bun --version'
+prepush_step python-version python -c 'import sys; print(sys.version); assert sys.version_info >= (3, 14), "CI archive probes require Python 3.14+"'
 prepush_step storage-preflight bash scripts/windows-gate.sh --filter gate_hermeticity_tests::gate_resolves_every_user_config_and_state_path_under_the_gate_homes
 export AFT_NEXTEST_ARCHIVE_FILE="$PWD/target/prepush-windows-nextest.tar.zst"
 prepush_step archive cargo nextest archive --workspace \

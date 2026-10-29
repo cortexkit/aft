@@ -4,6 +4,8 @@ python3 --version
 # These are mocked runner tests, not native builds. Avoid Darwin's extra
 # Gatekeeper warm-up Cargo call in the Cargo-only failure-collection fixture.
 export AFT_GATE_NO_XPROTECT_REMEDIATION=1
+python3 scripts/check-path-deps.py --self-test
+bash scripts/check-secret-test-fake.test.sh
 python3 scripts/test-ci-rust-quality.py
 bash scripts/test-ci-sccache-start.sh
 for test in workflow_gates ci_rustc_cache rust_gate_collection ci_macos_integration_archive \

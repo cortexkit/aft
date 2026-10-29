@@ -13,12 +13,12 @@ prepush_init fast
 trap 'prepush_abort $?' EXIT
 mkdir -p target/scratch/prepush-temp
 export TMPDIR="$PWD/target/scratch/prepush-temp"
-prepush_step versions bash -c 'set -euo pipefail; cargo fmt --version; bun --version; node --version; python3 --version'
+prepush_step versions bash -c 'set -euo pipefail; cargo --version; cargo fmt --version; bun --version; node --version; python3 --version'
 prepush_step rust-format cargo fmt --all -- --check
 prepush_step bun-lock bun install --frozen-lockfile
 prepush_step biome-version ./node_modules/.bin/biome --version
 prepush_step lint bun run lint
-prepush_step cargo-lock bash -c 'set -euo pipefail; mkdir -p "${CARGO_TARGET_DIR:-target}"; cargo metadata --locked --format-version 1 > "${CARGO_TARGET_DIR:-target}/prepush-metadata.json"'
+prepush_step cargo-lock bash -c 'set -euo pipefail; mkdir -p "${CARGO_TARGET_DIR:-target}"; cargo metadata --locked --format-version 1 > "${CARGO_TARGET_DIR:-target}/prepush-metadata.json"; python3 -c '\''import json, sys; data=json.load(open(sys.argv[1])); count=len(data["packages"]); assert count > 0; print("Locked Cargo metadata: %s packages, %s workspace members" % (count, len(data["workspace_members"])))'\'' "${CARGO_TARGET_DIR:-target}/prepush-metadata.json"'
 prepush_step bridge bun run --cwd packages/aft-bridge build
 prepush_step typecheck bun run typecheck
 prepush_step generated bash scripts/prepush/generated.sh
@@ -31,8 +31,6 @@ prepush_step landing-identity python3 scripts/landing-policy.py \
 prepush_step fixture-attributes python3 scripts/prepush/check-fixture-attributes.py
 prepush_step feature-inventory python3 scripts/prepush/check-feature-matrix.py
 prepush_step path-dependencies python3 scripts/check-path-deps.py
-prepush_step path-dependency-tests python3 scripts/check-path-deps.py --self-test
-prepush_step secret-fake-tests bash scripts/check-secret-test-fake.test.sh
 prepush_step secret-fake bash scripts/check-secret-test-fake.sh
 prepush_step rust-ci-policy python3 scripts/test-ci-rust-quality.py
 prepush_step prepush-tests python3 -m unittest discover -s scripts/prepush -p 'test_*.py' -v

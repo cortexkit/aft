@@ -49,15 +49,9 @@ prepush_step() {
 }
 
 prepush_finish() {
-  python3 - "$lane_log" <<'PY' || failures+=(summary-parser)
-import re
-import sys
-from pathlib import Path
-lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
-summaries = [line for line in lines if re.search(r"Summary \[|^test result:|^Ran \d+ tests|^\s*\d+ (pass|fail)$|Checked \d+ files", line)]
-for line in summaries[-25:]:
-    print(line)
-PY
+  # This pipe reads the saved log only; test exit codes were collected above.
+  # Keep failure reporting usable even when Python itself is the missing tool.
+  grep -E 'Summary \[|^test result:|^Ran [0-9]+ tests|^[[:space:]]*[0-9]+ (pass|fail)$|Checked [0-9]+ files' "$lane_log" | tail -n 25 || true
   printf '%s elapsed=%ss log=%s\n' "$lane" "$((SECONDS - lane_start))" "$lane_log"
   if ((${#failures[@]})); then
     printf 'GATE FAILED: %s' "$lane"

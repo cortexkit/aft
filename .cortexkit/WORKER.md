@@ -23,7 +23,7 @@ Launch independent lanes in parallel with `bash` calls (use `background: true` o
 
 For example: `bash({command: "git log -1; bash scripts/prepush/linux-rust.sh", runon: "linux,16c,net", background: true, timeout: 2700000})`. Launch the other lanes the same way. If a Windows transport omits Git metadata, prefix its command with `PREPUSH_COMMIT=` and the full snapshot SHA from your local `git rev-parse HEAD`; the lane requires and records that caller-reported value but cannot verify it against the copied files. Separate Linux jobs may queue behind the same workspace's active job; do not run Cargo and plugin E2E against the same checkout concurrently. Each lane saves full output under `.cortexkit/internal-docs/investigations/prepush/` and prints a short verdict. Use `return_paths` for the lane log when available; copy evidence out of build directories before delivery.
 
-Requirements: stable Rust, cargo-nextest (CI pins 0.9.138), Bun, Node 24, Python 3, and network for dependencies. Linux needs ripgrep, Docker, a Landlock-capable kernel and Rust 1.92 for MSRV; Windows needs MSVC, Git Bash and PowerShell. Local fast checks and the search lane need `origin/main` history; set `PREPUSH_BASE` to the pinned base SHA if necessary. Fast publication checks also need tag `v0.48.1`. Never silently skip a missing prerequisite. The parity audit records hosted-only identity/design/queue API checks and the intentional macOS coverage subset; the nightly cost benchmark is not a PR/queue gate.
+Requirements: stable Rust, cargo-nextest (CI pins 0.9.138), Bun, Node 24, Python 3, and network for dependencies. Linux needs zstd, ripgrep, Docker, real rust-analyzer, a Landlock-capable kernel/syscall policy and Rust 1.92 for MSRV. Windows needs MSVC, Git Bash, PowerShell and Python 3.14+ (`python` and `python3` on PATH) for archive probes/inventory. Local fast checks and the search lane need `origin/main` history; set `PREPUSH_BASE` to the pinned base SHA if necessary. Fast publication checks also need tag `v0.48.1`. Never silently skip a missing prerequisite. Some commit-attribution checks require GitHub PR or queue events; design approval and queue-member API checks remain hosted. The macOS lane covers selected native checks, not the complete macOS CI suite. Details: `.cortexkit/internal-docs/investigations/ci-parity-audit.md`. The nightly cost benchmark does not gate pull requests or the merge queue.
 
 ## Approvals and file fence
 
@@ -78,6 +78,20 @@ Build the bridge first whenever you change it: `bun run --cwd packages/aft-bridg
 | End-to-end tests | `bun run --cwd packages/opencode-plugin test:e2e` (and pi-plugin) | Same as above. They spawn `target/debug/aft`. |
 
 New test files go under `src/__tests__/`. A guard fails the suite on any test file elsewhere.
+
+## Generated artifacts / byte-drift checks
+
+Regenerate only with the named generator; do not hand-edit artifacts. Local fast checks JS outputs/config fixtures byte for byte and restores write-only generator output. `native-drift.sh` in the Linux Rust lane checks native outputs; zero matching tests is a failure.
+
+| Artifact | Regenerate | Check |
+|---|---|---|
+| Subc/remote schemas and JS presets | `bun run --cwd packages/opencode-plugin build:tool-schemas` | Local `--check-source-only`; server `bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check` also checks native hashline bytes |
+| Catalog replies and preset fixture | `cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored` | Server `native-drift.sh` regenerates both catalog JSON files, byte-compares and restores them |
+| Config parity fixtures | `bun scripts/capture-config-parity.ts` | Local `generated.sh` regenerates, byte-compares and restores; Rust integration verifies resolver parity |
+| Rich UI carrier samples | `cargo test -p agent-file-tools --lib capture_carrier_samples -- --ignored` | `cargo test -p agent-file-tools --lib -- carrier_samples_match_wire` |
+| Rich UI handler manifest `crates/aft/tests/fixtures/rich_ui/aft-rich-ui-manifest-v1.json` | `cargo test -p agent-file-tools --lib -- regenerate_rich_ui_samples --ignored --nocapture` | `cargo test -p agent-file-tools --lib -- rich_ui_samples` (server drift lane) |
+
+All worker guidance belongs in `.cortexkit/WORKER.md`, not a separate root guide.
 
 ## Do not
 - **Pipe a gated command** (`cmd | tail`, `cmd | grep`). The pipe's exit code hides the failure. Run it bare, or save output to a file and read the file.
