@@ -806,7 +806,7 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
-    private debugVia(message: string, meta?: LogMeta): void {
+  private debugVia(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
     // A host logger without a debug method, or no logger at all, gets the same
     // destination as an INFO record, as before DEBUG forwarding existed. Never

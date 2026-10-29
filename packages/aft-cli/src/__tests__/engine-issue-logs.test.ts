@@ -68,7 +68,8 @@ describe("doctor --issue engine logs", () => {
           join(directory, `aft-${pid}.log`),
           Array.from(
             { length: 300 },
-            (_, i) => `${stamp} INFO row=${i} token=${token} path=${homedir()}/private-project ${"x".repeat(400)}`,
+            (_, i) =>
+              `${stamp} INFO row=${i} token=${token} path=${homedir()}/private-project ${"x".repeat(400)}`,
           ).join("\n"),
         );
       }
