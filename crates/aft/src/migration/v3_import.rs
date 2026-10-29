@@ -1360,6 +1360,7 @@ fn storage_gap(error: &v3::Error) -> Option<String> {
         v3::Error::Refused(reason) if STORAGE_GAP_REFUSALS.contains(reason) => {
             Some(format!("storage_gap:{reason}"))
         }
+        v3::Error::Ledger { .. } if !error.is_busy() => Some(format!("storage_gap:{error}")),
         _ => None,
     }
 }

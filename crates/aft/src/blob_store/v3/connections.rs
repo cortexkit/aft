@@ -12,7 +12,9 @@ enum Slot {
         connection: IdentityConnection,
         writable: bool,
     },
-    Closed,
+    Closed {
+        route: PathBuf,
+    },
 }
 
 pub(super) struct Database {
@@ -27,7 +29,7 @@ impl Deref for Guard<'_> {
     fn deref(&self) -> &Self::Target {
         match &*self.0 {
             Slot::Open { connection, .. } => connection,
-            Slot::Closed => unreachable!("guard is created only for an open slot"),
+            Slot::Closed { .. } => unreachable!("guard is created only for an open slot"),
         }
     }
 }
@@ -35,18 +37,31 @@ impl DerefMut for Guard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut *self.0 {
             Slot::Open { connection, .. } => connection,
-            Slot::Closed => unreachable!("guard is created only for an open slot"),
+            Slot::Closed { .. } => unreachable!("guard is created only for an open slot"),
         }
     }
 }
 impl Database {
     pub(super) fn connection(&self) -> Result<Guard<'_>> {
-        let slot = self
+        let mut slot = self
             .slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(*slot, Slot::Closed) {
-            return Err(Error::Refused("reservation_ledger_unreadable"));
+        if let Slot::Closed { route } = &*slot {
+            if matches!((self.identity, identity_of(route)), (Some(expected), Some(actual)) if expected != actual)
+            {
+                return Err(Error::Refused("live_sqlite_file_replaced"));
+            }
+            // If replacing a read-only connection with a writable one fails,
+            // existing readers can reopen read-only on demand. A still-held
+            // SQLite lock returns its busy error; a later read retries after
+            // the lock is released.
+            let connection = open_db(route, self.kind, false, true)
+                .map_err(|source| Error::ledger(route, "reopen shared reader", source))?;
+            *slot = Slot::Open {
+                connection,
+                writable: false,
+            };
         }
         Ok(Guard(slot))
     }
@@ -55,7 +70,7 @@ impl Database {
             .slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let reopen = matches!(*slot, Slot::Closed)
+        let reopen = matches!(*slot, Slot::Closed { .. })
             || (!readonly
                 && matches!(
                     *slot,
@@ -69,7 +84,9 @@ impl Database {
             // the family is exclusively held, before opening its replacement.
             // Existing read capabilities still refer to this Database object,
             // so later operations use its replacement connection.
-            *slot = Slot::Closed;
+            *slot = Slot::Closed {
+                route: route.to_path_buf(),
+            };
             let connection = open_db(route, self.kind, create, readonly)?;
             *slot = Slot::Open {
                 connection,

@@ -378,6 +378,9 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
 }
 
 fn drain(ctx: &AppContext) {
+    // Match the runtime maintenance tick: a busy bind can defer identity
+    // resolution or view publication beyond configure's first drain.
+    aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
     aft::runtime_drain::drain_watcher_events(ctx);
     aft::runtime_drain::drain_search_index_events(ctx);
     aft::runtime_drain::drain_semantic_index_events(ctx);
@@ -390,14 +393,12 @@ fn trigram_artifact(root: &Path, storage: &Path) -> PathBuf {
 }
 
 /// Waits until the child session's trigram index is ready and persisted.
-/// Each round also runs the configure-tail drain both runtimes run on their
-/// maintenance tick: a child whose bind met a busy aft.db settles its identity
-/// there once the database is free, and only then starts its index.
+/// The runtime drain also settles a bind whose identity was deferred by busy
+/// storage, so its index can start once the database is free.
 fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
-        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
         let ready = ctx
             .search_index()
             .read()
@@ -420,6 +421,59 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
     }
 }
 
+#[test]
+fn runtime_drains_retry_child_trigram_after_busy_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("alpha");
+    let storage = base.join("storage");
+    init_repo(
+        &root,
+        &[("src/lib.rs", "pub fn retry_marker() {}\n".into())],
+    );
+    std::fs::create_dir_all(&storage).unwrap();
+    let lock = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+    // Rollback-journal mode blocks identity readers as well as writers.
+    lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let ctx = configure(&root, &storage, child_trigram_doc());
+    assert!(ctx
+        .degraded_reasons()
+        .iter()
+        .any(|reason| reason.contains("aft.db was busy at bind")));
+    assert!(ctx.cached_artifact_cache_key(&root).is_none());
+    assert!(!ctx.config().indexes.trigram);
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain(&ctx);
+        if ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready)
+            && trigram_artifact(&root, &storage).is_file()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime drains never retried the child's busy identity: {:?}",
+            ctx.degraded_reasons()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!ctx
+        .degraded_reasons()
+        .iter()
+        .any(|reason| reason.contains("aft.db was busy at bind")));
+    assert!(ctx.config().indexes.trigram);
+    assert!(ctx.cached_artifact_cache_key(&root).is_some());
+}
+
 /// Asks the child session for its call graph until it answers. The first
 /// answer binds the child's v3 call-graph view and publishes it; a later one
 /// publishes the edits made since.
@@ -427,7 +481,6 @@ fn child_callgraph_answer(ctx: &AppContext, root: &Path) -> Value {
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
-        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
         let answer = aft::commands::callers::handle_callers(
             &request(json!({
                 "id": "child-callers",
