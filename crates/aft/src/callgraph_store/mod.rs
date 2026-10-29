@@ -4452,6 +4452,128 @@ pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
     _view_pin: Option<Arc<crate::pins::QueryPin>>,
     _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
+    health_stale_census: Mutex<Option<CachedStalePathCensus>>,
+}
+
+#[derive(Debug)]
+struct CachedStalePathCensus {
+    data_version: i64,
+    total_changes: u64,
+    measured_at: Instant,
+    census: StalePathCensus,
+}
+
+pub(crate) struct StalePathHealthCensus {
+    pub census: StalePathCensus,
+    pub measured_age_ms: u64,
+}
+
+// Path existence and permissions can change without a SQLite commit. Recheck
+// them periodically even when the resident database has not changed.
+const HEALTH_STALE_PATH_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+mod health_stale_census_tests {
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        CallGraphStore,
+        ReadonlyCallGraphStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let files = [root.join("a.ts"), root.join("b.ts")];
+        for file in &files {
+            std::fs::write(file, "export function fixture() {}\n").unwrap();
+        }
+        let store_dir = dir.path().join("store");
+        let writer = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        writer.cold_build(&files).unwrap();
+        writer.mark_files_stale(&files[..1]).unwrap();
+        let reader = CallGraphStore::open_readonly(store_dir, root.clone())
+            .unwrap()
+            .unwrap();
+        (dir, root, writer, reader)
+    }
+
+    #[test]
+    fn health_stale_census_reuses_paths_with_honest_age_and_rechecks_filesystem() {
+        let (_dir, root, _writer, reader) = fixture();
+        let now = Instant::now();
+        let first = reader
+            .try_stale_path_census_for_health_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!((first.census.stale, first.census.absent), (1, 0));
+        let builds = STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        std::fs::remove_file(root.join("a.ts")).unwrap();
+        let reused = reader
+            .try_stale_path_census_for_health_at(now + Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.census, first.census);
+        assert_eq!(reused.measured_age_ms, 3_000);
+        assert_eq!(STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get), builds);
+        let expired = reader
+            .try_stale_path_census_for_health_at(now + HEALTH_STALE_PATH_MAX_AGE)
+            .unwrap()
+            .unwrap();
+        assert_eq!((expired.census.stale, expired.census.absent), (1, 1));
+        assert_eq!(expired.measured_age_ms, 0);
+        assert_eq!(
+            STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get),
+            builds + 1
+        );
+        let _guard = reader.inner.conn.lock().unwrap();
+        assert!(reader.try_stale_path_census_for_health().unwrap().is_none());
+    }
+
+    #[test]
+    fn health_stale_census_invalidates_on_other_connection_commits() {
+        let (_dir, root, writer, reader) = fixture();
+        let first = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!(first.census.stale, 1);
+        let builds = STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        writer.mark_files_stale(&[root.join("b.ts")]).unwrap();
+        let updated = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!(updated.census.stale, 2);
+        assert_eq!(updated.measured_age_ms, 0);
+        assert_eq!(
+            STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get),
+            builds + 1
+        );
+    }
+
+    #[test]
+    fn health_stale_census_invalidates_on_same_connection_writes() {
+        let (_dir, _root, writer, _reader) = fixture();
+        let reader = ReadonlyCallGraphStore::from_inner(writer);
+        assert_eq!(
+            reader
+                .try_stale_path_census_for_health()
+                .unwrap()
+                .unwrap()
+                .census
+                .stale,
+            1
+        );
+        reader
+            .inner
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE backend_file_state SET status = ?1 WHERE file_path = 'a.ts'",
+                [BACKEND_STATUS_UNDECODABLE],
+            )
+            .unwrap();
+        let updated = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!((updated.census.stale, updated.census.undecodable), (0, 1));
+        assert_eq!(updated.measured_age_ms, 0);
+    }
 }
 
 /// Bound the work spent counting possible callers for an empty reverse graph.
@@ -9482,6 +9604,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: None,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         })
     }
 
@@ -9513,6 +9636,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: pin,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         })
     }
 
@@ -9558,6 +9682,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: None,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         }
     }
 
@@ -9590,6 +9715,60 @@ impl ReadonlyCallGraphStore {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
         stale_path_census(&conn, &self.inner.project_root).map(Some)
+    }
+
+    pub(crate) fn try_stale_path_census_for_health(&self) -> Result<Option<StalePathHealthCensus>> {
+        self.try_stale_path_census_for_health_at(Instant::now())
+    }
+
+    fn try_stale_path_census_for_health_at(
+        &self,
+        now: Instant,
+    ) -> Result<Option<StalePathHealthCensus>> {
+        let conn = match self.inner.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let mut cached = match self.health_stale_census.try_lock() {
+            Ok(cached) => cached,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        // data_version observes other connections' commits, while total_changes
+        // also covers writes made on this connection. The memo belongs to this
+        // opened store, so replacing a resident generation cannot reuse it.
+        let data_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let total_changes = conn.total_changes();
+        if let Some(sample) = cached.as_ref() {
+            let age = now.saturating_duration_since(sample.measured_at);
+            if sample.data_version == data_version
+                && sample.total_changes == total_changes
+                && age < HEALTH_STALE_PATH_MAX_AGE
+            {
+                return Ok(Some(StalePathHealthCensus {
+                    census: sample.census,
+                    measured_age_ms: age.as_millis().min(u128::from(u64::MAX)) as u64,
+                }));
+            }
+        }
+        *cached = None;
+        let census = stale_path_census(&conn, &self.inner.project_root)?;
+        let after_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // A writer can commit between the census's queries. Do not preserve a
+        // mixed observation as an unchanged-database sample for future ticks.
+        if after_version == data_version {
+            *cached = Some(CachedStalePathCensus {
+                data_version,
+                total_changes,
+                measured_at: now,
+                census,
+            });
+        }
+        Ok(Some(StalePathHealthCensus {
+            census,
+            measured_age_ms: 0,
+        }))
     }
 
     pub(crate) fn projection_generation(&self) -> Option<&str> {
@@ -21215,7 +21394,14 @@ fn backend_file_paths_with_status(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STALE_PATH_CENSUS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn stale_path_census(conn: &Connection, project_root: &Path) -> Result<StalePathCensus> {
+    #[cfg(test)]
+    STALE_PATH_CENSUS_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut census = StalePathCensus {
         undecodable: backend_file_paths_with_status(
             conn,

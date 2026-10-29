@@ -6577,39 +6577,55 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    /// Return false after a failed delete so a task already in memory remains
+    /// eligible for retry. One orphan's database error must not abort replay.
     fn retire_already_reaped_orphaned_completion(
         &self,
         originating_session_id: &str,
         task_id: &str,
-    ) {
-        if let Some((harness, pool)) = self.db_harness_and_pool_for_session(originating_session_id)
-        {
+        task_harness: Option<&str>,
+    ) -> bool {
+        // Project replay reads all harnesses. Delete under the row's own
+        // namespace, not the route that happened to discover the orphan.
+        let harness = task_harness
+            .map(str::to_owned)
+            .or_else(|| self.db_harness_for_session(originating_session_id));
+        let pool = self.inner.db_pool.read().ok().and_then(|pool| pool.clone());
+        let retired = if let (Some(harness), Some(pool)) = (harness, pool) {
             // Fenced so a queued row snapshot cannot re-insert the row.
-            with_task_db_fence(originating_session_id, task_id, || {
-                match pool.lock() {
-                Ok(conn) => {
-                    if let Err(error) = crate::db::bash_tasks::delete_bash_task(
-                        &conn,
-                        &harness,
-                        originating_session_id,
-                        task_id,
-                    ) {
-                        crate::slog_warn!(
-                            "failed to delete already-reaped orphaned background completion row: task_id={task_id} error={error}"
-                        );
-                    }
-                }
-                Err(_) => crate::slog_warn!(
-                    "failed to delete already-reaped orphaned background completion row: task_id={task_id} error=database_lock_poisoned"
-                ),
-            }
+            let result = with_task_db_fence(originating_session_id, task_id, || {
+                let conn = pool
+                    .lock()
+                    .map_err(|_| "database_lock_poisoned".to_string())?;
+                crate::db::bash_tasks::delete_bash_task(
+                    &conn,
+                    &harness,
+                    originating_session_id,
+                    task_id,
+                )
+                .map(|removed| removed > 0)
+                .map_err(|error| error.to_string())
             });
-        }
+            match result {
+                Ok(retired) => retired,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to retire already-reaped task {task_id}: error={error}"
+                    );
+                    return false;
+                }
+            }
+        } else {
+            false
+        };
         let _ = self.remove_pending_completion(task_id);
         self.ack_persisted_watches_for_task(originating_session_id, task_id, true);
-        crate::slog_warn!(
-            "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
-        );
+        if retired {
+            crate::slog_warn!(
+                "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
+            );
+        }
+        true
     }
 
     fn retire_rehydrated_orphaned_completion(
@@ -6641,10 +6657,15 @@ impl BgTaskRegistry {
                 );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Ok(mut state) = task.lock_state() {
-                    state.metadata.completion_delivered = true;
+                if self.retire_already_reaped_orphaned_completion(
+                    &task.session_id,
+                    &task.task_id,
+                    task.db_harness.as_deref(),
+                ) {
+                    if let Ok(mut state) = task.lock_state() {
+                        state.metadata.completion_delivered = true;
+                    }
                 }
-                self.retire_already_reaped_orphaned_completion(&task.session_id, &task.task_id);
             }
             Err(error) => {
                 return Err(format!("failed to update completion delivery: {error}"));
@@ -7057,13 +7078,10 @@ impl BgTaskRegistry {
                         && (self.should_retire_foreign_delivery(&metadata.session_id, session_id)
                             || &metadata.session_id != session_id)
                     {
-                        crate::slog_warn!(
-                            "retiring reaped background task {}: reason=missing_layout",
-                            metadata.task_id
-                        );
                         self.retire_already_reaped_orphaned_completion(
                             &metadata.session_id,
                             &metadata.task_id,
+                            metadata.harness.as_deref(),
                         );
                         continue;
                     }
