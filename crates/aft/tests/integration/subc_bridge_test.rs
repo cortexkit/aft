@@ -303,9 +303,12 @@ fn bridge_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// In-process configure fixtures also resolve storage from the environment.
+// Hold their shared guard until the previous value has been restored.
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
+    _process_settings: crate::test_helpers::ProcessEnvLockGuard,
 }
 
 impl Drop for EnvVarGuard {
@@ -319,15 +322,48 @@ impl Drop for EnvVarGuard {
 }
 
 fn set_test_env(key: &'static str, value: &str) -> EnvVarGuard {
+    let process_settings = crate::test_helpers::process_env_lock();
     let previous = std::env::var_os(key);
     std::env::set_var(key, value);
-    EnvVarGuard { key, previous }
+    EnvVarGuard {
+        key,
+        previous,
+        _process_settings: process_settings,
+    }
 }
 
 fn remove_test_env(key: &'static str) -> EnvVarGuard {
+    let process_settings = crate::test_helpers::process_env_lock();
     let previous = std::env::var_os(key);
     std::env::remove_var(key);
-    EnvVarGuard { key, previous }
+    EnvVarGuard {
+        key,
+        previous,
+        _process_settings: process_settings,
+    }
+}
+
+#[test]
+fn storage_override_holds_shared_process_settings_guard() {
+    let storage = tempfile::tempdir().unwrap();
+    {
+        let _setting = set_test_env("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
+        assert!(
+            !std::thread::spawn(crate::test_helpers::process_env_lock_is_available)
+                .join()
+                .unwrap(),
+            "a bridge storage override must exclude in-process configure fixtures"
+        );
+    }
+    {
+        let _setting = remove_test_env("AFT_STORAGE_DIR");
+        assert!(
+            !std::thread::spawn(crate::test_helpers::process_env_lock_is_available)
+                .join()
+                .unwrap(),
+            "removing a bridge storage override must also hold the shared guard"
+        );
+    }
 }
 
 fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
