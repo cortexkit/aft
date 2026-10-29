@@ -196,6 +196,7 @@ fn main() {
     if parse_subc_arg(std::env::args_os().skip(1)).is_some() {
         aft::launch_nonce::capture_at_startup();
     }
+    aft::pinned_executable::capture_at_startup();
 
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.
@@ -263,6 +264,14 @@ fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("aft {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // Pin before CLI handlers, PATH discovery, or application startup can
+    // launch children. The helper entry points above already execute a pinned
+    // image and must not create a new pin for every sandbox or gh invocation.
+    if let Err(error) = aft::pinned_executable::initialize() {
+        eprintln!("cannot pin the running AFT executable: {error}");
+        std::process::exit(1);
     }
 
     if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
