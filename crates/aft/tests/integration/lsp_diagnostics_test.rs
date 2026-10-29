@@ -3415,6 +3415,15 @@ mod mutation_events {
     use super::*;
 
     fn check(command: &str, operation: &str, expected: &[(&str, i64)]) {
+        check_subscribed(command, operation, expected, None);
+    }
+
+    fn check_subscribed(
+        command: &str,
+        operation: &str,
+        expected: &[(&str, i64)],
+        watchers: Option<serde_json::Value>,
+    ) {
         let (_temp, root, files) = typescript_workspace_with_files(&["importer.ts", "before.ts"]);
         let importer = &files[0];
         let ctx = AppContext::new(
@@ -3428,6 +3437,14 @@ mod mutation_events {
         .with_test_checkpoint_store();
         ctx.lsp()
             .override_binary(ServerKind::TypeScript, fake_server_path());
+        if let Some(watchers) = watchers {
+            ctx.lsp()
+                .set_extra_env("AFT_FAKE_LSP_WATCHED_GLOBS", &watchers.to_string());
+        }
+        if operation == "ignored write" {
+            fs::write(root.join(".gitignore"), "src/after.ts\n").unwrap();
+            ctx.rebuild_gitignore();
+        }
         let outcome = ctx.lsp_notify_and_collect_diagnostics(
             importer,
             "export const importer = 1;\n",
@@ -3436,10 +3453,29 @@ mod mutation_events {
         assert!(outcome.complete(), "fake server startup: {outcome:?}");
         ctx.lsp().drain_events();
 
+        let (_other_temp, other_root, other_files) = typescript_workspace_with_files(&["other.ts"]);
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            &other_files[0],
+            "export const other = 1;\n",
+            Duration::from_secs(15),
+        );
+        assert!(
+            outcome.complete(),
+            "sibling fake server startup: {outcome:?}"
+        );
+        assert_eq!(
+            ctx.lsp().active_server_keys().len(),
+            2,
+            "two independent server roots"
+        );
+        ctx.lsp().drain_events();
+
         let before = root.join("src/before.ts");
         let after = root.join("src/after.ts");
         let params = match operation {
-            "write" => serde_json::json!({"file": after, "content": "export const added = 1;\n"}),
+            "write" | "queued write" | "ignored write" => {
+                serde_json::json!({"file": after, "content": "export const added = 1;\n"})
+            }
             "edit" => serde_json::json!({"file": before, "content": "export const value = 2;\n"}),
             "delete" => serde_json::json!({"file": before}),
             "move" => serde_json::json!({"file": before, "destination": after}),
@@ -3458,6 +3494,7 @@ mod mutation_events {
             lsp_hints: None,
             session_id: None,
         };
+        let held = (operation == "queued write").then(|| ctx.lsp());
         let response = match command {
             "write" => handle_write(&req, &ctx),
             "delete_file" => handle_delete_file(&req, &ctx),
@@ -3465,8 +3502,40 @@ mod mutation_events {
             "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, &ctx),
             _ => panic!("unknown command"),
         };
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while ctx.lsp_pending_changes_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "mutation events did not drain after contention"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         let response = serde_json::to_value(response).unwrap();
         assert_eq!(response["success"], true, "{operation}: {response:#}");
+
+        // Both typed events and the path-only OS watcher can echo the mutation.
+        // Neither may repeat the already delivered membership transition.
+        let echoes = expected
+            .iter()
+            .map(|(path, kind)| {
+                (
+                    root.join(path),
+                    if *kind == 1 {
+                        FileChangeType::CREATED
+                    } else {
+                        FileChangeType::DELETED
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        ctx.lsp().forward_watcher_file_events(&echoes, &[]);
+        ctx.lsp_forward_watcher_file_events(
+            &echoes
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+        );
 
         // The importer is untouched by the mutation. Its acknowledgement is a
         // protocol barrier: every earlier watched-file event has been echoed.
@@ -3497,6 +3566,13 @@ mod mutation_events {
             thread::sleep(Duration::from_millis(10));
         }
         actual.sort();
+        let (other_events, _) =
+            server_reports_before_barrier(&ctx, &other_files[0], "export const other = 2;\n");
+        assert!(
+            other_events.is_empty(),
+            "server rooted at {} received another root's mutation: {other_events:?}",
+            other_root.display()
+        );
         let mut expected = expected
             .iter()
             .map(|(path, kind)| (path.to_string(), *kind))
@@ -3543,6 +3619,32 @@ mod mutation_events {
     #[test]
     fn lsp_mutation_existing_content_keeps_document_notifications_only() {
         check("write", "edit", &[]);
+    }
+    #[test]
+    fn lsp_mutation_create_survives_busy_manager() {
+        check("write", "queued write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_create_ignored_source_still_notifies_server() {
+        check("write", "ignored write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_create_respects_registered_glob() {
+        check_subscribed(
+            "write",
+            "write",
+            &[],
+            Some(serde_json::json!([{"globPattern": "**/*.js"}])),
+        );
+    }
+    #[test]
+    fn lsp_mutation_create_respects_registered_kind() {
+        check_subscribed(
+            "write",
+            "write",
+            &[],
+            Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 4}])),
+        );
     }
 }
 

@@ -1107,6 +1107,7 @@ pub struct LspManager {
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
     pending_watched_changes: HashMap<ServerKey, PendingWatchedChanges>,
+    watched_lifecycle: HashMap<ServerKey, HashMap<PathBuf, WatchedLifecycle>>,
     /// rust-analyzer instances with a workspace reload running on a helper
     /// thread because the file watcher saw a Cargo manifest change (see
     /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
@@ -1387,6 +1388,7 @@ impl LspManager {
             transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
             pending_watched_changes: HashMap::new(),
+            watched_lifecycle: HashMap::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
@@ -3158,7 +3160,14 @@ impl LspManager {
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
-        self.notify_files_watched_changed_for_server(paths, None)
+        // Source membership uses exactly the watcher's root/glob/kind routing.
+        // Keep legacy configuration-content notifications on their existing path.
+        let (lifecycle, content): (Vec<_>, Vec<_>) = paths
+            .iter()
+            .cloned()
+            .partition(|(_, kind)| *kind != FileChangeType::CHANGED);
+        self.forward_watcher_file_events(&lifecycle, &[]);
+        self.notify_files_watched_changed_for_server(&content, None)
     }
 
     fn notify_files_watched_changed_for_server(
@@ -3367,10 +3376,16 @@ impl LspManager {
             .into_iter()
             .collect();
         for key in keys {
+            let previous = self.watched_lifecycle.get(&key);
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
                 .filter(|(raw, resolved, _)| {
                     resolved.starts_with(&key.root) || raw.starts_with(&key.root)
+                })
+                .filter(|(_, resolved, kind)| {
+                    !previous
+                        .and_then(|paths| paths.get(resolved))
+                        .is_some_and(|previous| previous.is_echo(resolved, *kind))
                 })
                 .collect();
             if in_root.is_empty() {
@@ -3463,11 +3478,25 @@ impl LspManager {
                             )
                         });
                         match sent {
-                            Some(Ok(())) if watchers.is_some() => {
-                                sent_to_registered_watcher = selected
-                                    .iter()
-                                    .map(|(_, resolved, _)| resolved.clone())
-                                    .collect();
+                            Some(Ok(())) => {
+                                let delivered =
+                                    self.watched_lifecycle.entry(key.clone()).or_default();
+                                for (_, path, kind) in &selected {
+                                    if *kind == FileChangeType::CHANGED {
+                                        delivered.remove(path);
+                                    } else {
+                                        delivered.insert(
+                                            path.clone(),
+                                            WatchedLifecycle::new(path, *kind),
+                                        );
+                                    }
+                                }
+                                if watchers.is_some() {
+                                    sent_to_registered_watcher = selected
+                                        .iter()
+                                        .map(|(_, resolved, _)| resolved.clone())
+                                        .collect();
+                                }
                             }
                             Some(Err(error)) => {
                                 crate::slog_warn!(
@@ -5622,6 +5651,7 @@ impl LspManager {
         self.watched_file_skip_logged.retain(keep);
         self.pending_watched_changes
             .retain(|server, _| keep(server));
+        self.watched_lifecycle.retain(|server, _| keep(server));
         self.latest_push_for_pull_servers
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
@@ -8476,6 +8506,31 @@ struct PendingWatchedChange {
     kind: FileChangeType,
     raw: Option<PathBuf>,
     extra_config_markers: Vec<String>,
+}
+
+/// Membership notifications and watcher echoes share this per-server state.
+/// Compare file size and modification time so a later content edit is forwarded
+/// rather than mistaken for an echo of the membership notification.
+struct WatchedLifecycle {
+    kind: FileChangeType,
+    stamp: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+impl WatchedLifecycle {
+    fn new(path: &Path, kind: FileChangeType) -> Self {
+        Self {
+            kind,
+            stamp: std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok())),
+        }
+    }
+
+    fn is_echo(&self, path: &Path, kind: FileChangeType) -> bool {
+        (kind == self.kind
+            || (kind == FileChangeType::CHANGED && self.kind == FileChangeType::CREATED))
+            && self.stamp == Self::new(path, kind).stamp
+    }
 }
 
 /// Wait through spawn and replay until a final startup outcome or the deadline.

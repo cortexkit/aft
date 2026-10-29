@@ -15507,6 +15507,12 @@ impl AppContext {
         );
     }
 
+    /// Publish final file membership, independently of delayed OS watcher echoes.
+    /// Content-only edits continue through the existing document notifications.
+    pub(crate) fn lsp_notify_mutation_file_events(&self, events: &[(PathBuf, FileChangeType)]) {
+        self.notify_watched_config_events(events);
+    }
+
     pub fn lsp_notify_watched_config_file(&self, file_path: &Path, change_type: FileChangeType) {
         // An agent write to package.json or a lockfile can change which
         // TypeScript server a file gets, even with the file watcher off.

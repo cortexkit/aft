@@ -1,0 +1,1 @@
+- Language servers now notice source files created, deleted, or moved by AFT tools, so imports of newly written modules no longer keep stale missing-module errors. Thanks @iceteaSA!

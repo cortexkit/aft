@@ -2989,6 +2989,7 @@ pub(crate) struct FileMutationGuard<'a> {
     ctx: &'a AppContext,
     revisit: Vec<PathBuf>,
     paths: std::collections::BTreeSet<PathBuf>,
+    files_before: std::collections::BTreeMap<PathBuf, bool>,
     before: MutationRefreshBudget,
     overflowed: bool,
     _view_intent: crate::views::intent::IntentGuard,
@@ -3085,10 +3086,18 @@ pub(crate) fn record_file_mutation<'a, 'p>(
     let mut before = MutationRefreshBudget::new();
     let overflowed =
         !collect_mutation_paths(ctx, &roots, &mut paths, Some(&mut revisit), &mut before);
+    // Explicit targets also matter when ignored by the search index: a language
+    // server can still watch and import a file that an agent writes there.
+    let files_before = roots
+        .iter()
+        .chain(paths.iter())
+        .map(|path| (path.clone(), path.is_file()))
+        .collect();
     FileMutationGuard {
         ctx,
         revisit,
         paths,
+        files_before,
         before,
         overflowed,
         _view_intent: view_intent,
@@ -3118,6 +3127,7 @@ impl Drop for FileMutationGuard<'_> {
                 &mut budget,
             );
             for path in discovered.difference(&self.paths) {
+                self.files_before.entry(path.clone()).or_insert(false);
                 if budget.exhausted() {
                     overflowed = true;
                     break;
@@ -3127,6 +3137,24 @@ impl Drop for FileMutationGuard<'_> {
                 budget.refreshed += 1;
             }
         }
+        let events = self
+            .files_before
+            .iter()
+            .filter_map(|(path, existed)| {
+                let exists = path.is_file();
+                (exists != *existed).then(|| {
+                    (
+                        path.clone(),
+                        if exists {
+                            lsp_types::FileChangeType::CREATED
+                        } else {
+                            lsp_types::FileChangeType::DELETED
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        self.ctx.lsp_notify_mutation_file_events(&events);
         let root = self.ctx.canonical_cache_root_opt();
         if overflowed
             && self.ctx.heavy_root_work_allowed()

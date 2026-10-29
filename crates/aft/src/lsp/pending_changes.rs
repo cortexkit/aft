@@ -1,4 +1,4 @@
-//! Document and configuration-file changes that wait for the LSP manager
+//! Document and watched-file changes that wait for the LSP manager
 //! lock instead of being dropped.
 //!
 //! An edit tells the language servers about the new file contents
@@ -23,8 +23,8 @@ use crate::lsp::manager::{start_servers_for_file_unlocked, LspManager};
 /// [`LspManager::resync_drifted_open_documents`]).
 pub const PENDING_LSP_DOCUMENTS_CAP: usize = 1_024;
 
-/// How many distinct configuration-file events may wait for the manager
-/// lock. Configuration files are few; further events are logged and dropped.
+/// How many distinct watched-file events may wait for the manager lock.
+/// Further events are logged and dropped.
 pub const PENDING_LSP_WATCHED_CAP: usize = 1_024;
 
 /// The per-context slot holding changes queued for the LSP manager. `Some`
@@ -43,7 +43,7 @@ pub struct PendingLspChanges {
     /// Documents whose change may start a server (a resync after a change
     /// outside AFT); the others go to servers already running.
     start_servers: HashSet<PathBuf>,
-    /// Configuration-file events, one per path, the latest kind winning.
+    /// Watched-file events, one per path, the latest kind winning.
     watched: Vec<(PathBuf, FileChangeType)>,
     /// Documents were dropped past [`PENDING_LSP_DOCUMENTS_CAP`].
     overflowed: bool,
@@ -71,7 +71,7 @@ impl PendingLspChanges {
         }
     }
 
-    /// Queue configuration-file events.
+    /// Queue watched-file events, including source-file creation and deletion.
     pub(crate) fn queue_watched(&mut self, events: &[(PathBuf, FileChangeType)]) {
         for (path, typ) in events {
             if let Some(existing) = self.watched.iter_mut().find(|(known, _)| known == path) {
