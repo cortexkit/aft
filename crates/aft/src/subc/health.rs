@@ -4551,6 +4551,38 @@ mod tests {
     }
 
     #[test]
+    fn health_budget_keeps_findings_evidence_out_of_the_public_reply() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let evidence = json!({
+            "build_breaker_error": null, "database_open_failed": false,
+            "lsp_start_failures": {("server".repeat(HEALTH_METRICS_BUDGET_BYTES)): 3}
+        });
+        let mut rollup = allocator_rollup(&cache);
+        rollup.status = HealthStatus::Degraded;
+        rollup.detail = Some("1 standing root(s) refused current resolved-path identity".into());
+        rollup.metrics["root_count"] = json!(1);
+        rollup.metrics["roots"] = json!([{
+            "project_root": "standing", "state": "ready", "standing": true,
+            "standing_refusal": "resolved-path-drift refusal", "diagnostics_evidence": evidence
+        }]);
+        cache.publish(Some(rollup));
+
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &DispatchPathMetrics::new(), &app);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(metrics["roots"][0]["standing_refusal"], "resolved-path-drift refusal");
+        assert!(metrics["roots"][0].get("diagnostics_evidence").is_none());
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        assert_eq!(cache.snapshot().0.metrics["roots"][0]["diagnostics_evidence"], evidence);
+        let findings = serde_json::to_value(cache.findings(1_000, 60_000)).unwrap();
+        assert!(findings.as_array().unwrap().iter().any(|finding| finding["check"] == "lsp_start_failures"));
+    }
+
+    #[test]
     fn health_fixture_ignores_process_global_sweep_telemetry() {
         let dir = tempfile::tempdir().unwrap();
         crate::gc::family::record_stale_rows(&dir.path().join("semantic.db"), "foreign-family", 1);
