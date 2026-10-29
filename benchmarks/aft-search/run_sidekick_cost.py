@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 
-from embedding_fixture_server import vector_server
+from run_concept_recall import vector_server
 from run_real_query import FIXTURE_PROVIDER_MODEL, load_inputs, runtime_evidence_tree
 
 HERE = Path(__file__).resolve().parent
