@@ -3473,7 +3473,7 @@ mod mutation_events {
         let before = root.join("src/before.ts");
         let after = root.join("src/after.ts");
         let params = match operation {
-            "write" | "queued write" | "ignored write" => {
+            "write" | "queued write" | "ignored write" | "recreate" => {
                 serde_json::json!({"file": after, "content": "export const added = 1;\n"})
             }
             "edit" => serde_json::json!({"file": before, "content": "export const value = 2;\n"}),
@@ -3514,9 +3514,23 @@ mod mutation_events {
         let response = serde_json::to_value(response).unwrap();
         assert_eq!(response["success"], true, "{operation}: {response:#}");
 
+        if operation == "recreate" {
+            let req: RawRequest = serde_json::from_value(
+                serde_json::json!({"id": "delete-again", "command": "delete_file", "file": after}),
+            )
+            .unwrap();
+            assert!(handle_delete_file(&req, &ctx).success);
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "create-again", "command": "write", "file": after, "content": "export const added = 1;\n"})).unwrap();
+            assert!(handle_write(&req, &ctx).success);
+        }
+
         // Both typed events and the path-only OS watcher can echo the mutation.
         // Neither may repeat the already delivered membership transition.
-        let echoes = expected
+        let final_events = expected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let echoes = final_events
             .iter()
             .map(|(path, kind)| {
                 (
@@ -3536,6 +3550,14 @@ mod mutation_events {
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>(),
         );
+
+        if operation == "write" {
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "edit-created", "command": "write", "file": after, "content": "export const added = 123456;\n"})).unwrap();
+            assert!(handle_write(&req, &ctx).success);
+            // An old create event can arrive after a later content edit. It
+            // still describes the same creation, not another new module.
+            ctx.lsp().forward_watcher_file_events(&echoes, &[]);
+        }
 
         // The importer is untouched by the mutation. Its acknowledgement is a
         // protocol barrier: every earlier watched-file event has been echoed.
@@ -3644,6 +3666,27 @@ mod mutation_events {
             "write",
             &[],
             Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 4}])),
+        );
+    }
+    #[test]
+    fn lsp_mutation_delete_then_recreate_reports_each_transition() {
+        check(
+            "write",
+            "recreate",
+            &[
+                ("src/after.ts", 1),
+                ("src/after.ts", 3),
+                ("src/after.ts", 1),
+            ],
+        );
+    }
+    #[test]
+    fn lsp_mutation_recreate_with_creation_only_subscription() {
+        check_subscribed(
+            "write",
+            "recreate",
+            &[("src/after.ts", 1), ("src/after.ts", 1)],
+            Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 1}])),
         );
     }
 }

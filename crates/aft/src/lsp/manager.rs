@@ -3376,6 +3376,18 @@ impl LspManager {
             .into_iter()
             .collect();
         for key in keys {
+            // A create after a delete, or a delete after a create, clears the
+            // earlier event even when the server subscribed to only one kind.
+            if let Some(previous) = self.watched_lifecycle.get_mut(&key) {
+                for (raw, path, kind) in &events {
+                    if *kind != FileChangeType::CHANGED
+                        && (path.starts_with(&key.root) || raw.starts_with(&key.root))
+                        && previous.get(path).is_some_and(|last| last.kind != *kind)
+                    {
+                        previous.remove(path);
+                    }
+                }
+            }
             let previous = self.watched_lifecycle.get(&key);
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
@@ -3482,9 +3494,7 @@ impl LspManager {
                                 let delivered =
                                     self.watched_lifecycle.entry(key.clone()).or_default();
                                 for (_, path, kind) in &selected {
-                                    if *kind == FileChangeType::CHANGED {
-                                        delivered.remove(path);
-                                    } else {
+                                    if *kind != FileChangeType::CHANGED {
                                         delivered.insert(
                                             path.clone(),
                                             WatchedLifecycle::new(path, *kind),
@@ -8527,9 +8537,10 @@ impl WatchedLifecycle {
     }
 
     fn is_echo(&self, path: &Path, kind: FileChangeType) -> bool {
-        (kind == self.kind
-            || (kind == FileChangeType::CHANGED && self.kind == FileChangeType::CREATED))
-            && self.stamp == Self::new(path, kind).stamp
+        kind == self.kind
+            || (kind == FileChangeType::CHANGED
+                && self.kind == FileChangeType::CREATED
+                && self.stamp == Self::new(path, kind).stamp)
     }
 }
 
