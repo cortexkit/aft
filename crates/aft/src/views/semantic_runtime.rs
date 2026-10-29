@@ -109,6 +109,7 @@ pub struct CheckoutSemantic {
     /// the scheduled deadline when a transient refresh is being retried. Searches
     /// report it as `semantic: unavailable: <reason>`.
     unavailable: Mutex<Option<String>>,
+    coordination_pending: AtomicBool,
     /// Semantic searches answered from this view.
     searches: AtomicU64,
     /// Readiness successors this view published as its base's owner.
@@ -210,6 +211,7 @@ impl CheckoutSemantic {
             unfolded: AtomicBool::new(false),
             refresh_attempts: AtomicUsize::new(0),
             unavailable: Mutex::new(None),
+            coordination_pending: AtomicBool::new(false),
             searches: AtomicU64::new(0),
             base_successors: AtomicU64::new(0),
             #[cfg(test)]
@@ -739,6 +741,10 @@ impl CheckoutSemantic {
     /// How many times `refresh` has run, successful or not.
     pub fn refresh_attempts(&self) -> usize {
         self.refresh_attempts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn coordination_pending(&self) -> bool {
+        self.coordination_pending.load(Ordering::Relaxed)
     }
 
     /// Why the checkout's vectors cannot be brought up to date, including a
@@ -1973,12 +1979,7 @@ fn serve_fills_with_status<F>(
                         slot,
                         epoch,
                         status,
-                        crate::context::SemanticIndexStatus::Building {
-                            stage: super::semantic_batch_lease::PENDING_REASON.into(),
-                            files: None,
-                            entries_done: None,
-                            entries_total: None,
-                        },
+                        crate::context::SemanticIndexStatus::ready(),
                     );
                 }
                 crate::slog_info!(
@@ -2241,8 +2242,14 @@ where
         if !is_current(slot, epoch) {
             return FillOutcome::Stop;
         }
+        if refresh.is_err() {
+            runtime.coordination_pending.store(false, Ordering::Relaxed);
+        }
         match refresh {
             Ok(report) => {
+                runtime
+                    .coordination_pending
+                    .store(report.pending.is_some(), Ordering::Relaxed);
                 if report.pending == Some(super::semantic::FillPending::LocalContention) {
                     // refresh, its file claims and all scoped permits have
                     // returned. Park only this background worker, checking lane

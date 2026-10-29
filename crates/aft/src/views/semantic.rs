@@ -712,6 +712,7 @@ pub struct FillReport {
     pub store_errors: Vec<String>,
     /// Return out of refresh before parking: no claims, gate or permit may wait.
     pub pending: Option<FillPending>,
+    chunked_files: BTreeMap<FamilyKey, usize>,
     pub timing: FillTiming,
 }
 
@@ -720,6 +721,8 @@ impl FillReport {
         self.queued = self.queued.max(report.queued);
         self.deferred = report.deferred;
         self.pending = report.pending;
+        self.chunked_files.extend(report.chunked_files);
+        self.chunks = self.chunked_files.values().sum();
         macro_rules! add { ($($field:ident),* $(,)?) => { $(self.$field += report.$field;)* }; }
         add!(
             moved,
@@ -729,7 +732,6 @@ impl FillReport {
             embedded_keys,
             embedded_texts,
             model_calls,
-            chunks,
             chunk_reused,
             chunk_resident_hits,
             source_reads,
@@ -1492,6 +1494,15 @@ impl SemanticPlane {
             let local_wait = report.pending == Some(FillPending::LocalContention);
             total.merge_attempt(report);
             if !local_wait || Instant::now() >= deadline {
+                if total.pending.is_none()
+                    && total.errors.is_empty()
+                    && total.store_errors.is_empty()
+                {
+                    // Retried preparation can revisit the same positions. Count
+                    // each file's chunks once, and distinguish new provider
+                    // inputs from positions satisfied without a new input.
+                    total.chunk_reused = total.chunks.saturating_sub(total.embedded_texts);
+                }
                 return Ok(total);
             }
             // Synchronous callers have no outer worker. Each attempt already
@@ -1740,6 +1751,9 @@ impl SemanticPlane {
                         );
                     }
                     report.chunks += file_chunks.len();
+                    report
+                        .chunked_files
+                        .insert(FamilyKey::from(&group.full_key), file_chunks.len());
                     chunks.push(file_chunks);
                     to_embed.push((item, relative, group.full_key, FillClaim::new(claim)));
                 }
@@ -2262,6 +2276,7 @@ impl SemanticPlane {
             })
             .collect::<Vec<_>>();
         if unique.len() < texts.len() {
+            report.chunk_reused += texts.len() - unique.len();
             let rows = self.embed_chunks(
                 arena,
                 store,
@@ -4622,6 +4637,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(report.embedded_texts, 2);
+        assert_eq!(report.chunk_reused, 1);
         assert_eq!(report.model_calls, 1);
         for (row, expected) in rows
             .iter()

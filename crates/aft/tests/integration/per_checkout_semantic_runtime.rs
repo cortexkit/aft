@@ -26,9 +26,10 @@ use serde_json::{json, Value};
 
 const DEADLINE: Duration = Duration::from_secs(90);
 const FINGERPRINT_PROBE: &str = "semantic index fingerprint probe";
+const COMPLETION_QUERY: &str = "single-flight-readiness-probe";
 
-/// Deterministic embeddings over HTTP, counting texts other than the
-/// fingerprint probe the model sends once at startup.
+/// Deterministic embeddings over HTTP, counting texts other than the known
+/// fingerprint and readiness-query probes (neither is chunk-vector work).
 struct MockEmbedder {
     base_url: String,
     addr: SocketAddr,
@@ -193,7 +194,7 @@ fn serve(
     texts.fetch_add(
         inputs
             .iter()
-            .filter(|input| *input != FINGERPRINT_PROBE)
+            .filter(|input| *input != FINGERPRINT_PROBE && !input.contains(COMPLETION_QUERY))
             .count(),
         Ordering::SeqCst,
     );
@@ -701,17 +702,27 @@ fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(gate.state.lock().unwrap().0.len(), 1);
+    // Contention is not a backend outage: completed base vectors still serve,
+    // while the new file remains an explicitly incomplete path.
+    let pending = linked.send(&json!({"id":"pending-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
+    assert_eq!(pending["complete"], false, "{pending}");
+    assert!(
+        pending["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "saved base vectors disappeared during contention: {pending}"
+    );
     gate.release();
     for process in [&mut main, &mut linked] {
         let deadline = Instant::now() + DEADLINE;
         loop {
-            let status = process.send(r#"{"id":"ready","command":"status"}"#);
-            if status["semantic_index"]["status"] == "ready" {
+            let answer = process.send(&json!({"id":"ready-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
+            if answer["complete"] == true {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "semantic worker never became ready: {status}"
+                "semantic worker never became ready: {answer}"
             );
             thread::sleep(Duration::from_millis(20));
         }

@@ -318,13 +318,25 @@ impl AppContext {
         } else {
             search_index_info
         };
-        let semantic_index_info = if self.root_too_broad() {
+        let mut semantic_index_info = if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.semantic {
             refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
         } else {
             semantic_index_info
         };
+
+        if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(runtime))) =
+            self.checkout_semantic().try_state()
+        {
+            if runtime.coordination_pending() {
+                // Keep the ready index queryable: only the missing paths are
+                // pending. Treating the ready index as loading or failed would
+                // hide saved results.
+                semantic_index_info["pending_reason"] =
+                    serde_json::json!(crate::views::semantic_batch_lease::PENDING_REASON);
+            }
+        }
 
         // Disk cache sizes — scoped to the **current project** only.
         //
