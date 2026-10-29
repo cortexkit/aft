@@ -1203,6 +1203,8 @@ impl CheckoutSemanticSlot {
     /// replaced, so status observers that must never block can report the
     /// lane as changing.
     pub fn try_state(&self) -> Option<Option<CheckoutSemanticState>> {
+        #[cfg(test)]
+        TEST_TRY_STATE_READS.with(|reads| reads.set(reads.get() + 1));
         match self.state.try_read() {
             Ok(state) => Some(state.clone()),
             Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().clone()),
@@ -1293,6 +1295,11 @@ impl CheckoutSemanticSlot {
         retry.due = now;
         true
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_TRY_STATE_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Everything the fill worker needs besides the slot.

@@ -326,15 +326,18 @@ impl AppContext {
             semantic_index_info
         };
 
-        if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(runtime))) =
-            self.checkout_semantic().try_state()
-        {
-            if runtime.coordination_pending() {
-                // Keep the ready index queryable: only the missing paths are
-                // pending. Treating the ready index as loading or failed would
-                // hide saved results.
-                semantic_index_info["pending_reason"] =
-                    serde_json::json!(crate::views::semantic_batch_lease::PENDING_REASON);
+        if config.views.enabled && config.indexes.semantic {
+            if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(
+                runtime,
+            ))) = self.checkout_semantic().try_state()
+            {
+                if runtime.coordination_pending() {
+                    // Keep the ready index queryable: only the missing paths are
+                    // pending. Treating the ready index as loading or failed would
+                    // hide saved results.
+                    semantic_index_info["pending_reason"] =
+                        serde_json::json!(crate::views::semantic_batch_lease::PENDING_REASON);
+                }
             }
         }
 
@@ -750,6 +753,29 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_batch_lease_disabled_status_never_probes_view_slot() {
+        for (views, semantic) in [(false, true), (true, false), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.project_root = Some(dir.path().to_path_buf());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.views.enabled = views;
+            config.indexes.semantic = semantic;
+            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+            crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.set(0));
+            let response = handle_status(&request(), &ctx);
+            let probes =
+                crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.get());
+            assert!(response.success);
+            if views && semantic {
+                assert!(probes > 0, "enabled status must exercise the probe counter");
+            } else {
+                assert_eq!(probes, 0, "disabled status touched the semantic slot (views={views}, semantic={semantic})");
+            }
+        }
+    }
+
     use super::handle_status;
     use crate::config::Config;
     use crate::context::AppContext;
