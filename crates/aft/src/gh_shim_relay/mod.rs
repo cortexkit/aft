@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 pub const BOT_REQUEST_OPERATION: &str = "gh_shim.bot_request";
 /// Relay plexus's repository-to-agent binding read for the shim's version
 /// check. Params: `{ticket}`; an `agent_id` the shim still sends is ignored,
-/// because the reply lists every repository's binding whichever agent asks.
+/// because the agent is captured from the ticket's authenticated launch scope.
 pub const BINDINGS_READ_OPERATION: &str = "gh_shim.bindings_read";
 /// Inspect the ticket's daemon-stamped session kind, without contacting Plexus.
 pub const SESSION_CONTEXT_OPERATION: &str = "gh_shim.session_context";
@@ -46,12 +46,7 @@ pub const SESSION_CONTEXT_OPERATION: &str = "gh_shim.session_context";
 pub const READ_REQUEST_OPERATION: &str = "gh_shim.read_request";
 
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
-/// The handle connection named in `bindings.read`. Plexus uses the name only
-/// to check that the caller holds a live module grant on that connection, and
-/// answers with the same full binding list for any connection named.
-/// `reserved:aft` holds grants on every handle connection, so AFT names its
-/// own bot's connection.
-const BINDINGS_READ_CONNECTION_ID: &str = "github-handle-aft-alfonso";
+const AGENT_BINDINGS_READ_OPERATION: &str = "bindings.read_for_agent";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 static RELAY_OPERATIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -729,10 +724,16 @@ async fn bindings_read<T: RelayTransport>(
     transport: &T,
     redeemed: &crate::gh_shim_ticket::Redeemed,
 ) -> RelayReply {
-    let body = github_call(json!({
-        "op": "bindings.read",
-        "connection_id": BINDINGS_READ_CONNECTION_ID,
-    }));
+    let agent = match redeemed.launch.as_ref().map(|launch| launch.agent()) {
+        Some(Ok(agent)) => agent,
+        _ => {
+            return RelayReply::task_refused(crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "start_delegation_missing",
+            ))
+        }
+    };
+    let body = agent_bindings_call(agent);
     match transport
         .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
         .await
@@ -1046,8 +1047,13 @@ async fn post_captured(
         .bindings
         .get(&repo)
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
-    let reply =
-        bindings_read_for_service(service, &redeemed.project_root, &redeemed.session_id).await?;
+    let reply = bindings_read_for_service(
+        service,
+        &redeemed.project_root,
+        &redeemed.session_id,
+        launch.agent()?,
+    )
+    .await?;
     service.check_pending(
         Some(&stored.record.incarnation),
         launch,
@@ -1060,11 +1066,18 @@ async fn post_captured(
         &facade_reply(&reply),
         launch.agent()?,
     )?;
-    let expect = current_bindings
-        .get(&repo)
-        .ok_or_else(|| Refusal::new(Code::IdentityConflict, "binding_changed"))?;
+    let expect = current_bindings.get(&repo).ok_or_else(|| {
+        crate::gh_shim_speech::service::binding_refusal(
+            Code::IdentityConflict,
+            "binding_changed",
+            format!(
+                "no_binding_row: repository={repo:?} launch_agent={:?}",
+                launch.agent().ok()
+            ),
+        )
+    })?;
     if expect.app_handle_id != initial.app_handle_id {
-        return Err(Refusal::new(Code::IdentityConflict, "binding_changed"));
+        return Err(crate::gh_shim_speech::service::binding_refusal(Code::IdentityConflict, "binding_changed", format!("binding_handle_mismatch: repository={repo:?} captured_handle={:?} returned_handle={:?}", initial.app_handle_id, expect.app_handle_id)));
     }
     let body =
         partner::BotRequest::new(request.clone(), nonce, expect.clone(), launch.run.as_ref())?;
@@ -1254,8 +1267,15 @@ async fn bindings_read_for_service(
     service: &crate::gh_shim_speech::service::Service,
     project: &str,
     session: &str,
+    agent: &str,
 ) -> Result<Value, crate::gh_shim_speech::Refusal> {
-    service.read_bindings(project, session).await
+    service.read_bindings(project, session, agent).await
+}
+
+// A connection-selected read returns only that handle's repositories. Select by
+// the authenticated registry agent instead, including all of its handles.
+fn agent_bindings_call(agent: &str) -> Value {
+    github_call(json!({"op": AGENT_BINDINGS_READ_OPERATION, "agent_id": agent}))
 }
 
 /// The body of AFT's call to plexus's `github` tool. AFT is the caller here:
@@ -1314,16 +1334,10 @@ impl GhRelay {
         &self,
         project: &str,
         session: &str,
+        agent: &str,
     ) -> Result<Value, TransportError> {
         self.transport
-            .plexus(
-                project,
-                session,
-                None,
-                github_call(
-                    json!({"op":"bindings.read","connection_id":BINDINGS_READ_CONNECTION_ID}),
-                ),
-            )
+            .plexus(project, session, None, agent_bindings_call(agent))
             .await
     }
 }
@@ -1829,6 +1843,9 @@ impl RelayTransport for SubcRelayTransport {
     }
 }
 
+#[cfg(test)]
+#[path = "../gh_shim/plexus_bindings_contract.rs"]
+pub(crate) mod bindings_contract;
 #[cfg(test)]
 pub(crate) mod tests;
 

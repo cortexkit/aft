@@ -10,6 +10,8 @@ crates/aft/tests/fixtures/gh_shim/plexus-contract/** text eol=lf
 # ALF's diagnostics.findings vectors are checked against sha256 digests
 # recorded from prefrontal's LF bytes, so they must stay LF on Windows too.
 crates/aft/tests/fixtures/diagnostics-findings-v1/** text eol=lf
+# Binding-discovery vectors and their provenance hashes also pin LF bytes.
+crates/aft/tests/fixtures/gh_shim/plexus-bindings-contract/** text eol=lf
 crates/aft/tests/fixtures/pty_render/*.raw binary
 # Golden render outputs are compared byte-exact against `\n`-joined screen
 # output, so they must stay LF on every platform (Windows autocrlf would

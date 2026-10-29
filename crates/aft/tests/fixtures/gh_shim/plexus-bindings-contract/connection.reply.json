@@ -1,0 +1,12 @@
+{
+  "result": {
+    "bindings": [
+      {
+        "agent_id": "agent-x",
+        "app_handle_id": "app-x",
+        "repository": "o/x"
+      }
+    ],
+    "repo_binding_generation": 3
+  }
+}

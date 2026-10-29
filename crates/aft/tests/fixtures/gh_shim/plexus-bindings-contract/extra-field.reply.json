@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "field": "connection_id"
+  }
+}

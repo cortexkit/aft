@@ -8152,7 +8152,11 @@ mod grant_path_tests {
                 .build()
                 .expect("current-thread test runtime");
             runtime.block_on(async {
-                let (mut startup, done) = startup_case(held_before_spawn_stub, 80).await;
+                // The test fires the deadline once the stub holds the sandbox
+                // profile step. The window is only a backstop and must outlast
+                // executor admission: at 80 ms a loaded macOS runner was still
+                // admitting, so the backstop fired first and named admission.
+                let (mut startup, done) = startup_case(held_before_spawn_stub, 3_000).await;
                 let response = done.response_for_test();
                 assert_eq!(response.data["code"], "bash_start_deadline");
                 let message = response.data["message"]

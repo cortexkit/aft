@@ -1087,6 +1087,8 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
             "cortexkit/aft",
         ],
         vec!["pr", "close", "7", "--repo", "cortexkit/aft"],
+        vec!["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"],
+        vec!["pr", "merge", "7", "--squash", "--repo", "cortexkit/aft"],
         vec![
             "api",
             "-X",
@@ -1096,18 +1098,21 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
             "body=hello",
         ],
     ] {
-        let status = run_with(
-            &args(&raw),
-            |forwarded| {
-                delegated.push(forwarded.to_vec());
-                0
-            },
-            |_, _, _, _| {
-                lookups += 1;
-                Ok(None)
-            },
-        );
-        assert_eq!(status, 86, "{raw:?}");
+        for bypass in [None, Some(OsStr::new("operator"))] {
+            let _bypass = Env::set("GH_SHIM_BYPASS", bypass);
+            let status = run_with(
+                &args(&raw),
+                |forwarded| {
+                    delegated.push(forwarded.to_vec());
+                    0
+                },
+                |_, _, _, _| {
+                    lookups += 1;
+                    Ok(None)
+                },
+            );
+            assert_eq!(status, 86, "{raw:?}, bypass={bypass:?}");
+        }
     }
     assert!(
         delegated.is_empty(),
@@ -1123,7 +1128,7 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
     let lines = lines.lock().unwrap();
     assert_eq!(
         lines.len(),
-        6,
+        16,
         "every worker write must refuse loudly: {lines:?}"
     );
     for line in lines.iter() {

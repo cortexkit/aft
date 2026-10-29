@@ -572,7 +572,7 @@ fn post_probe_policy_arms_recheck_new_protection_and_preserve_public_fallback() 
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn provisioned_operator_bypass_cannot_delegate_admin_or_pr_labels() {
+fn provisioned_admin_or_pr_labels_without_bypass_cannot_delegate() {
     let _lock = crate::test_env::process_env_lock();
     let workflow: Manifest = serde_json::from_str(include_str!(
         "../../tests/fixtures/gh_shim/v10-manifest.json"
@@ -598,7 +598,6 @@ fn provisioned_operator_bypass_cannot_delegate_admin_or_pr_labels() {
             crate::gh_shim_speech::start_view::PROVISIONED_ENV,
             Some(OsStr::new("1")),
         );
-        let _bypass = Env::set("GH_SHIM_BYPASS", Some(OsStr::new("operator")));
         let args: Vec<OsString> = argv.into_iter().map(Into::into).collect();
         assert!(matches!(
             classify(&args, &manifest, current_platform()),

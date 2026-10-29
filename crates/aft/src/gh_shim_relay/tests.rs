@@ -442,7 +442,9 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
     assert!(transport.calls().is_empty());
 
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-bindings", "call-b", "/p");
+    let live = crate::bash_background::registry::with_scope_spawn(Some(delegating_stamp()), || {
+        crate::gh_shim_ticket::ScopedTicket::issue("ses-bindings", "call-b", "/p")
+    });
     let bindings = json!({
         "repo_binding_generation": 3,
         "bindings": [{"repository": "org/repo", "app_handle_id": "aft-alfonso", "agent_id": "agent-fixture"}],
@@ -453,9 +455,9 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
         BINDINGS_READ_OPERATION,
         json!({
             "ticket": live.value().unwrap(),
-            "agent_id": "agent-fixture",
-            // A connection id from the caller is ignored; the daemon always
-            // names its own handle connection.
+            "agent_id": "caller-cannot-select-an-agent",
+            // Caller routing hints cannot replace the agent identity captured
+            // from the ticket's authenticated scope.
             "connection_id": "github-handle-someone-else",
         }),
     );
@@ -467,8 +469,19 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
         calls[0].2,
         json!({
             "name": "github",
-            "arguments": {"op": "bindings.read", "connection_id": "github-handle-aft-alfonso"},
+            "arguments": {"op": "bindings.read_for_agent", "agent_id": "agent-fixture"},
         })
+    );
+}
+
+#[test]
+fn agent_bindings_request_matches_the_real_plexus_contract() {
+    let (request, _) = bindings_contract::vector("agent");
+    let actual = agent_bindings_call("agent-x");
+    assert_eq!(actual["arguments"], request);
+    assert_eq!(
+        actual,
+        serde_json::json!({"name":"github", "arguments":request})
     );
 }
 
@@ -2427,6 +2440,14 @@ pub(crate) async fn fake_daemon_with_reply(
 ) -> FakeDaemon {
     fake_daemon(DaemonScript {
         reply: Some(reply),
+        ..Default::default()
+    })
+    .await
+}
+
+pub(crate) async fn fake_daemon_holding_first_request() -> FakeDaemon {
+    fake_daemon(DaemonScript {
+        hold_first_request: true,
         ..Default::default()
     })
     .await

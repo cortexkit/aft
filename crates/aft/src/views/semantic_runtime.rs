@@ -18,6 +18,7 @@
 //! on the request path. Queries read the installed snapshot and name every
 //! path without current vectors as a gap.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
@@ -32,7 +33,9 @@ use super::first_load::{
 use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::ViewRegistration;
-use super::semantic::{FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery};
+use super::semantic::{
+    FillAdmission, FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery,
+};
 use super::snapshot::{DiskState, LiveDelta, Snapshot};
 
 /// Producer written into a manifest header for a plane its view does not
@@ -413,7 +416,7 @@ impl CheckoutSemantic {
         &self,
         budget: FillBudget,
         embed: &mut F,
-        admit: &mut dyn FnMut(bool) -> Result<(), String>,
+        admit: &mut dyn FnMut(FillAdmission) -> Result<(), String>,
     ) -> Result<FillReport, RefreshError>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -452,7 +455,7 @@ impl CheckoutSemantic {
             // within both SMALL_PREPARATION limits stays on the preparation
             // lane, as a small fill of the checkout's own edits does.
             if !small_work(&snapshot, pending.iter().map(|(path, _)| path)) {
-                admit(false).map_err(RefreshError::classify)?;
+                admit(FillAdmission::Cold).map_err(RefreshError::classify)?;
             }
             let mut delta = LiveDelta::from_snapshot(&snapshot);
             for (path, content) in &pending {
@@ -479,9 +482,11 @@ impl CheckoutSemantic {
                     budget,
                     embed,
                     &move || driver.installed_cut().0,
-                    &mut || {
-                        admit(false)?;
-                        crate::cold_build_limiter::progress::stage("embedding");
+                    &mut |phase| {
+                        admit(phase)?;
+                        if phase == FillAdmission::Cold {
+                            crate::cold_build_limiter::progress::stage("embedding");
+                        }
                         Ok(())
                     },
                     // Read at most each file's recorded size plus one byte:
@@ -587,6 +592,22 @@ impl CheckoutSemantic {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        self.refresh_with_admission(budget, embed, &mut |phase| match phase {
+            FillAdmission::Preparation => admit(true),
+            FillAdmission::Cold => admit(false),
+            FillAdmission::SuspendCold | FillAdmission::ResumeCold => Ok(()),
+        })
+    }
+
+    fn refresh_with_admission<F>(
+        &self,
+        budget: FillBudget,
+        embed: &mut F,
+        admit: &mut dyn FnMut(FillAdmission) -> Result<(), String>,
+    ) -> Result<FillReport, RefreshError>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
         let mutex_started = Instant::now();
         let _serial = lock(&self.refresh);
         let mutex_wait = mutex_started.elapsed();
@@ -604,7 +625,12 @@ impl CheckoutSemantic {
         // stored vectors never queues behind cold builds.
         let mut queue_setup = Duration::ZERO;
         let cold_reconcile = needs_cold_reconcile(&snapshot, &self.root);
-        admit(!cold_reconcile).map_err(RefreshError::classify)?;
+        admit(if cold_reconcile {
+            FillAdmission::Cold
+        } else {
+            FillAdmission::Preparation
+        })
+        .map_err(RefreshError::classify)?;
         crate::cold_build_limiter::progress::stage("preparing");
         let reconcile_started = Instant::now();
         if needs_reload(&snapshot) {
@@ -631,7 +657,7 @@ impl CheckoutSemantic {
             let small = self.small_preparation(&snapshot);
             queue_setup = probe_started.elapsed();
             if !small {
-                admit(false).map_err(RefreshError::classify)?;
+                admit(FillAdmission::Cold).map_err(RefreshError::classify)?;
             }
             small
         };
@@ -644,9 +670,11 @@ impl CheckoutSemantic {
                 budget,
                 embed,
                 &move || driver.installed_cut().0,
-                &mut || {
-                    admit(false)?;
-                    crate::cold_build_limiter::progress::stage("embedding");
+                &mut |phase| {
+                    admit(phase)?;
+                    if phase == FillAdmission::Cold {
+                        crate::cold_build_limiter::progress::stage("embedding");
+                    }
                     Ok(())
                 },
                 small,
@@ -1315,6 +1343,22 @@ const PREPARATION_LIMIT: usize = 4;
 fn preparation_limiter() -> &'static Arc<crate::cold_build_limiter::ColdBuildLimiter> {
     static LIMITER: OnceLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>> = OnceLock::new();
     LIMITER.get_or_init(|| crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT))
+}
+
+const INFLIGHT_FILL_KIND: &str = "semantic view in-flight fill";
+const INFLIGHT_FILL_LIMIT: usize = 2;
+
+fn inflight_fill_limiter() -> &'static Arc<crate::cold_build_limiter::ColdBuildLimiter> {
+    static LIMITER: OnceLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>> = OnceLock::new();
+    // Parallel unit tests have independent roots and admission deadlines. Like
+    // the global cold limiter, leave their shared default unconstrained; tests
+    // of the memory bound inject the production limit explicitly.
+    let limit = if cfg!(test) {
+        1024
+    } else {
+        INFLIGHT_FILL_LIMIT
+    };
+    LIMITER.get_or_init(|| crate::cold_build_limiter::isolated_limiter(limit))
 }
 
 /// Lets a lane's driver publish its checkout's view only while the lane's
@@ -1994,6 +2038,31 @@ fn catch_up_with_preparation_limiter<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
+    catch_up_with_limiters(
+        slot,
+        epoch,
+        runtime,
+        schedule,
+        budget,
+        embed,
+        preparation_limiter,
+        inflight_fill_limiter(),
+    )
+}
+
+fn catch_up_with_limiters<F>(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    runtime: &CheckoutSemantic,
+    schedule: &FillSchedule,
+    budget: FillBudget,
+    embed: &mut F,
+    preparation_limiter: &Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    inflight_limiter: &Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+) -> FillOutcome
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
     let mut progress = false;
     let mut telemetry = None;
     loop {
@@ -2002,71 +2071,100 @@ where
         }
         let elapsed_started = Instant::now();
         let embedding_timing_scope = crate::semantic_index::EmbeddingTimingScope::new();
-        let mut admission_wait = Duration::ZERO;
+        let admission_wait = Cell::new(Duration::ZERO);
         let mut cold_admitted = false;
-        let refresh =
-            crate::semantic_index::retry_lane_pause_while(
-                || {
-                    let mut cold_permit = None;
-                    let mut preparation_permit = None;
-                    let report = runtime.refresh_admitted(budget, embed, &mut |small| {
-            if cold_permit.is_some() {
-                return Ok(());
-            }
-            // Missing vectors require cold admission. Release the preparation
-            // slot before waiting so fills that only reuse stored vectors can
-            // continue without waiting behind this model request.
-            let (limiter, kind) = if small {
-                (preparation_limiter, PREPARATION_KIND)
-            } else {
-                preparation_permit.take();
-                (&schedule.limiter, LIMITER_KIND)
-            };
-            crate::cold_build_limiter::progress::stage("waiting for admission");
-            let wait_started = Instant::now();
-            let permit = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                limiter,
-                kind,
-                &schedule.root,
-                || is_current(slot, epoch),
-            );
-            admission_wait += wait_started.elapsed();
-            let permit = permit.ok_or_else(|| "semantic lane superseded".to_owned())?;
-            if small {
-                preparation_permit = Some(permit);
-            } else {
-                cold_admitted = true;
-                cold_permit = Some(permit);
-            }
-            if telemetry.is_none() {
-                telemetry = Some(crate::cold_build_limiter::progress::start(
-                    &schedule.root,
-                    LIMITER_KIND,
-                    None,
-                    crate::cold_build_limiter::progress::StartLog::Info,
-                ));
-            }
-            Ok(())
-            }).map_err(|error| error.to_string())?;
-                    if let Some(pause) = report
-                        .errors
-                        .iter()
-                        .find(|error| crate::synapse_embed::LanePause::from_error(error).is_some())
-                    {
-                        return Err(pause.clone());
-                    }
-                    Ok(report)
-                },
-                &mut || is_current(slot, epoch) && !(schedule.paused)(),
-            )
-            .map_err(RefreshError::classify);
+        let refresh = crate::semantic_index::retry_lane_pause_while(
+            || {
+                let cold_permit = RefCell::new(None);
+                let mut preparation_permit = None;
+                let mut inflight_permit = None;
+                let acquire = |limiter: &Arc<crate::cold_build_limiter::ColdBuildLimiter>, kind| {
+                    crate::cold_build_limiter::progress::stage("waiting for admission");
+                    let started = Instant::now();
+                    let permit =
+                        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                            limiter,
+                            kind,
+                            &schedule.root,
+                            || is_current(slot, epoch),
+                        );
+                    admission_wait.set(admission_wait.get() + started.elapsed());
+                    permit.ok_or_else(|| "semantic lane superseded".to_owned())
+                };
+                let mut embedding = |texts| {
+                    cold_permit.borrow_mut().take();
+                    crate::cold_build_limiter::progress::stage("waiting for embedding backend");
+                    let result = embed(texts);
+                    // Chunk-gate waiters release cold admission before blocking,
+                    // so they cannot keep cold slots while the gate owner resumes.
+                    *cold_permit.borrow_mut() = Some(acquire(&schedule.limiter, LIMITER_KIND)?);
+                    crate::cold_build_limiter::progress::stage("storing embeddings");
+                    result
+                };
+                let report = runtime
+                    .refresh_with_admission(budget, &mut embedding, &mut |phase| {
+                        if phase == FillAdmission::SuspendCold {
+                            cold_permit.borrow_mut().take();
+                            crate::cold_build_limiter::progress::stage(
+                                "waiting for shared semantic work",
+                            );
+                            return Ok(());
+                        }
+                        if phase == FillAdmission::ResumeCold && inflight_permit.is_none() {
+                            return Ok(());
+                        }
+                        if cold_permit.borrow().is_some() {
+                            return Ok(());
+                        }
+                        if phase == FillAdmission::Preparation {
+                            if preparation_permit.is_none() {
+                                preparation_permit =
+                                    Some(acquire(preparation_limiter, PREPARATION_KIND)?);
+                            }
+                        } else {
+                            // A refresh retains all selected sources and chunks, not only
+                            // the current model batch. Bound those allocations across the
+                            // entire refresh, including backend waits. Small preparation
+                            // keeps its own permit until this memory admission succeeds.
+                            if inflight_permit.is_none() {
+                                inflight_permit =
+                                    Some(acquire(inflight_limiter, INFLIGHT_FILL_KIND)?);
+                            }
+                            preparation_permit.take();
+                            cold_admitted = true;
+                            *cold_permit.borrow_mut() =
+                                Some(acquire(&schedule.limiter, LIMITER_KIND)?);
+                        }
+                        if telemetry.is_none() {
+                            telemetry = Some(crate::cold_build_limiter::progress::start(
+                                &schedule.root,
+                                LIMITER_KIND,
+                                None,
+                                crate::cold_build_limiter::progress::StartLog::Info,
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                if let Some(pause) = report
+                    .errors
+                    .iter()
+                    .find(|error| crate::synapse_embed::LanePause::from_error(error).is_some())
+                {
+                    return Err(pause.clone());
+                }
+                Ok(report)
+            },
+            &mut || is_current(slot, epoch) && !(schedule.paused)(),
+        )
+        .map_err(RefreshError::classify);
         let embedding_timing = embedding_timing_scope.snapshot();
         drop(embedding_timing_scope);
         // Keep elapsed_ms comparable to older summaries, which started after
         // admission. Admission can now occur in the middle of a refresh.
         let elapsed_ms = elapsed_started
             .elapsed()
-            .saturating_sub(admission_wait)
+            .saturating_sub(admission_wait.get())
             .as_millis();
         if !is_current(slot, epoch) {
             return FillOutcome::Stop;
@@ -2097,7 +2195,7 @@ where
                         elapsed_ms,
                         embedding_timing.total_ms(),
                         embedding_timing.max_ms(),
-                        admission_wait.as_millis(),
+                        admission_wait.get().as_millis(),
                         cold_admitted,
                         report.timing.mutex_wait.as_millis(),
                         report.timing.reconcile.as_millis(),

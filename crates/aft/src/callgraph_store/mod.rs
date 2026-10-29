@@ -32679,7 +32679,10 @@ mod bounded_build_breaker_tests {
     const SPECIMEN_CHILD_SIGNAL: &str = "AFT_SPECIMEN_CHILD_SIGNAL";
 
     fn wait_for_child_barrier(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The child is a fresh test-binary process that builds a call graph
+        // before it reaches the barrier; a loaded macOS runner needed more
+        // than 10 s for that.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !path.exists() {
             assert!(
                 Instant::now() < deadline,

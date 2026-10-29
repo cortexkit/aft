@@ -1283,7 +1283,11 @@ mod tests {
         )
         .await;
         fixture.send_ping(891).await;
-        let reply = tokio::time::timeout(TEST_THRESHOLD, read_frame(&mut fixture.daemon)).await;
+        // The lock stays held until the read ends, so a frame loop that waits
+        // on it never answers. A generous bound still proves that, without
+        // failing when a loaded runner takes longer than one stall threshold.
+        let reply =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut fixture.daemon)).await;
         drop(held);
         fixture.finish();
         let pong = reply
@@ -1309,12 +1313,18 @@ mod tests {
                 let _ = release_rx
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(5));
+                    .recv_timeout(Duration::from_secs(90));
             })),
         )
         .await;
-        parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        parked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The watchdog fires one threshold after the step parks, but on a
+        // loaded runner its thread may run much later. Wait for the exit
+        // line while the step is still held rather than for a fixed time.
+        let waited = Instant::now();
+        while fixture.stderr.lines().is_empty() && waited.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(TEST_THRESHOLD).await;
+        }
         let terminal = fixture.stderr.lines();
         let snapshots: Vec<_> = fixture
             .capture

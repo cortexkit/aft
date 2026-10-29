@@ -824,7 +824,9 @@ fn run_with(
     {
         return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
     }
-    if crate::gh_shim_speech::start_view::protected(args) {
+    // Explicit operator administration keeps its audited path; worker writes
+    // have already been refused above, regardless of the bypass request.
+    if !operator_bypass_requested() && crate::gh_shim_speech::start_view::protected(args) {
         return run_captured_protected(
             args,
             &paths,
@@ -862,7 +864,7 @@ fn run_with(
     // Probing can publish captured context after the initial check. Recheck at
     // every later passthrough boundary without changing unprovisioned fallback.
     let captured_now = || {
-        crate::gh_shim_speech::start_view::protected(args)
+        (!operator_bypass_requested() && crate::gh_shim_speech::start_view::protected(args))
             .then(|| run_captured_protected(args, &paths, &target, &cwd, now))
     };
     // A write aimed at a repository no signed binding covers cannot be spoken

@@ -193,7 +193,7 @@ struct ParkAt {
 impl DurabilityObserver for ParkAt {
     fn reached(&self, step: DurabilityStep) {
         if step == self.step {
-            fs::write(&self.ready, self.step.as_str()).unwrap();
+            write_ready(&self.ready, self.step.as_str().as_bytes());
             loop {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -201,8 +201,17 @@ impl DurabilityObserver for ParkAt {
     }
 }
 
+/// The parent polls for the ready file and reads it the moment it exists, so
+/// the child writes it beside the destination and renames it into place: a
+/// plain write lets the parent read an empty file between create and write.
+fn write_ready(ready: &Path, contents: &[u8]) {
+    let staged = ready.with_extension("staged");
+    fs::write(&staged, contents).unwrap();
+    fs::rename(&staged, ready).unwrap();
+}
+
 fn park_forever(ready: &Path) -> ! {
-    fs::write(ready, b"ready").unwrap();
+    write_ready(ready, b"ready");
     loop {
         thread::sleep(Duration::from_millis(10));
     }
@@ -259,7 +268,7 @@ fn base_ref_child() {
             for _ in 0..3 {
                 sweep_family(&storage, FAMILY, None).unwrap();
             }
-            fs::write(&ready, b"swept").unwrap();
+            write_ready(&ready, b"swept");
         }
         "base-path" => {
             let name = std::env::var("BASE_REF_STEP").unwrap();

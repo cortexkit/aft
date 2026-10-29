@@ -1722,8 +1722,14 @@ fn file_mount_identity(file: &File) -> io::Result<(u64, Vec<u8>)> {
     #[cfg(target_os = "linux")]
     {
         let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // Call statx through syscall(2), not glibc's wrapper: the wrapper only
+        // exists from glibc 2.28, and the Linux release binary is linked
+        // against an older glibc so it runs on older distributions. A kernel
+        // without statx fails with ENOSYS, which refuses the repair like any
+        // other unverifiable mount boundary.
         if unsafe {
-            libc::statx(
+            libc::syscall(
+                libc::SYS_statx,
                 file.as_raw_fd(),
                 c"".as_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,

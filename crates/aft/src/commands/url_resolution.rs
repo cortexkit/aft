@@ -609,6 +609,7 @@ mod url_tests {
         use std::rc::Rc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
+        use std::time::{Duration, Instant};
 
         /// Key bytes with `/` and `+`, so the query copy is percent-encoded.
         const KEY: &[u8] = b"fetch-secret-key/0123456789+abc";
@@ -877,6 +878,10 @@ mod url_tests {
                     seen.borrow_mut().push((path.to_path_buf(), path.exists()));
                 })))
             });
+            // Direct handlers bypass run_tool_call's 25s budget. Outline uses
+            // bounded_io::command's 5s IO_BUDGET instead, leaving only 2s after
+            // the fetch's 3s read-back/reply reserve.
+            let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(25));
             let call = || match req.command.as_str() {
                 "outline" => super::super::super::outline::handle_outline(req, &fixture.ctx),
                 _ => super::super::super::zoom::handle_zoom(req, &fixture.ctx),
@@ -1518,6 +1523,10 @@ mod url_tests {
                         .push(std::fs::read(path).unwrap_or_default());
                 })))
             });
+            // Use run_tool_call's 25s budget: bounded_io::command's 5s IO_BUDGET
+            // otherwise leaves outline fetches 2s after the 3s read-back/reply
+            // reserve. Preserve shorter budgets installed by deadline tests.
+            let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(25));
             let call = || match req.command.as_str() {
                 "outline" => super::super::super::outline::handle_outline(req, &fixture.ctx),
                 _ => super::super::super::zoom::handle_zoom(req, &fixture.ctx),
@@ -1560,6 +1569,63 @@ mod url_tests {
         }
 
         fn no_extra(_: &mut UrlFetchOptions) {}
+
+        #[test]
+        fn run_with_supplies_the_tool_call_budget_to_both_handlers() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| Some(markdown(b"# Budget\n")));
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            for command in ["outline", "zoom"] {
+                assert!(crate::bounded_io::current().is_none());
+                let started = Instant::now();
+                let (run, _) = run_with(
+                    &fixture,
+                    &vault,
+                    &[("api.secret.test", server.addr)],
+                    &request(command, &url, serde_json::json!({"symbol": "Budget"})),
+                    move |_| {
+                        let deadline = crate::bounded_io::current().unwrap().deadline;
+                        assert!(deadline >= started + Duration::from_secs(25));
+                        assert!(deadline <= Instant::now() + Duration::from_secs(25));
+                    },
+                );
+                assert!(run.response.success, "{}", run.strings());
+                assert!(crate::bounded_io::current().is_none());
+            }
+            assert_eq!(server.targets().len(), 2);
+        }
+
+        #[test]
+        fn helpers_preserve_short_and_expired_call_budgets() {
+            let fixture = fixture(Default::default());
+            let server = serve(&fixture.tls, |_| Some(markdown(b"# Not fetched\n")));
+            let port = server.addr.port();
+            let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
+            let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            let req = request("zoom", &url, serde_json::json!({"symbol": "Not fetched"}));
+            for duration in [Duration::from_millis(2500), Duration::ZERO] {
+                let budget = crate::bounded_io::Budget::after(duration);
+                let deadline = budget.deadline;
+                let _io = crate::bounded_io::enter(Some(budget));
+                let routes = [("api.secret.test", server.addr)];
+                let ordinary = run(&fixture, &vault, &routes, &req, true);
+                let (observed, documents) = run_with(&fixture, &vault, &routes, &req, move |_| {
+                    assert_eq!(crate::bounded_io::current().unwrap().deadline, deadline);
+                });
+                assert!(documents.is_empty());
+                for run in [ordinary, observed] {
+                    assert!(!run.response.success);
+                    let strings = run.strings();
+                    assert!(strings.contains("url_fetch_timeout"), "{strings}");
+                    assert!(strings.contains("0ms fetch deadline"), "{strings}");
+                    assert!(run.documents.is_empty());
+                }
+                assert_eq!(crate::bounded_io::current().unwrap().deadline, deadline);
+            }
+            assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+        }
 
         /// The run was refused, and for exactly `reason` (the token a
         /// placeholder fetch writes in parentheses), not for something that
@@ -2243,6 +2309,9 @@ mod url_tests {
             let port = server.addr.port();
             let url = format!("https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}");
             let vault = granted_vault(rule("api.secret.test", port, "/v1"));
+            // Keep the short call deadline this timing assertion exercises,
+            // rather than the helpers' ordinary 25s tool-call budget.
+            let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(5));
             let started = std::time::Instant::now();
             let (run, documents) = run_with(
                 &fixture,

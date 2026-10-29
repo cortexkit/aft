@@ -1308,6 +1308,116 @@ fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassifi
 }
 
 #[test]
+fn gh_shim_provisioned_head_operator_admin_bypass_is_audited() {
+    use sha2::Digest;
+
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    let now = unix_seconds();
+    write_fresh_v10_admin_manifest(&state_home, now);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 10);
+    write_user_config(&config_home, &connection_file, None);
+
+    let shim_state = state_home.join("cortexkit/aft/gh-shim");
+    let envelope = fs::read(shim_state.join("gh-routing-manifest.json")).unwrap();
+    let ticket: Vec<u8> = (0..TEST_GH_SHIM_TICKET.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&TEST_GH_SHIM_TICKET[index..index + 2], 16).unwrap())
+        .collect();
+    let view = temp.path().join("speech-start.json");
+    fs::write(
+        &view,
+        serde_json::to_vec(&json!({
+            "ticket_digest": blake3::derive_key("aft-gh-speech-ticket-v1", &ticket).to_vec(),
+            "policy": {
+                "artifact_id": "gh-routing-manifest",
+                "version": 10,
+                "digest": sha2::Sha256::digest(&envelope).to_vec(),
+                "signed_envelope": envelope,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let audit_path = shim_state.join("operator-bypass.jsonl");
+    fs::create_dir_all(&upstream_bin).unwrap();
+    test_helpers::executable_cache::write_executable(
+        &upstream_bin.join("gh"),
+        b"#!/bin/sh\n[ -s \"$GH_SHIM_TEST_AUDIT\" ] || exit 74\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\nprintf 'audited-operator\\n'\nexit 73\n",
+    )
+    .unwrap();
+    let commands = [
+        ("run rerun", vec!["run", "rerun", "123", "--failed"]),
+        ("pr merge", vec!["pr", "merge", "7", "--squash"]),
+    ];
+    for bypass in [false, true] {
+        for (tuple, args) in &commands {
+            let mut command = shim_command(
+                args,
+                &project,
+                &config_home,
+                &state_home,
+                &home,
+                &upstream_bin,
+                &recorder,
+            );
+            command
+                .env("AFT_GH_SPEECH_PROVISIONED", "1")
+                .env("AFT_GH_SPEECH_START_VIEW", &view)
+                .env("GH_SHIM_TEST_AUDIT", &audit_path)
+                .env_remove("AFT_GH_SHIM_WORKER")
+                .env_remove("AFT_GH_WORKER_WRITE_POLICY");
+            if bypass {
+                command.env("GH_SHIM_BYPASS", "operator");
+            }
+            let output = command.output().expect("spawn provisioned head shim");
+            if bypass {
+                assert_eq!(
+                    output.status.code(),
+                    Some(73),
+                    "{tuple}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"audited-operator\n");
+                assert!(output.stderr.is_empty(), "{tuple}");
+            } else {
+                assert_eq!(output.status.code(), Some(86), "{tuple}");
+                assert!(output.stdout.is_empty(), "{tuple}");
+                let refusal = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    refusal.contains("task_gh_policy_denied:")
+                        && refusal.contains("(not_governed)"),
+                    "{tuple}: {refusal}"
+                );
+                assert!(!recorder.exists());
+                assert!(!audit_path.exists());
+            }
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(recorder).unwrap(),
+        "run rerun 123 --failed\npr merge 7 --squash\n"
+    );
+    let audit = fs::read_to_string(audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(audit.len(), 2);
+    for (record, (tuple, _)) in audit.iter().zip(&commands) {
+        assert_eq!(record["tuple"], *tuple);
+        assert_eq!(record["repository"], "cortexkit/aft");
+    }
+}
+
+#[test]
 fn gh_shim_v10_run_rerun_is_operator_bypassed_reads_passthrough_and_cancel_is_refused() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");

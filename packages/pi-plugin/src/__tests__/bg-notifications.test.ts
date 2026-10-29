@@ -40,6 +40,7 @@ import {
   markBgCompletionDelivered,
   markExplicitControl,
   markTaskWaiting,
+  type PatternMatchEntry,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -1507,6 +1508,111 @@ test("each_line queue replaces snapshots without discarding another watch", asyn
   expect(pending).toHaveLength(2);
   expect(pending?.find((entry) => entry.watch_id === "watch-a")?.batch?.dropped_lines).toBe(3);
 });
+
+for (const route of ["push", "forced-drain", "restart-replay"] as const) {
+  test(`queued each_line batches render once in order with an exact ack (${route})`, async () => {
+    const sessionID = "s-queued-lines";
+    const frames = [0, 18, 36].map((offset, index) => ({
+      task_id: "bash-queued-lines",
+      session_id: sessionID,
+      watch_id: "watch-queued-lines",
+      match_text: "matching lines",
+      match_offset: offset,
+      context: "unused: render the batch",
+      once: false,
+      reason: "pattern_match" as const,
+      batch: {
+        pending_id: "watch-queued-lines:0",
+        version: offset,
+        lines: [
+          {
+            stream: "stdout",
+            offset,
+            end_offset: offset + 18,
+            text: `LIVECHECK3 line ${index + 1}`,
+            count: 1,
+          },
+        ],
+        dropped_lines: 0,
+        first_dropped_offset: null,
+        first_dropped_stream: null,
+        skipped_long_lines: 0,
+      },
+    }));
+    let pending: PatternMatchEntry[] = [];
+    const acks: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: pending };
+      if (command === "bash_ack_completions") {
+        acks.push(params);
+        pending = [];
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sendUserMessage = mock(() => {});
+    const context = { ctx, directory: "/project", sessionID, runtime: { sendUserMessage } };
+    trackBgTask(sessionID, "bash-queued-lines");
+    await handleSubcBgEventsNudge(context);
+    for (const [index, frame] of frames.entries()) {
+      pending = [
+        {
+          ...frame,
+          batch: {
+            ...frame.batch,
+            snapshot: true,
+            lines: frames.slice(0, index + 1).flatMap((entry) => entry.batch.lines),
+          },
+        },
+      ];
+      if (route === "forced-drain") await handleSubcBgEventsNudge(context);
+      else await handlePushedPatternMatch(context, frame);
+      if (route === "restart-replay" && index === 1) {
+        __resetBgNotificationStateForTests();
+        await handleSubcBgEventsNudge(context);
+      }
+    }
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(acks).toEqual([]);
+    expect(sessionBgStates.get(sessionID)?.pendingPatternMatches).toMatchObject([
+      {
+        match_offset: 36,
+        batch: {
+          lines: [
+            { offset: 0, text: "LIVECHECK3 line 1", count: 1 },
+            { offset: 18, text: "LIVECHECK3 line 2", count: 1 },
+            { offset: 36, text: "LIVECHECK3 line 3", count: 1 },
+          ],
+        },
+      },
+    ]);
+    const result = await appendToolResultBgCompletions(context, [{ type: "text", text: "tool" }]);
+    const reminder = result?.at(-1);
+    expect(reminder?.type).toBe("text");
+    expect(
+      reminder && "text" in reminder
+        ? reminder.text.split("\n").filter((line) => line.includes("stdout byte"))
+        : [],
+    ).toEqual([
+      "      > stdout byte 0: LIVECHECK3 line 1",
+      "      > stdout byte 18: LIVECHECK3 line 2",
+      "      > stdout byte 36: LIVECHECK3 line 3",
+    ]);
+    expect(acks).toEqual([
+      {
+        session_id: sessionID,
+        matches: [
+          { task_id: "bash-queued-lines", watch_id: "watch-queued-lines", match_offset: 36 },
+        ],
+      },
+    ]);
+    expect(
+      await appendToolResultBgCompletions(context, [{ type: "text", text: "next" }]),
+    ).toBeUndefined();
+    expect(acks).toHaveLength(1);
+  });
+}
 
 test("exact pattern ack retries keep sibling watches and newer versions deliverable", async () => {
   const old = {

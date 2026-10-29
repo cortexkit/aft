@@ -38,6 +38,9 @@ pub fn try_acquire() -> Option<ColdBuildPermit> {
 /// while CPU sat idle; waiting serializes that pressure at the source. Only
 /// call from dedicated background threads, never the dispatch thread or an
 /// executor worker.
+/// A permit bounds local build CPU and memory pressure, not backend latency.
+/// A build that yields it during model I/O must separately bound its retained
+/// batches and avoid blocking on a shared gate while holding a cold slot.
 pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
     acquire_blocking_while(kind, || true).expect("unconditional cold-build admission")
 }
