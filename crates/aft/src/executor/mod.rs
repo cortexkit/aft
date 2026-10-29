@@ -64,7 +64,19 @@ pub enum Lane {
     /// overlaps PureReads; serialized to one in-flight per actor so
     /// maintenance cannot self-stack.
     MaintenanceCommit,
+    /// Provider discovery and policy-store operations. Serialized per root on
+    /// reserved capacity, without an index epoch hold or writer-barrier wait.
+    ProviderMetadata,
 }
+
+const ALL_LANES: [Lane; 6] = [
+    Lane::PureRead,
+    Lane::SerialLspStatus,
+    Lane::HeavyInit,
+    Lane::Mutating,
+    Lane::MaintenanceCommit,
+    Lane::ProviderMetadata,
+];
 
 /// Scheduler class used to keep deferrable maintenance from occupying the
 /// workers reserved for interactive route binds, tool calls, and bash.
@@ -108,6 +120,11 @@ const BIND_PROMOTION_AGE: Duration = Duration::from_millis(500);
 /// release a worker. Two, so a cold root's slower full configure does not
 /// serialize every other bind behind it.
 const BIND_RESERVE_WORKERS: usize = 2;
+/// Provider metadata (tool catalogs, role descriptions, grants) has reserved
+/// workers, so these short requests never wait for an index builder,
+/// configure writer or maintenance job to free a worker. Callers such as a
+/// worker launch check ask for them under a deadline of a few seconds.
+const PROVIDER_RESERVE_WORKERS: usize = 2;
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
 const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
@@ -157,13 +174,13 @@ struct EffectiveConfig {
     maintenance_cap: usize,
     /// Workers beyond `pool_size` that only route-bind configures may use.
     bind_reserve: usize,
+    provider_reserve: usize,
 }
 
 impl EffectiveConfig {
-    /// Every worker thread the executor runs: the general pool plus the
-    /// bind-only reserve.
+    /// Every worker thread, including the bind and provider reservations.
     fn total_workers(&self) -> usize {
-        self.pool_size + self.bind_reserve
+        self.pool_size + self.bind_reserve + self.provider_reserve
     }
 }
 
@@ -196,6 +213,7 @@ impl ExecutorConfig {
             interactive_reserve,
             maintenance_cap,
             bind_reserve: BIND_RESERVE_WORKERS,
+            provider_reserve: PROVIDER_RESERVE_WORKERS,
         }
     }
 }
@@ -1290,8 +1308,9 @@ impl Executor {
         cancelled
     }
 
-    /// Quiesce drops queued maintenance; running jobs consult the lifecycle grace
-    /// through their tokens rather than being abandoned on a short disconnect.
+    /// When a root becomes unbound, cancel queued maintenance and metadata.
+    /// Started provider commits retain their result. Running maintenance checks
+    /// at checkpoints whether the root stayed unbound past the abandonment grace.
     pub(crate) fn cancel_queued_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
         let cancelled = self
             .inner
@@ -1299,7 +1318,7 @@ impl Executor {
             .lock()
             .actors
             .get_mut(root_id)
-            .map(|actor| actor.maintenance.cancel_queued_jobs())
+            .map(ActorState::cancel_queued_root_work)
             .unwrap_or(0);
         self.wake_scheduler();
         cancelled
@@ -1315,16 +1334,10 @@ impl Executor {
         let mut cancelled = state
             .actors
             .get_mut(root_id)
-            .map(|actor| actor.maintenance.cancel_queued_jobs())
+            .map(ActorState::cancel_queued_root_work)
             .unwrap_or(0);
         if let Some(actor) = state.actors.get_mut(root_id) {
-            for lane in [
-                Lane::PureRead,
-                Lane::SerialLspStatus,
-                Lane::HeavyInit,
-                Lane::Mutating,
-                Lane::MaintenanceCommit,
-            ] {
+            for lane in ALL_LANES {
                 for job in actor
                     .interactive
                     .queue(lane)
@@ -1831,7 +1844,10 @@ impl Executor {
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
         rerun: Option<RepeatableJob>,
     ) {
-        let cancellation = if job_class == JobClass::Maintenance || command == "inspect" {
+        let cancellation = if job_class == JobClass::Maintenance
+            || command == "inspect"
+            || lane == Lane::ProviderMetadata
+        {
             Some(cancellation.unwrap_or_else(JobCancellation::new))
         } else {
             cancellation
@@ -1851,7 +1867,20 @@ impl Executor {
             match state.actors.get_mut(&root_id) {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
-                    if (job_class == JobClass::Maintenance || command == "inspect")
+                    // Validate the sampled configure generation against the bound
+                    // root under its lifecycle lock. A separate bound check and
+                    // later sample could let an older request use a rebind's generation.
+                    let provider_generation = if lane == Lane::ProviderMetadata {
+                        let generation = actor.ctx.configure_generation();
+                        actor
+                            .ctx
+                            .run_if_subc_bound_generation(generation, || generation)
+                    } else {
+                        None
+                    };
+                    if (job_class == JobClass::Maintenance
+                        || command == "inspect"
+                        || lane == Lane::ProviderMetadata)
                         && command != "unbound-teardown-persist"
                     {
                         cancellation = cancellation.map(|token| {
@@ -1859,6 +1888,21 @@ impl Executor {
                         });
                     }
                     let mut admission_error = None;
+                    if lane == Lane::ProviderMetadata {
+                        if job_class != JobClass::Interactive {
+                            admission_error = Some(Response::error(
+                                request_id.clone(),
+                                "invalid_lane",
+                                "provider metadata requires interactive admission",
+                            ));
+                        } else if provider_generation.is_none() {
+                            admission_error = Some(Response::error(
+                                request_id.clone(),
+                                "request_cancelled",
+                                "provider metadata root is unbound",
+                            ));
+                        }
+                    }
                     if job_class == JobClass::Maintenance {
                         if (actor.ctx.subc_unbound_quiesced()
                             && command != "unbound-teardown-persist")
@@ -1905,6 +1949,7 @@ impl Executor {
                                 force_exclusive: false,
                                 not_before: None,
                                 exclusive_attempts: 0,
+                                provider_generation,
                             },
                         );
                     }
@@ -1951,6 +1996,13 @@ impl Executor {
     #[cfg(test)]
     pub(crate) fn idle_workers_for_test(&self) -> usize {
         self.inner.state.lock().idle_workers
+    }
+
+    /// Number of workers reserved for provider metadata, so tests can distinguish
+    /// those idle workers from the separate bind reservation.
+    #[cfg(test)]
+    pub(crate) fn provider_reserve_for_test(&self) -> usize {
+        self.inner.config.provider_reserve
     }
 
     pub fn pool_size(&self) -> usize {
@@ -2167,6 +2219,8 @@ struct SchedulerState {
     idle_workers: usize,
     interactive_inflight: usize,
     maintenance_inflight: usize,
+    provider_inflight: usize,
+    binds_inflight: usize,
     config: EffectiveConfig,
     running_jobs: HashMap<u64, RunningJob>,
     next_job_id: u64,
@@ -2184,6 +2238,8 @@ impl SchedulerState {
             idle_workers: config.total_workers(),
             interactive_inflight: 0,
             maintenance_inflight: 0,
+            provider_inflight: 0,
+            binds_inflight: 0,
             config,
             running_jobs: HashMap::new(),
             next_job_id: 1,
@@ -2273,6 +2329,21 @@ impl SchedulerState {
             .count();
         debug_assert_eq!(self.interactive_inflight, interactive);
         debug_assert_eq!(self.maintenance_inflight, maintenance);
+        debug_assert_eq!(
+            self.binds_inflight,
+            self.running_jobs
+                .values()
+                .filter(|job| is_bind_job(job.job_class, job.lane, &job.request_id))
+                .count()
+        );
+        debug_assert_eq!(
+            self.provider_inflight,
+            self.running_jobs
+                .values()
+                .filter(|job| job.lane == Lane::ProviderMetadata)
+                .count()
+        );
+        debug_assert!(self.provider_inflight <= self.config.provider_reserve);
         debug_assert_eq!(
             self.idle_workers + self.running_jobs.len(),
             self.config.total_workers()
@@ -2478,6 +2549,10 @@ fn is_configure_request(request_id: &str) -> bool {
     request_id.starts_with("subc-bind-")
 }
 
+fn is_bind_job(job_class: JobClass, lane: Lane, request_id: &str) -> bool {
+    job_class == JobClass::Interactive && lane == Lane::Mutating && is_configure_request(request_id)
+}
+
 fn format_bind_blocker_reader(reader: &BindBlockerReaderSnapshot) -> String {
     format!(
         "job={} command={} lane={:?} age_ms={} execution_started={} started_before_oldest_writer={}",
@@ -2552,6 +2627,7 @@ struct ActorState {
     /// `current_bind_gate_is_shared`).
     shared_bind_inflight: bool,
     maintenance_commit_inflight: bool,
+    provider_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
     deficit: isize,
@@ -2579,6 +2655,7 @@ impl ActorState {
             writer_inflight: false,
             shared_bind_inflight: false,
             maintenance_commit_inflight: false,
+            provider_inflight: false,
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
             deficit: 0,
@@ -2611,7 +2688,14 @@ impl ActorState {
     }
 
     fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
-        self.class_queues(job_class).has_queued_jobs()
+        if job_class == JobClass::Interactive {
+            self.interactive
+                .order
+                .iter()
+                .any(|lane| *lane != Lane::ProviderMetadata)
+        } else {
+            self.class_queues(job_class).has_queued_jobs()
+        }
     }
 
     fn front_lane(&self, job_class: JobClass) -> Option<Lane> {
@@ -2658,6 +2742,10 @@ impl ActorState {
         self.sync_waiting_writers();
     }
 
+    fn cancel_queued_root_work(&mut self) -> usize {
+        self.maintenance.cancel_queued_jobs() + self.interactive.cancel_queued_provider_jobs()
+    }
+
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
         self.interactive.has_queued_mutating_job(request_id)
             || self.maintenance.has_queued_mutating_job(request_id)
@@ -2700,6 +2788,7 @@ struct ClassQueues {
     heavy_init: VecDeque<QueuedJob>,
     mutating: VecDeque<QueuedJob>,
     maintenance_commit: VecDeque<QueuedJob>,
+    provider_metadata: VecDeque<QueuedJob>,
 }
 
 impl ClassQueues {
@@ -2711,6 +2800,7 @@ impl ClassQueues {
             heavy_init: VecDeque::new(),
             mutating: VecDeque::new(),
             maintenance_commit: VecDeque::new(),
+            provider_metadata: VecDeque::new(),
         }
     }
 
@@ -2789,7 +2879,7 @@ impl ClassQueues {
         self.order
             .iter()
             .copied()
-            .find(|lane| *lane != Lane::PureRead)
+            .find(|lane| !matches!(lane, Lane::PureRead | Lane::ProviderMetadata))
     }
 
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob> {
@@ -2806,15 +2896,7 @@ impl ClassQueues {
     }
 
     fn has_maintenance_coalesce_key(&self, key: MaintenanceCoalesceKey) -> bool {
-        [
-            Lane::PureRead,
-            Lane::SerialLspStatus,
-            Lane::HeavyInit,
-            Lane::Mutating,
-            Lane::MaintenanceCommit,
-        ]
-        .into_iter()
-        .any(|lane| {
+        ALL_LANES.into_iter().any(|lane| {
             self.queue(lane)
                 .iter()
                 .any(|job| job.maintenance_coalesce_key == Some(key))
@@ -2824,7 +2906,7 @@ impl ClassQueues {
     /// Remove only redundant idempotent drains while preserving survivor order.
     fn remove_duplicate_maintenance_jobs(&mut self) -> Vec<QueuedJob> {
         let mut seen = HashSet::new();
-        let mut lane_positions = [0usize; 5];
+        let mut lane_positions = [0usize; ALL_LANES.len()];
         let mut duplicates = Vec::new();
 
         for (order_position, lane) in self.order.iter().copied().enumerate() {
@@ -2865,6 +2947,7 @@ impl ClassQueues {
         fail_queued_job_queue(&mut self.heavy_init);
         fail_queued_job_queue(&mut self.mutating);
         fail_queued_job_queue(&mut self.maintenance_commit);
+        fail_queued_job_queue(&mut self.provider_metadata);
     }
 
     fn cancel_queued_jobs(&mut self) -> usize {
@@ -2874,6 +2957,23 @@ impl ClassQueues {
             + cancel_queued_job_queue(&mut self.heavy_init)
             + cancel_queued_job_queue(&mut self.mutating)
             + cancel_queued_job_queue(&mut self.maintenance_commit)
+            + cancel_queued_job_queue(&mut self.provider_metadata)
+    }
+
+    fn cancel_queued_provider_jobs(&mut self) -> usize {
+        self.order.retain(|lane| *lane != Lane::ProviderMetadata);
+        let cancelled = self.provider_metadata.len();
+        for queued in self.provider_metadata.drain(..) {
+            if let Some(token) = &queued.cancellation {
+                let _ = token.try_cancel_before_running();
+            }
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "request_cancelled",
+                "provider metadata root has no bound routes",
+            ));
+        }
+        cancelled
     }
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
@@ -2912,13 +3012,7 @@ impl ClassQueues {
     /// shift the pairing and reorder the survivors, so the occurrence at the
     /// job's own queue position is removed instead.
     fn remove_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
-        for lane in [
-            Lane::PureRead,
-            Lane::SerialLspStatus,
-            Lane::HeavyInit,
-            Lane::Mutating,
-            Lane::MaintenanceCommit,
-        ] {
+        for lane in ALL_LANES {
             let queue = self.queue_mut(lane);
             let position = queue.iter().position(|queued| {
                 queued
@@ -2968,6 +3062,7 @@ impl ClassQueues {
             Lane::HeavyInit => &self.heavy_init,
             Lane::Mutating => &self.mutating,
             Lane::MaintenanceCommit => &self.maintenance_commit,
+            Lane::ProviderMetadata => &self.provider_metadata,
         }
     }
 
@@ -2978,6 +3073,7 @@ impl ClassQueues {
             Lane::HeavyInit => &mut self.heavy_init,
             Lane::Mutating => &mut self.mutating,
             Lane::MaintenanceCommit => &mut self.maintenance_commit,
+            Lane::ProviderMetadata => &mut self.provider_metadata,
         }
     }
 }
@@ -3001,6 +3097,9 @@ struct QueuedJob {
     not_before: Option<Instant>,
     /// How many times this bind found the gate held by a detached writer.
     exclusive_attempts: u32,
+    /// Checked before metadata starts, so unbind or reconfiguration rejects
+    /// queued or dispatched work from an older configure generation.
+    provider_generation: Option<u64>,
 }
 
 fn lane_index(lane: Lane) -> usize {
@@ -3010,6 +3109,7 @@ fn lane_index(lane: Lane) -> usize {
         Lane::HeavyInit => 2,
         Lane::Mutating => 3,
         Lane::MaintenanceCommit => 4,
+        Lane::ProviderMetadata => 5,
     }
 }
 
@@ -3134,6 +3234,7 @@ struct RunJob {
     /// promotion over new readers is not reset.
     queued_at: Instant,
     exclusive_attempts: u32,
+    provider_generation: Option<u64>,
 }
 
 struct JobCompletionOwnership;
@@ -3356,6 +3457,12 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
         }
     }
 
+    if lane == Lane::ProviderMetadata {
+        state.provider_inflight = state.provider_inflight.saturating_sub(1);
+    }
+    if is_bind_job(job_class, lane, &request_id) {
+        state.binds_inflight = state.binds_inflight.saturating_sub(1);
+    }
     if let Some(actor) = state.actors.get_mut(&root_id) {
         actor.actor_total_inflight = actor.actor_total_inflight.saturating_sub(1);
         match lane {
@@ -3374,6 +3481,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
             Lane::MaintenanceCommit => {
                 actor.maintenance_commit_inflight = false;
             }
+            Lane::ProviderMetadata => actor.provider_inflight = false,
         }
 
         if outcome == JobCompletionOutcome::Panicked && lane == Lane::Mutating {
@@ -3442,6 +3550,18 @@ fn dispatch_runnable(
         // subc refuses the module once a bind relay exceeds its deadline, so a
         // bind must never wait for a DRR turn behind other roots' work.
         made_progress |= dispatch_queued_binds(
+            state,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
+        made_progress |= dispatch_provider_metadata(
             state,
             heavy,
             run_tx,
@@ -3596,7 +3716,12 @@ fn dispatch_queued_binds(
 
     let mut made_progress = false;
     for (_, root_id) in candidates {
-        if state.idle_workers == 0 {
+        if state.idle_workers
+            <= state
+                .config
+                .provider_reserve
+                .saturating_sub(state.provider_inflight)
+        {
             break;
         }
         let run_job = {
@@ -3617,6 +3742,45 @@ fn dispatch_queued_binds(
             if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
                 *dispatch_failed = true;
                 return made_progress;
+            }
+        }
+    }
+    made_progress
+}
+
+/// Provider work uses the same root queues, completion and cancellation machinery
+/// as other jobs, but never waits for an index lane's capacity or epoch gate.
+fn dispatch_provider_metadata(
+    state: &mut SchedulerState,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob>,
+    event_tx: &Sender<SchedulerEvent>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    let mut made_progress = false;
+    for _ in 0..state.actor_order.len() {
+        if state.idle_workers == 0 || state.provider_inflight >= state.config.provider_reserve {
+            break;
+        }
+        state.cursor %= state.actor_order.len();
+        let root_id = state.actor_order[state.cursor].clone();
+        state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let Some(actor) = state.actors.get_mut(&root_id).filter(|actor| !actor.fatal) else {
+            continue;
+        };
+        if let Some(run_job) = try_admit_actor(
+            &root_id,
+            actor,
+            AdmissionPass::ProviderMetadata,
+            &state.config,
+            heavy,
+            None,
+        ) {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                break;
             }
         }
     }
@@ -3665,6 +3829,12 @@ fn launch_run_job(
         JobClass::Interactive => state.interactive_inflight += 1,
         JobClass::Maintenance => state.maintenance_inflight += 1,
     }
+    if run_job.lane == Lane::ProviderMetadata {
+        state.provider_inflight += 1;
+    }
+    if is_bind_job(run_job.job_class, run_job.lane, &run_job.request_id) {
+        state.binds_inflight += 1;
+    }
     state.assert_running_invariants();
     log::debug!(
         "executor dispatch: job_id={job_id} class={:?} lane={:?} request_id={} root={}",
@@ -3681,9 +3851,18 @@ fn launch_run_job(
 }
 
 fn can_dispatch_class(state: &SchedulerState, job_class: JobClass) -> bool {
-    // The bind reserve sits on top of the general pool: only
-    // `dispatch_queued_binds` may take those last workers.
-    let general_idle = state.idle_workers.saturating_sub(state.config.bind_reserve);
+    // Running binds and metadata have already reduced idle_workers. Hold back
+    // only the unused part of each reservation, or each running bind would also
+    // remove a general-pool slot. All jobs still use one worker channel.
+    let provider_idle = state
+        .config
+        .provider_reserve
+        .saturating_sub(state.provider_inflight);
+    let bind_idle = state
+        .config
+        .bind_reserve
+        .saturating_sub(state.binds_inflight);
+    let general_idle = state.idle_workers.saturating_sub(bind_idle + provider_idle);
     if general_idle == 0 {
         return false;
     }
@@ -3703,6 +3882,9 @@ enum AdmissionPass {
     /// Mutating lane ahead of any other writer queued before it. This pass may
     /// use the reserved bind workers, so it must never admit anything else.
     Bind,
+    /// Provider jobs bypass ordinary per-root deficit scheduling and do not
+    /// acquire the index epoch gate.
+    ProviderMetadata,
     /// The ordinary DRR pass for one job class.
     Class(JobClass),
 }
@@ -3717,10 +3899,15 @@ fn try_admit_actor(
 ) -> Option<RunJob> {
     let bind_pass = pass == AdmissionPass::Bind;
     let job_class = match pass {
-        AdmissionPass::Bind => JobClass::Interactive,
+        AdmissionPass::Bind | AdmissionPass::ProviderMetadata => JobClass::Interactive,
         AdmissionPass::Class(job_class) => job_class,
     };
     let lane = match pass {
+        AdmissionPass::ProviderMetadata => actor
+            .interactive
+            .provider_metadata
+            .front()
+            .map(|_| Lane::ProviderMetadata)?,
         // Only the bind itself: an edit queued ahead of it waits for the
         // general pool (it is not admitted here, so it can never occupy a
         // reserved bind worker), and the bind runs first.
@@ -3743,8 +3930,9 @@ fn try_admit_actor(
             lane,
             Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
         );
-    if (actor.writer_inflight && !shared_bind_admits_lane)
-        || actor.higher_priority_writer_barrier_blocks(job_class)
+    if lane != Lane::ProviderMetadata
+        && ((actor.writer_inflight && !shared_bind_admits_lane)
+            || actor.higher_priority_writer_barrier_blocks(job_class))
     {
         return None;
     }
@@ -3780,7 +3968,8 @@ fn try_admit_actor(
     // by an interactive request for the same actor.
     let actor_interactive_inflight = actor
         .actor_total_inflight
-        .saturating_sub(usize::from(actor.maintenance_commit_inflight));
+        .saturating_sub(usize::from(actor.maintenance_commit_inflight))
+        .saturating_sub(usize::from(actor.provider_inflight));
     let actor_has_interactive_capacity = actor_interactive_inflight < config.actor_cap;
     let runnable = match lane {
         Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_interactive_capacity,
@@ -3815,6 +4004,7 @@ fn try_admit_actor(
         // reserves workers globally, and the boolean prevents same-actor
         // maintenance from stacking without consuming an interactive slot.
         Lane::MaintenanceCommit => !actor.maintenance_commit_inflight,
+        Lane::ProviderMetadata => !actor.provider_inflight,
     };
 
     if !runnable {
@@ -3837,7 +4027,7 @@ fn try_admit_actor(
         actor.pop_front_job(job_class, lane)?
     };
     // The bind pass runs outside DRR, so it does not spend the actor's turn.
-    if !bind_pass {
+    if matches!(pass, AdmissionPass::Class(_)) {
         actor.deficit -= JOB_COST;
     }
     if lane == Lane::Mutating {
@@ -3868,6 +4058,10 @@ fn try_admit_actor(
             actor.maintenance_commit_inflight = true;
             actor.actor_total_inflight += 1;
         }
+        Lane::ProviderMetadata => {
+            actor.provider_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
     }
 
     Some(RunJob {
@@ -3890,6 +4084,7 @@ fn try_admit_actor(
         rerun: queued.rerun,
         queued_at: queued.queued_at,
         exclusive_attempts: queued.exclusive_attempts,
+        provider_generation: queued.provider_generation,
     })
 }
 
@@ -4003,6 +4198,7 @@ fn requeue_as_exclusive(
         force_exclusive: true,
         not_before: retry_after.map(|delay| Instant::now() + delay),
         exclusive_attempts: run_job.exclusive_attempts + u32::from(retry_after.is_some()),
+        provider_generation: None,
     })
 }
 
@@ -4128,17 +4324,33 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
     };
     let run = |job: ExecutorJob| {
         if cancel_requested()
-            || ((run_job.job_class == JobClass::Maintenance || run_job.command == "inspect")
+            || ((run_job.job_class == JobClass::Maintenance
+                || run_job.command == "inspect"
+                || run_job.lane == Lane::ProviderMetadata)
                 && ((run_job.ctx.subc_unbound_quiesced()
                     && run_job.command != "unbound-teardown-persist")
                     || !run_job.root_id.as_path().is_dir()))
         {
             return cancelled_before_execution();
         }
-        let can_start = run_job
-            .cancellation
-            .as_ref()
-            .is_none_or(JobCancellation::mark_running);
+        let can_start = if let Some(generation) = run_job.provider_generation {
+            // Only the start decision holds the root lifecycle lock. Once a
+            // provider may have committed policy, unbind must not discard it.
+            run_job
+                .ctx
+                .run_if_subc_bound_generation(generation, || {
+                    run_job
+                        .cancellation
+                        .as_ref()
+                        .is_none_or(|token| token.mark_running() && token.try_seal_committed())
+                })
+                .unwrap_or(false)
+        } else {
+            run_job
+                .cancellation
+                .as_ref()
+                .is_none_or(JobCancellation::mark_running)
+        };
         if !can_start {
             return cancelled_before_execution();
         }
@@ -4166,6 +4378,10 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
         // constructs its response would delay completion behind maintenance and
         // park later readers behind an otherwise unnecessary writer.
         Lane::HeavyInit => run(job),
+        Lane::ProviderMetadata => {
+            let _config = run_job.ctx.pin_config();
+            run(job)
+        }
         Lane::Mutating if run_job.shared_bind_gate => {
             // A cancelled bind never touches the gate.
             if cancel_requested() {

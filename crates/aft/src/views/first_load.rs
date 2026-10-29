@@ -4719,7 +4719,7 @@ impl CompositePlane for CallgraphBridge {
                 }
                 Ok(())
             })
-            .map_err(|e| error(e.to_string()))?;
+            .map_err(super::callgraph::v3_error)?;
         }
         for (_, key) in &keys {
             if !v3_readers.contains(key) {
@@ -5018,7 +5018,7 @@ impl CompositePlane for CallgraphBridge {
                 }
                 Ok(())
             })
-            .map_err(|e| error(e.to_string()))?;
+            .map_err(super::callgraph::v3_error)?;
         }
         for (path, key, _) in &payloads {
             if let Some(super::manifest_v2::EntryV2::Regular {
@@ -5045,7 +5045,7 @@ impl CompositePlane for CallgraphBridge {
                 &route.family,
                 FamilyPlane::Callgraph,
             )
-            .map_err(|e| error(e.to_string()))?,
+            .map_err(super::callgraph::v3_error)?,
         );
         let dir = route.member_dir();
         // Open (and so initialize and recover) the member's view store before

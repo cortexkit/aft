@@ -273,14 +273,19 @@ impl LspChildRegistry {
     /// termination of one server must not delay the kill of the next.
     /// Returns how many groups were sent the kill (or were already gone).
     pub fn force_kill_pids(&self, pids: &[u32]) -> usize {
-        let mut killed = 0;
+        let mut killed = Vec::new();
         for pid in pids {
             if force_kill_child_process_group_nowait(*pid) {
-                self.untrack(*pid);
-                killed += 1;
+                killed.push(*pid);
             }
         }
-        killed
+        // Spawning a child holds the registry mutex across process creation.
+        // Send every kill before cleanup can block on that mutex, otherwise a
+        // slow fork can leave the remaining servers running without a signal.
+        for pid in &killed {
+            self.untrack(*pid);
+        }
+        killed.len()
     }
 
     /// Snapshot tracked children without holding the registry lock across CWD
@@ -809,6 +814,134 @@ fn kill_child_process_group(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_deadline_does_not_wait_for_registry_cleanup() {
+        use crate::lsp::client::LspClient;
+        use crate::lsp::manager::{LspManager, LSP_SHUTDOWN_ALL_BUDGET};
+        use crate::lsp::roots::ServerKey;
+
+        let registry = LspChildRegistry::new();
+        let temp = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let mut clients = Vec::new();
+        for index in 0..6 {
+            let ready = temp.path().join(format!("ready-{index}"));
+            let client = LspClient::spawn(
+                ServerKind::Biome,
+                temp.path().to_path_buf(),
+                Path::new("sh"),
+                &[
+                    "-c".into(),
+                    "trap '' TERM; printf ready > \"$1\"; exec sleep 30".into(),
+                    "aft-lsp-test".into(),
+                    ready.to_string_lossy().into_owned(),
+                ],
+                &HashMap::new(),
+                event_tx.clone(),
+                registry.clone(),
+            )
+            .unwrap();
+            let ready_by = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() && Instant::now() < ready_by {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                ready.exists(),
+                "stand-in must ignore SIGTERM before shutdown"
+            );
+            clients.push((
+                ServerKey {
+                    kind: ServerKind::Biome,
+                    root: temp.path().join(index.to_string()),
+                },
+                client,
+            ));
+        }
+        let pids = registry.pids();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_registry = registry.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held_registry.inner.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            // Process creation can hold this same lock. Keep it held until
+            // shutdown returns; the timeout only prevents a broken test hanging.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        locked_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let outcome = LspManager::shutdown_taken_clients(clients, registry.clone());
+        let elapsed = started.elapsed();
+        release_tx.send(()).ok();
+        holder.join().unwrap();
+
+        assert!(
+            elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
+            "registry cleanup held shutdown open: {outcome:?} wall={elapsed:?}"
+        );
+        assert_eq!(outcome.graceful, 0, "{outcome:?}");
+        assert_eq!(outcome.forced, 6, "{outcome:?}");
+        assert_eq!(
+            outcome.unreaped, 6,
+            "completion must not precede client drop"
+        );
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < reaped_by
+            && (!registry.pids().is_empty()
+                || pids
+                    .iter()
+                    .any(|pid| crate::bash_background::process::is_process_alive(*pid)))
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(registry.pids().is_empty(), "background cleanup must finish");
+        for pid in pids {
+            assert!(!crate::bash_background::process::is_process_alive(pid));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_exit_reports_unreaped_until_detached_owner_waits() {
+        use crate::lsp::manager::{LspManager, LSP_SHUTDOWN_ALL_BUDGET};
+        use std::os::unix::process::CommandExt;
+
+        let registry = LspChildRegistry::new();
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = registry.spawn_tracked(&mut command).unwrap();
+        let pid = child.id();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            // Keep the killed child waitable after the kill dispatcher has
+            // untracked it. A successful signal is not evidence of a reap.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            child.wait().unwrap();
+        });
+        let started = Instant::now();
+        let outcome = LspManager::shutdown_at_process_exit(Vec::new(), registry.clone());
+        let elapsed = started.elapsed();
+        release_tx.send(()).ok();
+        owner.join().unwrap();
+        assert!(elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150));
+        assert_eq!(outcome.forced, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.unreaped, 1,
+            "untracking must not hide a waitable child"
+        );
+        assert!(!crate::bash_background::process::is_process_alive(pid));
+    }
 
     #[test]
     fn track_untrack_pids_round_trip() {

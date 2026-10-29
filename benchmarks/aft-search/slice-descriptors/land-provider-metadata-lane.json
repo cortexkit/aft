@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "provider-metadata-lane"
+  ],
+  "note": "Executor scheduling: tool.catalog, role.describe and grants ops get a reserved per-root lane; queued calls past their client deadline are dropped with a terminal reply. No changed path matches RANKING_FENCE_PREFIXES."
+}

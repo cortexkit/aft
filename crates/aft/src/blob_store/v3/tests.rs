@@ -134,6 +134,172 @@ fn db(storage: &Path, family: &str) -> PathBuf {
     family_dir(storage, family).unwrap().join("members.sqlite")
 }
 
+type RecheckHook = Box<dyn FnMut() -> Result<()>>;
+thread_local! {
+    static RECHECK_HOOK: std::cell::RefCell<Option<RecheckHook>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn measurement_recheck_hook() -> Result<()> {
+    RECHECK_HOOK.with(|hook| match &mut *hook.borrow_mut() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[test]
+fn path_context_keeps_io_contention_classifiable() {
+    let path = Path::new("busy-ledger/members.sqlite");
+    let error = crate::views::io::at(
+        "checking v3 registry",
+        path,
+        std::io::Error::from(std::io::ErrorKind::WouldBlock),
+    );
+    let error = Error::Io(std::io::Error::other(error));
+    assert!(error.is_busy(), "{error}");
+    for code in [32, 33] {
+        let error = crate::views::io::at(
+            "resolving v3 database",
+            path,
+            std::io::Error::from_raw_os_error(code),
+        );
+        let error = Error::ledger(path, "open registry", error);
+        assert_eq!(error.is_busy(), cfg!(windows), "{error}");
+        let detail = error.to_string();
+        assert!(detail.contains("resolving v3 database"), "{detail}");
+        assert!(detail.contains("busy-ledger/members.sqlite"), "{detail}");
+    }
+}
+
+#[test]
+fn checkpoint_contention_is_busy_and_preserves_sqlite_cause() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let path = db(root.path(), A);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_for_barrier(root.path(), A, &lock).unwrap();
+    writer
+        .connection()
+        .unwrap()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    let reader = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        "v3-checkpoint-blocker",
+    )
+    .unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT * FROM accounting;")
+        .unwrap();
+    writer
+        .with_barrier(|tx| {
+            tx.execute("UPDATE accounting SET watermark=watermark+1", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+    let error = writer.covering_measurement().unwrap_err();
+    assert!(error.is_busy(), "{error}");
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: checkpoint WAL"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(
+        detail.contains("wal_checkpoint(TRUNCATE): busy=1"),
+        "{detail}"
+    );
+    assert!(matches!(error, Error::Ledger { source, .. }
+        if matches!(*source, Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy)));
+
+    reader.execute_batch("ROLLBACK").unwrap();
+    writer.covering_measurement().unwrap();
+    assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+}
+
+#[test]
+fn busy_validation_is_not_persisted_as_schema_drift() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let path = db(root.path(), A);
+    let blocker = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "v3-validation-blocker",
+    )
+    .unwrap();
+    blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+    let error = match LedgerReader::open_existing(root.path(), A) {
+        Ok(_) => panic!("an exclusively held ledger must not validate through another connection"),
+        Err(error) => error,
+    };
+    assert!(error.is_busy(), "{error}");
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: read format version"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("database is locked"), "{detail}");
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert_eq!(
+        LedgerReader::open_existing(root.path(), A)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes,
+        0
+    );
+}
+
+#[test]
+fn changing_derived_database_reports_busy_then_measurement_recovers() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let derived_dir = view_dir(root.path(), A, "churning-view").unwrap();
+    fs::create_dir_all(&derived_dir).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let writes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = writes.clone();
+    // A derived graph can commit outside the root reservation lock. Create a
+    // new generation between each inventory walk and its confirmation, so
+    // growth does not depend on the filesystem's allocation granularity.
+    RECHECK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let derived = IdentityConnection::open(
+                derived_dir.join(format!("derived-{}.sqlite", count.get())),
+                "v3-measurement-churn",
+            )?;
+            derived.execute_batch(
+                "CREATE TABLE growing(payload BLOB); INSERT INTO growing VALUES(zeroblob(16384));",
+            )?;
+            count.set(count.get() + 1);
+            Ok(())
+        }))
+    });
+    let result = writer.covering_measurement();
+    RECHECK_HOOK.with(|hook| *hook.borrow_mut() = None);
+    let error = result.unwrap_err();
+    assert_eq!(writes.get(), 8);
+    assert!(error.is_busy(), "{error}");
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: measure registry"),
+        "{detail}"
+    );
+    assert!(detail.contains("8 measurements"), "{detail}");
+
+    let measured = writer.covering_measurement().unwrap();
+    assert_eq!(measured, allocated_bytes(writer.family_dir()).unwrap());
+    assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+}
+
 #[test]
 fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
     let _guard = serial();
@@ -233,7 +399,14 @@ fn unreadable_peer_ledger_refuses_instead_of_ignoring_reserved_bytes() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("members.sqlite"), b"not sqlite").unwrap();
     let error = publish(root.path(), B, 100, None, |_| Ok(())).unwrap_err();
-    assert_eq!(error.to_string(), "reservation_ledger_unreadable");
+    let detail = error.to_string();
+    assert!(!error.is_busy(), "{detail}");
+    assert!(
+        detail.starts_with("reservation_ledger_unreadable: recover registry"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("schema_drift"), "{detail}");
     assert!(!db(root.path(), B).exists());
 }
 
@@ -1027,6 +1200,86 @@ fn member_kind_constraint_and_v3_namespace_are_not_v2_registration() {
         .starts_with(family_dir(root.path(), A).unwrap()));
 }
 
+fn blocked_read_only_upgrade(root: &Path) -> (LedgerReader, IdentityConnection, ReservationLock) {
+    seed(root, A);
+    let path = db(root, A);
+    let blocker = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "v3-upgrade-blocker",
+    )
+    .unwrap();
+    // Rollback mode permits an exclusive lock while the idle read-only handle
+    // is still open, making a failed connection handoff deterministic.
+    blocker.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+    let ledger = LedgerReader::open_existing(root, A).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let lock = ReservationLock::acquire(root).unwrap();
+    let error = match RegistryWriter::open_existing(root, A, &lock) {
+        Ok(_) => panic!("writer upgrade must be blocked by the exclusive transaction"),
+        Err(error) => error,
+    };
+    assert!(error.is_busy(), "{error}");
+    (ledger, blocker, lock)
+}
+
+#[test]
+fn failed_read_only_upgrade_preserves_busy_and_existing_reader_recovers() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    let path = db(root.path(), A);
+    let (ledger, blocker, lock) = blocked_read_only_upgrade(root.path());
+    let error = ledger.accounting().unwrap_err();
+    assert!(
+        error.is_busy(),
+        "existing reader lost the busy cause: {error}"
+    );
+    let detail = error.to_string();
+    assert!(
+        detail.starts_with("reservation_ledger_busy: reopen shared reader"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("read format version"), "{detail}");
+    assert!(detail.contains("database is locked"), "{detail}");
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert_eq!(ledger.accounting().unwrap().reserved_bytes, 0);
+    assert_eq!(
+        ledger
+            .read(|c| Ok(c.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?))
+            .unwrap(),
+        1
+    );
+    assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert!(Arc::ptr_eq(&ledger.database, &writer.database));
+    assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+}
+
+#[test]
+fn failed_upgrade_reader_rejects_a_replaced_database() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    let path = db(root.path(), A);
+    let (ledger, blocker, _lock) = blocked_read_only_upgrade(root.path());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    let original = path.with_extension("original.sqlite");
+    fs::rename(&path, &original).unwrap();
+    // Rebuild the file through SQLite itself: the source fence forbids copying
+    // file-set bytes, and VACUUM INTO gives the same content a new identity.
+    Connection::open(&original)
+        .unwrap()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    assert!(matches!(
+        ledger.accounting(),
+        Err(Error::Refused("live_sqlite_file_replaced"))
+    ));
+    assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+}
+
 #[test]
 fn read_only_first_owner_upgrades_without_a_second_live_connection() {
     let _g = serial();
@@ -1491,7 +1744,14 @@ fn incomplete_marker_with_application_data_is_not_reset() {
     let root = tempdir().unwrap();
     legacy_bootstrap(root.path(), Kind::Registry, 2, true);
     let error = publish(root.path(), B, 1, None, |_| Ok(())).unwrap_err();
-    assert_eq!(error.to_string(), "reservation_ledger_unreadable");
+    let detail = error.to_string();
+    assert!(!error.is_busy(), "{detail}");
+    assert!(
+        detail.starts_with("reservation_ledger_unreadable: recover registry"),
+        "{detail}"
+    );
+    assert!(detail.contains("members.sqlite"), "{detail}");
+    assert!(detail.contains("schema_drift"), "{detail}");
     let path = db(root.path(), A);
     assert_eq!(crate::db::file_identity::open_connections(&path), 0);
     let c = IdentityConnection::open_with_flags(

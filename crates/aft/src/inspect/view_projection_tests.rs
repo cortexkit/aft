@@ -770,6 +770,7 @@ fn views_tier2_pending_plane_never_falls_back_to_legacy() {
 #[test]
 fn views_tier2_and_legacy_dead_code_verdicts_match() {
     let (_project, _storage, mut job, request) = view_projection_fixture();
+    let view = crate::views::ViewStore::open(&request.storage, &request.scope).unwrap();
     for source in [
         "export function used() {}\nexport function dead() {}\n",
         "export function used() { dead(); }\nexport function dead() {}\n",
@@ -779,6 +780,9 @@ fn views_tier2_and_legacy_dead_code_verdicts_match() {
     ] {
         write_projection_cache_file(&job.project_root.join("target.ts"), source);
         crate::views::assembly::publish_checkout(&request).unwrap();
+        // Publication makes the immutable generation current before its
+        // detached checkpoint closes the last writer; wait for readability.
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
         Arc::make_mut(&mut job.config).views.enabled = true;
         let view =
             build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();

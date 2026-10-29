@@ -259,25 +259,37 @@ static INDEX_EVENT_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
-    static LOG_LINE_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static LOG_LINE_CAPTURE: RefCell<Option<Arc<Mutex<Vec<String>>>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let result = capture_log_lines_into(capture.clone(), f);
+    let lines = capture.lock().unwrap().clone();
+    (result, lines)
+}
+
+/// Share a worker thread's captured records with the test while it is running.
+#[cfg(test)]
+pub(crate) fn capture_log_lines_into<R>(
+    capture: Arc<Mutex<Vec<String>>>,
+    f: impl FnOnce() -> R,
+) -> R {
     // Keep the test representative of a libtest process where another test
     // may already have installed the global logger.
     let _ = env_logger::builder().is_test(true).try_init();
-    LOG_LINE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let previous = LOG_LINE_CAPTURE.with(|slot| slot.replace(Some(capture)));
     let result = f();
-    let lines = LOG_LINE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default());
-    (result, lines)
+    LOG_LINE_CAPTURE.with(|slot| slot.replace(previous));
+    result
 }
 
 #[cfg(test)]
 fn capture_log_line(level: log::Level, line: &str) {
     LOG_LINE_CAPTURE.with(|slot| {
-        if let Some(lines) = slot.borrow_mut().as_mut() {
-            lines.push(format!("{level} {line}"));
+        if let Some(lines) = slot.borrow().as_ref() {
+            lines.lock().unwrap().push(format!("{level} {line}"));
         }
     });
 }

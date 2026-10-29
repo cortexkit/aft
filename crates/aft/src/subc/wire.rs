@@ -1451,6 +1451,7 @@ pub(super) fn response_is_fatal_panic(response: &Response) -> bool {
 
 #[derive(Debug)]
 pub enum SubcError {
+    RuntimeThread(std::io::Error),
     Runtime(std::io::Error),
     StorageLease(std::io::Error),
     ConnectionFile {
@@ -1502,6 +1503,7 @@ pub enum SubcError {
 impl fmt::Display for SubcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeThread(e) => write!(f, "failed to start subc runtime thread: {e}"),
             Self::Runtime(e) => write!(f, "failed to build subc tokio runtime: {e}"),
             Self::StorageLease(e) => write!(f, "failed to acquire subc storage lease: {e}"),
             Self::ConnectionFile { path, source } => {

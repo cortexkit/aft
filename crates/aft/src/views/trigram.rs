@@ -45,6 +45,15 @@ fn absolute_member_path(
     }
     Ok(root.join(relative))
 }
+pub(crate) fn bind_is_busy(reason: &str) -> bool {
+    // Lexical snapshot errors carry strings. Match only the explicit retry
+    // markers preserved by the v3 registry and base builder, including markers
+    // nested beneath a driver or registry diagnostic.
+    reason.contains(crate::blob_store::v3::BUSY_PREFIX)
+        || reason.contains("reservation_ledger_busy:")
+        || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
+}
+
 /// Checkout-local lexical authority, independent of the semantic worker's
 /// lifetime and model availability. Queries serialize reconciliation so an
 /// installed membership and its payloads always come from the same snapshot.

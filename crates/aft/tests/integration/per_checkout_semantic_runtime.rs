@@ -13,7 +13,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,10 @@ struct MockEmbedder {
 
 impl MockEmbedder {
     fn start() -> Self {
+        Self::with_gate(None)
+    }
+
+    fn with_gate(gate: Option<Arc<EmbeddingGate>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
@@ -50,8 +54,9 @@ impl MockEmbedder {
                     break;
                 };
                 let texts = Arc::clone(&thread_texts);
+                let gate = gate.clone();
                 thread::spawn(move || {
-                    let _ = serve(&mut stream, &texts);
+                    let _ = serve(&mut stream, &texts, gate.as_deref());
                 });
             }
         });
@@ -66,6 +71,60 @@ impl MockEmbedder {
 
     fn texts(&self) -> usize {
         self.texts.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Default)]
+struct EmbeddingGate {
+    state: Mutex<(Vec<Vec<String>>, bool)>,
+    changed: Condvar,
+}
+
+impl EmbeddingGate {
+    fn arrive(&self, inputs: &[String]) {
+        if !inputs
+            .iter()
+            .any(|text| text.contains("concurrent_paid_chunk"))
+        {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.0.push(inputs.to_vec());
+        self.changed.notify_all();
+        let deadline = Instant::now() + DEADLINE;
+        while !state.1 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "embedding response was not released");
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+
+    fn wait_for_two(&self) -> Vec<Vec<String>> {
+        let mut state = self.state.lock().unwrap();
+        let deadline = Instant::now() + DEADLINE;
+        while state.0.len() < 2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "only {} processes reached the model",
+                state.0.len()
+            );
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        state.0.clone()
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ReleaseEmbeddingGate(Arc<EmbeddingGate>);
+
+impl Drop for ReleaseEmbeddingGate {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -86,7 +145,11 @@ fn vector(text: &str) -> Vec<f32> {
         .collect()
 }
 
-fn serve(stream: &mut TcpStream, texts: &AtomicUsize) -> std::io::Result<()> {
+fn serve(
+    stream: &mut TcpStream,
+    texts: &AtomicUsize,
+    gate: Option<&EmbeddingGate>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -134,6 +197,9 @@ fn serve(stream: &mut TcpStream, texts: &AtomicUsize) -> std::io::Result<()> {
             .count(),
         Ordering::SeqCst,
     );
+    if let Some(gate) = gate {
+        gate.arrive(&inputs);
+    }
     // Vectors depend on the model too, so vectors of one model never rank
     // like another's: a test can tell which model's vectors were scored.
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -253,28 +319,53 @@ fn send_configure(
     model: &str,
 ) {
     let configured = aft::commands::configure::handle_configure(
-        &request(json!({
-            "id": "configure-views-semantic",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({
-                "indexes": { "trigram": true, "semantic": true, "callgraph": false },
-                "views": { "enabled": views },
-                "semantic": {
-                    "backend": "openai_compatible",
-                    "model": model,
-                    "base_url": server.base_url,
-                    "timeout_ms": 5_000,
-                    "max_batch_size": 64,
-                    "max_files": 2_000
-                }
-            }))
-        })),
+        &request(configure_payload(
+            root, storage, server, views, model, 5_000,
+        )),
         ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
+    let resolved = ctx.config().storage_dir.clone().expect("resolved storage");
+    eprintln!(
+        "semantic configure: root={} requested={} resolved={}",
+        root.display(),
+        storage.display(),
+        resolved.display()
+    );
+    assert_eq!(
+        crate::helpers::canonicalize_like_product(&resolved),
+        crate::helpers::canonicalize_like_product(storage),
+        "fixture storage was overridden"
+    );
+}
+
+fn configure_payload(
+    root: &Path,
+    storage: &Path,
+    server: &MockEmbedder,
+    views: bool,
+    model: &str,
+    timeout_ms: u64,
+) -> Value {
+    json!({
+        "id": "configure-views-semantic",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root,
+        "storage_dir": storage,
+        "config": crate::helpers::user_config(json!({
+            "indexes": { "trigram": true, "semantic": true, "callgraph": false },
+            "views": { "enabled": views },
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": model,
+                "base_url": server.base_url,
+                "timeout_ms": timeout_ms,
+                "max_batch_size": 64,
+                "max_files": 2_000
+            }
+        }))
+    })
 }
 
 fn drain(ctx: &AppContext) {
@@ -367,6 +458,7 @@ fn search(ctx: &AppContext, query: &str) -> Value {
 
 #[test]
 fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
+    let _settings = crate::test_helpers::without_storage_override();
     let _serial = crate::helpers::watcher_serial_lock();
     let _audit = EnvGuard(
         "AFT_SEARCH_RECALL_AUDIT",
@@ -471,6 +563,7 @@ fn unique_chunks(root: &Path) -> usize {
 
 #[test]
 fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -509,6 +602,71 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
     );
 }
 
+/// Holds both HTTP responses so neither process can publish the new chunk
+/// before the other process has sent it to the paid-provider boundary.
+#[test]
+#[ignore = "known cross-process duplicate embedding; durable claim design must be reviewed before fixing"]
+fn views_on_two_processes_reproduce_duplicate_checkout_chunk() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let gate = Arc::new(EmbeddingGate::default());
+    let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    {
+        let warm = configure(&repo.main, storage.path(), &server, true);
+        wait_views_filled(&warm);
+        assert_eq!(server.texts(), chunks);
+    }
+    // The committed base is already filled. Identical uncommitted files belong
+    // to each checkout's own fill, which does not take the shared base claim.
+    for root in [&repo.main, &repo.linked] {
+        write(
+            root,
+            "src/concurrent.rs",
+            "pub fn concurrent_paid_chunk() -> u64 { 424242 }\n",
+        );
+    }
+    let mut main = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
+        "AFT_STORAGE_DIR",
+        storage.path().as_os_str(),
+    )]);
+    let mut linked = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
+        "AFT_STORAGE_DIR",
+        storage.path().as_os_str(),
+    )]);
+    let _release = ReleaseEmbeddingGate(Arc::clone(&gate));
+    eprintln!(
+        "two-process fill: main_pid={} linked_pid={} storage={}",
+        main.pid(),
+        linked.pid(),
+        storage.path().display()
+    );
+    for (process, root) in [(&mut main, &repo.main), (&mut linked, &repo.linked)] {
+        let configured = process.send(
+            &configure_payload(root, storage.path(), &server, true, MODEL, 120_000).to_string(),
+        );
+        assert_eq!(configured["success"], true, "{configured:?}");
+    }
+    let requests = gate.wait_for_two();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0], requests[1],
+        "processes must request identical text"
+    );
+    assert_eq!(requests[0].len(), 1, "one new function is one chunk");
+    assert_eq!(
+        server.texts() - chunks,
+        2,
+        "known bug: both processes embedded the same chunk"
+    );
+    eprintln!(
+        "two-process duplicate: baseline={chunks} total={} new_inputs=2 unique_new_inputs=1",
+        server.texts()
+    );
+    gate.release();
+}
+
 /// The model fingerprint of the root's served semantic view, if any.
 fn served_model(ctx: &AppContext) -> Option<String> {
     ctx.checkout_semantic_runtime().map(|runtime| {
@@ -543,6 +701,7 @@ fn wait_single_worker(ctx: &AppContext) {
 /// so any vector of the old model would change them).
 #[test]
 fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -619,6 +778,7 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
 /// second configure's model; the superseded lane embeds nothing.
 #[test]
 fn views_on_back_to_back_configures_leave_one_worker() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -663,6 +823,7 @@ fn views_on_back_to_back_configures_leave_one_worker() {
 
 #[test]
 fn views_on_search_ranks_like_views_off_on_the_same_content() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let legacy_storage = tempfile::tempdir().unwrap();
@@ -741,6 +902,7 @@ fn wait_for_row(ctx: &AppContext, name: &str, gone: &str) {
 
 #[test]
 fn views_on_aft_and_outside_edits_reach_the_fill() {
+    let _settings = crate::test_helpers::without_storage_override();
     let _serial = crate::helpers::watcher_serial_lock();
     let _quiet = EnvGuard(
         "AFT_SEMANTIC_QUIET_WINDOW_MS",
@@ -889,6 +1051,7 @@ fn reload_trigram_after_eviction(ctx: &AppContext) {
 /// are ready again.
 #[test]
 fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -932,6 +1095,7 @@ fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
 /// disclosure, not as the ready its evicted index left behind.
 #[test]
 fn views_off_search_after_idle_eviction_reports_the_index_reloading() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();

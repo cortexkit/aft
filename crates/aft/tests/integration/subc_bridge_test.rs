@@ -303,9 +303,44 @@ fn bridge_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// In-process configure fixtures also resolve storage from the environment,
+// so every environment change here must happen while the shared
+// process-settings lock is held, until the previous value is restored.
+//
+// That lock is reentrant per thread only. A bridge runner takes it on its own
+// thread for the whole test and then runs the dispatch closure on another
+// thread; taking it again there would wait on the runner forever. While a
+// runner owns the lock, changes made under it are already excluded from the
+// configure fixtures, so the setters below skip their own acquisition.
+static BRIDGE_RUNNER_OWNS_ENV_LOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Marks the current bridge runner as owner of the process-settings lock.
+/// Declare it after the guard that took the lock so it is released first.
+struct BridgeRunnerEnvLockOwner;
+
+impl BridgeRunnerEnvLockOwner {
+    fn claim() -> Self {
+        BRIDGE_RUNNER_OWNS_ENV_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for BridgeRunnerEnvLockOwner {
+    fn drop(&mut self) {
+        BRIDGE_RUNNER_OWNS_ENV_LOCK.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn process_settings_unless_runner_owns() -> Option<crate::test_helpers::ProcessEnvLockGuard> {
+    (!BRIDGE_RUNNER_OWNS_ENV_LOCK.load(std::sync::atomic::Ordering::SeqCst))
+        .then(crate::test_helpers::process_env_lock)
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
+    _process_settings: Option<crate::test_helpers::ProcessEnvLockGuard>,
 }
 
 impl Drop for EnvVarGuard {
@@ -319,15 +354,48 @@ impl Drop for EnvVarGuard {
 }
 
 fn set_test_env(key: &'static str, value: &str) -> EnvVarGuard {
+    let process_settings = process_settings_unless_runner_owns();
     let previous = std::env::var_os(key);
     std::env::set_var(key, value);
-    EnvVarGuard { key, previous }
+    EnvVarGuard {
+        key,
+        previous,
+        _process_settings: process_settings,
+    }
 }
 
 fn remove_test_env(key: &'static str) -> EnvVarGuard {
+    let process_settings = process_settings_unless_runner_owns();
     let previous = std::env::var_os(key);
     std::env::remove_var(key);
-    EnvVarGuard { key, previous }
+    EnvVarGuard {
+        key,
+        previous,
+        _process_settings: process_settings,
+    }
+}
+
+#[test]
+fn storage_override_holds_shared_process_settings_guard() {
+    let storage = tempfile::tempdir().unwrap();
+    {
+        let _setting = set_test_env("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
+        assert!(
+            !std::thread::spawn(crate::test_helpers::process_env_lock_is_available)
+                .join()
+                .unwrap(),
+            "a bridge storage override must exclude in-process configure fixtures"
+        );
+    }
+    {
+        let _setting = remove_test_env("AFT_STORAGE_DIR");
+        assert!(
+            !std::thread::spawn(crate::test_helpers::process_env_lock_is_available)
+                .join()
+                .unwrap(),
+            "removing a bridge storage override must also hold the shared guard"
+        );
+    }
 }
 
 fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
@@ -336,26 +404,17 @@ fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_error() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "1");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "1")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_panic() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "panic");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "panic")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_bash_elicitation_ttl_ms(ms: u64) -> EnvVarGuard {
-    let key = "AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, ms.to_string());
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS", &ms.to_string())
 }
 
 fn install_bridge_state(state: Arc<BridgeState>) {
@@ -1689,6 +1748,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let _serial = bridge_test_serial_guard();
     crate::test_helpers::disable_in_process_file_watcher();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
     let _subc_module_id = remove_test_env("SUBC_MODULE_ID");
     let _subc_launch_nonce = remove_test_env("SUBC_LAUNCH_NONCE");
     let _env_guards = env_setup();
@@ -1916,6 +1976,7 @@ where
 {
     let _serial = bridge_test_serial_guard();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
     let conn_dir = tempfile::tempdir().expect("connection tempdir");
     let storage = tempfile::tempdir().expect("storage tempdir");
     let conn_path = conn_dir.path().join("subc-connection.json");
@@ -7981,23 +8042,45 @@ async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemo
             .expect("rebind submission barrier ping"),
     )
     .await;
-    let rebind_barrier = read_frame_timeout(&mut stream, "rebind submission barrier pong").await;
-    assert_eq!(rebind_barrier.header.ty, FrameType::Pong);
-    assert_eq!(rebind_barrier.header.corr, 124);
+    let mut released_terminal = false;
+    let mut rebind_barrier = false;
+    let mut bind_ack = None;
+    // Goodbye must settle the queued call's request credit, not merely remove
+    // the job. Pong has its own writer priority, so accept either reply order.
+    while !released_terminal || !rebind_barrier {
+        let frame = read_frame_timeout(&mut stream, "released call terminal and rebind pong").await;
+        match (frame.header.ty, frame.header.channel, frame.header.corr) {
+            (FrameType::Error, 1, 121) => {
+                assert!(!released_terminal, "queued call received two terminals");
+                assert_eq!(frame.header.epoch, 1);
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["code"], "route_released", "{body}");
+                released_terminal = true;
+            }
+            (FrameType::Pong, 0, 124) => rebind_barrier = true,
+            (FrameType::Response, 0, 220) => bind_ack = Some(frame),
+            other => panic!("unexpected reply before releasing heavy work: {other:?}"),
+        }
+    }
 
     state.release_heavy();
     state.release_epoch_reads();
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut bind_ack = None;
-    while let Some(frame) =
-        read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
-    {
-        if frame.header.channel == 0
-            && frame.header.corr == 220
-            && frame.header.ty == FrameType::Response
+    if bind_ack.is_none() {
+        while let Some(frame) =
+            read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
         {
-            bind_ack = Some(frame);
-            break;
+            assert!(
+                frame.header.channel != 1 || frame.header.corr != 121,
+                "queued call received a second terminal after release"
+            );
+            if frame.header.channel == 0
+                && frame.header.corr == 220
+                && frame.header.ty == FrameType::Response
+            {
+                bind_ack = Some(frame);
+                break;
+            }
         }
     }
     assert!(
@@ -13271,6 +13354,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "page.collect",
             "page.read",
             "page.release",
+            "diagnostics.findings",
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
