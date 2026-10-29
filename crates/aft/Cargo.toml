@@ -182,7 +182,7 @@ rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functi
 aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.2" }
 # The placeholder grammar, key-location rules and audit record AFT's vault
 # seam speaks. AFT owns the crate; basal links it later.
-secret-rules = { path = "../secret-rules", version = "0.1.0" }
+secret-rules = { path = "../secret-rules", version = "0.63.2", package = "aft-secret-rules" }
 zeroize = "1"
 bytes = "1"
 http-body-util = "0.1"
