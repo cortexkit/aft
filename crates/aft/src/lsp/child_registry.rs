@@ -20,37 +20,6 @@ use std::time::{Duration, Instant};
 
 use crate::lsp::registry::ServerKind;
 
-#[cfg(test)]
-type ShutdownTrace = (Instant, std::thread::ThreadId, &'static str);
-#[cfg(test)]
-static SHUTDOWN_TRACE: std::sync::LazyLock<(
-    crossbeam_channel::Sender<ShutdownTrace>,
-    crossbeam_channel::Receiver<ShutdownTrace>,
-)> = std::sync::LazyLock::new(crossbeam_channel::unbounded);
-#[cfg(test)]
-pub(super) fn shutdown_trace(phase: &'static str) {
-    if std::env::var_os("AFT_SHUTDOWN_TRACE").is_some() {
-        let _ = SHUTDOWN_TRACE
-            .0
-            .send((Instant::now(), std::thread::current().id(), phase));
-    }
-}
-#[cfg(test)]
-fn dump_shutdown_trace() {
-    eprintln!("SHUTDOWN_TARGET {:?}", std::thread::current().id());
-    let events: Vec<_> = SHUTDOWN_TRACE.1.try_iter().collect();
-    if let Some((start, _, _)) = events.first() {
-        for (at, thread, phase) in &events {
-            eprintln!(
-                "SHUTDOWN_TRACE {:?} {:.3} {}",
-                thread,
-                at.duration_since(*start).as_secs_f64() * 1000.,
-                phase
-            );
-        }
-    }
-}
-
 /// How long a freshly spawned child may wait for its `LspClient` to claim it
 /// before the orphan sweep treats it as abandoned. Claiming normally takes
 /// microseconds; the window only has to outlast a slow fork under load while
@@ -126,6 +95,15 @@ pub struct LspChildRegistry {
     // checks only these known roots for reclaim markers, avoiding directory
     // scans while still covering servers rooted below a task worktree.
     inner: Arc<Mutex<HashMap<u32, TrackedChild>>>,
+    #[cfg(test)]
+    force_kill_hook: Option<Arc<dyn Fn(ForceKillPhase) + Send + Sync>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ForceKillPhase {
+    BeforeSignals,
+    AfterCleanup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,17 +179,11 @@ impl LspChildRegistry {
         server_root: Option<&Path>,
         kind: Option<&ServerKind>,
     ) -> io::Result<Child> {
-        #[cfg(test)]
-        shutdown_trace("spawn_lock_enter");
         let mut children = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
-        #[cfg(test)]
-        shutdown_trace("spawn_lock_acquired");
         let child = command.spawn()?;
-        #[cfg(test)]
-        shutdown_trace("process_spawn_done");
         // The caller is about to wrap this child in an `LspClient`. Until it
         // calls `mark_client_live`, the child must not look like an orphan:
         // a maintenance sweep blocked on this lock during the fork would
@@ -253,27 +225,17 @@ impl LspChildRegistry {
 
     /// Forget a PID (called when the client is dropped or shut down gracefully).
     pub fn untrack(&self, pid: u32) {
-        #[cfg(test)]
-        shutdown_trace("untrack_lock_enter");
         if let Ok(mut children) = self.inner.lock() {
-            #[cfg(test)]
-            shutdown_trace("untrack_lock_acquired");
             children.remove(&pid);
         }
     }
 
     /// Snapshot of currently-tracked PIDs.
     pub fn pids(&self) -> Vec<u32> {
-        #[cfg(test)]
-        shutdown_trace("snapshot_enter");
-        let pids = self
-            .tracked_children()
+        self.tracked_children()
             .into_iter()
             .map(|(pid, _)| pid)
-            .collect();
-        #[cfg(test)]
-        shutdown_trace("snapshot_done");
-        pids
+            .collect()
     }
 
     fn tracked_children(&self) -> Vec<(u32, TrackedChild)> {
@@ -321,16 +283,14 @@ impl LspChildRegistry {
     /// Returns how many groups were sent the kill (or were already gone).
     pub fn force_kill_pids(&self, pids: &[u32]) -> usize {
         #[cfg(test)]
-        shutdown_trace("kills_enter");
+        if let Some(hook) = &self.force_kill_hook {
+            hook(ForceKillPhase::BeforeSignals);
+        }
         let mut killed = Vec::new();
         for pid in pids {
-            #[cfg(test)]
-            shutdown_trace("kill_enter");
             if force_kill_child_process_group_nowait(*pid) {
                 killed.push(*pid);
             }
-            #[cfg(test)]
-            shutdown_trace("kill_done");
         }
         // Spawning a child holds the registry mutex across process creation.
         // Send every kill before cleanup can block on that mutex, otherwise a
@@ -339,7 +299,9 @@ impl LspChildRegistry {
             self.untrack(*pid);
         }
         #[cfg(test)]
-        shutdown_trace("kills_cleanup_done");
+        if let Some(hook) = &self.force_kill_hook {
+            hook(ForceKillPhase::AfterCleanup);
+        }
         killed.len()
     }
 
@@ -962,9 +924,113 @@ mod tests {
     #[test]
     fn shutdown_exit_reports_unreaped_until_detached_owner_waits() {
         use crate::lsp::manager::{LspManager, LSP_SHUTDOWN_ALL_BUDGET};
+
+        let (killed_tx, killed_rx) = crossbeam_channel::bounded(1);
+        let mut registry = LspChildRegistry::new();
+        registry.force_kill_hook = Some(Arc::new(move |phase| {
+            if matches!(phase, ForceKillPhase::AfterCleanup) {
+                killed_tx.send(()).unwrap();
+            }
+        }));
+        let mut child = spawn_shutdown_child(&registry);
+        let pid = child.id();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            // Keep the killed child waitable after the kill dispatcher has
+            // untracked it. A successful signal is not evidence of a reap.
+            let released = release_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+            child.wait().unwrap();
+            released
+        });
+        let started = Instant::now();
+        let mut deadlines = Vec::new();
+        let outcome = LspManager::shutdown_all_clients_with_wait(
+            Vec::new(),
+            registry.clone(),
+            LSP_SHUTDOWN_ALL_BUDGET,
+            true,
+            started,
+            |_, until| {
+                deadlines.push(until.duration_since(started));
+                if deadlines.len() == 2 {
+                    // Simulate the final timeout only after the real dispatcher
+                    // has killed and untracked the still-waitable child. The
+                    // ten-second waits are deadlock guards, not timing oracles.
+                    killed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(registry.pids().is_empty());
+                    assert!(crate::bash_background::process::is_process_alive(pid));
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            },
+        );
+        release_tx.send(()).ok();
+        assert!(
+            owner.join().unwrap(),
+            "shutdown must return before the owner waits"
+        );
+        assert_eq!(
+            deadlines,
+            [Duration::from_millis(1200), LSP_SHUTDOWN_ALL_BUDGET]
+        );
+        assert_eq!(outcome.forced, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.unreaped, 1,
+            "untracking must not hide a waitable child"
+        );
+        assert!(!crate::bash_background::process::is_process_alive(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_deadline_does_not_wait_for_forced_kill() {
+        use crate::lsp::manager::{LspManager, LSP_SHUTDOWN_ALL_BUDGET};
+
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+        let mut registry = LspChildRegistry::new();
+        registry.force_kill_hook = Some(Arc::new(move |phase| {
+            if matches!(phase, ForceKillPhase::BeforeSignals) {
+                entered_tx.send(std::thread::current().id()).unwrap();
+                let released = release_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+                finished_tx.send(released).unwrap();
+            }
+        }));
+        let mut child = spawn_shutdown_child(&registry);
+        let started = Instant::now();
+        let mut deadlines = Vec::new();
+        let outcome = LspManager::shutdown_all_clients_with_wait(
+            Vec::new(),
+            registry,
+            LSP_SHUTDOWN_ALL_BUDGET,
+            true,
+            started,
+            |_, until| {
+                // Timeout delivery can be arbitrarily late on a loaded runner.
+                // Returning it immediately instead tests the two fixed cutoffs
+                // without asking the operating system to schedule us on time.
+                deadlines.push(until.duration_since(started));
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            },
+        );
+        let dispatch_thread = entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).ok();
+        let released = finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        child.wait().unwrap();
+        assert!(released, "the caller must not join or run the blocked kill");
+        assert_ne!(dispatch_thread, std::thread::current().id());
+        assert_eq!(
+            deadlines,
+            [Duration::from_millis(1200), LSP_SHUTDOWN_ALL_BUDGET]
+        );
+        assert_eq!(outcome.forced, 1, "{outcome:?}");
+        assert_eq!(outcome.unreaped, 1, "{outcome:?}");
+    }
+
+    #[cfg(unix)]
+    fn spawn_shutdown_child(registry: &LspChildRegistry) -> Child {
         use std::os::unix::process::CommandExt;
 
-        let registry = LspChildRegistry::new();
         let mut command = Command::new("sleep");
         command.arg("30");
         unsafe {
@@ -975,32 +1041,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut child = registry.spawn_tracked(&mut command).unwrap();
-        let pid = child.id();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let owner = std::thread::spawn(move || {
-            // Keep the killed child waitable after the kill dispatcher has
-            // untracked it. A successful signal is not evidence of a reap.
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
-            child.wait().unwrap();
-        });
-        let started = Instant::now();
-        let outcome = LspManager::shutdown_at_process_exit(Vec::new(), registry.clone());
-        let elapsed = started.elapsed();
-        release_tx.send(()).ok();
-        owner.join().unwrap();
-        dump_shutdown_trace();
-        eprintln!("SHUTDOWN_TOTAL wall={elapsed:?} outcome={outcome:?}");
-        assert!(
-            elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
-            "{elapsed:?} {outcome:?}"
-        );
-        assert_eq!(outcome.forced, 1, "{outcome:?}");
-        assert_eq!(
-            outcome.unreaped, 1,
-            "untracking must not hide a waitable child"
-        );
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        registry.spawn_tracked(&mut command).unwrap()
     }
 
     #[test]

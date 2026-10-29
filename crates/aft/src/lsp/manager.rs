@@ -1029,6 +1029,8 @@ pub struct LspShutdownAllOutcome {
     pub elapsed: Duration,
 }
 
+type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
+
 pub struct LspManager {
     #[cfg(test)]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -5600,8 +5602,6 @@ impl LspManager {
     /// waiting on child processes. The caller owns graceful shutdown so the
     /// manager lock is not held across a Shutdown handshake.
     pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("take_clients_enter");
         self.cancel_startups();
         self.starting.clear();
         self.ready_startup_events.clear();
@@ -5609,8 +5609,6 @@ impl LspManager {
         let clients: Vec<_> = self.clients.drain().collect();
         self.clients_generation = self.clients_generation.wrapping_add(1);
         self.forget_server_state(None);
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("take_clients_done");
         clients
     }
 
@@ -5706,9 +5704,29 @@ impl LspManager {
         budget: Duration,
         include_registered: bool,
     ) -> LspShutdownAllOutcome {
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("shutdown_enter");
-        let started = Instant::now();
+        Self::shutdown_all_clients_with_wait(
+            clients,
+            child_registry,
+            budget,
+            include_registered,
+            Instant::now(),
+            |rx, until| rx.recv_deadline(until),
+        )
+    }
+
+    // Keep deadline selection shared with deterministic tests. Only receiving
+    // reports is replaceable; spawning, killing, dropping and reporting are real.
+    pub(super) fn shutdown_all_clients_with_wait(
+        clients: Vec<(ServerKey, LspClient)>,
+        child_registry: LspChildRegistry,
+        budget: Duration,
+        include_registered: bool,
+        started: Instant,
+        mut receive: impl FnMut(
+            &Receiver<ShutdownResult>,
+            Instant,
+        ) -> Result<ShutdownResult, RecvTimeoutError>,
+    ) -> LspShutdownAllOutcome {
         let mut pending_pids = clients
             .iter()
             .map(|(_, client)| client.child_pid())
@@ -5722,26 +5740,18 @@ impl LspManager {
             }
         }
         let servers = pending_pids.len();
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("setup_done");
         let (result_tx, result_rx) = unbounded();
 
         for (key, mut client) in clients {
             let pid = client.child_pid();
             let result_tx = result_tx.clone();
             std::thread::spawn(move || {
-                #[cfg(test)]
-                super::child_registry::shutdown_trace("stop_request_enter");
                 let result = client.shutdown();
-                #[cfg(test)]
-                super::child_registry::shutdown_trace("stop_request_done");
                 // Do the drop before reporting completion so the registry cannot
                 // briefly report a reaped client as still live after this method
                 // has returned its shutdown summary. The drop also waits for the
                 // child, so a report means the process has been reaped.
                 drop(client);
-                #[cfg(test)]
-                super::child_registry::shutdown_trace("client_drop_done");
                 let _ = result_tx.send((Some(key), pid, result));
             });
         }
@@ -5758,8 +5768,6 @@ impl LspManager {
             });
         }
         drop(result_tx);
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("workers_spawned");
 
         // Graceful handshakes get the budget minus the forced-termination
         // reserve; whatever is still running then is killed, and the reserve
@@ -5769,10 +5777,9 @@ impl LspManager {
         let force_at = deadline - LSP_FORCED_TERMINATION_RESERVE.min(budget / 2);
         let mut outcome = LspShutdownAllOutcome::default();
         while !pending_pids.is_empty() {
-            let remaining = force_at.saturating_duration_since(Instant::now());
-            #[cfg(test)]
-            super::child_registry::shutdown_trace("graceful_recv_enter");
-            match result_rx.recv_timeout(remaining) {
+            // Pass the absolute cutoff through to the channel: descheduling
+            // before a receive must not restart a relative timeout later.
+            match receive(&result_rx, force_at) {
                 Ok((key, pid, result)) => {
                     if !pending_pids.remove(&pid) {
                         continue;
@@ -5790,8 +5797,6 @@ impl LspManager {
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("graceful_recv_done");
 
         if !pending_pids.is_empty() {
             let pids = pending_pids.into_iter().collect::<Vec<_>>();
@@ -5803,29 +5808,20 @@ impl LspManager {
             // load. A killed server closes its pipes, unblocking its worker,
             // which reaps it and reports in. Never join the dispatcher here.
             let kill_pids = pids.clone();
-            #[cfg(test)]
-            super::child_registry::shutdown_trace("dispatcher_spawn_enter");
             std::thread::spawn(move || {
                 child_registry.force_kill_pids(&kill_pids);
             });
-            #[cfg(test)]
-            super::child_registry::shutdown_trace("dispatcher_spawn_done");
             let mut unreaped = pids.into_iter().collect::<HashSet<_>>();
             while !unreaped.is_empty() {
-                // A zero timeout still takes a report that is already queued,
+                // An expired deadline still takes a report that is already queued,
                 // so a late wake-up counts every server reaped in the meantime.
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                #[cfg(test)]
-                super::child_registry::shutdown_trace("reap_recv_enter");
-                match result_rx.recv_timeout(remaining) {
+                match receive(&result_rx, deadline) {
                     Ok((_, pid, _)) => {
                         unreaped.remove(&pid);
                     }
                     Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
                 }
             }
-            #[cfg(test)]
-            super::child_registry::shutdown_trace("reap_recv_done");
             // Waiting longer would break the ceiling. The dispatcher continues
             // sending kills, and the client workers continue reaping, without
             // holding up the caller. A pending kill is not a completed reap.
@@ -5833,8 +5829,6 @@ impl LspManager {
         }
 
         outcome.elapsed = started.elapsed();
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("summary_enter");
         slog_info!(
             "lsp shutdown_all: servers={} graceful={} killed={} unreaped={} elapsed_ms={}",
             servers,
@@ -5843,8 +5837,6 @@ impl LspManager {
             outcome.unreaped,
             outcome.elapsed.as_millis()
         );
-        #[cfg(test)]
-        super::child_registry::shutdown_trace("summary_done");
         outcome
     }
 
