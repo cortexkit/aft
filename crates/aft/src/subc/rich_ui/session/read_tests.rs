@@ -3,7 +3,7 @@ use super::*;
 const SOURCE: &str =
     "pub fn session_marker() -> u32 { session_leaf() }\npub fn session_leaf() -> u32 { 42 }\n";
 
-fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+pub(super) fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     assert!(matches!(
         crate::sandbox_spawn::current_authenticated_principal(),
         AuthenticatedPrincipal::RouteBind {
@@ -27,7 +27,12 @@ fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
-async fn query_with(f: &Fixture, name: &str, args: Value, dispatch: DispatchFn) -> Value {
+pub(super) async fn query_with(
+    f: &Fixture,
+    name: &str,
+    args: Value,
+    dispatch: DispatchFn,
+) -> Value {
     let mut args = args;
     args["rich_ui_op"] = json!(format!("{name}@1"));
     let operation = super::super::super::admission::prepare(name, &args).unwrap();
@@ -52,7 +57,7 @@ async fn query_with(f: &Fixture, name: &str, args: Value, dispatch: DispatchFn) 
     body
 }
 
-fn indexed_fixture(shape: &str) -> Fixture {
+pub(super) fn indexed_fixture(shape: &str) -> Fixture {
     let mut f = Fixture::new(if shape == "worker" { "worker" } else { "head" });
     std::fs::write(f.dir.path().join("main.rs"), SOURCE).unwrap();
     let request: RawRequest = serde_json::from_value(json!({
