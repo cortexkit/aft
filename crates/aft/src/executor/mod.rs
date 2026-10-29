@@ -2220,6 +2220,7 @@ struct SchedulerState {
     interactive_inflight: usize,
     maintenance_inflight: usize,
     provider_inflight: usize,
+    binds_inflight: usize,
     config: EffectiveConfig,
     running_jobs: HashMap<u64, RunningJob>,
     next_job_id: u64,
@@ -2238,6 +2239,7 @@ impl SchedulerState {
             interactive_inflight: 0,
             maintenance_inflight: 0,
             provider_inflight: 0,
+            binds_inflight: 0,
             config,
             running_jobs: HashMap::new(),
             next_job_id: 1,
@@ -2327,6 +2329,13 @@ impl SchedulerState {
             .count();
         debug_assert_eq!(self.interactive_inflight, interactive);
         debug_assert_eq!(self.maintenance_inflight, maintenance);
+        debug_assert_eq!(
+            self.binds_inflight,
+            self.running_jobs
+                .values()
+                .filter(|job| is_bind_job(job.job_class, job.lane, &job.request_id))
+                .count()
+        );
         debug_assert_eq!(
             self.provider_inflight,
             self.running_jobs
@@ -2538,6 +2547,10 @@ impl SchedulerState {
 
 fn is_configure_request(request_id: &str) -> bool {
     request_id.starts_with("subc-bind-")
+}
+
+fn is_bind_job(job_class: JobClass, lane: Lane, request_id: &str) -> bool {
+    job_class == JobClass::Interactive && lane == Lane::Mutating && is_configure_request(request_id)
 }
 
 fn format_bind_blocker_reader(reader: &BindBlockerReaderSnapshot) -> String {
@@ -3447,6 +3460,9 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
     if lane == Lane::ProviderMetadata {
         state.provider_inflight = state.provider_inflight.saturating_sub(1);
     }
+    if is_bind_job(job_class, lane, &request_id) {
+        state.binds_inflight = state.binds_inflight.saturating_sub(1);
+    }
     if let Some(actor) = state.actors.get_mut(&root_id) {
         actor.actor_total_inflight = actor.actor_total_inflight.saturating_sub(1);
         match lane {
@@ -3816,6 +3832,9 @@ fn launch_run_job(
     if run_job.lane == Lane::ProviderMetadata {
         state.provider_inflight += 1;
     }
+    if is_bind_job(run_job.job_class, run_job.lane, &run_job.request_id) {
+        state.binds_inflight += 1;
+    }
     state.assert_running_invariants();
     log::debug!(
         "executor dispatch: job_id={job_id} class={:?} lane={:?} request_id={} root={}",
@@ -3832,15 +3851,18 @@ fn launch_run_job(
 }
 
 fn can_dispatch_class(state: &SchedulerState, job_class: JobClass) -> bool {
-    // General work cannot spend the bind reserve or the provider reservation
-    // not already occupied by metadata. All jobs still use one worker channel.
+    // Running binds and metadata have already reduced idle_workers. Hold back
+    // only the unused part of each reservation, or each running bind would also
+    // remove a general-pool slot. All jobs still use one worker channel.
     let provider_idle = state
         .config
         .provider_reserve
         .saturating_sub(state.provider_inflight);
-    let general_idle = state
-        .idle_workers
-        .saturating_sub(state.config.bind_reserve + provider_idle);
+    let bind_idle = state
+        .config
+        .bind_reserve
+        .saturating_sub(state.binds_inflight);
+    let general_idle = state.idle_workers.saturating_sub(bind_idle + provider_idle);
     if general_idle == 0 {
         return false;
     }

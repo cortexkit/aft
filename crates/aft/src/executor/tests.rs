@@ -5018,9 +5018,13 @@ fn provider_metadata_reservation_bypasses_index_writers_and_serializes_each_root
             }),
         ));
     }
+    // These are positive waits for blocked jobs to start: every held job and
+    // every admitted metadata job blocks until released, so a slow (loaded)
+    // runner can only make them late, never let a violation pass. 30 s bounds
+    // a real hang without making a loaded Windows runner fail the setup.
     for _ in 0..4 {
         running
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(30))
             .expect("general and bind slots occupied");
     }
     let mut provider_releases = Vec::new();
@@ -5042,7 +5046,7 @@ fn provider_metadata_reservation_bypasses_index_writers_and_serializes_each_root
     }
     for _ in 0..2 {
         running
-            .recv_timeout(Duration::from_millis(500))
+            .recv_timeout(Duration::from_secs(30))
             .expect("metadata bypasses held index, writer, and bind slots");
     }
     assert_eq!(
@@ -5078,7 +5082,7 @@ fn provider_metadata_reservation_bypasses_index_writers_and_serializes_each_root
     );
     provider_releases[1].send(()).unwrap();
     assert_eq!(
-        running.recv_timeout(Duration::from_millis(500)).unwrap(),
+        running.recv_timeout(Duration::from_secs(30)).unwrap(),
         "third-root"
     );
     assert!(
@@ -5086,13 +5090,18 @@ fn provider_metadata_reservation_bypasses_index_writers_and_serializes_each_root
         "same-root policy operations must not overlap"
     );
     provider_releases[0].send(()).unwrap();
-    assert!(second.recv_timeout(Duration::from_secs(2)).unwrap().success);
+    assert!(
+        second
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .success
+    );
     release_third.send(()).unwrap();
     for release in releases {
         release.send(()).unwrap();
     }
     for job in held_jobs.into_iter().chain(provider_jobs).chain([third]) {
-        assert!(job.recv_timeout(Duration::from_secs(3)).unwrap().success);
+        assert!(job.recv_timeout(Duration::from_secs(30)).unwrap().success);
     }
 }
 
@@ -5232,4 +5241,100 @@ fn dispatched_provider_metadata_cannot_start_after_unbind_and_rebind() {
             .unwrap()
             .success
     );
+}
+
+#[test]
+fn binds_first_dispatch_preserves_the_general_worker_pool() {
+    let config = ExecutorConfig {
+        pool_size: 2,
+        read_cap: 1,
+        actor_cap: 1,
+        heavy_permits: 1,
+        drr_quantum: 1,
+    }
+    .effective();
+    let mut state = SchedulerState::new(config.clone());
+    let roots: Vec<_> = (0..4)
+        .map(|i| test_root(&format!("binds-first-{i}")))
+        .collect();
+    for (_, root) in &roots {
+        state.actor_order.push(root.clone());
+        state
+            .actors
+            .insert(root.clone(), ActorState::new(test_ctx()));
+    }
+    let queued_at = Instant::now();
+    for (index, lane, id) in [
+        (0, Lane::Mutating, "subc-bind-first-a"),
+        (1, Lane::Mutating, "subc-bind-first-b"),
+        (2, Lane::Mutating, "general-writer"),
+        (3, Lane::HeavyInit, "general-index"),
+    ] {
+        let (completion, _) = crossbeam_channel::bounded(1);
+        state.actors.get_mut(&roots[index].1).unwrap().push_job(
+            JobClass::Interactive,
+            lane,
+            QueuedJob {
+                job: Box::new(move |_| ok(id)),
+                completion: CompletionSender::Sync(completion),
+                request_id: id.into(),
+                command: id.into(),
+                queued_at: queued_at + Duration::from_nanos(index as u64),
+                cancellation: None,
+                maintenance_coalesce_key: None,
+                rerun: None,
+                force_exclusive: false,
+                not_before: None,
+                exclusive_attempts: 0,
+                provider_generation: None,
+            },
+        );
+    }
+    let (run_tx, run_rx) = crossbeam_channel::unbounded();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let violations = AtomicUsize::new(0);
+    // Seed all queues before a single dispatcher pass. No scheduler thread can
+    // admit general work first and accidentally hide the binds-first case.
+    dispatch_runnable(
+        &mut state,
+        &Arc::new(HeavySemaphore::new(config.heavy_permits)),
+        &run_tx,
+        &event_tx,
+        &violations,
+    );
+    let jobs: Vec<_> = run_rx.try_iter().collect();
+    let ids: Vec<_> = jobs.iter().map(|job| job.request_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "subc-bind-first-a",
+            "subc-bind-first-b",
+            "general-writer",
+            "general-index"
+        ],
+        "running binds must not reserve their already-occupied workers a second time"
+    );
+    assert_eq!(state.binds_inflight, 2);
+    assert_eq!(state.idle_workers, config.provider_reserve);
+    assert_eq!(violations.load(Ordering::SeqCst), 0);
+    for mut job in jobs {
+        let response = match run_lane_job(&mut job) {
+            LaneRun::Finished(response) => response,
+            LaneRun::RerunExclusive { .. } => panic!("ordinary binds do not requeue"),
+        };
+        assert!(response.success);
+        job.completion_guard
+            .as_mut()
+            .unwrap()
+            .set_outcome(JobCompletionOutcome::Completed);
+        drop(job);
+        let SchedulerEvent::Completed(event) =
+            event_rx.recv_timeout(Duration::from_secs(30)).unwrap()
+        else {
+            panic!("one completion event per dispatched job")
+        };
+        complete_job(&mut state, event);
+    }
+    assert_eq!(state.binds_inflight, 0);
+    assert_eq!(state.idle_workers, config.total_workers());
 }
