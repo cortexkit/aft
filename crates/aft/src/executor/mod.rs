@@ -1996,6 +1996,13 @@ impl Executor {
         self.inner.state.lock().idle_workers
     }
 
+    /// Number of workers reserved for provider metadata, so tests can distinguish
+    /// those idle workers from the separate bind reservation.
+    #[cfg(test)]
+    pub(crate) fn provider_reserve_for_test(&self) -> usize {
+        self.inner.config.provider_reserve
+    }
+
     pub fn pool_size(&self) -> usize {
         self.inner.config.pool_size
     }

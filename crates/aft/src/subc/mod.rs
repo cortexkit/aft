@@ -23005,8 +23005,9 @@ mod tests {
         assert!(queued_a.is_some(), "root A's pi bind waits in the queue");
         assert!(queued_b.is_some(), "root B's pi bind waits in the queue");
         assert_eq!(
-            idle_with_pi_binds_waiting, 2,
-            "both reserved bind workers are free while the pi binds wait"
+            idle_with_pi_binds_waiting,
+            2 + executor.provider_reserve_for_test(),
+            "both bind workers and the unused metadata reservation are free while pi binds wait"
         );
     }
 
