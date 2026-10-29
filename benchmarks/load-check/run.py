@@ -163,7 +163,7 @@ def arguments():
 class NDJSONClient:
     def __init__(self, process, output):
         self.process = process
-        self.subject_pid = process.pid if process else None
+        self.subject_pid = getattr(process, "pid", None)
         self.output = output
         self.pending = {}
         self.sequence = 0
