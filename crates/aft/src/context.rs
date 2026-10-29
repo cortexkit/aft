@@ -22716,7 +22716,10 @@ mod view_load_health_tests {
         assert!(!degraded(&ctx));
         let snapshot = ctx.try_health_snapshot(root);
         assert_eq!(snapshot.view_load_failures.get("trigram:other"), Some(&2));
-        let last = snapshot.view_load_failure_last.expect("last failure kept");
+        let last = snapshot
+            .view_load_failure_last
+            .as_ref()
+            .expect("last failure kept");
         assert_eq!(last.plane, "trigram");
         assert_eq!(last.cause, "other");
         assert_eq!(last.count, 2);
@@ -22740,7 +22743,10 @@ mod view_load_health_tests {
             Some(&2)
         );
         assert_eq!(snapshot.view_load_failures.get("callgraph:busy"), Some(&1));
-        let last = snapshot.view_load_failure_last.expect("last failure");
+        let last = snapshot
+            .view_load_failure_last
+            .as_ref()
+            .expect("last failure");
         assert_eq!(last.plane, "trigram");
         assert_eq!(last.cause, "unavailable");
         assert_eq!((last.count, last.total), (2, 3));
