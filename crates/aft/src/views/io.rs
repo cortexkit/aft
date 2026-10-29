@@ -4,6 +4,19 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// Keep the error kind available to retry/absence checks while naming the I/O
+/// that failed. OS errors alone do not include the path they operated on.
+pub(crate) fn at(
+    operation: &str,
+    path: &std::path::Path,
+    source: std::io::Error,
+) -> std::io::Error {
+    std::io::Error::new(
+        source.kind(),
+        format!("{operation} {}: {source}", path.display()),
+    )
+}
+
 /// Lifetime totals for measured work sites, shared by every root in this process.
 /// Relaxed loads are intentionally not a transactional snapshot; difference them
 /// only within one daemon lifetime, never sum overlapping per-root intervals.
@@ -315,6 +328,19 @@ impl Drop for Event {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_context_preserves_absence_and_retry_kinds() {
+        for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::WouldBlock] {
+            let error = super::at(
+                "reading",
+                std::path::Path::new("missing-input"),
+                std::io::Error::new(kind, "original failure"),
+            );
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "reading missing-input: original failure");
+        }
+    }
+
     use super::*;
     #[test]
     fn performance_work_counts_real_source_operations() {

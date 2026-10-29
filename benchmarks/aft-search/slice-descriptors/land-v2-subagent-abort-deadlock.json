@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "v2-subagent-abort-deadlock"
+  ],
+  "note": "OpenCode 2 plugin: subagent tool hooks no longer join a drain parked on execution settlement (#1110). No changed path matches RANKING_FENCE_PREFIXES."
+}

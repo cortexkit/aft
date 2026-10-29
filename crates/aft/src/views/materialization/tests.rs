@@ -1646,7 +1646,8 @@ fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
         row.kind == join::BlobRefKind::Call && row.status == join::ResolutionStatus::Resolved
     }));
     assert!(foo_rows.iter().any(|row| {
-        row.kind == join::BlobRefKind::ValueRef && row.status == join::ResolutionStatus::Unresolved
+        row.kind == join::BlobRefKind::CallbackRef
+            && row.status == join::ResolutionStatus::Unresolved
     }));
 }
 

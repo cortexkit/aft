@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-manifest-fail-closed"
+  ],
+  "note": "gh shim: on a machine that once had a valid signed manifest, a missing or broken one refuses every write before upstream gh. No changed path matches RANKING_FENCE_PREFIXES."
+}

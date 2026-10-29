@@ -474,7 +474,10 @@ fn member_row(
     scope: &str,
 ) -> Result<Option<(String, String, String)>> {
     let registry = v3::family_dir(storage, family)?.join("members.sqlite");
-    if !registry.try_exists()? {
+    if !registry
+        .try_exists()
+        .map_err(|e| super::io::at("checking base registry", &registry, e))?
+    {
         return Ok(None);
     }
     Ok(LedgerReader::open_existing(storage, family)?.member(scope)?)

@@ -33,7 +33,7 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// Version 10 stores the parser's corrected symbols: Go type aliases, separate
 /// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
 /// HTML headings that share a row.
-pub const PRODUCER: &str = "ruled-callgraph-v11-callback-constructor-inline-test-items";
+pub const PRODUCER: &str = "ruled-callgraph-v12-rust-module-paths-and-function-references";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {

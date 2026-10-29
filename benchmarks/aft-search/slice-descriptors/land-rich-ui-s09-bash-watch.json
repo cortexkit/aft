@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rich-ui-s09-bash-watch"
+  ],
+  "note": "Rich UI carrier: bounded polling bash_watch for a viewed task, reply budget from frame receipt. No changed path matches RANKING_FENCE_PREFIXES."
+}

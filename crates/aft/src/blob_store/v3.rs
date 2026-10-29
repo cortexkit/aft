@@ -293,7 +293,9 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 /// its partial sum is never a total.
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
     let mut total = 0u64;
-    for entry in fs::read_dir(path)? {
+    for entry in fs::read_dir(path)
+        .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
+    {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(None);
         }
@@ -303,7 +305,8 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
                 std::thread::sleep(delay.get());
             }
         });
-        let entry = entry?;
+        let entry =
+            entry.map_err(|e| crate::views::io::at("reading v3 accounting entry", path, e))?;
         let path = entry.path();
         #[cfg(test)]
         WALK_BEFORE_STAT.with(|hook| {
@@ -317,7 +320,11 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(
+                    crate::views::io::at("reading v3 accounting metadata", &path, error).into(),
+                )
+            }
         };
         if meta.is_dir() {
             let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
@@ -350,10 +357,18 @@ fn file_allocated(meta: &fs::Metadata) -> u64 {
 fn registry_allocated(dir: &Path) -> Result<u64> {
     let mut total = 0u64;
     for name in ["members.sqlite", "members.sqlite-wal", "members.sqlite-shm"] {
-        match fs::symlink_metadata(dir.join(name)) {
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
             Ok(meta) => total = total.saturating_add(file_allocated(&meta)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(crate::views::io::at(
+                    "reading v3 registry accounting metadata",
+                    &path,
+                    error,
+                )
+                .into())
+            }
         }
     }
     Ok(total)
@@ -388,6 +403,42 @@ pub enum Measurement {
     Owed,
 }
 
+/// A reservation-lock failure that names the lock file but keeps the typed
+/// [`crate::fs_lock::AcquireError`] reachable as its `source()`, so callers
+/// can still tell a busy lock (a timeout) from a real failure.
+#[derive(Debug)]
+pub struct ReservationLockError {
+    path: PathBuf,
+    source: crate::fs_lock::AcquireError,
+}
+impl ReservationLockError {
+    fn io(path: &Path, source: crate::fs_lock::AcquireError) -> Error {
+        Error::Io(std::io::Error::other(Self {
+            path: path.to_path_buf(),
+            source,
+        }))
+    }
+    /// Whether this is a lock that another holder kept past the wait.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self.source, crate::fs_lock::AcquireError::Timeout)
+    }
+}
+impl fmt::Display for ReservationLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "acquiring v3 reservation lock {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+impl std::error::Error for ReservationLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Owning capability for the non-reentrant storage-root lease. Pass this guard
 /// into nested writers rather than acquiring the same lease again.
 pub struct ReservationLock {
@@ -396,12 +447,12 @@ pub struct ReservationLock {
 }
 impl ReservationLock {
     pub fn acquire(storage: &Path) -> Result<Self> {
-        fs::create_dir_all(storage.join("blobs/v3"))?;
-        let guard = crate::fs_lock::try_acquire(
-            &storage.join("blobs/v3/reservations.lock"),
-            Duration::from_secs(120),
-        )
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let dir = storage.join("blobs/v3");
+        fs::create_dir_all(&dir)
+            .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
+        let path = dir.join("reservations.lock");
+        let guard = crate::fs_lock::try_acquire(&path, Duration::from_secs(120))
+            .map_err(|e| ReservationLockError::io(&path, e))?;
         Ok(Self {
             guard,
             storage: storage.to_path_buf(),
@@ -409,19 +460,27 @@ impl ReservationLock {
     }
     /// Like [`Self::acquire`], but waits no later than `deadline`; a deadline already past makes exactly one attempt.
     pub fn acquire_until(storage: &Path, deadline: std::time::Instant) -> Result<Self> {
-        fs::create_dir_all(storage.join("blobs/v3"))?;
-        let guard = crate::fs_lock::try_acquire_until(
-            &storage.join("blobs/v3/reservations.lock"),
-            deadline,
-        )
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let dir = storage.join("blobs/v3");
+        fs::create_dir_all(&dir)
+            .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
+        let path = dir.join("reservations.lock");
+        let guard = crate::fs_lock::try_acquire_until(&path, deadline)
+            .map_err(|e| ReservationLockError::io(&path, e))?;
         Ok(Self {
             guard,
             storage: storage.to_path_buf(),
         })
     }
     fn verify(&self, storage: &Path) -> Result<()> {
-        if self.storage != storage || !self.guard.verify_writer_epoch()? {
+        if self.storage != storage
+            || !self.guard.verify_writer_epoch().map_err(|e| {
+                crate::views::io::at(
+                    "verifying v3 reservation lock",
+                    &storage.join("blobs/v3/reservations.lock"),
+                    e,
+                )
+            })?
+        {
             return Err(Error::InvalidIdentity);
         }
         Ok(())
@@ -728,18 +787,28 @@ fn for_each_registry(
     mut body: impl FnMut(&str, &Path) -> Result<()>,
 ) -> Result<()> {
     let root = storage.join("blobs/v3");
-    if !root.try_exists()? {
+    if !root
+        .try_exists()
+        .map_err(|e| crate::views::io::at("checking v3 namespace", &root, e))?
+    {
         return Ok(());
     }
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    for entry in
+        fs::read_dir(&root).map_err(|e| crate::views::io::at("listing v3 registries", &root, e))?
+    {
+        let entry =
+            entry.map_err(|e| crate::views::io::at("reading v3 registry entry", &root, e))?;
+        if !entry
+            .file_type()
+            .map_err(|e| crate::views::io::at("reading v3 registry entry type", &entry.path(), e))?
+            .is_dir()
+        {
             continue;
         }
         let path = entry.path().join("members.sqlite");
         if !path
             .try_exists()
-            .map_err(|_| Error::Refused("reservation_ledger_unreadable"))?
+            .map_err(|e| crate::views::io::at("checking v3 registry", &path, e))?
         {
             continue;
         }
@@ -799,17 +868,33 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
     let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
     let mut reserved = 0u64;
     let root = storage.join("blobs/v3");
-    if root.try_exists()? {
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+    if root
+        .try_exists()
+        .map_err(|e| crate::views::io::at("checking v3 namespace", &root, e))?
+    {
+        for entry in fs::read_dir(&root)
+            .map_err(|e| crate::views::io::at("listing v3 reservation registries", &root, e))?
+        {
+            let entry = entry.map_err(|e| {
+                crate::views::io::at("reading v3 reservation registry entry", &root, e)
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|e| {
+                    crate::views::io::at(
+                        "reading v3 reservation registry entry type",
+                        &entry.path(),
+                        e,
+                    )
+                })?
+                .is_dir()
+            {
                 continue;
             }
             let registry = entry.path().join("members.sqlite");
-            if !registry
-                .try_exists()
-                .map_err(|_| Error::Refused("reservation_ledger_unreadable"))?
-            {
+            if !registry.try_exists().map_err(|e| {
+                crate::views::io::at("checking v3 reservation registry", &registry, e)
+            })? {
                 continue;
             }
             let name = entry.file_name();
@@ -882,7 +967,8 @@ impl<'a> RegistryWriter<'a> {
         lock.verify(storage)?;
         let dir = family_dir(storage, family)?;
         if create {
-            fs::create_dir_all(&dir)?;
+            fs::create_dir_all(&dir)
+                .map_err(|e| crate::views::io::at("creating v3 family directory", &dir, e))?;
         }
         Ok(Self {
             database: connections::shared(
@@ -1205,7 +1291,9 @@ impl<'a> RegistryWriter<'a> {
         )?)
     }
     fn registry_identity(&self) -> Result<RegistryIdentity> {
-        let path = fs::canonicalize(self.dir.join("members.sqlite"))?;
+        let registry = self.dir.join("members.sqlite");
+        let path = fs::canonicalize(&registry)
+            .map_err(|e| crate::views::io::at("resolving v3 registry", &registry, e))?;
         Ok(RegistryIdentity {
             file: identity_of(&path),
             path,
@@ -1481,9 +1569,10 @@ pub fn open_base_refs_registry<'a>(
         FORMAT_VERSION,
         || {
             observe(observer, DurabilityStep::V3FloorRaised);
-            let exists = family_dir(storage, family)?
-                .join("members.sqlite")
-                .try_exists()?;
+            let path = family_dir(storage, family)?.join("members.sqlite");
+            let exists = path.try_exists().map_err(|e| {
+                crate::views::io::at("checking v3 base reference registry", &path, e)
+            })?;
             let mut registry = if exists {
                 RegistryWriter::open_for_barrier(storage, family, lock)?
             } else {
@@ -1821,7 +1910,9 @@ impl Publication<'_, '_> {
         for (_, database) in &self.planes {
             checkpoint(&**database.connection()?)?;
         }
-        crate::durability::sync_dir(&self.registry.dir)?;
+        crate::durability::sync_dir(&self.registry.dir).map_err(|e| {
+            crate::views::io::at("syncing v3 registry directory", &self.registry.dir, e)
+        })?;
         Ok(())
     }
 }

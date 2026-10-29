@@ -5451,8 +5451,10 @@ fn reservation_lock_busy(error: &crate::blob_store::v3::Error) -> bool {
         crate::blob_store::v3::Error::Io(error)
             if error
                 .get_ref()
-                .and_then(|source| source.downcast_ref::<crate::fs_lock::AcquireError>())
-                .is_some_and(|source| matches!(source, crate::fs_lock::AcquireError::Timeout))
+                .and_then(|source| {
+                    source.downcast_ref::<crate::blob_store::v3::ReservationLockError>()
+                })
+                .is_some_and(crate::blob_store::v3::ReservationLockError::is_timeout)
     )
 }
 

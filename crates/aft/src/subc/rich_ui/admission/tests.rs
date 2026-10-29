@@ -157,6 +157,47 @@ fn operation_arguments_caps_closed_fields_and_remote_targets() {
 }
 
 #[test]
+fn watch_arguments_are_closed_and_timeouts_are_bounded() {
+    let base = json!({"rich_ui_op":"bash_watch@1","task":"key","pattern":"needle"});
+    for (key, value) in [
+        ("background", json!(true)),
+        ("once", json!(true)),
+        ("deliver", json!("each_line")),
+        ("taskId", json!("bash-0123456789abcdef")),
+        ("ref", json!("HEAD")),
+        ("output_offset", json!(0)),
+        ("outputMode", json!("raw")),
+        ("unknown", json!(true)),
+        ("timeoutMs", json!(0)),
+        ("timeoutMs", json!(20_001)),
+        ("timeoutMs", json!(1.5)),
+        ("timeoutMs", json!("1000")),
+        ("pattern", json!("x".repeat(1025))),
+        ("regex", json!("true")),
+    ] {
+        let mut args = base.clone();
+        args[key] = value;
+        assert_eq!(
+            prepare("bash_watch", args).unwrap_err().code,
+            "args_invalid",
+            "{key}"
+        );
+    }
+    for timeout in [1, 20_000] {
+        let mut args = base.clone();
+        args["timeoutMs"] = timeout.into();
+        assert!(prepare("bash_watch", args).is_ok());
+    }
+    let operation = prepare("bash_watch", base).unwrap();
+    assert_eq!(
+        operation
+            .translate_query(Some("bash-0123456789abcdef"), 120_000)
+            .unwrap()["timeoutMs"],
+        20_000
+    );
+}
+
+#[test]
 fn operation_requires_publication_and_non_carrier_rejects_even_null_marker() {
     for name in ["read", "bash_status"] {
         assert_eq!(

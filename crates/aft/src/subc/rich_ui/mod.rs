@@ -19,12 +19,13 @@
 //! - `session`: stamped session roles, policy-route selection and read dispatch.
 //!
 //! Operation admission is live but fails closed without a published manifest.
-//! Session reads and command views use the selected policy route. Command
-//! watches remain fail-closed until the bounded watch handler is connected.
+//! Session reads, command views and bounded polling watches use the selected
+//! policy route without inheriting worker wait or task-lifetime side effects.
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod admission;
 mod bash_output;
+mod bash_watch;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod builder;
 #[cfg_attr(not(test), allow(dead_code))]

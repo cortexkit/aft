@@ -565,6 +565,7 @@ pub enum RefusalCode {
     AdminTier,
     ManifestBelowFloor,
     ManifestRegressed,
+    ManifestUnavailable,
     SeamSchemaMismatch,
     UnboundIdentity,
     BypassAuditUnavailable,
@@ -583,13 +584,14 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::WorkerNativeGh,
         Self::WorkerWriteRefused,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
         Self::ManifestRegressed,
+        Self::ManifestUnavailable,
         Self::SeamSchemaMismatch,
         Self::UnboundIdentity,
         Self::BypassAuditUnavailable,
@@ -615,6 +617,7 @@ impl RefusalCode {
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
             Self::ManifestRegressed => "gh_shim_manifest_regressed",
+            Self::ManifestUnavailable => "gh_shim_manifest_unavailable",
             Self::SeamSchemaMismatch => "gh_shim_seam_schema_mismatch",
             Self::UnboundIdentity => "gh_shim_unbound_identity",
             Self::BypassAuditUnavailable => "gh_shim_bypass_audit_unavailable",
@@ -749,7 +752,7 @@ fn run(args: &[OsString]) -> i32 {
 
 fn run_with(
     args: &[OsString],
-    mut delegate: impl FnMut(&[OsString]) -> i32,
+    mut native_delegate: impl FnMut(&[OsString]) -> i32,
     mut read_identity: impl FnMut(
         &[OsString],
         &Manifest,
@@ -758,6 +761,10 @@ fn run_with(
     ) -> Result<Option<bool>, String>,
 ) -> i32 {
     let paths = StatePaths::from_process();
+    // The manifest can disappear after authority and audit checks finish.
+    // Recheck it before calling upstream gh, including audited operator writes.
+    let mut delegate =
+        |args: &[OsString]| delegate_with_manifest_guard(args, &paths, &mut native_delegate);
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
             println!("{line}");
@@ -871,9 +878,9 @@ fn run_with(
     // by any bot, and upstream `gh` would run it under the operator's own
     // login. Decide that before the rung probe: the answer does not depend on
     // the governance daemon, and a bound target falls through to the governed
-    // path below unchanged. Without a signed manifest (a public installation,
-    // or one that never verified) there are no bindings to compare against,
-    // so those keep passing through as before.
+    // path below unchanged. Without a signed manifest there are no bindings to
+    // compare against; the fallback below separately checks whether this machine
+    // was previously provisioned before allowing upstream execution.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
@@ -912,9 +919,28 @@ fn run_with(
                 &manifest,
                 current_platform(),
             ),
-            ManifestResolution::Regressed { .. }
-            | ManifestResolution::Invalid(_)
-            | ManifestResolution::Dormant => GovernanceDisposition::Delegate,
+            ManifestResolution::Regressed { manifest, problem } => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
+                return match regressed_disposition(args, &manifest, current_platform(), &problem) {
+                    RegressedDisposition::Passthrough => {
+                        delegate_after_invalid_manifest_notice(args, &problem, delegate)
+                    }
+                    RegressedDisposition::Refuse { code, text } => refuse(code, &text),
+                };
+            }
+            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
+                return dispatch_without_valid_manifest(
+                    args,
+                    &paths,
+                    invalid_manifest_problem.as_ref(),
+                    delegate,
+                );
+            }
         };
         return match disposition {
             GovernanceDisposition::Unavailable(agent_binding) => {
@@ -948,8 +974,7 @@ fn run_with(
 
     // A valid manifest gates R3 both during fresh discovery and when a cached
     // R3 determination is reused. If it disappears or fails validation between
-    // those two moments, the whole invocation falls back to R2 passthrough
-    // instead of a classification-shaped refusal.
+    // those two moments, use the same unavailable-manifest gate as below R3.
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
@@ -967,13 +992,13 @@ fn run_with(
             if let Some(status) = captured_now() {
                 return status;
             }
-            return delegate_after_invalid_manifest_notice(args, &problem, delegate);
+            return dispatch_without_valid_manifest(args, &paths, Some(&problem), delegate);
         }
         ManifestResolution::Dormant => {
             if let Some(status) = captured_now() {
                 return status;
             }
-            return delegate(args);
+            return dispatch_without_valid_manifest(args, &paths, None, delegate);
         }
     };
     let classification = classify(args, &manifest, current_platform());
@@ -4446,14 +4471,88 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
     }
 }
 
+fn manifest_state_was_provisioned(root: &Path) -> bool {
+    [
+        "last-valid-manifest.json",
+        "manifest-version-high-water.json",
+    ]
+    .iter()
+    .any(|name| match fs::symlink_metadata(root.join(name)) {
+        Ok(_) => true,
+        // An unreadable record cannot establish that this is a public,
+        // never-provisioned installation. Only absence permits that fallback.
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    })
+}
+
+fn dispatch_without_valid_manifest(
+    args: &[OsString],
+    paths: &StatePaths,
+    problem: Option<&ManifestProblem>,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
+    if let Some(status) = unavailable_manifest_refusal(args, paths) {
+        return status;
+    }
+    match problem {
+        Some(problem) => delegate_after_invalid_manifest_notice(args, problem, delegate),
+        None => delegate(args),
+    }
+}
+
+fn unavailable_manifest_refusal(args: &[OsString], paths: &StatePaths) -> Option<i32> {
+    // The agent may select an empty override. Check the default location too,
+    // without constructing StatePaths there: that constructor tightens permissions.
+    let default_root = gh_shim_state_dir_from(
+        None,
+        crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
+        crate::environment::non_empty_os_var("HOME").as_deref(),
+    );
+    if (manifest_state_was_provisioned(&paths.root)
+        || manifest_state_was_provisioned(&default_root))
+        && !is_unbound_safe(args)
+    {
+        return Some(refuse(
+            RefusalCode::ManifestUnavailable,
+            "GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",
+        ));
+    }
+    None
+}
+
+fn delegate_with_manifest_guard(
+    args: &[OsString],
+    paths: &StatePaths,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
+    if !is_unbound_safe(args) {
+        match resolve_manifest(paths, unix_seconds()) {
+            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
+                if let Some(status) = unavailable_manifest_refusal(args, paths) {
+                    return status;
+                }
+            }
+            ManifestResolution::Regressed { manifest, problem } => {
+                if let RegressedDisposition::Refuse { code, text } =
+                    regressed_disposition(args, &manifest, current_platform(), &problem)
+                {
+                    return refuse(code, &text);
+                }
+            }
+            ManifestResolution::Active(_) => {}
+        }
+    }
+    delegate(args)
+}
+
 fn delegate_after_invalid_manifest_notice(
     args: &[OsString],
     problem: &ManifestProblem,
     delegate: impl FnOnce(&[OsString]) -> i32,
 ) -> i32 {
-    // Missing manifests identify public installations and must remain silent.
-    // An installed but invalid manifest instead signals a misconfigured
-    // governed seat, so say which ambient identity will execute the fallback.
+    // An invalid artifact gets a notice on permitted fallback, explaining which
+    // ambient identity upstream gh will use. Missing-manifest passthrough stays
+    // silent only when the unavailable-manifest gate permits it.
     eprintln!(
         "gh-shim: manifest invalid ({}); executing with ambient gh credentials",
         problem.fallback_notice_reason().replace(['\n', '\r'], " ")
@@ -8694,6 +8793,41 @@ mod tests {
         assert_eq!(StatePaths::from_process().root, PathBuf::from(selected));
     }
 
+    #[test]
+    fn native_manifest_guard_rechecks_writes_before_upstream_execution() {
+        let _guard = crate::test_env::gh_shim_state_guard();
+        let paths = StatePaths::from_process();
+        let _home = ScopedTestEnvVar::set("HOME", paths.root.to_str());
+        let _xdg = ScopedTestEnvVar::set("XDG_STATE_HOME", paths.root.to_str());
+        write_version_high_water(&paths, 1);
+        let mut calls = 0;
+        for bypass in [None, Some("operator")] {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", bypass);
+            let status = delegate_with_manifest_guard(
+                &os_args(&["pr", "merge", "1", "--squash"]),
+                &paths,
+                |_| {
+                    calls += 1;
+                    73
+                },
+            );
+            assert_eq!(status, 86);
+        }
+        assert_eq!(calls, 0);
+
+        write_signed_manifest(&paths, fixture_manifest(), unix_seconds());
+        let status = delegate_with_manifest_guard(
+            &os_args(&["pr", "merge", "1", "--squash"]),
+            &paths,
+            |_| {
+                calls += 1;
+                73
+            },
+        );
+        assert_eq!(status, 73);
+        assert_eq!(calls, 1);
+    }
+
     /// The shim's state ladder is the operator's XDG state home, deliberately
     /// not the daemon's storage root: every governed seat's placed manifest,
     /// high-water and rung cache live there. See `gh_shim_state_dir_from`.
@@ -11270,10 +11404,14 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 21);
+        assert_eq!(RefusalCode::ALL.len(), 22);
         assert_eq!(
             RefusalCode::WorkerWriteRefused.as_str(),
             crate::gh_shim_speech::WORKER_WRITE_CODE
+        );
+        assert_eq!(
+            RefusalCode::ManifestUnavailable.as_str(),
+            "gh_shim_manifest_unavailable"
         );
         assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
@@ -16568,6 +16706,16 @@ fn run_captured_protected(
     now: u64,
 ) -> i32 {
     use crate::gh_shim_speech::{Code, Refusal};
+    // Background writes retain a signed policy snapshot from command launch,
+    // but still require the current manifest. Report its absence before dispatch.
+    if matches!(
+        resolve_manifest(paths, now),
+        ManifestResolution::Invalid(_) | ManifestResolution::Dormant
+    ) {
+        if let Some(status) = unavailable_manifest_refusal(args, paths) {
+            return status;
+        }
+    }
     let (manifest, classification, binding, rung) =
         match captured_plan(args, paths, target, cwd, now) {
             Ok(plan) => plan,

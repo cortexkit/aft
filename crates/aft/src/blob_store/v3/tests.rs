@@ -24,6 +24,20 @@ fn seed(storage: &Path, family: &str) {
 }
 
 #[test]
+fn directory_reservation_lock_error_names_operation_and_path() {
+    let storage = tempdir().unwrap();
+    let path = storage.path().join("blobs/v3").join("reservations.lock");
+    fs::create_dir_all(&path).unwrap();
+    let error = match ReservationLock::acquire_until(storage.path(), Instant::now()) {
+        Ok(_) => panic!("directory lock must not be accepted"),
+        Err(error) => crate::views::base_refs::BaseRefError::from(error).to_string(),
+    };
+    assert!(error.contains("acquiring v3 reservation lock"), "{error}");
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(path.is_dir());
+}
+
+#[test]
 fn put_batch_keeps_conflict_winners_and_commits_other_rows_in_one_transaction() {
     let _guard = serial();
     let root = tempdir().unwrap();

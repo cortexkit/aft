@@ -29,6 +29,53 @@ fn impact(store: &CallGraphStore, file: &str, symbol: &str, tests: bool) -> Stri
 }
 
 #[test]
+fn callgraph_empty_receiver_note_exact_counts_and_test_filtering() {
+    let (_temp, store) = fixture(&[("lib.rs", "fn target() {}\n")]);
+    let target = store.node_for(Path::new("lib.rs"), "target").unwrap();
+    for include_tests in [false, true] {
+        assert!(empty_receiver_note(&store, &target, 0, include_tests)
+            .unwrap()
+            .is_none());
+    }
+
+    let (_temp, store) = fixture(&[
+        ("lib.rs", "fn target() {}\nfn caller() { unknown(); }\n#[test]\nfn inline_test() { unknown(); }\n"),
+        ("tests/integration.rs", "fn test_caller() { unknown(); }\n"),
+    ]);
+    let target = store.node_for(Path::new("lib.rs"), "target").unwrap();
+    for (include_tests, count, expected) in [
+        (false, 1, "Incomplete: 1 call site in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`."),
+        (true, 3, "Incomplete: 3 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`."),
+    ] {
+        let note = empty_receiver_note(&store, &target, 0, include_tests).unwrap().unwrap();
+        assert_eq!(note.unresolved_call_sites, count);
+        assert_eq!(note.incomplete_reason, expected);
+        assert!(!note.complete);
+        assert!(empty_receiver_note(&store, &target, 1, include_tests).unwrap().is_none());
+    }
+}
+
+#[test]
+fn callgraph_empty_receiver_note_reports_lower_bound_at_cap() {
+    let calls = "unknown();\n".repeat(UNRESOLVED_CALL_SITE_COUNT_LIMIT + 17);
+    let source = format!("fn target() {{}}\nfn caller() {{\n{calls}}}\n");
+    let (_temp, store) = fixture(&[("lib.rs", &source)]);
+    for include_tests in [false, true] {
+        let result =
+            callers_result(&store, Path::new("lib.rs"), "target", 1, include_tests).unwrap();
+        let note = result.incomplete.unwrap();
+        assert_eq!(note.unresolved_call_sites, 1_000);
+        assert_eq!(note.incomplete_reason, "Incomplete: at least 1000 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`.");
+        let result =
+            impact_result(&store, Path::new("lib.rs"), "target", 1, include_tests).unwrap();
+        assert_eq!(
+            result.incomplete.unwrap().incomplete_reason,
+            note.incomplete_reason
+        );
+    }
+}
+
+#[test]
 fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
     for (file, source, entry) in [
         (

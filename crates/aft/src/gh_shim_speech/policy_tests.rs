@@ -502,12 +502,60 @@ fn exact_policy_refusal(reason: &str) -> String {
 }
 
 #[test]
-fn post_probe_policy_arms_recheck_new_protection_and_preserve_public_fallback() {
+fn audited_operator_write_rechecks_manifest_before_native_delegation() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = super::tests::fixture_manifest();
+    let fixture = RunWithFixture::new(&manifest);
+    let _bypass = Env::set("GH_SHIM_BYPASS", Some(OsStr::new("operator")));
+    let args = [
+        "issue",
+        "comment",
+        "7",
+        "--repo",
+        "outside/unbound",
+        "--body",
+        "body",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect::<Vec<OsString>>();
+    let (_capture, lines) = capture_refusals_for_test();
+    let mut delegated = 0;
+    let mut lookups = 0;
+    let exit = run_with(
+        &args,
+        |_| {
+            delegated += 1;
+            71
+        },
+        |_, _, _, _| {
+            lookups += 1;
+            std::fs::remove_file(&fixture.paths.manifest).unwrap();
+            Ok(None)
+        },
+    );
+    assert_eq!(lookups, 1);
+    assert_eq!(exit, 86);
+    assert_eq!(delegated, 0);
+    // The audited operator bypass exists only where the fixture manifest
+    // governs writes (macOS, Linux). Elsewhere the write is not governed, so
+    // nothing is audited, but the missing manifest must still refuse it.
+    assert_eq!(
+        fixture.paths.bypass_audit.is_file(),
+        current_platform() != "unsupported"
+    );
+    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.".to_string()]);
+}
+
+#[test]
+fn post_probe_policy_arms_recheck_protection_and_refuse_provisioned_writes() {
     let _lock = crate::test_env::process_env_lock();
     for mode in ["dormant", "invalid", "regressed"] {
         for protected in [false, true] {
             let manifest = super::tests::fixture_manifest();
             let fixture = RunWithFixture::new(&manifest);
+            // Accepting the initial manifest leaves durable provisioning records.
+            // Losing the artifact during discovery cannot make this a public install.
             let repo = manifest.bindings.keys().next().unwrap();
             let args: Vec<OsString> = ["issue", "comment", "7", "--repo", repo, "--body", "body"]
                 .into_iter()
@@ -557,15 +605,17 @@ fn post_probe_policy_arms_recheck_new_protection_and_preserve_public_fallback() 
                 ),
                 "{mode}: wrong post-probe arm"
             );
-            if protected {
-                assert_ne!(exit, 0);
-                assert_eq!(delegated.get(), 0, "{mode}");
-                assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: this command's bot-write permission cannot be verified (current_manifest_unverifiable); start the command again from a live session, and tell the operator if it repeats.".to_string()], "{mode}");
-            } else {
-                assert_eq!(exit, 71, "{mode}");
-                assert_eq!(delegated.get(), 1, "{mode}");
-                assert!(lines.lock().unwrap().is_empty(), "{mode}");
-            }
+            let expected = match (mode, protected) {
+                ("regressed", true) => "gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: this command's bot-write permission cannot be verified (current_manifest_unverifiable); start the command again from a live session, and tell the operator if it repeats.",
+                // Where the last valid manifest governs nothing (Windows), the
+                // command was never declared, so it refuses as unclassified.
+                ("regressed", false) if current_platform() == "unsupported" => "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest artifact fails validation)",
+                ("regressed", false) => "gh-shim: gh_shim_manifest_regressed: the manifest artifact fails validation; issue comment is refused until the manifest is repaired",
+                _ => "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",
+            };
+            assert_eq!(exit, 86, "{mode}, protected={protected}");
+            assert_eq!(delegated.get(), 0, "{mode}");
+            assert_eq!(*lines.lock().unwrap(), vec![expected.to_string()], "{mode}");
         }
     }
 }

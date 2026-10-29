@@ -593,9 +593,13 @@ pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
 
 static RELIABLE_PUSH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
-fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
-    if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
-        queue.pop_front();
+pub(super) fn reliable_push_evictions() -> u64 {
+    RELIABLE_PUSH_EVICTIONS.load(Ordering::Relaxed)
+}
+
+fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) -> Option<T> {
+    let evicted = if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
+        let evicted = queue.pop_front();
         let total = RELIABLE_PUSH_EVICTIONS
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
@@ -603,28 +607,41 @@ fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
         if total.is_power_of_two() {
             log::warn!("subc reliable Push buffer overflow: evicted_total={total}");
         }
-    }
+        evicted
+    } else {
+        None
+    };
     queue.push_back(item);
+    evicted
 }
 
 fn buffer_push_frame(
+    metrics: &DispatchPathMetrics,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     key: ReplayKey,
     frame: PushFrame,
 ) {
-    bounded_push_back(push_buffer.entry(key).or_default(), frame);
+    if let Some(evicted) = bounded_push_back(push_buffer.entry(key.clone()).or_default(), frame) {
+        metrics.watch_delivery.evicted(key, evicted);
+    }
 }
 
-fn buffer_retry_frame(
+pub(super) fn buffer_retry_frame(
+    metrics: &DispatchPathMetrics,
     retry_buffer: &mut RetryBuffer,
     channel: RouteChannel,
     key: ReplayKey,
     frame: PushFrame,
 ) {
-    bounded_push_back(retry_buffer.entry(channel).or_default(), (key, frame));
+    if let Some((key, frame)) =
+        bounded_push_back(retry_buffer.entry(channel).or_default(), (key, frame))
+    {
+        metrics.watch_delivery.evicted(key, frame);
+    }
 }
 
 pub(super) fn migrate_retry_buffer_to_push_buffer(
+    metrics: &DispatchPathMetrics,
     retry_buffer: &mut RetryBuffer,
     channel: RouteChannel,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
@@ -634,7 +651,7 @@ pub(super) fn migrate_retry_buffer_to_push_buffer(
     };
     let migrated = frames.len();
     for (key, frame) in frames {
-        buffer_push_frame(push_buffer, key, frame);
+        buffer_push_frame(metrics, push_buffer, key, frame);
     }
     migrated
 }
@@ -814,6 +831,7 @@ fn matching_session_route_channels(
 }
 
 fn buffer_detached_reliable_push_frame(
+    metrics: &DispatchPathMetrics,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     root: &ProjectRootId,
@@ -832,7 +850,7 @@ fn buffer_detached_reliable_push_frame(
         if frame_is_bash_observation(frame) && !trust.allows_bash_observation() {
             return;
         }
-        buffer_push_frame(push_buffer, key, frame.clone());
+        buffer_push_frame(metrics, push_buffer, key, frame.clone());
         if let (Some(probe), Some(task_id)) = (lifecycle_probe, completed_task_id(frame)) {
             probe.reliable_completion_retained(task_id, session);
         }
@@ -981,6 +999,7 @@ fn fan_out_reliable_push_frame(
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
         buffer_detached_reliable_push_frame(
+            metrics,
             push_buffer,
             session_identity,
             root,
@@ -1004,14 +1023,14 @@ fn fan_out_reliable_push_frame(
             .get(&channel)
             .is_some_and(|queue| !queue.is_empty())
         {
-            buffer_retry_frame(retry_buffer, channel, key, frame.clone());
+            buffer_retry_frame(metrics, retry_buffer, channel, key, frame.clone());
             continue;
         }
 
         match try_send_push_frame(writer_tx, metrics, channel, frame) {
             PushSendOutcome::Sent => sent_frames += 1,
             PushSendOutcome::Backpressure => {
-                buffer_retry_frame(retry_buffer, channel, key, frame.clone());
+                buffer_retry_frame(metrics, retry_buffer, channel, key, frame.clone());
             }
             PushSendOutcome::PermanentFailure => {
                 log::warn!(
@@ -2183,6 +2202,7 @@ mod tests {
 
         for index in 0..total {
             buffer_push_frame(
+                &DispatchPathMetrics::new(),
                 &mut push_buffer,
                 key.clone(),
                 completion_frame(&format!("task-{index}")),
@@ -2214,8 +2234,18 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
-        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
-        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-b"));
+        buffer_push_frame(
+            &DispatchPathMetrics::new(),
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("task-a"),
+        );
+        buffer_push_frame(
+            &DispatchPathMetrics::new(),
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("task-b"),
+        );
 
         let replayed = replay_buffered_push_frames(
             &writer_tx,
@@ -2250,7 +2280,12 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
-        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
+        buffer_push_frame(
+            &DispatchPathMetrics::new(),
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("task-a"),
+        );
 
         let replayed = replay_buffered_push_frames(
             &writer_tx,
@@ -2941,7 +2976,12 @@ mod tests {
             .expect("prefill writer queue");
         let mut push_buffer = HashMap::new();
         for task in ["replay-1", "replay-2", "replay-3"] {
-            buffer_push_frame(&mut push_buffer, key.clone(), completion_frame(task));
+            buffer_push_frame(
+                &DispatchPathMetrics::new(),
+                &mut push_buffer,
+                key.clone(),
+                completion_frame(task),
+            );
         }
 
         assert_eq!(
@@ -2997,6 +3037,7 @@ mod tests {
         };
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(
+            &DispatchPathMetrics::new(),
             &mut retry_buffer,
             route_key(5, 1),
             key.clone(),
@@ -3006,6 +3047,7 @@ mod tests {
 
         assert_eq!(
             migrate_retry_buffer_to_push_buffer(
+                &DispatchPathMetrics::new(),
                 &mut retry_buffer,
                 route_key(5, 1),
                 &mut push_buffer
@@ -3035,6 +3077,7 @@ mod tests {
 
         let mut push_buffer = HashMap::new();
         buffer_push_frame(
+            &DispatchPathMetrics::new(),
             &mut push_buffer,
             key.clone(),
             completion_frame("closed-replay"),
@@ -3055,6 +3098,7 @@ mod tests {
 
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(
+            &DispatchPathMetrics::new(),
             &mut retry_buffer,
             route_key(4, 1),
             key,

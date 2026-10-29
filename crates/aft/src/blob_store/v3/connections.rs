@@ -93,10 +93,16 @@ pub(super) fn shared(
     create: bool,
     readonly: bool,
 ) -> Result<Arc<Database>> {
-    let canonical = if path.try_exists()? {
-        fs::canonicalize(path)?
+    let canonical = if path
+        .try_exists()
+        .map_err(|e| crate::views::io::at("checking v3 database", path, e))?
+    {
+        fs::canonicalize(path)
+            .map_err(|e| crate::views::io::at("resolving v3 database", path, e))?
     } else {
-        fs::canonicalize(path.parent().ok_or(Error::InvalidIdentity)?)?
+        let parent = path.parent().ok_or(Error::InvalidIdentity)?;
+        fs::canonicalize(parent)
+            .map_err(|e| crate::views::io::at("resolving v3 database directory", parent, e))?
             .join(path.file_name().ok_or(Error::InvalidIdentity)?)
     };
     let identity = identity_of(&canonical);

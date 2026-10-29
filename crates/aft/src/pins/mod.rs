@@ -149,10 +149,12 @@ impl AssemblyPin {
         generation: String,
         keys: Vec<String>,
     ) -> Result<Self, PinError> {
-        let _barrier = crate::storage_retention::pin_barrier(view_dir)?;
+        let _barrier = crate::storage_retention::pin_barrier(view_dir)
+            .map_err(|e| crate::views::io::at("acquiring pin barrier in", view_dir, e))?;
         validate_generation(&generation)?;
         let pins_dir = view_dir.join("pins");
-        crate::private_storage::create_dir_all(&pins_dir)?;
+        crate::private_storage::create_dir_all(&pins_dir)
+            .map_err(|e| crate::views::io::at("creating pin directory", &pins_dir, e))?;
 
         let keys_path = pins_dir.join(format!("{generation}.keys"));
         write_keys(&keys_path, keys)?;
@@ -190,7 +192,7 @@ impl AssemblyPin {
     /// its own metadata. A sweep may have reclaimed a pin it wrongly judged
     /// dead; publishing without it would expose keys nothing protected.
     pub fn verify_held(&self) -> Result<(), PinError> {
-        let stored: PinMetadata = serde_json::from_slice(&fs::read(&self.metadata_path)?)?;
+        let stored: PinMetadata = read_metadata_strict(&self.metadata_path)?;
         if stored.owner != self.metadata.owner
             || stored.generation != self.metadata.generation
             || stored.family != self.metadata.family
@@ -308,11 +310,14 @@ pub fn protect_then_touch(
 /// Reads a pin's metadata, failing on anything unreadable or malformed. The
 /// family sweep aborts on such an error instead of skipping the pin.
 pub(crate) fn read_metadata_strict(path: &Path) -> Result<PinMetadata, PinError> {
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    Ok(serde_json::from_slice(&fs::read(path).map_err(|e| {
+        crate::views::io::at("reading pin metadata", path, e)
+    })?)?)
 }
 
 pub(crate) fn read_keys(path: &Path) -> Result<Vec<[u8; 32]>, PinError> {
-    let contents = fs::read_to_string(path)?;
+    let contents =
+        fs::read_to_string(path).map_err(|e| crate::views::io::at("reading pin keys", path, e))?;
     contents.lines().map(parse_hex_key).collect()
 }
 
@@ -344,7 +349,8 @@ fn write_keys(path: &Path, mut encoded: Vec<String>) -> Result<(), PinError> {
     encoded.sort_unstable();
     encoded.dedup();
     let file = create_private(path)?;
-    write_key_lines(file, encoded.iter().map(String::as_str))?;
+    write_key_lines(file, encoded.iter().map(String::as_str))
+        .map_err(|e| crate::views::io::at("writing pin keys", path, e))?;
     Ok(())
 }
 
@@ -416,11 +422,20 @@ fn write_metadata(path: &Path, metadata: &PinMetadata) -> Result<(), PinError> {
     let temporary = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_ms()));
     let result = (|| {
         let mut file = create_private(&temporary)?;
-        serde_json::to_writer(&mut file, metadata)?;
-        file.write_all(b"\n")?;
-        crate::durability::sync_file(&file, path)?;
+        file.write_all(&serde_json::to_vec(metadata)?)
+            .map_err(|e| crate::views::io::at("writing pin metadata", &temporary, e))?;
+        file.write_all(b"\n")
+            .map_err(|e| crate::views::io::at("writing pin metadata", &temporary, e))?;
+        crate::durability::sync_file(&file, path)
+            .map_err(|e| crate::views::io::at("syncing pin metadata", &temporary, e))?;
         drop(file);
-        fs_lock::rename_over(&temporary, path)?;
+        fs_lock::rename_over(&temporary, path).map_err(|e| {
+            crate::views::io::at(
+                &format!("renaming pin metadata {} to", temporary.display()),
+                path,
+                e,
+            )
+        })?;
         // Strict family sweeps abort on malformed metadata. Keep its data
         // flush even though keys and directory entries are process-lifetime.
         Ok(())
@@ -436,6 +451,7 @@ fn create_private(path: &Path) -> io::Result<File> {
         .write(true)
         .create_new(true)
         .open(path)
+        .map_err(|e| crate::views::io::at("creating pin file", path, e))
 }
 
 fn parse_hex_key(value: &str) -> Result<[u8; 32], PinError> {
@@ -453,6 +469,42 @@ fn parse_hex_key(value: &str) -> Result<[u8; 32], PinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_pin_files_name_operation_and_path_for_v2_and_v3() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for v3 in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let owner = if v3 {
+                ViewRegistration::register_v3(storage.path(), "family", "worker", root.path())
+                    .unwrap()
+            } else {
+                crate::views::registry::FamilyRegistry::open(storage.path(), "family")
+                    .unwrap()
+                    .register_view_with_storage(storage.path(), "worker", root.path())
+                    .unwrap()
+            };
+            let path = owner.view_dir().join("pins").join("generation.keys");
+            fs::create_dir_all(&path).unwrap();
+            let error = AssemblyPin::create_v2(&owner, "generation", &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("creating pin file"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(path.is_dir());
+
+            let mut live = LivePin::create(&owner).unwrap();
+            let path = live.keys_path().to_path_buf();
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let key = FamilyKey::new(crate::blob_store::v2::FamilyPlane::Trigram, [7; 32]);
+            let error = live.protect(&[key]).unwrap_err().to_string();
+            assert!(error.contains("renaming live pin keys"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(path.is_dir());
+        }
+    }
 
     #[test]
     fn durability_assembly_pin_counts() {
@@ -483,6 +535,12 @@ mod tests {
             Ok(())
         });
         assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("renaming pin metadata"), "{error}");
+        assert!(
+            error.contains(&pin.metadata_path.display().to_string()),
+            "{error}"
+        );
         assert!(!put_called, "a failed renewal must stop the put");
     }
 }

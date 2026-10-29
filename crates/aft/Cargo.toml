@@ -178,7 +178,7 @@ oxc_span = "0.126"
 oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
 aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.1" }
 # The placeholder grammar, key-location rules and audit record AFT's vault
 # seam speaks. AFT owns the crate; basal links it later.

@@ -634,7 +634,7 @@ pub struct FileCallData {
     /// Map from symbol name → list of call sites within that symbol's body.
     pub calls_by_symbol: HashMap<String, Vec<CallSite>>,
     /// Rust function items referenced as values, grouped by containing symbol.
-    /// These do not participate in callgraph navigation.
+    /// Callable targets participate in reverse references, not execution trees.
     pub value_refs_by_symbol: HashMap<String, Vec<CallSite>>,
     /// Calls written in a `macro_rules!` template outside any item defined in
     /// that template, keyed by macro name with its `!` (e.g. `check!`). They
@@ -1496,12 +1496,18 @@ fn collect_rust_value_refs_by_symbol(
     symbols: &[Symbol],
     line_index: &SourceLineIndex,
 ) -> HashMap<String, Vec<CallSite>> {
-    attribute_sites_to_symbols(
+    let mut references = attribute_sites_to_symbols(
         line_index,
         symbols,
         extract_rust_value_references(source, root),
         LangId::Rust,
-    )
+    );
+    // A function item remains a reference whether it is passed to an API or
+    // stored for later use. The resolver rejects non-callable value candidates.
+    for site in references.values_mut().flatten() {
+        site.kind = CallSiteKind::CallbackReference;
+    }
+    references
 }
 
 fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> Option<bool> {
@@ -4459,7 +4465,7 @@ mod tests {
             for (site, value_ref) in sites {
                 let node = root.descendant_for_byte_range(site.byte_start, site.byte_end).unwrap();
                 let expected = if value_ref {
-                    if node.parent().is_some_and(|parent| {
+                    if lang == LangId::Rust || node.parent().is_some_and(|parent| {
                         matches!(parent.kind(), "arguments" | "argument_list")
                     }) {
                         CallSiteKind::CallbackReference

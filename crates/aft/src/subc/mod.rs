@@ -254,6 +254,7 @@ mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
 mod rich_ui;
+pub(crate) mod watch_delivery;
 // Drives the chunk queries and Occipital's route shapes through the real
 // frame loop, so it lives beside the chunk module but runs as a child of this
 // module to reach the loop and its test fixtures.
@@ -4042,7 +4043,8 @@ async fn teardown_installed_route(
             channel.channel
         );
     }
-    let migrated = push::migrate_retry_buffer_to_push_buffer(retry_buffer, channel, push_buffer);
+    let migrated =
+        push::migrate_retry_buffer_to_push_buffer(metrics, retry_buffer, channel, push_buffer);
     if let Some(identity) = routes.get(&channel) {
         let has_pending_bind = pending_binds
             .values()
@@ -5128,6 +5130,7 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    dispatch_path_metrics.watch_delivery.install(&executor);
     if let Some(probe) = lifecycle_probe.clone() {
         *dispatch_path_metrics
             .lifecycle_probe
@@ -5497,6 +5500,7 @@ where
                 &routes,
                 &mut retry_buffer,
             );
+            dispatch_path_metrics.watch_delivery.kick();
             if retried > 0 {
                 log::debug!(
                     "subc attach: retried {retried} reliable Push frame(s) after writer backpressure"
@@ -10705,6 +10709,7 @@ async fn handle_tool_call_with_capabilities(
                     operation,
                     dispatch,
                     rich_ui_proofs,
+                    reply_budget,
                 )
                 .await;
             }

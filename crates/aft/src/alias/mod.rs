@@ -314,7 +314,9 @@ impl AliasStore {
             .join(artifact_key)
             .join("oid-alias.sqlite");
         if let Some(parent) = path.parent() {
-            crate::private_storage::open_dir(storage, parent)?;
+            crate::private_storage::open_dir(storage, parent).map_err(|e| {
+                crate::views::io::at("creating alias database directory", parent, e)
+            })?;
         }
 
         let connection =
@@ -632,7 +634,9 @@ pub struct ManifestSqliteStore {
 impl ManifestSqliteStore {
     pub fn open(path: &Path) -> Result<Self, AliasError> {
         if let Some(parent) = path.parent() {
-            crate::private_storage::create_dir_all(parent)?;
+            crate::private_storage::create_dir_all(parent).map_err(|e| {
+                crate::views::io::at("creating alias manifest directory", parent, e)
+            })?;
         }
         let connection = crate::db::file_identity::IdentityConnection::open(
             path,
@@ -718,7 +722,8 @@ pub fn capture_git_head_metadata(
     let git_dir = if dot_git.is_dir() {
         canonical_or_original(dot_git)
     } else {
-        let marker = fs::read_to_string(&dot_git)?;
+        let marker = fs::read_to_string(&dot_git)
+            .map_err(|e| crate::views::io::at("reading Git directory marker", &dot_git, e))?;
         let relative = marker
             .trim()
             .strip_prefix("gitdir:")
@@ -737,7 +742,8 @@ pub fn capture_git_head_metadata(
         })
     };
     let head_path = canonical_or_original(git_dir.join("HEAD"));
-    let head = fs::read_to_string(&head_path)?;
+    let head = fs::read_to_string(&head_path)
+        .map_err(|e| crate::views::io::at("reading Git HEAD", &head_path, e))?;
     let resolved_ref_path = head
         .trim()
         .strip_prefix("ref:")
@@ -784,7 +790,8 @@ pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasErro
         .arg("-C")
         .arg(repo_root)
         .args(["ls-tree", "-r", "-z", "HEAD"])
-        .output()?;
+        .output()
+        .map_err(|e| crate::views::io::at("running git ls-tree -r -z HEAD in", repo_root, e))?;
     if !output.status.success() {
         return Err(AliasError::Git {
             command: "ls-tree -r -z HEAD",
@@ -922,7 +929,14 @@ fn git_filter_attributes(
             .args(["check-attr", "--cached", "-z", "--stdin", "filter"]),
         input,
         GIT_METADATA_TIMEOUT,
-    )?;
+    )
+    .map_err(|e| {
+        crate::views::io::at(
+            "running git check-attr --cached -z --stdin filter in",
+            repo_root,
+            e,
+        )
+    })?;
     // Info level: the daemon does not emit debug, and this is the only line an
     // operator can read to see that a large root's attribute pass finished
     // (the write-then-read form of this call once blocked executor workers).
@@ -1127,6 +1141,31 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 fn path_display(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    #[test]
+    fn directory_head_error_names_operation_and_path() {
+        let root = tempfile::tempdir().unwrap();
+        let head = root.path().join(".git").join("HEAD");
+        fs::create_dir_all(&head).unwrap();
+        let error = capture_git_head_metadata(root.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reading Git HEAD"), "{error}");
+        // Windows reports the root in its verbatim `\\?\` spelling, so accept
+        // the canonical form as well as the path the test built.
+        let canonical = fs::canonicalize(&head).unwrap();
+        assert!(
+            error.contains(&head.display().to_string())
+                || error.contains(&canonical.display().to_string()),
+            "{error}"
+        );
+        assert!(head.is_dir());
+    }
 }
 
 #[cfg(all(test, unix))]
