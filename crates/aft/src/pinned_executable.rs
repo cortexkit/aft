@@ -198,6 +198,98 @@ fn linux_image_path() -> PathBuf {
     PathBuf::from(format!("/proc/{}/exe", std::process::id()))
 }
 
+/// A procfs image remains executable after unlink, but realpath cannot resolve
+/// its deleted deployment name. Preserve only an exact, live image alias that
+/// has the same inode as this process, including in the sandbox-launch child.
+pub(crate) fn running_image_read_path(path: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let _image = open_running_image_read(path).ok()??;
+        return Some(path.to_path_buf());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Open only a numeric procfs image endpoint matching the executing image.
+/// The launcher gives Landlock this same verified descriptor, not a reopened
+/// pathname that could identify a different image by the time it is granted.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn open_running_image_read(path: &Path) -> io::Result<Option<std::fs::File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::{ffi::CStr, fs::File};
+
+    let Some(value) = path.to_str() else {
+        return Ok(None);
+    };
+    let Some(pid) = value
+        .strip_prefix("/proc/")
+        .and_then(|value| value.strip_suffix("/exe"))
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return Ok(None);
+    };
+    if pid == 0 || value != format!("/proc/{pid}/exe") {
+        return Ok(None);
+    }
+    fn require_procfs(directory: &File) -> io::Result<()> {
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the live file descriptor and writable statfs buffer are valid.
+        if unsafe { libc::fstatfs(directory.as_raw_fd(), info.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { info.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+            return Err(io::Error::other("image endpoint is not on procfs"));
+        }
+        Ok(())
+    }
+    fn open_at(parent: &File, name: &CStr, directory: bool) -> io::Result<File> {
+        let flags = libc::O_PATH
+            | libc::O_CLOEXEC
+            | if directory {
+                libc::O_DIRECTORY | libc::O_NOFOLLOW
+            } else {
+                0
+            };
+        // SAFETY: parent stays open and name is NUL-terminated. Only the known
+        // procfs `exe` endpoint is opened with final-link following enabled.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new descriptor owned by this File.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    fn image_at(proc_root: &File, pid: u32) -> io::Result<File> {
+        let name = std::ffi::CString::new(pid.to_string()).map_err(io::Error::other)?;
+        let directory = open_at(proc_root, &name, true)?;
+        require_procfs(&directory)?;
+        open_at(&directory, c"exe", false)
+    }
+    let proc_root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/proc")?;
+    require_procfs(&proc_root)?;
+    let candidate = image_at(&proc_root, pid)?;
+    let candidate_metadata = candidate.metadata()?;
+    let running = image_at(&proc_root, std::process::id())?.metadata()?;
+    if !candidate_metadata.is_file()
+        || (candidate_metadata.dev(), candidate_metadata.ino()) != (running.dev(), running.ino())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "procfs image does not match the executing image",
+        ));
+    }
+    Ok(Some(candidate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

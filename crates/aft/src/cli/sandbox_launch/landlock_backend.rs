@@ -372,6 +372,14 @@ struct OpenedRulePath {
 }
 
 fn open_read_rule_path(path: &Path, from_listing: bool) -> Result<Option<OpenedRulePath>, String> {
+    if let Some(image) = aft::pinned_executable::open_running_image_read(path)
+        .map_err(|error| format!("failed to open running image {}: {error}", path.display()))?
+    {
+        return Ok(Some(OpenedRulePath {
+            fd: image.into(),
+            is_dir: false,
+        }));
+    }
     match open_rule_path(path) {
         Ok(opened) => Ok(Some(opened)),
         // A child can disappear even after launcher validation. Removing this
@@ -597,6 +605,42 @@ pub(super) fn abi_label(abi: ABI) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_image_read_rule_retains_verified_inode_and_no_directory_access() {
+        use std::os::unix::fs::MetadataExt;
+        let path = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        let opened = open_read_rule_path(&path, false).unwrap().unwrap();
+        let held = fstat_fd(&opened.fd).unwrap();
+        let running = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_eq!((held.st_dev, held.st_ino), (running.dev(), running.ino()));
+        assert!(!opened.is_dir);
+        assert!(
+            !access_for_opened_path(AccessFs::from_read(TARGET_ABI), opened.is_dir)
+                .contains(AccessFs::ReadDir)
+        );
+        assert!(
+            open_rule_path(&path).is_err(),
+            "write grants still reject the magic link"
+        );
+    }
+
+    #[test]
+    fn running_image_read_rule_refuses_missing_or_foreign_images_even_if_listed() {
+        let missing = Path::new("/proc/4294967295/exe");
+        assert!(open_read_rule_path(missing, false).is_err());
+        assert!(open_read_rule_path(missing, true).is_err());
+        let mut foreign = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let path = PathBuf::from(format!("/proc/{}/exe", foreign.id()));
+        let result = open_read_rule_path(&path, false);
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert!(result.is_err());
+        assert!(open_read_rule_path(Path::new("/proc/self/exe"), false).is_err());
+    }
 
     #[test]
     fn vanished_listed_read_rule_is_omitted_after_validation() {

@@ -367,6 +367,13 @@ fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
     path.canonicalize()
 }
 
+fn canonicalize_read_path(path: &Path) -> std::io::Result<PathBuf> {
+    match crate::pinned_executable::running_image_read_path(path) {
+        Some(image) => Ok(image),
+        None => canonicalize_path(path),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -428,7 +435,12 @@ fn canonicalize_required_paths(
     let mut canonical = Vec::with_capacity(paths.len());
     for path in paths {
         validate_absolute(&path, field)?;
-        canonical.push(canonicalize_path(&path).map_err(|error| {
+        let resolved = if matches!(field, "read_allow" | "data_policy.read_allow") {
+            canonicalize_read_path(&path)
+        } else {
+            canonicalize_path(&path)
+        };
+        canonical.push(resolved.map_err(|error| {
             SandboxProfileError::new(format!(
                 "{field} path does not exist: {}: {error}",
                 path.display()
@@ -502,7 +514,7 @@ fn canonicalize_read_grants(
             continue;
         }
         let from_listing = inventory.contains(&path);
-        let resolved = match canonicalize_path(&path) {
+        let resolved = match canonicalize_read_path(&path) {
             Ok(resolved) => resolved,
             // Omitting a vanished inventory entry only removes an additive read
             // grant. Explicit read paths still fail closed, even after transfer.

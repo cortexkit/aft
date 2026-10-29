@@ -80,6 +80,50 @@ fn copy_and_warm_aft(destination: &Path) {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn pinned_executable_read_grants_preserve_only_matching_live_numeric_proc_images() {
+    use aft::sandbox_profile::SandboxProfile;
+
+    let root = tempfile::tempdir().unwrap();
+    let profile = |image: PathBuf| {
+        SandboxProfile::build(
+            vec![root.path().to_path_buf()],
+            vec![],
+            vec![],
+            vec![image],
+            vec![],
+            vec![],
+            vec![],
+            root.path().to_path_buf(),
+        )
+    };
+    let own_image = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+    let mut own = profile(own_image.clone()).unwrap();
+    own.data_policy.read_allow.push(own_image.clone());
+    own.data_policy.write_allow.push(own_image.clone());
+    let own = own.canonicalize_for_launch().unwrap();
+    assert_eq!(own.read_allow, vec![own_image.clone()]);
+    assert_eq!(own.data_policy.read_allow, vec![own_image.clone()]);
+    assert_ne!(own.data_policy.write_allow, vec![own_image]);
+
+    let self_alias = PathBuf::from("/proc/self/exe");
+    let ordinary = profile(self_alias.clone()).unwrap();
+    assert_eq!(
+        ordinary.read_allow,
+        vec![self_alias.canonicalize().unwrap()]
+    );
+    assert!(profile(PathBuf::from("/proc/4294967295/exe")).is_err());
+
+    let mut foreign = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let foreign_alias = PathBuf::from(format!("/proc/{}/exe", foreign.id()));
+    let expected = foreign_alias.canonicalize();
+    let foreign_profile = profile(foreign_alias);
+    let _ = foreign.kill();
+    let _ = foreign.wait();
+    assert_eq!(foreign_profile.unwrap().read_allow, vec![expected.unwrap()]);
+}
+
 #[test]
 fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pins() {
     use std::os::unix::fs::MetadataExt;
