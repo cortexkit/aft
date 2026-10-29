@@ -53,6 +53,9 @@ ready trigram/callgraph indexes and no semantic embedding service. Bash replies
 observe a persisted terminal task with stdout `one\n`, stderr `two\n` and exit
 code 0; no shell command or network request is run.
 
+`manifestDigest` identifies the injected manifest bytes. It is not a production
+publication tag; regenerate and review the samples when publishing the manifest.
+
 Normalization replaces the temporary project root with `${FIXTURE_ROOT}`, the
 fixture task id with `bash-SAMPLE`, and the viewed call key with `sample-CALL`.
 Numeric task timestamps and measured durations, if present, become 0. The

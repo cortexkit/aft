@@ -68,6 +68,7 @@ async fn capture() -> Value {
     let mut document = json!({
         "format":"aft-rich-ui-manifest-v1",
         "publication":"injected-test-manifest",
+        "manifestDigest":super::super::super::canonical::manifest_digest(MANIFEST),
         "vectors":vectors,
     });
     normalize(&mut document, &f);
@@ -138,13 +139,15 @@ fn validate(document: &Value) {
     }
     for vector in vectors {
         let request = &vector["request"];
-        let operation = super::super::super::admission::prepare(
-            request["name"].as_str().unwrap(),
-            &request["arguments"],
-        )
-        .unwrap();
-        super::super::super::carrier::validate_body(Some(&operation.entry), &vector["reply"])
+        let (id, version) = request["arguments"]["rich_ui_op"]
+            .as_str()
+            .unwrap()
+            .rsplit_once('@')
             .unwrap();
+        assert_eq!(version, "1");
+        let entry = entries.iter().find(|entry| entry["id"] == id).unwrap();
+        assert_eq!(entry["target"]["tool"], request["name"]);
+        super::super::super::carrier::validate_body(Some(entry), &vector["reply"]).unwrap();
     }
 }
 
