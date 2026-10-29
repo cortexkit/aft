@@ -14,7 +14,6 @@ const LANE_CAP: usize = 256;
 
 pub(super) struct StandaloneReads {
     executor: Arc<Executor>,
-    root: ProjectRootId,
     reads: Arc<AtomicUsize>,
     heavy: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -22,13 +21,7 @@ pub(super) struct StandaloneReads {
 }
 
 impl StandaloneReads {
-    pub(super) fn new(ctx: &Arc<AppContext>) -> Self {
-        let root = ctx
-            .config()
-            .project_root
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().expect("standalone working directory"));
-        let root = ProjectRootId::from_path(&root).expect("standalone root identity");
+    pub(super) fn new() -> Self {
         // Even on small machines, a capped heavy lane must leave an actor and
         // worker slot for a cheap read. The executor still owns all scheduling.
         let mut config = ExecutorConfig::default();
@@ -36,10 +29,8 @@ impl StandaloneReads {
         config.actor_cap = config.actor_cap.max(2);
         config.heavy_permits = config.heavy_permits.min(config.actor_cap - 1);
         let executor = Arc::new(Executor::with_config(config));
-        executor.register_actor(root.clone(), Arc::clone(ctx));
         Self {
             executor,
-            root,
             reads: Arc::new(AtomicUsize::new(0)),
             heavy: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -53,25 +44,36 @@ impl StandaloneReads {
         ctx: &Arc<AppContext>,
         lane: Lane,
     ) -> DispatchOutcome {
+        let config = ctx.config();
+        let root = match ProjectRootId::from_path(
+            config
+                .project_root
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                return DispatchOutcome::Immediate(Response::error(
+                    &req.id,
+                    "invalid_project_root",
+                    format!("standalone root identity: {error}"),
+                ))
+            }
+        };
+        self.executor.register_actor(root.clone(), Arc::clone(ctx));
         let count = match lane {
             Lane::PureRead => &self.reads,
             Lane::HeavyInit => &self.heavy,
             _ => unreachable!("standalone parallel read lane"),
         };
-        if count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < LANE_CAP).then_some(n + 1)
-            })
-            .is_err()
-        {
+        let Some(slot) = AdmissionSlot::try_acquire(count) else {
             return DispatchOutcome::Immediate(Response::error_with_data(
                 &req.id,
                 "busy",
                 "standalone read lane is full; retry after outstanding calls finish",
                 serde_json::json!({"retryable": true}),
             ));
-        }
-        let slot = AdmissionSlot(Arc::clone(count));
+        };
         let id = req.id.clone();
         let session = req.session().to_string();
         let command = super::attach_command_for_request(&req);
@@ -91,17 +93,21 @@ impl StandaloneReads {
                 Instant::now() + Duration::from_millis(remaining)
             });
         let (tx, rx) = mpsc::sync_channel(1);
-        let config = ctx.config();
         let ask_route = aft::access_policy::capture_ask_route();
         let worker_session = req.session_id.clone();
         #[cfg(test)]
         let probe = self.probe.clone();
         self.executor.submit_tool_call_with_completion(
-            self.root.clone(),
+            root.clone(),
             lane,
             id.clone(),
             &command,
             Box::new(move |ctx| {
+                // Detached view updates must share the process-wide publication
+                // lock used by standalone mutations and maintenance. The executor's
+                // actor lock alone does not protect those inline file mutations.
+                let _publication =
+                    aft::executor::view_publication::install_standalone_scope(Arc::clone(ctx));
                 let _ask_route = ask_route.install();
                 let _config = ctx.pin_config_to(config);
                 if expired(deadline) {
@@ -124,7 +130,6 @@ impl StandaloneReads {
         let shutdown_id = id.clone();
         let shutdown_command = command.clone();
         let executor = self.executor.clone();
-        let root = self.root.clone();
         let poll_cancellation = cancellation.clone();
         DispatchOutcome::Deferred(
             PendingResponse::polling(
@@ -132,6 +137,11 @@ impl StandaloneReads {
                 session,
                 command,
                 Box::new(move |_| {
+                    if poll_cancellation.cancel_already_requested() {
+                        // Queued jobs settle immediately; running handlers own
+                        // their terminal response, including any partial data.
+                        executor.cancel_job(&root, &poll_cancellation);
+                    }
                     match rx.try_recv() {
                         Ok(response) => Some(response),
                         Err(mpsc::TryRecvError::Disconnected) => Some(Response::error(
@@ -143,14 +153,6 @@ impl StandaloneReads {
                             if expired(deadline) {
                                 executor.cancel_job(&root, &poll_cancellation);
                                 Some(deadline_response(&poll_id))
-                            } else if poll_cancellation.cancel_already_requested() {
-                                // Remove queued work immediately; running handlers keep
-                                // their token and their admission slot until they exit.
-                                executor.cancel_job(&root, &poll_cancellation);
-                                Some(super::cancelled_deferred_response(
-                                    &poll_id,
-                                    &shutdown_command,
-                                ))
                             } else {
                                 None
                             }
@@ -161,13 +163,33 @@ impl StandaloneReads {
             .with_poll_interval(Duration::from_millis(10))
             .with_cancellation(cancellation)
             .with_shutdown(Box::new(move |_| {
-                super::cancelled_deferred_response(&shutdown_id, "read")
+                super::cancelled_deferred_response(&shutdown_id, &shutdown_command)
             })),
         )
     }
 }
 
 struct AdmissionSlot(Arc<AtomicUsize>);
+
+impl AdmissionSlot {
+    fn try_acquire(count: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut observed = count.load(Ordering::Acquire);
+        loop {
+            if observed >= LANE_CAP {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(Arc::clone(count))),
+                Err(current) => observed = current,
+            }
+        }
+    }
+}
 
 impl Drop for AdmissionSlot {
     fn drop(&mut self) {
@@ -251,7 +273,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("fixture.rs"), "fn fast_zoom() {}\n").unwrap();
         let ctx = fixture(root.path());
-        let mut reads = StandaloneReads::new(&ctx);
+        let mut reads = StandaloneReads::new();
         let clock_ms = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let release = Release(Arc::clone(&gate));
@@ -280,7 +302,7 @@ mod tests {
                     request(
                         &format!("slow-{n}"),
                         "callers",
-                        serde_json::json!({"path":"fixture.rs", "symbol":"fast_zoom"}),
+                        serde_json::json!({"file":"fixture.rs", "symbol":"fast_zoom"}),
                     ),
                     &ctx,
                     &reads,
@@ -297,7 +319,7 @@ mod tests {
                 request(
                     "fast",
                     "zoom",
-                    serde_json::json!({"path":"fixture.rs", "symbol":"fast_zoom"}),
+                    serde_json::json!({"file":"fixture.rs", "symbol":"fast_zoom"}),
                 ),
                 &ctx,
                 &reads,
@@ -317,7 +339,7 @@ mod tests {
     fn standalone_write_then_parallel_reads_observe_mutation_in_same_session() {
         let root = tempfile::tempdir().unwrap();
         let ctx = fixture(root.path());
-        let reads = StandaloneReads::new(&ctx);
+        let reads = StandaloneReads::new();
         for wrapped in [false, true] {
             let symbol = if wrapped {
                 "after_wrapped_write"
@@ -329,7 +351,7 @@ mod tests {
                     "write",
                     "write",
                     serde_json::json!({
-                        "path":"fixture.rs", "content":format!("fn {symbol}() {{}}\n"), "validate":"off"
+                        "file":"fixture.rs", "content":format!("fn {symbol}() {{}}\n"), "validate":"off"
                     }),
                 ),
                 &ctx,
@@ -345,17 +367,28 @@ mod tests {
                     "grep",
                     serde_json::json!({"pattern":symbol, "path":"fixture.rs"}),
                 ),
-                ("outline", serde_json::json!({"path":"fixture.rs"})),
+                (
+                    "outline",
+                    if wrapped {
+                        serde_json::json!({"target":"fixture.rs"})
+                    } else {
+                        serde_json::json!({"file":"fixture.rs"})
+                    },
+                ),
                 (
                     "zoom",
-                    serde_json::json!({"path":"fixture.rs", "symbol":symbol}),
+                    if wrapped {
+                        serde_json::json!({"batch":[{"target":"fixture.rs", "symbols":symbol}]})
+                    } else {
+                        serde_json::json!({"file":"fixture.rs", "symbol":symbol})
+                    },
                 ),
             ] {
                 let req = if wrapped {
                     request(
                         command,
                         "tool_call",
-                        serde_json::json!({"name":format!("aft_{command}"), "arguments":params}),
+                        serde_json::json!({"name":command, "arguments":params}),
                     )
                 } else {
                     request(command, command, params)
@@ -377,7 +410,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("fixture.rs"), "fn fast_zoom() {}\n").unwrap();
         let ctx = fixture(root.path());
-        let mut reads = StandaloneReads::new(&ctx);
+        let mut reads = StandaloneReads::new();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let release = Release(Arc::clone(&gate));
         reads.probe = Some(Arc::new(move |req| {
@@ -396,7 +429,7 @@ mod tests {
                     request(
                         &format!("queued-{n}"),
                         "callers",
-                        serde_json::json!({"path":"fixture.rs", "symbol":"fast_zoom"}),
+                        serde_json::json!({"file":"fixture.rs", "symbol":"fast_zoom"}),
                     ),
                     &ctx,
                     &reads,
@@ -419,7 +452,7 @@ mod tests {
                 request(
                     "deadline",
                     "zoom",
-                    serde_json::json!({"path":"fixture.rs", "symbol":"fast_zoom", "deadline_ms":0}),
+                    serde_json::json!({"file":"fixture.rs", "symbol":"fast_zoom", "deadline_ms":0}),
                 ),
                 &ctx,
                 &reads,
@@ -460,7 +493,7 @@ mod tests {
         )
         .unwrap();
         let ctx = fixture(root.path());
-        let reads = StandaloneReads::new(&ctx);
+        let reads = StandaloneReads::new();
         for command in [
             "grep",
             "glob",
@@ -474,23 +507,49 @@ mod tests {
             "trace_data",
         ] {
             for wrapped in [false, true] {
-                let params = serde_json::json!({"path":"fixture.rs", "pattern":"target", "symbol":"target", "to_symbol":"caller", "expression":"target"});
+                let native = match command {
+                    "grep" => serde_json::json!({"path":"fixture.rs", "pattern":"target"}),
+                    "glob" => serde_json::json!({"pattern":"**/*.rs"}),
+                    "outline" => serde_json::json!({"file":"fixture.rs"}),
+                    _ => {
+                        serde_json::json!({"file":"fixture.rs", "symbol":"target", "toSymbol":"caller", "expression":"target"})
+                    }
+                };
                 let req = if wrapped {
+                    let (name, arguments) = match command {
+                        "grep" | "glob" => (command, native.clone()),
+                        "outline" => (command, serde_json::json!({"target":"fixture.rs"})),
+                        "zoom" => (
+                            command,
+                            serde_json::json!({"batch":[{"target":"fixture.rs", "symbols":"target"}]}),
+                        ),
+                        _ => (
+                            "callgraph",
+                            serde_json::json!({"op":command, "path":"fixture.rs", "symbol":"target", "toSymbol":"caller", "expression":"target"}),
+                        ),
+                    };
                     request(
                         "parity",
                         "tool_call",
-                        serde_json::json!({"name":format!("aft_{command}"), "arguments":params}),
+                        serde_json::json!({"name":name, "arguments":arguments}),
                     )
                 } else {
-                    request("parity", command, params)
+                    request("parity", command, native)
                 };
-                let inline = super::super::dispatch(req.clone(), &ctx);
+                super::super::dispatch(req.clone(), &ctx);
+                let mut inline = super::super::dispatch(req.clone(), &ctx);
+                assert_ne!(inline.data["code"], "unknown_command", "{inline:?}");
+                assert_ne!(inline.data["code"], "invalid_request", "{inline:?}");
                 let mut pending = PendingResponses::default();
                 register(
                     &mut pending,
                     super::super::dispatch_outcome(req, &ctx, &reads),
                 );
-                let response = finish(&ctx, &mut pending).pop().unwrap();
+                let mut response = finish(&ctx, &mut pending).pop().unwrap();
+                // Grep reports measured handler time; only that volatile field
+                // is excluded from the inline/deferred response comparison.
+                inline.data.as_object_mut().unwrap().remove("search_ms");
+                response.data.as_object_mut().unwrap().remove("search_ms");
                 assert_eq!(
                     serde_json::to_value(response).unwrap(),
                     serde_json::to_value(inline).unwrap(),

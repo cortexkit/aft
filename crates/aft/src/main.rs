@@ -599,7 +599,7 @@ fn main() {
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
     let pending_poll_interval = standalone_pending_poll_interval();
     let mut pending = PendingResponses::default();
-    let reads = StandaloneReads::new(registry.current());
+    let reads = StandaloneReads::new();
     let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
     let mut queued_lines = VecDeque::new();
     let input_budget = InputBudget::new(MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS);
@@ -2425,7 +2425,7 @@ mod core_framing_tests {
             serde_json::json!({"id":"shared-id","session_id":"second-session","command":"ping"}),
         )
         .unwrap();
-        let reads = StandaloneReads::new(&ctx);
+        let reads = StandaloneReads::new();
         let outcome = dispatch_with_pending_admission(request, &ctx, &mut pending, &reads);
         DISPATCH_CONFIG_PROBE.with(|slot| slot.borrow_mut().take());
         assert!(
@@ -3431,7 +3431,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             slow_search_request("deferred-search"),
             &deferred_ctx,
-            &StandaloneReads::new(&deferred_ctx),
+            &StandaloneReads::new(),
         ));
         deferred_started
             .recv_timeout(Duration::from_secs(10))
@@ -3478,7 +3478,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             slow_search_request("cancelled-search"),
             &ctx,
-            &StandaloneReads::new(&ctx),
+            &StandaloneReads::new(),
         ));
         started
             .recv_timeout(Duration::from_secs(30))
@@ -3649,7 +3649,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             make_request(),
             &deferred_ctx,
-            &StandaloneReads::new(&deferred_ctx),
+            &StandaloneReads::new(),
         ));
         let mut deferred_bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -3717,7 +3717,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             make_request(),
             &deferred_ctx,
-            &StandaloneReads::new(&deferred_ctx),
+            &StandaloneReads::new(),
         ));
         let mut deferred_bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3823,7 +3823,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             make_request(),
             &deferred_ctx,
-            &StandaloneReads::new(&deferred_ctx),
+            &StandaloneReads::new(),
         ));
         let mut deferred_bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(30);

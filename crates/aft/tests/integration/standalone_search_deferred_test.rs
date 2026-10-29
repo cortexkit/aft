@@ -1154,7 +1154,7 @@ fn standalone_back_to_back_write_then_grep_outline_zoom_observe_write() {
     let (_project, _storage, mut aft) =
         mutation_freshness_fixture_with_content("export function before_write() { return 1; }\n");
     // Populate parser caches before replacing the file through the protocol.
-    let warm = aft.send(r#"{"id":"warm","command":"outline","path":"src/source.ts"}"#);
+    let warm = aft.send(r#"{"id":"warm","command":"outline","file":"src/source.ts"}"#);
     assert_eq!(warm["success"], true, "{warm:?}");
     for wrapped in [false, true] {
         let symbol = if wrapped {
@@ -1164,16 +1164,30 @@ fn standalone_back_to_back_write_then_grep_outline_zoom_observe_write() {
         };
         aft.send_silent(&json!({
             "id":"write", "command":"write", "session_id":"ordered-session",
-            "path":"src/source.ts", "content":format!("export function {symbol}() {{ return 2; }}\n"),
+            "file":"src/source.ts", "content":format!("export function {symbol}() {{ return 2; }}\n"),
             "validate":"off"
         }).to_string());
         for (command, params) in [
             ("grep", json!({"path":"src/source.ts", "pattern":symbol})),
-            ("outline", json!({"path":"src/source.ts"})),
-            ("zoom", json!({"path":"src/source.ts", "symbol":symbol})),
+            (
+                "outline",
+                if wrapped {
+                    json!({"target":"src/source.ts"})
+                } else {
+                    json!({"file":"src/source.ts"})
+                },
+            ),
+            (
+                "zoom",
+                if wrapped {
+                    json!({"batch":[{"target":"src/source.ts", "symbols":symbol}]})
+                } else {
+                    json!({"file":"src/source.ts", "symbol":symbol})
+                },
+            ),
         ] {
             let request = if wrapped {
-                json!({"id":command, "command":"tool_call", "session_id":"ordered-session", "name":format!("aft_{command}"), "arguments":params})
+                json!({"id":command, "command":"tool_call", "session_id":"ordered-session", "name":command, "arguments":params})
             } else {
                 let mut request = params;
                 request["id"] = json!(command);

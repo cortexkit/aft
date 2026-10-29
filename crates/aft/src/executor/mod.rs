@@ -1561,6 +1561,7 @@ impl Executor {
     /// Submit with a transport completion callback. The callback runs after the
     /// terminal response exists, including admission refusals and cancellation,
     /// so a synchronous transport can wake its frame loop without a waiter thread.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_tool_call_with_completion(
         &self,
         root_id: ProjectRootId,
