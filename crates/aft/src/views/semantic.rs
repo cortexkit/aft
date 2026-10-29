@@ -1481,6 +1481,7 @@ impl SemanticPlane {
     {
         let deadline = Instant::now() + budget.shared_wait;
         let mut total = FillReport::default();
+        let mut backoff = Duration::from_millis(10);
         loop {
             let report = self.fill_admitted(
                 owner,
@@ -1491,9 +1492,14 @@ impl SemanticPlane {
                 &mut |_| Ok(()),
                 false,
             )?;
-            let local_wait = report.pending == Some(FillPending::LocalContention);
+            // Another caller can own the filesystem lease before taking the local
+            // gate. Synchronous callers must retry either contention outcome.
+            let contended = matches!(
+                report.pending.as_ref(),
+                Some(FillPending::LocalContention | FillPending::Contended)
+            );
             total.merge_attempt(report);
-            if !local_wait || Instant::now() >= deadline {
+            if !contended || Instant::now() >= deadline {
                 if total.pending.is_none()
                     && total.errors.is_empty()
                     && total.store_errors.is_empty()
@@ -1508,9 +1514,14 @@ impl SemanticPlane {
             // Synchronous callers have no outer worker. Each attempt already
             // dropped its claims and guards; preserve the legacy bounded wait
             // here, never inside the admitted fill used by background workers.
-            std::thread::park_timeout(
-                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-            );
+            let half = backoff / 2;
+            let salt = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            let wait = half + Duration::from_nanos(salt % (half.as_nanos() as u64 + 1));
+            std::thread::park_timeout(wait.min(deadline.saturating_duration_since(Instant::now())));
+            backoff = (backoff * 2).min(Duration::from_millis(250));
         }
     }
 
