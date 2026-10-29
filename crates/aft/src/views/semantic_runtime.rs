@@ -1840,18 +1840,18 @@ impl FillObserver {
         let deadline = Instant::now() + timeout;
         let mut retries = Vec::new();
         loop {
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "semantic fill deadline expired for {}; retries={retries:?}",
-                    self.root.display()
-                ));
-            }
             let event = self.rx.recv_deadline(deadline).map_err(|error| {
                 format!(
                     "semantic fill did not settle for {}: {error}; retries={retries:?}",
                     self.root.display()
                 )
             })?;
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "semantic fill deadline expired for {}; event={event:?}; retries={retries:?}",
+                    self.root.display()
+                ));
+            }
             match event.state {
                 "settled" => return Ok(()),
                 "retry" => {
