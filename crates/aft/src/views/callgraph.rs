@@ -977,10 +977,8 @@ mod tests {
             _ => panic!("the live base owner must fence another completion driver"),
         };
         assert_eq!(owner_pid, std::process::id());
-        let error = CallgraphViewError::from(PlaneError::loader(
-            super::super::contracts::LoaderStage::Driver,
-            format!("{V3_BASE_COMPLETION_BUSY}: {outcome:?}"),
-        ));
+        let graph = view(&root, &storage);
+        let error = graph.reader().unwrap_err();
         assert!(error.busy, "{error}");
         assert!(error.reason.contains(V3_BASE_COMPLETION_BUSY), "{error}");
         assert!(
@@ -989,20 +987,83 @@ mod tests {
                 .contains(&format!("owner_pid: {}", std::process::id())),
             "{error}"
         );
+        assert!(!graph.is_ready());
         assert!(matches!(
             crate::context::checkout_view_callgraph_access(Some(Err(error))),
-            crate::context::CallgraphStoreAccess::Error(error)
-                if error.is_transient_lock_contention()
+            crate::context::CallgraphStoreAccess::Building
         ));
 
         claim.release().unwrap();
-        let graph = view(&root, &storage);
         let crate::context::CallgraphStoreAccess::Ready(ready) =
             crate::context::checkout_view_callgraph_access(Some(graph.reader()))
         else {
             panic!("the completed base must serve a ready call graph")
         };
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+    }
+
+    #[test]
+    fn failed_lexical_bootstrap_releases_completion_claim_for_callgraph() {
+        use super::super::first_load::{
+            CheckoutDriver, ConfiguredMembershipWalker, MembershipWalker, TrigramBridge,
+        };
+
+        struct FailSecondWalk(std::sync::atomic::AtomicUsize);
+        impl MembershipWalker for FailSecondWalk {
+            fn files(&self, root: &Path) -> Result<Vec<PathBuf>, PlaneError> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    return Err(PlaneError::loader(
+                        super::super::contracts::LoaderStage::Driver,
+                        "injected reconciliation failure after base publication",
+                    ));
+                }
+                ConfiguredMembershipWalker.files(root)
+            }
+        }
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let storage = temp.path().join("storage");
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let lexical = CheckoutDriver::new_v3(
+            &storage,
+            "donor-reuse",
+            "lexical",
+            &root,
+            super::super::manifest_v2::Producers {
+                trigram: policy.fingerprint_hex(),
+                semantic: None,
+                callgraph: PRODUCER.into(),
+            },
+            Arc::new(FailSecondWalk(std::sync::atomic::AtomicUsize::new(0))),
+            vec![Arc::new(TrigramBridge::new(storage.clone(), policy))],
+        )
+        .unwrap();
+        let error = lexical
+            .verified_bind(
+                &lexical.access(),
+                lexical.installed_snapshot().generation().clone(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected reconciliation failure"),
+            "{error}"
+        );
+
+        // Keep the failed lexical driver alive: its process is still live, so
+        // another driver can finish the graph only if the failed bind released
+        // its completion claim rather than waiting for process-death takeover.
+        let graph = view(&root, &storage);
+        let ready = graph
+            .reader()
+            .expect("a failed bind must not strand a live claim");
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert_eq!(lexical.installed_snapshot().generation().name(), "empty");
     }
 
     #[test]
