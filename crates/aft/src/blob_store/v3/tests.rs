@@ -1934,9 +1934,13 @@ fn semantic_batch_lease_metadata_placement() {
     let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let before = inventory(&family);
     assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
     let lease = crate::views::semantic_batch_lease::try_acquire(root.path(), A, "producer")
         .unwrap()
         .unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     assert_eq!(inventory(&family), before);
     assert_eq!(writer.accounting().unwrap().usage(), before);
     drop(writer);

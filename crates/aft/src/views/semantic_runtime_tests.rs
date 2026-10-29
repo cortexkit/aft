@@ -2486,7 +2486,8 @@ fn semantic_batch_lease_durable_chunks_reused_during_cold_readmission() {
         })
     };
     entered_rx.recv().unwrap();
-    // Provider I/O holds neither root publication nor a registry write barrier.
+    // While embedding is blocked, publication must still acquire the root
+    // lease and SQLite registry transaction and complete independently.
     crate::blob_store::v3::publish(storage.path(), "family", 0, None, |_| Ok(())).unwrap();
     let non_semantic = limiter.try_acquire().expect("HTTP released cold admission");
     release_tx.send(()).unwrap();
@@ -2571,6 +2572,46 @@ fn semantic_batch_lease_pending_releases_refresh_claims_and_capacity() {
         ),
         FillOutcome::Settled
     ));
+}
+
+#[test]
+fn semantic_batch_lease_preparation_upgrade_releases_claims_before_cold_wait() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn admission_chunk() {}\n")]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let held = limiter.try_acquire().unwrap();
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| Model::default().embed(texts),
+            )
+        })
+    };
+    assert!(wait_for_fill_queue(&limiter));
+    assert!(
+        runtime.plane().arena("family").pause_resources_are_free(),
+        "file claims and batch gate must be released before cold admission waits"
+    );
+    let lease = super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    )
+    .unwrap()
+    .unwrap();
+    drop(lease);
+    drop(held);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
 }
 
 #[test]

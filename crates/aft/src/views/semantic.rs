@@ -2000,20 +2000,17 @@ impl SemanticPlane {
                     if dispatched {
                         release_claims();
                         before_embed(FillAdmission::ResumeCold).map_err(plane_error)?;
-                        for (_, relative, _, claim) in &to_embed {
+                        for (_, _relative, _, claim) in &to_embed {
                             let owned = arena.claim(*claim.key());
-                            if let Some(stored) = arena
-                                .load(
-                                    &*store.reader(),
-                                    claim.key(),
-                                    relative,
-                                    &payload_producer,
-                                    &self.producer,
-                                )
-                                .map_err(plane_error)?
-                            {
-                                drop(stored);
-                            } else if owned.is_none() {
+                            // Inspect existence now; the immutable write below
+                            // validates/adopts a stored winner via its conflict
+                            // path, including recovery if that winner disappears.
+                            let completed = arena.get(claim.key()).is_some()
+                                || store
+                                    .get(claim.key())
+                                    .map_err(|error| plane_error(error.to_string()))?
+                                    .is_some();
+                            if owned.is_none() && !completed {
                                 report.pending = Some(FillPending::LocalContention);
                                 return Ok(report);
                             }
@@ -2284,8 +2281,8 @@ impl SemanticPlane {
         before_embed(FillAdmission::CheckCurrent)?;
         // Order: semantic batch lease -> local batch gate -> root publication
         // lease -> registry barrier. The local gate is only attempted, never
-        // waited on. Root and
-        // SQLite write resources are acquired later, inside store persistence,
+        // waited on. Root and SQLite write resources are acquired only later,
+        // inside chunk persistence, never around provider I/O.
         // Both semantic lease and gate end at this batch boundary.
         let key_started = Instant::now();
         let identity = self.producer.chunk_identity();

@@ -2127,6 +2127,9 @@ where
 {
     let mut progress = false;
     let mut telemetry = None;
+    let mut local_backoff = schedule.retry_initial;
+    let mut local_attempts = 0u64;
+    let local_started = Instant::now();
     loop {
         if !is_current(slot, epoch) {
             return FillOutcome::Stop;
@@ -2245,9 +2248,33 @@ where
                     // returned. Park only this background worker, checking lane
                     // cancellation at a bounded interval, outside refresh and
                     // both semantic exclusion guards.
-                    std::thread::park_timeout(
-                        schedule.retry_initial.min(Duration::from_millis(100)),
+                    local_attempts += 1;
+                    let salt = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos() as u64
+                        ^ local_attempts;
+                    let half = local_backoff / 2;
+                    let jitter = Duration::from_nanos(
+                        salt % (half.as_nanos().min(u64::MAX as u128) as u64 + 1),
                     );
+                    let deadline = Instant::now() + (half + jitter).min(schedule.retry_max);
+                    crate::slog_debug!(
+                        "semantic local batch pending retry_count={} wait_age_ms={}",
+                        local_attempts,
+                        local_started.elapsed().as_millis()
+                    );
+                    while Instant::now() < deadline {
+                        if !is_current(slot, epoch) {
+                            return FillOutcome::Stop;
+                        }
+                        std::thread::park_timeout(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(100)),
+                        );
+                    }
+                    local_backoff = (local_backoff * 2).min(schedule.retry_max);
                     continue;
                 }
                 if let Some(pending) = &report.pending {
