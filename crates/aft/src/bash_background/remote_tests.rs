@@ -1034,28 +1034,155 @@ fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
 }
 
 #[tokio::test]
-async fn runon_pre_acceptance_refusal_ends_standalone_foreground_wait_promptly() {
-    let daemon = daemon(Script::Refused, "exec-remote/v1").await;
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = remote_test_context(dir.path());
-    let (response, _) = tokio::time::timeout(
-        Duration::from_secs(1),
-        orchestrated_reply_with_probe(
+async fn runon_head_queue_wait_limit_is_five_minutes_for_foreground_and_background() {
+    for background in [false, true] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = remote_test_context(dir.path());
+        let response = handle_with_policy(
             &ctx,
-            &daemon,
+            Some(launch(daemon.connection.clone())),
             serde_json::json!({
-                "command": "printf must-not-run",
-                "runon": "linux",
-                "wait": true,
-                "foreground_orchestrate": true,
-                "compressed": false,
+                "command": "uname -s", "runon": "linux", "background": background,
+                "timeout": 7_200_000, "compressed": false,
             }),
-            |_| true,
-        ),
-    )
-    .await
-    .expect("a pre-start refusal must not consume the thirty-minute wait budget");
-    assert_runon_refusal(&response, "future_refusal");
+        );
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        terminal(ctx.bash_background(), task_id).await;
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["queue_wait_limit_s"], 300, "{}", runs[0]);
+        assert_eq!(runs[0]["timeout"], 7_200);
+    }
+}
+
+#[tokio::test]
+async fn runon_pre_acceptance_refusal_ends_standalone_foreground_wait_promptly() {
+    for (reason, detail) in [
+        ("runner_full", Some("hosted_host_full")),
+        ("network_unsupported", None),
+        ("queue_wait_exceeded", None),
+    ] {
+        let daemon = daemon(
+            Script::GatedPreStartRefusal { reason, detail },
+            "exec-remote/v1",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(remote_test_context(dir.path()));
+        let request = orchestrated_request(serde_json::json!({
+            "command": "printf must-not-run",
+            "workdir": dir.path(),
+            "runon": "linux",
+            "wait": true,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }));
+        let spawned = crate::bash_background::with_remote_policy(
+            Some(launch(daemon.connection.clone())),
+            || crate::commands::bash::handle(&request, &ctx),
+        );
+        let task_id = spawned.data["task_id"].as_str().unwrap().to_owned();
+        let crate::response_finalize::DispatchOutcome::Deferred(mut pending) =
+            crate::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawned)
+        else {
+            panic!("foreground must wait while the executor holds its refusal");
+        };
+        let crate::response_finalize::DispatchOutcome::Deferred(mut watch) =
+            crate::commands::bash_watch::handle_deferred(
+                &crate::protocol::RawRequest {
+                    id: "refusal-watch".into(),
+                    command: "bash_watch".into(),
+                    session_id: Some("session".into()),
+                    lsp_hints: None,
+                    params: serde_json::json!({"task_id": task_id, "worker_session": true}),
+                },
+                ctx.clone(),
+            )
+        else {
+            panic!("watch must wait while the executor holds its refusal");
+        };
+        daemon.wait_for_requests("exec.run", 1).await;
+        daemon.acceptance_gate.notify_one();
+        let (response, watch_response) = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut foreground_reply = None;
+            let mut watch_reply = None;
+            loop {
+                foreground_reply = foreground_reply.or_else(|| (pending.poll)(&ctx));
+                watch_reply = watch_reply.or_else(|| (watch.poll)(&ctx));
+                if foreground_reply.is_some() && watch_reply.is_some() {
+                    return (foreground_reply.unwrap(), watch_reply.unwrap());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a pre-start refusal must not consume the thirty-minute wait budget");
+        assert_runon_refusal(&response, &rendered_refusal_reason(reason, detail));
+        assert_eq!(
+            ctx.bash_background()
+                .runon_inputs_captured(&task_id, "session"),
+            Some(false)
+        );
+        let status = crate::commands::bash_status::handle(
+            &crate::protocol::RawRequest {
+                id: "refusal-status".into(),
+                command: "bash_status".into(),
+                session_id: Some("session".into()),
+                lsp_hints: None,
+                params: serde_json::json!({"task_id": task_id}),
+            },
+            &ctx,
+        );
+        assert_eq!(response.data["code"], status.data["code"]);
+        assert_eq!(response.data["message"], status.data["message"]);
+        assert_eq!(watch_response.data["waited"]["reason"], "exited");
+        assert_eq!(
+            watch_response.data["remote_refusal"]["code"],
+            status.data["code"]
+        );
+        assert_eq!(
+            watch_response.data["remote_refusal"]["message"],
+            status.data["message"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn runon_pre_submission_failures_end_standalone_foreground_wait_promptly() {
+    for unavailable_connection in [false, true] {
+        let daemon = daemon(Script::Plain, "unrelated/v1").await;
+        if unavailable_connection {
+            std::fs::remove_file(&daemon.connection).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = remote_test_context(dir.path());
+        let (response, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            orchestrated_reply_with_probe(
+                &ctx,
+                &daemon,
+                serde_json::json!({
+                    "command": "printf must-not-run", "runon": "linux", "wait": true,
+                    "foreground_orchestrate": true, "compressed": false,
+                }),
+                |_| true,
+            ),
+        )
+        .await
+        .expect("a capability or connection refusal must end the foreground wait");
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+        assert!(
+            response.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("command did not run"),
+            "{response:?}"
+        );
+        assert!(exec_runs(&daemon).is_empty());
+    }
 }
 
 #[test]
