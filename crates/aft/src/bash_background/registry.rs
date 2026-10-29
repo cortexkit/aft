@@ -6577,12 +6577,14 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    /// Return false after a failed delete so a task already in memory remains
+    /// eligible for retry. One orphan's database error must not abort replay.
     fn retire_already_reaped_orphaned_completion(
         &self,
         originating_session_id: &str,
         task_id: &str,
         task_harness: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> bool {
         // Project replay reads all harnesses. Delete under the row's own
         // namespace, not the route that happened to discover the orphan.
         let harness = task_harness
@@ -6591,7 +6593,7 @@ impl BgTaskRegistry {
         let pool = self.inner.db_pool.read().ok().and_then(|pool| pool.clone());
         let retired = if let (Some(harness), Some(pool)) = (harness, pool) {
             // Fenced so a queued row snapshot cannot re-insert the row.
-            with_task_db_fence(originating_session_id, task_id, || {
+            let result = with_task_db_fence(originating_session_id, task_id, || {
                 let conn = pool
                     .lock()
                     .map_err(|_| "database_lock_poisoned".to_string())?;
@@ -6602,10 +6604,19 @@ impl BgTaskRegistry {
                     task_id,
                 )
                 .map(|removed| removed > 0)
-                .map_err(|error| format!("failed to retire already-reaped task {task_id}: {error}"))
-            })?
+                .map_err(|error| error.to_string())
+            });
+            match result {
+                Ok(retired) => retired,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to retire already-reaped task {task_id}: error={error}"
+                    );
+                    return false;
+                }
+            }
         } else {
-            true
+            false
         };
         let _ = self.remove_pending_completion(task_id);
         self.ack_persisted_watches_for_task(originating_session_id, task_id, true);
@@ -6614,7 +6625,7 @@ impl BgTaskRegistry {
                 "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
             );
         }
-        Ok(())
+        true
     }
 
     fn retire_rehydrated_orphaned_completion(
@@ -6646,13 +6657,14 @@ impl BgTaskRegistry {
                 );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.retire_already_reaped_orphaned_completion(
+                if self.retire_already_reaped_orphaned_completion(
                     &task.session_id,
                     &task.task_id,
                     task.db_harness.as_deref(),
-                )?;
-                if let Ok(mut state) = task.lock_state() {
-                    state.metadata.completion_delivered = true;
+                ) {
+                    if let Ok(mut state) = task.lock_state() {
+                        state.metadata.completion_delivered = true;
+                    }
                 }
             }
             Err(error) => {
@@ -7070,7 +7082,7 @@ impl BgTaskRegistry {
                             &metadata.session_id,
                             &metadata.task_id,
                             metadata.harness.as_deref(),
-                        )?;
+                        );
                         continue;
                     }
                     if Self::persisted_task_process_is_alive(&metadata) {

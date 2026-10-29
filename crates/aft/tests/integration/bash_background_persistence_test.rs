@@ -1181,6 +1181,187 @@ fn foreign_harness_replay_retires_missing_layout_once() {
 }
 
 #[test]
+fn replay_delete_failure_keeps_later_live_tasks_and_retries_orphan() {
+    struct KillOnDrop<'a> {
+        registry: &'a BgTaskRegistry,
+        task_id: String,
+    }
+    impl Drop for KillOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.registry.kill(&self.task_id, "live-session");
+        }
+    }
+
+    for resident in [false, true] {
+        init_test_logger();
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let orphan_id = if resident {
+            "bash-00000000000002a3"
+        } else {
+            "bash-00000000000002a2"
+        };
+        let paths = task_paths(storage.path(), "orphan-session", orphan_id).unwrap();
+        let mut orphan = PersistedTask::starting(
+            orphan_id.to_string(),
+            "orphan-session".to_string(),
+            "true".to_string(),
+            project.path().to_path_buf(),
+            Some(project.path().to_path_buf()),
+            None,
+            true,
+            true,
+        );
+        orphan.started_at = 1;
+        orphan.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        let conn = Arc::new(Mutex::new(
+            aft::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        aft::db::bash_tasks::upsert_bash_task(
+            &conn.lock().unwrap(),
+            &orphan.to_bash_task_row("pi", &paths).unwrap(),
+        )
+        .unwrap();
+        let replayer = registry();
+        replayer.set_harness(aft::harness::Harness::Opencode);
+        replayer.set_db_pool(Arc::clone(&conn));
+        if resident {
+            write_task(&paths.json, &orphan).unwrap();
+            fs::write(&paths.stdout, "").unwrap();
+            fs::write(&paths.stderr, "").unwrap();
+            replayer
+                .replay_session_for_project(storage.path(), "orphan-session", project.path())
+                .unwrap();
+            assert!(replayer
+                .list(0)
+                .iter()
+                .any(|task| task.info.task_id == orphan_id));
+            fs::remove_dir_all(&paths.dir).unwrap();
+        }
+
+        let owner = registry();
+        owner.set_harness(aft::harness::Harness::Pi);
+        owner.set_db_pool(Arc::clone(&conn));
+        let live_id = owner
+            .spawn(
+                aft::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "sleep 60",
+                "live-session".to_string(),
+                project.path().to_path_buf(),
+                Default::default(),
+                aft::bash_background::HardKill::After(Duration::from_secs(90)),
+                None,
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+        let _cleanup = KillOnDrop {
+            registry: &owner,
+            task_id: live_id.clone(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = aft::db::bash_tasks::get_bash_task(
+                &conn.lock().unwrap(),
+                "pi",
+                "live-session",
+                &live_id,
+            )
+            .unwrap();
+            if row.is_some_and(|row| row.status == "running") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live task was not persisted as running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!replayer
+            .list(0)
+            .iter()
+            .any(|task| task.info.task_id == live_id));
+        {
+            let db = conn.lock().unwrap();
+            let rows = aft::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                &db,
+                "pi",
+                &aft::path_identity::project_scope_key(project.path()),
+            )
+            .unwrap();
+            assert_eq!(rows[0].task_id, orphan_id);
+            assert_eq!(rows[1].task_id, live_id);
+            // Reject only this delete so reads and recovery of later rows stay usable.
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reject_orphan_delete BEFORE DELETE ON bash_tasks
+                 WHEN OLD.task_id = '{orphan_id}'
+                 BEGIN SELECT RAISE(FAIL, 'orphan_delete_busy'); END;"
+            ))
+            .unwrap();
+        }
+        let _ = take_logs();
+        replayer
+            .replay_session_for_project(storage.path(), "current-session", project.path())
+            .expect("one failed orphan delete must not abort the batch");
+        let live = replayer
+            .list(0)
+            .into_iter()
+            .find(|task| task.info.task_id == live_id)
+            .expect("the live row after the orphan must be rehydrated without status recovery");
+        assert_eq!(live.info.status, BgTaskStatus::Running);
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains(orphan_id) && line.contains("orphan_delete_busy"))
+                .count(),
+            1,
+            "the failed delete should warn once: {logs:?}"
+        );
+        assert!(!logs
+            .iter()
+            .any(|line| line.contains(orphan_id)
+                && line.contains("orphaned completion already reaped")));
+        assert!(aft::db::bash_tasks::get_bash_task(
+            &conn.lock().unwrap(),
+            "pi",
+            "orphan-session",
+            orphan_id
+        )
+        .unwrap()
+        .is_some());
+
+        conn.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_orphan_delete;")
+            .unwrap();
+        for _ in 0..2 {
+            replayer
+                .replay_session_for_project(storage.path(), "current-session", project.path())
+                .unwrap();
+        }
+        assert!(aft::db::bash_tasks::get_bash_task(
+            &conn.lock().unwrap(),
+            "pi",
+            "orphan-session",
+            orphan_id
+        )
+        .unwrap()
+        .is_none());
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains(orphan_id)
+                    && line.contains("orphaned completion already reaped"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn foreign_session_replay_retires_completion_but_preserves_status_control() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
