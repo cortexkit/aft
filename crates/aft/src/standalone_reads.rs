@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const LANE_CAP: usize = 256;
 
 pub(super) struct StandaloneReads {
-    executor: Executor,
+    executor: Arc<Executor>,
     root: ProjectRootId,
     reads: Arc<AtomicUsize>,
     heavy: Arc<AtomicUsize>,
@@ -35,7 +35,7 @@ impl StandaloneReads {
         config.pool_size = config.pool_size.max(3);
         config.actor_cap = config.actor_cap.max(2);
         config.heavy_permits = config.heavy_permits.min(config.actor_cap - 1);
-        let executor = Executor::with_config(config);
+        let executor = Arc::new(Executor::with_config(config));
         executor.register_actor(root.clone(), Arc::clone(ctx));
         Self {
             executor,

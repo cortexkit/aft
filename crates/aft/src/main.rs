@@ -3216,6 +3216,7 @@ mod deferred_semantic_search_tests {
         handle_cancel_request, wait_for_semantic_index_before_search,
         write_ready_pending_to_writer,
     };
+    use crate::StandaloneReads;
     use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
     use aft::context::{AppContext, SemanticIndexStatus};
     use aft::parser::TreeSitterProvider;
