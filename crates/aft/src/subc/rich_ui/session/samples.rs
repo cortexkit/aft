@@ -7,11 +7,54 @@ const FIXTURE: &str = "tests/fixtures/rich_ui/aft-rich-ui-manifest-v1.json";
 const TASK: &str = "bash-0000000000000081";
 const VIEWED_CALL: &str = "sample-viewed-call";
 
+fn wait_for_capture_ready(ctx: &AppContext, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        crate::runtime_drain::drain_watcher_events(ctx);
+        crate::runtime_drain::drain_build_completions(ctx);
+        let search_ready = ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready);
+        let callgraph_ready = matches!(
+            ctx.callgraph_store_for_ops(),
+            crate::context::CallgraphStoreAccess::Ready(_)
+        );
+        // These are the same pending signals captured before indexed tool calls
+        // and rendered as watcher/callgraph lag disclosures in their replies.
+        let pending = ctx.pending_changes_for_query(true);
+        let callgraph_pending = pending.callgraph.resolved();
+        assert!(
+            Instant::now() < deadline,
+            "rich-UI sample fixture did not catch up within {timeout:?}: \
+             search_ready={search_ready}, callgraph_ready={callgraph_ready}, \
+             watcher_pending={}, callgraph_pending={callgraph_pending:?}",
+            pending.watcher,
+        );
+        if search_ready && callgraph_ready && !pending.watcher && callgraph_pending.is_empty() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
 async fn capture() -> Value {
     // These calls inject a test manifest without publishing a production manifest.
     let _manifest =
         super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = read_tests::indexed_fixture("head");
+    // Finish task-artifact writes before waiting for any indexed sample reply.
+    bash_tests::seed(
+        &f,
+        TASK,
+        "session",
+        "reserved:prefrontal-core",
+        VIEWED_CALL,
+        false,
+        false,
+    );
     let mut vectors = Vec::new();
     for (id, args) in [
         (
@@ -34,25 +77,18 @@ async fn capture() -> Value {
             json!({"op":"callers", "path":"main.rs", "symbol":"session_leaf"}),
         ),
     ] {
+        wait_for_capture_ready(&f.ctx, Duration::from_secs(60));
         let body = read_tests::query_with(&f, id, args.clone(), read_tests::dispatch).await;
         assert_eq!(body["isError"], false, "{id}: {body}");
         vectors.push(vector(id, id, args, body));
     }
 
-    bash_tests::seed(
-        &f,
-        TASK,
-        "session",
-        "reserved:prefrontal-core",
-        VIEWED_CALL,
-        false,
-        false,
-    );
     for (id, args) in [
         ("bash_status", json!({})),
         ("bash_output", json!({"limit":200})),
         ("bash_watch", json!({"pattern":"one", "timeoutMs":1})),
     ] {
+        wait_for_capture_ready(&f.ctx, Duration::from_secs(60));
         let body = bash_tests::query(&f, id, VIEWED_CALL, args.clone()).await;
         assert_eq!(body["isError"], false, "{id}: {body}");
         let mut args = args;
@@ -61,6 +97,7 @@ async fn capture() -> Value {
     }
 
     let args = json!({"path":"missing.rs"});
+    wait_for_capture_ready(&f.ctx, Duration::from_secs(60));
     let body = read_tests::query_with(&f, "read", args.clone(), read_tests::dispatch).await;
     assert_eq!(body["isError"], true, "missing read: {body}");
     vectors.push(vector("read_missing", "read", args, body));
@@ -163,6 +200,59 @@ async fn rich_ui_samples_match_handlers() {
         String::from_utf8(expected).unwrap(),
         "real carrier replies drifted; regenerate with the command in WORKER.md"
     );
+}
+
+#[test]
+fn rich_ui_samples_wait_for_pending_watcher_application() {
+    let f = read_tests::indexed_fixture("head");
+    wait_for_capture_ready(&f.ctx, Duration::from_secs(60));
+    // Replace OS event delivery with a queued real path application so the
+    // assertion does not depend on when a platform's watcher reports a write.
+    f.ctx.stop_watcher_runtime();
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *f.ctx.watcher_rx().lock() = Some(watcher_rx);
+    let path = f.policy.project_root.join("main.rs");
+    let (reached_rx, release_tx) =
+        crate::runtime_drain::install_watcher_phase_commit_gate_for_test(path.clone());
+    watcher_tx
+        .send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
+            path,
+        ]))
+        .unwrap();
+    let ctx = f.ctx.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        wait_for_capture_ready(&ctx, Duration::from_secs(60));
+        done_tx.send(()).unwrap();
+    });
+    let reached = reached_rx.recv_timeout(Duration::from_secs(10));
+    let pending = f.ctx.watcher_query_has_pending_changes();
+    let early_result = done_rx.try_recv();
+    // Release and join even if the observations below fail, so no drain thread
+    // or path-scoped test gate can outlive the fixture.
+    let _ = release_tx.send(());
+    waiter.join().unwrap();
+    reached.expect("sample-readiness barrier must apply the queued watcher event");
+    assert!(pending, "the held watcher application must remain pending");
+    assert_eq!(
+        early_result,
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "sample-readiness barrier returned before the watcher applied the event"
+    );
+    assert!(!f.ctx.watcher_query_has_pending_changes());
+    assert!(f
+        .ctx
+        .pending_changes_for_query(true)
+        .callgraph
+        .resolved()
+        .is_empty());
+}
+
+#[test]
+#[should_panic(expected = "search_ready=false, callgraph_ready=false, watcher_pending=false")]
+fn rich_ui_samples_readiness_timeout_names_pending_state() {
+    let f = Fixture::new("head");
+    wait_for_capture_ready(&f.ctx, Duration::ZERO);
 }
 
 #[tokio::test]
