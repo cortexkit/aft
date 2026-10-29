@@ -848,6 +848,44 @@ fn confine_lookup_refuses_while_database_opens_or_after_it_failed() {
     }
 }
 
+#[tokio::test]
+async fn provider_catalog_fails_closed_when_worker_confinement_cannot_be_read() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context_without_database(root.path(), storage.path()));
+    ctx.mark_database_runtime_initializing_for_test();
+    let route = identity(root.path(), "designer", 7, true);
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(route.root.clone(), ctx);
+    let (writer, mut replies) = mpsc::channel(8);
+    let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+    submit_provider_read(
+        &writer,
+        &frame,
+        route,
+        &executor,
+        &Arc::default(),
+        &Arc::new(DispatchPathMetrics::new()),
+        "tool.catalog",
+        json!({"preset":"worker"}),
+        PhaseTrace::new(Instant::now()),
+        test_support::test_request_meta(),
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv())
+        .await
+        .expect("an exhausted database-open wait must not be repeated by the provider")
+        .unwrap();
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["code"], "confine_policy_unavailable", "{body}");
+    assert!(
+        body.get("tools").is_none(),
+        "unreadable confinement must never offer a catalog"
+    );
+}
+
 #[test]
 fn confine_lookup_takes_no_write_lock_and_copies_no_row() {
     let root = tempfile::tempdir().unwrap();
@@ -1925,6 +1963,7 @@ async fn exercise_catalog_remote_bash(
         "tool.catalog",
         fetch(&plan("broca-worker")),
         PhaseTrace::new(Instant::now()),
+        test_support::test_request_meta(),
     )
     .await
     .unwrap();

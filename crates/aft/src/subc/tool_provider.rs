@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cortexkit_role_tool_provider::{
@@ -243,29 +243,51 @@ struct ServedTool {
     /// Admission validates those calls against it, and the command refuses
     /// `ref` by name when the setting is off.
     with_ref: Option<CatalogTool>,
-    /// Compiled once, when the catalog is built, and never during admission:
-    /// the module admits calls on its frame loop's thread, whose stack the host
-    /// may size as small as Windows' 1 MiB default, and compiling a JSON Schema
-    /// recurses through the meta-schema.
-    validator: jsonschema::Validator,
+    /// Filled by module preparation, not by catalog discovery. Metadata only
+    /// needs schemas and digests; compiling call validators can be much slower.
+    validator: OnceLock<jsonschema::Validator>,
 }
 
-static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
-    // The first caller to need a catalog is the first tool call, admitted on
-    // the frame loop's thread. Build the catalog, and compile every admission
-    // validator, on a thread with the ordinary default stack, so the frame loop
-    // only ever iterates validators that are already compiled.
+static SERVED_TOOLS: [OnceLock<Vec<ServedTool>>; 3] = [const { OnceLock::new() }; 3];
+
+fn build_served_tools(preset: CatalogPreset) -> Vec<ServedTool> {
+    build_tools(preset)
+        .into_iter()
+        .map(|(catalog, with_runon, with_ref)| ServedTool {
+            catalog,
+            with_runon,
+            with_ref,
+            validator: OnceLock::new(),
+        })
+        .collect()
+}
+
+static ADMISSION_READY: LazyLock<()> = LazyLock::new(|| {
+    // Compilation recursively checks JSON Schema's own rules and can need more
+    // stack than the host's protocol thread provides. Prepare on a worker before HELLO.
+    // Catalog discovery must not wait for this unrelated admission preparation.
     std::thread::Builder::new()
         .name("aft-admission-validators".into())
         .spawn(|| {
-            CatalogPreset::ALL.map(|preset| {
-                build_tools(preset)
-                    .into_iter()
-                    .map(|(catalog, with_runon, with_ref)| {
-                        let tool = with_runon
+            #[cfg(test)]
+            {
+                let gate = VALIDATOR_BUILD_GATE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some((reached, release)) = gate {
+                    let _ = reached.send(());
+                    let _ = release.recv();
+                }
+            }
+            for preset in CatalogPreset::ALL {
+                for served in served_tools(preset) {
+                    served.validator.get_or_init(|| {
+                        let tool = served
+                            .with_runon
                             .as_ref()
-                            .or(with_ref.as_ref())
-                            .unwrap_or(&catalog);
+                            .or(served.with_ref.as_ref())
+                            .unwrap_or(&served.catalog);
                         #[cfg(test)]
                         ADMISSION_WORK.with(|count| {
                             let (catalogs, validators) = count.get();
@@ -273,27 +295,40 @@ static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
                         });
                         let validator = jsonschema::validator_for(&tool.input_schema)
                             .expect("embedded schemas are valid JSON schemas");
-                        ServedTool {
-                            catalog,
-                            with_runon,
-                            with_ref,
-                            validator,
-                        }
-                    })
-                    .collect()
-            })
+                        #[cfg(test)]
+                        VALIDATORS_COMPILED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        validator
+                    });
+                }
+            }
         })
         .expect("spawning the admission-validator builder")
         .join()
-        .expect("embedded tool catalog builds on a worker")
+        .expect("embedded admission validators build on a worker")
 });
 
+/// Prepare immutable call validators before advertising the module's providers.
+/// Catalog discovery uses schema snapshots and does not need these validators.
+pub(super) fn prepare_admission() {
+    LazyLock::force(&ADMISSION_READY);
+}
+
+#[cfg(test)]
+static VALIDATORS_COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+type ValidatorBuildGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+static VALIDATOR_BUILD_GATE: Mutex<Option<ValidatorBuildGate>> = Mutex::new(None);
+
 fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
-    &SERVED_TOOLS[match preset {
+    SERVED_TOOLS[match preset {
         CatalogPreset::Head => 0,
         CatalogPreset::Worker => 1,
         CatalogPreset::Reader => 2,
     }]
+    .get_or_init(|| build_served_tools(preset))
 }
 
 type ServedVariants = (CatalogTool, Option<CatalogTool>, Option<CatalogTool>);
@@ -3255,7 +3290,12 @@ pub(super) fn admit_arguments(
             return Err(errors::invalid_request(key, "host-only argument"));
         }
     }
-    if let Some(error) = served.validator.iter_errors(checked).next() {
+    prepare_admission();
+    let validator = served
+        .validator
+        .get()
+        .expect("admission preparation compiles every served schema");
+    if let Some(error) = validator.iter_errors(checked).next() {
         let field = error.instance_path.to_string();
         return Err(errors::invalid_request(
             if field.is_empty() {
@@ -3470,6 +3510,7 @@ mod tests {
     fn warm_admission_does_not_rebuild_catalog_or_validator() {
         let request = call("read", json!({"filePath": "src/main.rs", "limit": 200}));
         admit(&request, false, &[], true, "session", true).unwrap();
+        let compiled = VALIDATORS_COMPILED.load(std::sync::atomic::Ordering::SeqCst);
         ADMISSION_WORK.with(|count| count.set((0, 0)));
         for _ in 0..12 {
             admit(&request, false, &[], true, "session", true).unwrap();
@@ -3479,6 +3520,11 @@ mod tests {
             work,
             (0, 0),
             "catalog builds, validator compilations: {work:?}"
+        );
+        assert_eq!(
+            VALIDATORS_COMPILED.load(std::sync::atomic::Ordering::SeqCst),
+            compiled,
+            "warm admission must not compile on another thread either"
         );
     }
 
@@ -6611,13 +6657,13 @@ pub(in crate::subc) mod route_tests {
     }
 
     #[tokio::test]
-    async fn catalog_queues_behind_reads_but_not_database_or_cold_builds() {
+    async fn catalog_bypasses_reads_configure_warmup_and_cold_builds() {
         let (_dir, root) = test_support::test_root("catalog-pure-read");
         let (_heavy_dir, heavy_root) = test_support::test_root("catalog-cold-build");
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 6,
             read_cap: 1,
-            actor_cap: 2,
+            actor_cap: 3,
             heavy_permits: 1,
             drr_quantum: 1,
         }));
@@ -6638,6 +6684,19 @@ pub(in crate::subc) mod route_tests {
             }),
         );
         started.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (tail_started, started) = std::sync::mpsc::channel();
+        let (release_tail, tail_release) = std::sync::mpsc::channel();
+        let tail = executor.submit_maintenance_async(
+            root.clone(),
+            Lane::MaintenanceCommit,
+            "held-configure-warmup".into(),
+            Box::new(move |_| {
+                tail_started.send(()).unwrap();
+                let _ = tail_release.recv();
+                Response::success("tail", json!({}))
+            }),
+        );
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
         let (read_started, started) = std::sync::mpsc::channel();
         let (release_read, read_release) = std::sync::mpsc::channel();
         let read = executor.submit_async(
@@ -6653,6 +6712,7 @@ pub(in crate::subc) mod route_tests {
         started.recv_timeout(Duration::from_secs(3)).unwrap();
         let (writer, mut replies) = mpsc::channel(8);
         let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+        let requested_at = Instant::now();
         submit_provider_read(
             &writer,
             &frame,
@@ -6662,21 +6722,29 @@ pub(in crate::subc) mod route_tests {
             &Arc::new(DispatchPathMetrics::new()),
             "tool.catalog",
             json!({}),
-            PhaseTrace::new(Instant::now()),
+            PhaseTrace::new(requested_at),
+            test_support::test_request_meta(),
         )
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), replies.recv())
-                .await
-                .is_err(),
-            "catalogs must share existing read permits"
-        );
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+        let reply_elapsed = requested_at.elapsed();
+        if reply.is_err() {
+            eprintln!(
+                "catalog timeout: dispatch={:?} running={:?}",
+                executor.try_dispatch_liveness_snapshot(),
+                executor.try_take_long_running_interactive_jobs(Duration::ZERO)
+            );
+        }
+        // Release held work even on failure, so a regression cannot hang teardown.
         release_read.send(()).unwrap();
+        release_tail.send(()).unwrap();
+        release_heavy.send(()).unwrap();
         assert!(read.await.unwrap().success);
-        let reply = tokio::time::timeout(Duration::from_secs(3), replies.recv())
-            .await
-            .unwrap()
+        assert!(tail.await.unwrap().success);
+        assert!(heavy.await.unwrap().success);
+        let reply = reply
+            .expect("catalog must answer while index and warmup remain held")
             .unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
         let trace = reply
@@ -6686,33 +6754,15 @@ pub(in crate::subc) mod route_tests {
         let completed = trace
             .finish(now, now, now, reply.frame.body.len(), None)
             .expect("tool.catalog trace must have executor and writer timings");
-        assert!(completed.phases.total > Duration::from_millis(50));
-        assert!(completed.phases.queue > Duration::from_millis(50));
-        let _ = crate::logging::take_slow_tool_call_logs_for_test();
-        crate::log_ctx::with_session(Some(completed.session.clone()), || {
-            crate::logging::note_tool_call_trace(
-                &completed.name,
-                &completed.session,
-                &completed.root,
-                completed.channel,
-                completed.corr,
-                completed.phases,
-                crate::logging::ToolCallCaller::Agent,
-            );
-        });
-        let lines = crate::logging::take_slow_tool_call_logs_for_test();
-        let slow_line = lines
-            .iter()
-            .find(|line| line.contains("slow tool_call name=tool.catalog"))
-            .expect("delayed catalog response should produce a slow tool_call log");
-        assert!(slow_line.contains("session=catalog-session"));
-        assert!(slow_line.contains("queue="));
-        assert!(slow_line.contains("exec="));
-        assert!(slow_line.contains("egress="));
+        assert_eq!(completed.session, "catalog-session");
+        assert!(completed.phases.queue < Duration::from_millis(500));
+        eprintln!(
+            "catalog with index/warmup held: reply_ms={} queue_ms={}",
+            reply_elapsed.as_millis(),
+            completed.phases.queue.as_millis()
+        );
         assert!(ctx.database_runtime_pending("write"));
         assert_eq!(executor.heavy_permits(), 1);
-        release_heavy.send(()).unwrap();
-        assert!(heavy.await.unwrap().success);
     }
 
     /// Sends `body` through the ledger edge, the frame loop's first stop for a
@@ -8713,5 +8763,255 @@ mod authorization_failure_tests {
     #[tokio::test]
     async fn missing_authorization_database_resolves_one_ask_without_execution() {
         authorization_failure("missing-db").await;
+    }
+}
+
+#[cfg(test)]
+mod metadata_lane_tests {
+    use super::super::*;
+
+    #[tokio::test]
+    async fn cold_catalog_does_not_wait_for_admission_validator_preparation() {
+        const CHILD: &str = "AFT_TEST_COLD_CATALOG_VALIDATORS";
+        const NAME: &str = "subc::tool_provider::metadata_lane_tests::cold_catalog_does_not_wait_for_admission_validator_preparation";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cold catalog child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (entered, preparing) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *super::VALIDATOR_BUILD_GATE.lock().unwrap() = Some((entered, held));
+        let preparation = std::thread::spawn(super::prepare_admission);
+        preparing
+            .recv_timeout(Duration::from_secs(30))
+            .expect("validator builder held before compiling");
+        let (_dir, root) = test_support::test_root("cold-catalog-validators");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut replies_while_held = Vec::new();
+        for (corr, preset) in [(7, "head"), (8, "worker"), (9, "reader")] {
+            let (writer, mut replies) = mpsc::channel(8);
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 41, 1, corr, vec![]).unwrap();
+            let requested_at = Instant::now();
+            submit_provider_read(
+                &writer,
+                &frame,
+                test_support::route_identity(&root, "cold-preflight"),
+                &executor,
+                &Arc::default(),
+                &Arc::new(DispatchPathMetrics::new()),
+                "tool.catalog",
+                json!({"preset":preset}),
+                PhaseTrace::new(requested_at),
+                test_support::test_request_meta(),
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+            replies_while_held.push((preset, requested_at.elapsed(), reply));
+        }
+        let compiled = super::VALIDATORS_COMPILED.load(Ordering::SeqCst);
+        let preparation_started = Instant::now();
+        release.send(()).unwrap();
+        preparation
+            .join()
+            .expect("admission preparation completes after release");
+        let preparation_elapsed = preparation_started.elapsed();
+        for (preset, elapsed, reply) in replies_while_held {
+            let reply = reply
+                .expect("a cold catalog cannot depend on the held validator builder")
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{preset}");
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert!(!body["tools"].as_array().unwrap().is_empty(), "{preset}");
+            eprintln!(
+                "cold catalog while validator preparation held: preset={preset} reply_ms={}",
+                elapsed.as_millis()
+            );
+        }
+        assert_eq!(
+            compiled, 0,
+            "metadata must not compile call-admission validators"
+        );
+        assert!(super::VALIDATORS_COMPILED.load(Ordering::SeqCst) > 0);
+        let invalid =
+            serde_json::from_value(json!({"name":"read", "arguments":{"path":42}})).unwrap();
+        let error = super::admit(&invalid, false, &[], false, "cold-preflight", true).unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            cortexkit_role_tool_provider::errors::invalid_request_field(&error),
+            Some("path")
+        );
+        eprintln!(
+            "admission_prepare_after_release_ms={} validators={}",
+            preparation_elapsed.as_millis(),
+            super::VALIDATORS_COMPILED.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_admission_errors_keep_their_code_and_send_a_terminal() {
+        for missing_actor in [true, false] {
+            let (_dir, root) = test_support::test_root("provider-admission-error");
+            let executor = Arc::new(Executor::new());
+            if !missing_actor {
+                executor.register_actor(root.clone(), test_support::test_ctx());
+            }
+            let (writer, mut replies) = mpsc::channel(8);
+            let active = Arc::default();
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+            let mut meta = test_support::test_request_meta();
+            if !missing_actor {
+                meta.deadline =
+                    queued_call::Deadline::from_envelope(Instant::now(), &json!({"deadline_ms":1}));
+            }
+            submit_provider_read(
+                &writer,
+                &frame,
+                test_support::route_identity(&root, "preflight"),
+                &executor,
+                &active,
+                &Arc::new(DispatchPathMetrics::new()),
+                "tool.catalog",
+                json!({}),
+                PhaseTrace::new(Instant::now()),
+                meta,
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert_eq!(reply.header.corr, 7);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(
+                body["code"],
+                if missing_actor {
+                    "actor_not_registered"
+                } else {
+                    "deadline_exceeded"
+                },
+                "{body}"
+            );
+            tokio::task::yield_now().await;
+            assert!(active.lock().unwrap().is_empty());
+            assert!(replies.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn started_metadata_keeps_reply_ownership_when_route_is_released() {
+        let (_dir, root) = test_support::test_root("started-metadata");
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), test_support::test_ctx());
+        let active = Arc::default();
+        let route = route_key(41, 1);
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let response = submit_active_tool_call(
+            &executor,
+            &active,
+            route,
+            7,
+            root,
+            Lane::ProviderMetadata,
+            "metadata".into(),
+            RouteDetachPolicy::RetainForReplay,
+            "tool.catalog",
+            test_support::test_request_meta(),
+            Box::new(move |_| {
+                let _ = entered.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                assert!(!crate::executor::current_job_cancelled());
+                Response::success("metadata", json!({"answer":{}}))
+            }),
+        );
+        running.await.unwrap();
+        assert!(queued_call::release_route(
+            &active,
+            &executor,
+            route,
+            &PendingSubcResponses::default()
+        )
+        .is_empty());
+        assert_eq!(
+            apply_route_work_disposition(
+                &active,
+                &executor,
+                route,
+                RouteWorkDisposition::RetainStartedForReplay,
+                "Goodbye"
+            ),
+            1
+        );
+        release.send(()).unwrap();
+        assert!(response.await.unwrap().success);
+        assert!(claim_active_tool_call(&active, route, 7));
+        assert!(finish_active_tool_call(&active, route, 7));
+    }
+
+    #[tokio::test]
+    async fn queued_metadata_admission_budget_sends_a_terminal_without_waiting_for_the_lane() {
+        let (_dir, root) = test_support::test_root("metadata-admission-timeout");
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), test_support::test_ctx());
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = executor.submit_async(
+            root.clone(),
+            Lane::ProviderMetadata,
+            "held-metadata".into(),
+            Box::new(move |_| {
+                let _ = entered.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                Response::success("held", json!({}))
+            }),
+        );
+        running.await.unwrap();
+        let (writer, mut replies) = mpsc::channel(8);
+        let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+        let active = Arc::default();
+        submit_provider_read(
+            &writer,
+            &frame,
+            test_support::route_identity(&root, "preflight"),
+            &executor,
+            &active,
+            &Arc::new(DispatchPathMetrics::new()),
+            "tool.catalog",
+            json!({}),
+            PhaseTrace::new(Instant::now() - Duration::from_secs(2)),
+            test_support::test_request_meta(),
+        )
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+        release.send(()).unwrap();
+        assert!(blocker.await.unwrap().success);
+        let reply = reply
+            .expect("queued metadata must refuse before the held operation finishes")
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "provider_busy", "{body}");
+        tokio::task::yield_now().await;
+        assert!(active.lock().unwrap().is_empty());
+        assert!(replies.try_recv().is_err());
     }
 }
