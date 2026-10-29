@@ -596,8 +596,8 @@ pub(super) fn note_route_closed(route: RouteChannel) {
     }
 }
 
-/// A consent ask that is still waiting for Cingulate, registered when its
-/// `consent.request` returns an elicitation id and removed when its hold ends.
+/// A consent ask that is still waiting for Cingulate, registered before sending
+/// `consent.request` and removed when its last overlapping hold ends.
 /// A folder (`allow_scope`) grant that truly covers one of these asks withdraws
 /// its card so the phone no longer shows it, and the waiting call runs without
 /// needing a second answer. Both sides already carry canonical policy
@@ -610,50 +610,80 @@ struct LiveCoverable {
     scope: crate::db::access_grants::ScopeKey,
     operation: AccessOperation,
     path: PathBuf,
-    elicitation: String,
+    elicitation: Option<String>,
+    covering: Option<CoveringGrant>,
+    holds: usize,
     selector: ScopeSelector,
     project_root: PathBuf,
 }
 
-static LIVE_COVERABLE: LazyLock<StdMutex<HashMap<String, LiveCoverable>>> =
+#[derive(Clone)]
+struct CoveringGrant {
+    grant: AccessGrant,
+    elicitation: String,
+}
+
+// A persisted call key can be reused by another session. Share overlapping
+// holds only within one session, which is also the principal for withdrawal.
+type LiveCoverKey = (String, String);
+
+static LIVE_COVERABLE: LazyLock<StdMutex<HashMap<LiveCoverKey, LiveCoverable>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Removes the live entry when the hold ends, on every return path.
+/// Removes the live entry when its last overlapping hold ends, on every return path.
 struct LiveCoverGuard {
-    elicitation: Option<String>,
+    key: LiveCoverKey,
+}
+
+impl LiveCoverGuard {
+    fn record_elicitation(&self, elicitation: &str) -> Option<(LiveCoverable, CoveringGrant)> {
+        let mut live = LIVE_COVERABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let covered = live.get_mut(&self.key)?;
+        covered.elicitation = Some(elicitation.to_owned());
+        // The folder grant may have scanned this request while its reply was
+        // still in flight. Publishing the id and taking that deferred withdraw
+        // share the scan's lock, so neither ordering can miss the card.
+        let covering = covered.covering.take()?;
+        Some((covered.clone(), covering))
+    }
 }
 
 impl Drop for LiveCoverGuard {
     fn drop(&mut self) {
-        if let Some(elicitation) = self.elicitation.take() {
-            LIVE_COVERABLE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&elicitation);
+        let mut live = LIVE_COVERABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(covered) = live.get_mut(&self.key) {
+            covered.holds -= 1;
+            if covered.holds == 0 {
+                live.remove(&self.key);
+            }
         }
     }
 }
 
-fn track_live_coverable(call: &HeldCall, prep: &Prepared, elicitation: &str) -> LiveCoverGuard {
-    LIVE_COVERABLE
+fn track_live_coverable(call: &HeldCall, prep: &Prepared) -> LiveCoverGuard {
+    let key = (prep.call_key.clone(), call.identity.session.clone());
+    let mut live = LIVE_COVERABLE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            elicitation.to_string(),
-            LiveCoverable {
-                key: prep.key.clone(),
-                session: call.identity.session.clone(),
-                scope: prep.key.scope.clone(),
-                operation: prep.grant.operation,
-                path: prep.grant.path.clone(),
-                elicitation: elicitation.to_string(),
-                selector: prep.selector.clone(),
-                project_root: call.identity.project_root.clone(),
-            },
-        );
-    LiveCoverGuard {
-        elicitation: Some(elicitation.to_string()),
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    live.entry(key.clone())
+        .and_modify(|covered| covered.holds += 1)
+        .or_insert_with(|| LiveCoverable {
+            key: prep.key.clone(),
+            session: call.identity.session.clone(),
+            scope: prep.key.scope.clone(),
+            operation: prep.grant.operation,
+            path: prep.grant.path.clone(),
+            elicitation: None,
+            covering: None,
+            holds: 1,
+            selector: prep.selector.clone(),
+            project_root: call.identity.project_root.clone(),
+        });
+    LiveCoverGuard { key }
 }
 
 /// One info line per withdrawn ask, naming the grant that covered it. The
@@ -695,57 +725,77 @@ async fn settle_covered_asks(
     if covering.kind != GrantKind::Subtree {
         return;
     }
+    let covering = CoveringGrant {
+        grant: covering.clone(),
+        elicitation: covering_elicitation.to_owned(),
+    };
+    let ready = {
+        let mut live = LIVE_COVERABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ready = Vec::new();
+        for covered in live.values_mut() {
+            if covered.elicitation.as_deref() == Some(covering_elicitation)
+                || covered.key == *covering_key
+                || covered.scope != covering_key.scope
+                || covered.session != call.identity.session
+                || covered.operation != covering.grant.operation
+            {
+                continue;
+            }
+            // Both paths are canonical policy identities, so `covers` compares
+            // them exactly as the grant check does.
+            if !covering.grant.covers(covered.operation, &covered.path) {
+                continue;
+            }
+            if covered.elicitation.is_some() {
+                ready.push(covered.clone());
+            } else {
+                // The card can already be visible on the phone even though
+                // its request reply has not delivered the id to AFT yet.
+                covered.covering = Some(covering.clone());
+            }
+        }
+        ready
+    };
+    for covered in ready {
+        withdraw_covered_ask(&covered, &covering).await;
+    }
+}
+
+async fn withdraw_covered_ask(covered: &LiveCoverable, covering: &CoveringGrant) {
+    let Some(elicitation) = covered.elicitation.as_deref() else {
+        return;
+    };
     let Some(transport) = transport() else {
         return;
     };
-    let live: Vec<LiveCoverable> = LIVE_COVERABLE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
-    for covered in live {
-        if covered.elicitation == covering_elicitation
-            || covered.key == *covering_key
-            || covered.scope != covering_key.scope
-            || covered.session != call.identity.session
-            || covered.operation != covering.operation
-        {
-            continue;
-        }
-        // Both paths are canonical policy identities, so `covers` compares
-        // them exactly as the grant check does.
-        if !covering.covers(covered.operation, &covered.path) {
-            continue;
-        }
-        let withdraw = ConsentCall {
-            scope: covered.selector.clone(),
-            project_root: covered.project_root.clone(),
-            session: covered.session.clone(),
-            method: "consent.withdraw",
-            params: json!({"elicitation_id": covered.elicitation}),
-            timeout: UNARY_TIMEOUT,
-        };
-        match transport.call(withdraw).await {
-            Ok(record) => match decode_record(&record) {
-                Ok(Settlement::Refused(code)) if code == "access_withdrawn" => {
-                    log_covered_withdrawn(
-                        &call.identity.session,
-                        &covered.elicitation,
-                        covering_elicitation,
-                        covering,
-                    );
-                }
-                // Already settled: its own waiting call applies that real
-                // answer through its own `consent.await`. Anything else
-                // (including a pending record, which a withdraw never
-                // returns) leaves the ask alone.
-                _ => {}
-            },
-            // The ask is gone or belongs to another principal: it stays
-            // pending and untouched.
-            Err(_) => {}
-        }
+    let withdraw = ConsentCall {
+        scope: covered.selector.clone(),
+        project_root: covered.project_root.clone(),
+        session: covered.session.clone(),
+        method: "consent.withdraw",
+        params: json!({"elicitation_id": elicitation}),
+        timeout: UNARY_TIMEOUT,
+    };
+    match transport.call(withdraw).await {
+        Ok(record) => match decode_record(&record) {
+            Ok(Settlement::Refused(code)) if code == "access_withdrawn" => {
+                log_covered_withdrawn(
+                    &covered.session,
+                    elicitation,
+                    &covering.elicitation,
+                    &covering.grant,
+                );
+            }
+            // Already settled: its own waiting call applies that real
+            // answer through its own `consent.await`. Anything else
+            // (including a pending record, which a withdraw never
+            // returns) leaves the ask alone.
+            _ => {}
+        },
+        // Any withdrawal error leaves the local ask pending and untouched.
+        Err(_) => {}
     }
 }
 
@@ -2234,6 +2284,9 @@ async fn hold(
             "no consent transport is connected",
         ));
     };
+    // Register before sending: a sibling's folder answer can arrive while
+    // Cingulate is still returning this request's elicitation id.
+    let live = track_live_coverable(call, &prep);
     let reply = transport
         .call(consent_call(
             call,
@@ -2265,10 +2318,9 @@ async fn hold(
         })
         .await;
     }
-    // Registered until this hold returns: a folder grant stored by a sibling
-    // call finds this ask here (same scope, session, operation and covered
-    // path) and withdraws its card so it resumes without a second answer.
-    let _live = track_live_coverable(call, &prep, &elicitation);
+    if let Some((covered, covering)) = live.record_elicitation(&elicitation) {
+        withdraw_covered_ask(&covered, &covering).await;
+    }
     // Await at least once, even with no budget left, so an ask that already
     // settled (a retry after the answer) is applied rather than parked.
     let mut first = true;

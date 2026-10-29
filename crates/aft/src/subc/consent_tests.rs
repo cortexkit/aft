@@ -1261,6 +1261,23 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
     let requests = f.fake.calls("consent.request");
     assert_eq!(requests.len(), 2);
     let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = f.asks();
+        if records
+            .iter()
+            .filter(|record| record.elicitation_id.is_some())
+            .count()
+            == 2
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both elicitation ids were not recorded within 30s; ask records: {records:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let before: std::collections::HashSet<String> = f
         .asks()
         .into_iter()
@@ -1297,6 +1314,100 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
         before.contains(withdrawn),
         "withdrawn ask was pending {withdrawn:?}"
     );
+}
+
+/// Holds the reply for b.txt after Cingulate creates its card, before AFT can
+/// record the id. Other requests and answers continue through the normal fake.
+#[cfg(unix)]
+struct DelayedSiblingRequest {
+    fake: Arc<FakeCingulate>,
+    received: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl ConsentTransport for DelayedSiblingRequest {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        let delayed = call.method == "consent.request"
+            && call.params["paths"][0]
+                .as_str()
+                .is_some_and(|path| path.ends_with("b.txt"));
+        let reply = SharedFake(Arc::clone(&self.fake)).call(call);
+        let received = Arc::clone(&self.received);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            let reply = reply.await?;
+            if delayed {
+                received.notify_one();
+                release.notified().await;
+            }
+            Ok(reply)
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_withdraws_sibling_after_delayed_request_reply() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(30)));
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(DelayedSiblingRequest {
+        fake: Arc::clone(&f.fake),
+        received: Arc::clone(&received),
+        release: Arc::clone(&release),
+    })));
+    let sub = f.head_root.join("lateid");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 903).await;
+    let mut rx2 = f.send_read(&f.worker, &b, 904).await;
+    tokio::time::timeout(Duration::from_secs(30), received.notified())
+        .await
+        .expect("sibling card exists while its request reply is held");
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 2);
+    let key1 = call_key_for_file(&requests, "a.txt");
+    let key2 = call_key_for_file(&requests, "b.txt");
+    let records = f.asks();
+    let sibling = records
+        .iter()
+        .find(|record| record.call_key.as_deref() == Some(&key2))
+        .expect("sibling ask is persisted before its request");
+    assert_eq!(sibling.elicitation_id, None, "{records:?}");
+    f.fake.answer(
+        &key1,
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+    );
+    let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+        .await
+        .expect("covering call completes before releasing the sibling id")
+        .expect("writer stays open");
+    let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+    assert!(text(&v1).contains("a contents"), "{v1}");
+    assert_eq!(f.worker_grants().len(), 1);
+    assert_eq!(f.worker_grants()[0].kind, GrantKind::Subtree);
+    assert!(f.fake.calls("consent.withdraw").is_empty());
+    release.notify_one();
+    let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+        .await
+        .expect("late sibling resumes without a second answer")
+        .expect("writer stays open");
+    let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+    assert!(text(&v2).contains("b contents"), "{v2}");
+    let withdraws = f.fake.calls("consent.withdraw");
+    assert_eq!(withdraws.len(), 1, "{withdraws:?}");
+    let state = f.fake.state.lock().unwrap();
+    let sibling_id = &state.asks[&key2];
+    assert_eq!(withdraws[0]["elicitation_id"], json!(sibling_id));
+    assert!(state.withdrawn.contains(sibling_id));
+    assert!(!state.answers.contains_key(sibling_id));
 }
 
 /// The call key of the consent request for `file_name`. Parallel calls file

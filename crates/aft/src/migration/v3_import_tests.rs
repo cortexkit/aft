@@ -462,3 +462,22 @@ fn a_refused_reservation_is_a_named_storage_gap() {
         .unwrap()
         .exists());
 }
+
+#[test]
+fn ledger_storage_gap_keeps_diagnostics_but_does_not_swallow_busy() {
+    let error = |code| v3::Error::Ledger {
+        path: PathBuf::from("family/members.sqlite"),
+        operation: "recover registry",
+        source: Box::new(v3::Error::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("underlying SQLite cause".into()),
+        ))),
+    };
+    let unreadable = error(rusqlite::ffi::SQLITE_NOTADB);
+    assert_eq!(
+        storage_gap(&unreadable),
+        Some(format!("storage_gap:{unreadable}"))
+    );
+    assert!(unreadable.to_string().contains("underlying SQLite cause"));
+    assert_eq!(storage_gap(&error(rusqlite::ffi::SQLITE_BUSY)), None);
+}

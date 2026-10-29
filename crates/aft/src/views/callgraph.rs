@@ -104,6 +104,15 @@ impl ManifestBlobReader for BlobReader {
 
 /// Reads callgraph blobs from the family's v3 callgraph plane store.
 pub struct V3BlobReader(pub crate::blob_store::v3::PlaneReader);
+
+pub(super) fn v3_error(error: crate::blob_store::v3::Error) -> PlaneError {
+    if error.is_busy() {
+        self::error(format!("{V3_STORE_BUSY}: {error}"))
+    } else {
+        self::error(error)
+    }
+}
+
 impl ManifestBlobReader for V3BlobReader {
     fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
         let bytes = parse_hex32(key)
@@ -358,9 +367,9 @@ impl PlaneAdapter for CallgraphPlane {
         }
     }
 }
-/// Why a checkout view could not supply a reader. `busy` marks a transient
-/// SQLite lock on the view's database: the graph exists and the caller should
-/// retry, which is reported as building rather than unavailable.
+/// Why a checkout view could not supply a reader. `busy` marks transient
+/// contention on a view database or its family ledger, so callers can retry
+/// rather than reporting a permanently unavailable graph.
 #[derive(Clone, Debug)]
 pub(crate) struct CallgraphViewError {
     pub reason: String,
@@ -372,6 +381,27 @@ impl From<String> for CallgraphViewError {
         Self {
             reason,
             busy: false,
+        }
+    }
+}
+
+impl From<PlaneError> for CallgraphViewError {
+    fn from(error: PlaneError) -> Self {
+        // Base-reference errors enter through the loader's driver stage,
+        // whereas plane materializers return their reason without a stage.
+        let reason = error
+            .reason
+            .strip_prefix("[driver]: ")
+            .unwrap_or(&error.reason);
+        let reason = reason
+            .strip_prefix("family registry I/O error: ")
+            .unwrap_or(reason);
+        Self {
+            busy: reason.starts_with(DERIVED_STORE_BUSY)
+                || reason.starts_with(V3_STORE_BUSY)
+                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX)
+                || reason.starts_with(V3_BASE_COMPLETION_BUSY),
+            reason: error.to_string(),
         }
     }
 }
@@ -391,6 +421,8 @@ impl std::fmt::Display for CallgraphViewError {
 /// Prefix of the plane error for a derived database that a SQLite lock kept
 /// from opening.
 pub(crate) const DERIVED_STORE_BUSY: &str = "callgraph derived store is busy";
+const V3_STORE_BUSY: &str = "callgraph v3 store is busy";
+const V3_BASE_COMPLETION_BUSY: &str = "v3 base plane completion is owned elsewhere";
 
 /// Supplies a checkout's verified call graph to one request, without
 /// exposing its storage layout. Implementations never publish v1/v2 data and
@@ -457,7 +489,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         let (mut snapshot, revision) = self
             .driver
             .verified_bind(&self.access, seed)
-            .map_err(|error| error.to_string())?;
+            .map_err(CallgraphViewError::from)?;
         if has_unpublished_changes(&snapshot) {
             // Publish the edits as a new worker generation (a donor clone
             // patched with the diff) before the single install, as a fresh
@@ -471,7 +503,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                     &snapshot,
                     super::first_load::DERIVED_CALLGRAPH_SEEDING,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(CallgraphViewError::from)?;
             let cut = snapshot
                 .install_cut()
                 .cloned()
@@ -492,7 +524,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         }
         self.driver
             .install(&self.access, &snapshot, revision)
-            .map_err(|error| error.to_string())?;
+            .map_err(CallgraphViewError::from)?;
         // Read the installed cut directly: `installed_snapshot` would mark a
         // checkout without a steady watcher subscription overflowed at once.
         // That mark only decides how the next bind reconciles; this cut was
@@ -528,10 +560,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                 self.bridge
                     .adapter
                     .open_generation(&self.access, snapshot.generation())
-                    .map_err(|error| CallgraphViewError {
-                        busy: error.reason.starts_with(DERIVED_STORE_BUSY),
-                        reason: error.to_string(),
-                    })?;
+                    .map_err(CallgraphViewError::from)?;
                 self.bridge
                     .adapter
                     .reader(&self.access, &snapshot)
@@ -596,7 +625,7 @@ impl CallgraphView {
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: crate::blob_store::v2::TrigramPolicy,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CallgraphViewError> {
         let scope = view_scope(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -619,7 +648,7 @@ impl CallgraphView {
                 Arc::new(super::first_load::ConfiguredMembershipWalker),
                 vec![trigram, bridge.clone()],
             )
-            .map_err(|error| error.to_string())?
+            .map_err(CallgraphViewError::from)?
             .with_adapters(vec![adapter]),
         );
         driver.register_write_intent();
@@ -759,6 +788,221 @@ mod tests {
 
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
+    }
+
+    #[test]
+    fn v3_checkpoint_contention_reaches_checkout_reader_as_busy() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+        let _serial = v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = view(&root, &storage);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        let plane = v3::plane_path(&storage, "donor-reuse", FamilyPlane::Callgraph).unwrap();
+        let blocker = IdentityConnection::open_with_flags(
+            &plane,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            "callgraph-v3-checkpoint-blocker",
+        )
+        .unwrap();
+        // Pin a real WAL snapshot before the next publication appends frames.
+        blocker
+            .execute_batch("BEGIN; SELECT * FROM sqlite_schema;")
+            .unwrap();
+        let added = root.join("c.ts");
+        std::fs::write(
+            &added,
+            "import { caller } from './b';\nexport function top() { return caller(); }\n",
+        )
+        .unwrap();
+        graph.record_change(&added);
+        let error = match graph.reader() {
+            Ok(_) => panic!("a pinned WAL reader should prevent the truncating checkpoint"),
+            Err(error) => error,
+        };
+        assert!(error.busy, "{error}");
+        assert!(error.reason.contains(V3_STORE_BUSY), "{error}");
+        assert!(error.reason.contains("checkpoint WAL"), "{error}");
+        assert!(error.reason.contains("callgraph.sqlite"), "{error}");
+        assert!(
+            error.reason.contains("wal_checkpoint(TRUNCATE): busy=1"),
+            "{error}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
+    }
+
+    #[test]
+    fn v3_busy_ledger_survives_driver_error_wrapping() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+        let _serial = v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let family = "driver-busy";
+        v3::publish(temp.path(), family, 1024, None, |_| Ok(())).unwrap();
+        let path = v3::family_dir(temp.path(), family)
+            .unwrap()
+            .join("members.sqlite");
+        let lock = v3::ReservationLock::acquire(temp.path()).unwrap();
+        let mut writer = v3::RegistryWriter::open_for_barrier(temp.path(), family, &lock).unwrap();
+        let blocker = IdentityConnection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            "callgraph-v3-ledger-blocker",
+        )
+        .unwrap();
+        blocker
+            .execute_batch("BEGIN; SELECT * FROM accounting;")
+            .unwrap();
+        writer
+            .with_barrier(|tx| {
+                tx.execute("UPDATE accounting SET watermark=watermark+1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let ledger_error = writer.covering_measurement().unwrap_err();
+        let driver_error = |error| {
+            PlaneError::loader(
+                super::super::contracts::LoaderStage::Driver,
+                super::super::base_refs::BaseRefError::from(error).to_string(),
+            )
+        };
+        let error = CallgraphViewError::from(driver_error(ledger_error));
+        assert!(error.busy, "{error}");
+        assert!(
+            error
+                .reason
+                .starts_with("view loader [driver]: v3 store busy: "),
+            "{error}"
+        );
+        assert!(error.reason.contains("members.sqlite"), "{error}");
+        assert!(
+            error.reason.contains("wal_checkpoint(TRUNCATE): busy=1"),
+            "{error}"
+        );
+        let permanent = CallgraphViewError::from(driver_error(v3::Error::Refused(
+            "reservation_ledger_unreadable",
+        )));
+        assert!(!permanent.busy, "{permanent}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        writer.covering_measurement().unwrap();
+    }
+
+    #[test]
+    fn v3_busy_ledger_during_view_construction_is_retryable() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+        let _serial = v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        v3::publish(&storage, "donor-reuse", 1024, None, |_| Ok(())).unwrap();
+        let path = v3::family_dir(&storage, "donor-reuse")
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = IdentityConnection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "callgraph-v3-open-blocker",
+        )
+        .unwrap();
+        // SQLite's exclusive locking mode prevents a second connection from
+        // opening the ledger until this transaction and connection are gone.
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        let construct = || {
+            CallgraphView::new(
+                root.clone(),
+                crate::root_cache::StoragePaths::same(&storage),
+                "donor-reuse".into(),
+                crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: 1 << 20,
+                },
+            )
+        };
+        let error = match construct() {
+            Ok(_) => panic!("view construction must not open an exclusively held ledger"),
+            Err(error) => error,
+        };
+        assert!(error.busy, "{error}");
+        assert!(error.reason.contains("v3 store busy: "), "{error}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert_eq!(
+            callers(&construct().unwrap().reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn v3_base_completion_owned_by_another_driver_answers_building_then_ready() {
+        use super::super::base_builder::{build_base, BaseBuild, BaseBuildInput};
+        use super::super::eviction::DiskBudget;
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let paths: Vec<_> = FILES
+            .iter()
+            .map(|(name, _)| RelPath::new(name.as_bytes().to_vec()).unwrap())
+            .collect();
+        let BaseBuild::Published { claim, .. } = build_base(
+            BaseBuildInput {
+                storage: &storage,
+                family: "donor-reuse",
+                root: &root,
+                paths: &paths,
+                policy: crate::blob_store::v2::TrigramPolicy {
+                    max_file_size: 1 << 20,
+                },
+                semantic_producer: None,
+                callgraph_producer: PRODUCER.into(),
+                ignore_fingerprint: None,
+                history: None,
+                budget: DiskBudget::default(),
+            },
+            None,
+        )
+        .unwrap() else {
+            panic!("the fixture must own its fresh base")
+        };
+        let outcome =
+            super::super::base_builder::claim_base(&storage, "donor-reuse", claim.scope(), None)
+                .unwrap();
+        let owner_pid = match &outcome {
+            super::super::base_builder::ClaimOutcome::Busy { owner_pid, .. } => *owner_pid,
+            _ => panic!("the live base owner must fence another completion driver"),
+        };
+        assert_eq!(owner_pid, std::process::id());
+        let error = CallgraphViewError::from(PlaneError::loader(
+            super::super::contracts::LoaderStage::Driver,
+            format!("{V3_BASE_COMPLETION_BUSY}: {outcome:?}"),
+        ));
+        assert!(error.busy, "{error}");
+        assert!(error.reason.contains(V3_BASE_COMPLETION_BUSY), "{error}");
+        assert!(
+            error
+                .reason
+                .contains(&format!("owner_pid: {}", std::process::id())),
+            "{error}"
+        );
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(error))),
+            crate::context::CallgraphStoreAccess::Error(error)
+                if error.is_transient_lock_contention()
+        ));
+
+        claim.release().unwrap();
+        let graph = view(&root, &storage);
+        let crate::context::CallgraphStoreAccess::Ready(ready) =
+            crate::context::checkout_view_callgraph_access(Some(graph.reader()))
+        else {
+            panic!("the completed base must serve a ready call graph")
+        };
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
     }
 
     #[test]

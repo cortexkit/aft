@@ -1416,10 +1416,20 @@ fn callgraph_workspace_package_cache_refreshes_after_reconfigure() {
 
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":{},"symbol":"target","depth":1}}"#,
-        crate::helpers::json_string(&pkg.join("src/index.ts").display())
-    ));
+    // The first build runs in the background after configure; on a busy
+    // runner the query can still answer `callgraph_building`, so retry as an
+    // agent would, the same way the post-reconfigure query below does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let resp = loop {
+        let resp = aft.send(&format!(
+            r#"{{"id":"1","command":"callers","file":{},"symbol":"target","depth":1}}"#,
+            crate::helpers::json_string(&pkg.join("src/index.ts").display())
+        ));
+        if resp["code"] != "callgraph_building" || std::time::Instant::now() >= deadline {
+            break resp;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
     assert_eq!(
         resp["success"], true,
         "first callers should succeed: {resp:?}"

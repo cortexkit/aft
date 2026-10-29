@@ -29,6 +29,7 @@ pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 /// ages them out by epoch instead of by marking.
 pub const SYMBOL_RETENTION_SWEEPS: i64 = 8;
 const TIMEOUT_MS: i64 = 5_000;
+pub(crate) const BUSY_PREFIX: &str = "v3 store busy: ";
 mod connections;
 mod copy;
 mod initialization;
@@ -156,6 +157,12 @@ pub enum Error {
     Sqlite(rusqlite::Error),
     Incompatible(UnsupportedPersistedFormat),
     Refused(&'static str),
+    Busy(&'static str),
+    Ledger {
+        path: PathBuf,
+        operation: &'static str,
+        source: Box<Error>,
+    },
     InvalidIdentity,
     ReservationRegistryMismatch,
 }
@@ -166,12 +173,77 @@ impl fmt::Display for Error {
             Self::Sqlite(e) => write!(f, "{e}"),
             Self::Incompatible(e) => write!(f, "{e}"),
             Self::Refused(reason) => f.write_str(reason),
+            Self::Busy(reason) => write!(f, "{BUSY_PREFIX}{reason}"),
+            Self::Ledger {
+                path,
+                operation,
+                source,
+            } => write!(
+                f,
+                "{}: {operation} {}: {source}",
+                if self.is_busy() {
+                    "reservation_ledger_busy"
+                } else {
+                    "reservation_ledger_unreadable"
+                },
+                path.display()
+            ),
             Self::InvalidIdentity => f.write_str("invalid v3 family, scope or lock identity"),
             Self::ReservationRegistryMismatch => f.write_str("reservation_registry_mismatch"),
         }
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Sqlite(error) => Some(error),
+            Self::Ledger { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+impl Error {
+    /// Contention is retryable; unreadable or incompatible ledgers are not
+    /// treated as empty accounting or as transient contention.
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Self::Busy(_) => true,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            Self::Io(error) => Self::io_is_busy(error),
+            Self::Ledger { source, .. } => source.is_busy(),
+            _ => false,
+        }
+    }
+
+    fn ledger(path: &Path, operation: &'static str, source: impl Into<Error>) -> Self {
+        Self::Ledger {
+            path: path.to_path_buf(),
+            operation,
+            source: Box::new(source.into()),
+        }
+    }
+
+    fn io_is_busy(error: &std::io::Error) -> bool {
+        // Path context must not hide a Windows sharing violation or a nested
+        // WouldBlock error from the ledger's retry classification.
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(error) = cause {
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+                {
+                    return true;
+                }
+            }
+            cause = error.source();
+        }
+        false
+    }
+}
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
@@ -547,25 +619,50 @@ fn schema_rows(c: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
     c.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE substr(name,1,7) != 'sqlite_' ORDER BY type,name,tbl_name,sql")?
         .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect()
 }
+fn format_read<T>(
+    result: rusqlite::Result<T>,
+    path: &Path,
+    operation: &'static str,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let error = Error::Sqlite(error);
+            // A locked format table is not evidence of a missing or corrupt
+            // schema. Other read failures retain the format-drift checks.
+            if error.is_busy() {
+                Err(Error::ledger(path, operation, error))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
 fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
     #[cfg(test)]
     let _profile = work_profile::span("validate_database");
-    let version = c
-        .query_row(
+    let version = format_read(
+        c.query_row(
             "SELECT format_version FROM format_meta WHERE singleton=1",
             [],
             |r| r.get::<_, u64>(0),
-        )
-        .unwrap_or(0);
+        ),
+        path,
+        "read format version",
+    )?
+    .unwrap_or(0);
     let displayed = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     persisted_format::gate(kind.store(), &displayed, path, Some(version))
         .map_err(Error::Incompatible)?;
     if version == 0 {
         return Err(incompatible(kind, path, 0, IncompatibleReason::SchemaDrift));
     }
-    let app = c
-        .query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0);
+    let app = format_read(
+        c.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0)),
+        path,
+        "read application id",
+    )?
+    .unwrap_or(0);
     if app != kind.app_id() {
         return Err(incompatible(
             kind,
@@ -574,13 +671,16 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
             IncompatibleReason::ApplicationId,
         ));
     }
-    let (schema, layout, text): (u32, u32, String) = c
-        .query_row(
+    let (schema, layout, text): (u32, u32, String) = format_read(
+        c.query_row(
             "SELECT schema_version,layout_tag,schema_text FROM format_meta WHERE singleton=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|_| incompatible(kind, path, version, IncompatibleReason::SchemaDrift))?;
+        ),
+        path,
+        "read format schema",
+    )?
+    .ok_or_else(|| incompatible(kind, path, version, IncompatibleReason::SchemaDrift))?;
     let compiled_schema = match (kind, version, schema) {
         // A registry of the base-reference protocol carries its own exact
         // text; any other version/schema pair falls through to the drift check.
@@ -617,8 +717,9 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
     };
     if !known_version
         || text != format!("{META}{compiled_schema}")
-        || schema_rows(c).ok() != Some(schema_rows(&expected)?)
-        || !initialization::has_seed(c, kind)
+        || format_read(schema_rows(c), path, "read schema objects")?
+            != Some(schema_rows(&expected)?)
+        || !format_read(initialization::has_seed(c, kind), path, "read seed")?.unwrap_or(false)
     {
         return Err(incompatible(
             kind,
@@ -814,14 +915,14 @@ fn for_each_registry(
         let path = entry.path().join("members.sqlite");
         if !path
             .try_exists()
-            .map_err(|e| crate::views::io::at("checking v3 registry", &path, e))?
+            .map_err(|error| Error::ledger(&path, "checking v3 registry", error))?
         {
             continue;
         }
         let name = entry.file_name();
         body(
             name.to_str()
-                .ok_or(Error::Refused("reservation_ledger_unreadable"))?,
+                .ok_or_else(|| Error::ledger(&path, "decode family", Error::InvalidIdentity))?,
             &path,
         )?;
     }
@@ -859,13 +960,13 @@ fn preflight_floor(storage: &Path, request: u64) -> Result<()> {
 }
 fn recover_ledgers(storage: &Path, lock: &ReservationLock) -> Result<()> {
     lock.verify(storage)?;
-    for_each_registry(storage, |family, _| {
+    for_each_registry(storage, |family, path| {
         let recover = LedgerReader::open_existing(storage, family)
             .and_then(|reader| reader.reservation_owners())
             .map_or(true, |(_, abandoned)| abandoned);
         if recover {
             RegistryWriter::open_existing(storage, family, lock)
-                .map_err(|_| Error::Refused("reservation_ledger_unreadable"))?;
+                .map_err(|error| Error::ledger(path, "recover registry", error))?;
         }
         Ok(())
     })
@@ -898,15 +999,19 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
                 continue;
             }
             let registry = entry.path().join("members.sqlite");
-            if !registry.try_exists().map_err(|e| {
-                crate::views::io::at("checking v3 reservation registry", &registry, e)
+            if !registry.try_exists().map_err(|error| {
+                Error::ledger(&registry, "checking v3 reservation registry", error)
             })? {
                 continue;
             }
             let name = entry.file_name();
-            let name = name
-                .to_str()
-                .ok_or(Error::Refused("reservation_ledger_unreadable"))?;
+            let name = name.to_str().ok_or_else(|| {
+                Error::ledger(
+                    &registry,
+                    "decode family for admission",
+                    Error::InvalidIdentity,
+                )
+            })?;
             let own_connection = own.filter(|(path, _)| {
                 registry == *path
                     || crate::db::file_identity::identity_of(&registry).is_some_and(|identity| {
@@ -918,7 +1023,9 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
                     || LedgerReader::open_existing(storage, name).and_then(|r| r.accounting()),
                     |(_, connection)| accounting(connection),
                 )
-                .map_err(|_| Error::Refused("reservation_ledger_unreadable"))?;
+                .map_err(|error| {
+                    Error::ledger(&registry, "read accounting for admission", error)
+                })?;
             reserved = reserved
                 .checked_add(ledger.reserved_bytes)
                 .ok_or(Error::Refused("device_free_space_floor"))?;
@@ -1185,13 +1292,19 @@ impl<'a> RegistryWriter<'a> {
             // walk did not count, so only a complete recheck that finds the
             // same total confirms it. A recheck the deadline stops is not a
             // confirmation.
+            #[cfg(test)]
+            tests::measurement_recheck_hook()?;
             match allocated_bytes_until(&self.dir, deadline)? {
                 Some(again) if again == bytes => return Ok(Measurement::Recorded(bytes)),
                 Some(_) => {}
                 None => return settle_registry_growth(&mut connection, &self.dir, bytes, counted),
             }
         }
-        Err(Error::Refused("reservation_ledger_unreadable"))
+        Err(Error::ledger(
+            &self.dir,
+            "measure registry",
+            Error::Busy("namespace size did not stabilize after 8 measurements"),
+        ))
     }
     pub fn with_barrier<T>(
         &mut self,
@@ -1234,8 +1347,14 @@ impl<'a> RegistryWriter<'a> {
     pub fn reserve(&mut self, request: u64) -> Result<Reservation> {
         let storage = self.lock.storage.clone();
         recover_ledgers(&storage, self.lock)?;
-        let owner_start = crate::root_cache::process_start_time_ms(std::process::id())
-            .ok_or(Error::Refused("reservation_ledger_unreadable"))?;
+        let owner_start =
+            crate::root_cache::process_start_time_ms(std::process::id()).ok_or_else(|| {
+                Error::ledger(
+                    &self.dir,
+                    "reserve",
+                    std::io::Error::other("current process start time unavailable"),
+                )
+            })?;
         let before = allocated_bytes(&self.dir)?;
         let registry = self.registry_identity()?;
         let path = self.dir.join("members.sqlite");
@@ -1349,7 +1468,11 @@ fn settle_registry_growth(
         checkpoint(connection)?;
         recorded = safe;
     }
-    Err(Error::Refused("reservation_ledger_unreadable"))
+    Err(Error::ledger(
+        dir,
+        "settle registry growth",
+        Error::Busy("registry size did not stabilize after 8 corrections"),
+    ))
 }
 
 #[cfg(test)]
@@ -1366,12 +1489,21 @@ pub(crate) fn grow_and_expire_recheck_for_test() {
 }
 
 fn checkpoint(c: &Connection) -> Result<()> {
-    let (busy, _, _): (i64, i64, i64) =
+    let (busy, log, checkpointed): (i64, i64, i64) =
         c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
     if busy != 0 {
-        return Err(Error::Refused("reservation_ledger_unreadable"));
+        return Err(Error::ledger(
+            Path::new(c.path().unwrap_or("<unknown>")),
+            "checkpoint WAL",
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some(format!(
+                    "wal_checkpoint(TRUNCATE): busy={busy}, log={log}, checkpointed={checkpointed}"
+                )),
+            ),
+        ));
     }
     Ok(())
 }

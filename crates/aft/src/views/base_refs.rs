@@ -81,6 +81,7 @@ pub enum BaseRefError {
 impl fmt::Display for BaseRefError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Store(error) if error.is_busy() => write!(f, "{}{error}", v3::BUSY_PREFIX),
             Self::Store(error) => write!(f, "v3 store: {error}"),
             Self::View(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
