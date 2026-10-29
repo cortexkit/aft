@@ -82,7 +82,7 @@ impl StandaloneReads {
             .params
             .get("deadline_ms")
             .and_then(|v| v.as_u64())
-            .map(|ms| {
+            .and_then(|ms| {
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -90,7 +90,7 @@ impl StandaloneReads {
                 let remaining = u128::from(ms)
                     .saturating_sub(now_ms)
                     .min(u128::from(u64::MAX)) as u64;
-                Instant::now() + Duration::from_millis(remaining)
+                Instant::now().checked_add(Duration::from_millis(remaining))
             });
         let (tx, rx) = mpsc::sync_channel(1);
         let ask_route = aft::access_policy::capture_ask_route();
@@ -482,6 +482,53 @@ mod tests {
         drop(release);
         finish(&ctx, &mut pending);
         assert_eq!(reads.heavy.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn standalone_running_cancellation_preserves_handler_partial_results() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture.rs"), "fn target() {}\n").unwrap();
+        let ctx = fixture(root.path());
+        let mut reads = StandaloneReads::new();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Release(Arc::clone(&gate));
+        let (started_tx, started_rx) = mpsc::channel();
+        reads.probe = Some(Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let mut released = gate.0.lock().unwrap();
+            while !*released {
+                released = gate.1.wait(released).unwrap();
+            }
+        }));
+        let mut pending = PendingResponses::default();
+        register(
+            &mut pending,
+            super::super::dispatch_outcome(
+                request(
+                    "cancel-running",
+                    "grep",
+                    serde_json::json!({"pattern":"target"}),
+                ),
+                &ctx,
+                &reads,
+            ),
+        );
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(pending.cancel_request("cancel-running"));
+        assert!(
+            pending.poll_ready(&ctx).is_empty(),
+            "a running handler still owns its response"
+        );
+        drop(release);
+        let response = finish(&ctx, &mut pending).pop().unwrap();
+        assert_eq!(response.data["complete"], false, "{response:?}");
+        assert!(
+            response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("cancelled"),
+            "{response:?}"
+        );
     }
 
     #[test]
