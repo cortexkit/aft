@@ -1,11 +1,12 @@
 # Provenance of this directory
 
 Copied byte-for-byte from the Plexus repository (`cortexkit/plexus`),
-commit `0025bdf6cdca8c2d9c6aa10409df9424260d7b5e` (2026-10-28,
-"mason: refuse foreign-PR review-thread resolves"), directory
+commit `3a702b4dc39eca2013407c8bed82b2adc5bc968b` (2026-10-29,
+"mason: add owned bot pull request merge queue operations"), directory
 `crates/plexus-core/tests/fixtures/gh_shim_wire/`:
-`README.md`, `requests-contract/` (144 vectors) and `replies-contract/`
-(17 vectors). This replaces the contract copy from commit `377e1874`.
+`README.md`, `requests-contract/` (159 vectors) and `replies-contract/`
+(26 vectors). This replaces the copy from Plexus commit
+`0025bdf6cdca8c2d9c6aa10409df9424260d7b5e`.
 As in the previous vendoring, Plexus's AFT-derived `requests/` captures and
 its `PROVENANCE.md` are not copied; this file records AFT's contract import.
 
@@ -25,10 +26,19 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 
 | Path | SHA-256 |
 | --- | --- |
-| `README.md` | `c07a1d453c58a00d6e067ab70a12059ed815c4c2b714ef6ec63f4da10618204f` |
+| `README.md` | `83865eb4155c7ee99eb8ae3efb4f3b39308fea8b5a622c1c55f71cf7b54593ed` |
+| `replies-contract/pr-dequeue-closed.json` | `a325282140b12603035d0925c3068c42872e54f0ca5a86a3760aeb0f884eba02` |
+| `replies-contract/pr-dequeue-graphql-errors.json` | `69a7cc46a10cef3b8a9d3934896add2915d17ef55975678e3b78a5d1c6710282` |
+| `replies-contract/pr-dequeue-not-own.json` | `32c72e5195ec93a61fda09b95ab093e6de27c615ffbbe0dbb975fd1cab16034f` |
+| `replies-contract/pr-dequeue-own.json` | `53268db11e0077d539863791b1ac0c3011f495250d9790498fd0800c8cf36431` |
 | `replies-contract/pr-draft-not-own.json` | `2291c88046bf5f97179f06a26091861beda31b3fc66cab8c1d88439ca8c9a3e5` |
 | `replies-contract/pr-edit-not-own.json` | `fdb61597f7b15e9e1da6ca5648250e1fcae09a98ae42d9ea3552111695c71621` |
 | `replies-contract/pr-edit-pull-request-not-found.json` | `c391b6fe818cb1fa6318ad65e44c540c1153ab82c5ec71bd67680b91a2f3ed90` |
+| `replies-contract/pr-enqueue-closed.json` | `d6de551937145eb949a69717c1e0cf824e4c9987b4f08da1c58c5e9959f13cec` |
+| `replies-contract/pr-enqueue-graphql-errors.json` | `cd08865baf532049d3685452260dd77be657a82eedb47a0abdaa92d5847d0553` |
+| `replies-contract/pr-enqueue-head-moved.json` | `2b655f033baa4109e0f3d373d7dac5b3b0b1a3b63d386783351417761188bcc1` |
+| `replies-contract/pr-enqueue-not-own.json` | `ddf9e52cebbcef7f885d6ff995457e799426714b37b432988cbcebd65af3c7a8` |
+| `replies-contract/pr-enqueue-own.json` | `f27d754fb60d1fc7fce566f62c55c949c095fde0c0d71840b4299ebcb0dfb55c` |
 | `replies-contract/pr-ready-not-own.json` | `1cc3bcdc280efb26f96ee91275c99df7085e3b25a180b0f3c6789cdf8718b34c` |
 | `replies-contract/pr-ready-pull-request-read-incomplete.json` | `3f61bb24e26b692790b51f82b025c9d0818ce280d0f3b12c7636552e162dac54` |
 | `replies-contract/resolve-thread-graphql-errors.json` | `332ebe6a0e7ba8e0c9708b360b5817dca2f0cf4f8e28bd8d169965455f64467d` |
@@ -54,8 +64,10 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `requests-contract/accepted-issue-edit-labels.json` | `11d9b9d282da18e47d255252df58afc417e14b2cabd065b6a0adc33e887cdf66` |
 | `requests-contract/accepted-issue-edit-title-body.json` | `4e0b611dc1a8dd0ca52a3d454cf305710d1b14154ff812afb5ca701930d611c8` |
 | `requests-contract/accepted-pr-create.json` | `f360d1a044df48012858fbe1d47b0f89d444a3822c87efa9c549ce272bc81e91` |
+| `requests-contract/accepted-pr-dequeue.json` | `fdb0e90138a0180bb77f75db934953a43744ce090ba8639f5dbb6bc684000df8` |
 | `requests-contract/accepted-pr-draft.json` | `7bd206ba654a06d6d7b5ba0cf481d0d1629cd1ecf918ba80c2296428d706157b` |
 | `requests-contract/accepted-pr-edit.json` | `f932f7ccc9c7c516e2b451319e3c6d7198f5adfe1542d6e5dfd7d8eff1895fa9` |
+| `requests-contract/accepted-pr-enqueue.json` | `6edc2d6012e552039dbd271cfc5285642a5dd2251a6dc9cd0604b406e498b99d` |
 | `requests-contract/accepted-pr-ready.json` | `94993c4e82c2ce6f573cd5f2e23509bf73928cd078ef2cf5a6c5dbe2fc222e8b` |
 | `requests-contract/accepted-pr-review.json` | `a7dc3ba0bd5ff5920de26b7bc89f8b6504331879f64c8dfe508e1d8e656affbb` |
 | `requests-contract/accepted-reaction-issue.json` | `5357630f73147e9d1b26a8b074e254eeecb1cf2c5999122529e41e6724f11a78` |
@@ -74,6 +86,7 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `requests-contract/refused-any-kind-repo.json` | `8e39578f5c2100ce570a3c5d01528e96c023022c0b5eceae7251b66534cbab59` |
 | `requests-contract/refused-any-kind-repositories.json` | `16dfcfd9322adc38e7bebf82fb74c9807db1eadb8ef61ba1fc279e16ff25be2b` |
 | `requests-contract/refused-any-kind-target-repository.json` | `51187f4f89e86f4c5c2ef893688a2bf66243e3c1611174f3a2567bec96be802d` |
+| `requests-contract/refused-body-pr-dequeue.json` | `68816b8f60c8cb5d8aab2d729c68578ab8809dcd8432528e96da734752e077eb` |
 | `requests-contract/refused-close-body-field.json` | `fd1d9bb0d3a46376f9363d07e4299806859f835479a6fa587336a60152714fd7` |
 | `requests-contract/refused-close-comment-wrong-type.json` | `5cd228075ac718cf3ad81a0a9545cdf837454870264929300c336f970cbd5000` |
 | `requests-contract/refused-close-title-field.json` | `a703f191f33c8a7e2806af4aa42ebda1695e5b49a91fe7e9e8194e5f46ca50bd` |
@@ -86,6 +99,12 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `requests-contract/refused-issue-edit-labels-non-string.json` | `269cc2aac5b64eb51c42987c199007e2c7be29b46fff22293bf0e47b44a2d610` |
 | `requests-contract/refused-issue-edit-milestone.json` | `934719cfed4055df1d20798a15cac8b71b9e4e6d683f654c559e5283fc165460` |
 | `requests-contract/refused-issue-edit-state.json` | `7facb615f6af0e270641836548cb0c50d6b4f2c387443f59c2572fdc2c3e7f3d` |
+| `requests-contract/refused-jump-pr-dequeue.json` | `9eb7d9fec56200a3cfafc60fc2764db8777e03e4ea4a7de86817a1e3ed86f7da` |
+| `requests-contract/refused-jump-pr-enqueue.json` | `1f4745cb860916ac492053b39fb01bac2875036531bd7eb2728077586b74b217` |
+| `requests-contract/refused-missing-number-pr-dequeue.json` | `ac6abb11ef3330d78bde9e97c460b1e9cee4c78b8871c6acf40cf265badfdc7b` |
+| `requests-contract/refused-missing-number-pr-enqueue.json` | `a0d4fae2955e3c56cdcbab17a4adba9bcaa9a99d9bbc0a375ca692068fd5c959` |
+| `requests-contract/refused-missing-sha-pr-enqueue.json` | `f0f07b4698403b1885ce64021166391956c0df27fd6d2bd4d7e6d5ab2e1ae036` |
+| `requests-contract/refused-nonhex-sha-pr-enqueue.json` | `76f55df61a7496407957e8923199b5dcb7e6a73d1e6d5125990b3b9382a8bc52` |
 | `requests-contract/refused-pr-create-body-wrong-type.json` | `ac6e5c150a41f30edf7702ccc27911cb47b5a1f6c6bc6b4995b52070e36d62e4` |
 | `requests-contract/refused-pr-create-empty-head.json` | `862660e0a5aff1f29d21b5e0ccc06ec1b9503beea4745e13b4b75b67dac7b2c1` |
 | `requests-contract/refused-pr-create-head-cross-repository.json` | `8f6c8d33b0b64e9415513e2e12e953ffb45c6e1ea9459aa3bd88536765ade409` |
@@ -153,6 +172,8 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `requests-contract/refused-review-reply-unknown-body-field.json` | `98ff89b2c558758fce5a72b73466a9c9f0e3b17267fa886bd5a01d996f5b6ffd` |
 | `requests-contract/refused-review-reply-unknown-target-field.json` | `4d0b5a1e9a296d6b9e4c94ca203c0d6aa16c93b0d3972fc21d07df6dd886c3df` |
 | `requests-contract/refused-review-reply-unknown-top-level-field.json` | `9bbc5778a19a26acfadea745a79c68ba9f0f78c7e821faafd46da9a9a42f9eb1` |
+| `requests-contract/refused-sha-type-pr-enqueue.json` | `30c9b432542ce95d1fe6d497280c700414ed731aef65aaa94a09e78206e0a1e2` |
+| `requests-contract/refused-short-sha-pr-enqueue.json` | `242de1c82cb8bfd0c8be7f8fc806b479982e30eca098126399dc4a753e1945ab` |
 | `requests-contract/refused-stack-add-missing-pull-requests.json` | `2eaec0a05dc35c54927e0a02ba2460c06a48a826f97d88e3f093f4d6da203d2c` |
 | `requests-contract/refused-stack-add-missing-stack-number.json` | `878c2687376ec1d1d767f01dba80ba73bb9a678dd5549262653dfb0bec7966d1` |
 | `requests-contract/refused-stack-add-pull-requests-duplicate.json` | `0dd176a429ac31905373fabd8ecbd7e3bddce958b643c7d9bbf449f25d972335` |
@@ -178,6 +199,10 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `requests-contract/refused-stack-unstack-unknown-body-field.json` | `f34a13d25d6dc0f00100b8ee91c0860dee3249d41b46b93f4c20a39533b761bc` |
 | `requests-contract/refused-stack-unstack-unknown-target-field.json` | `e3f08c4aefab665db9024854f8ad193df7a4735f0df9c6748447ecc2d2703606` |
 | `requests-contract/refused-stack-unstack-unknown-top-level-field.json` | `af4ba313f81baea349049788bbdb46252cfa562937f7a19581e98f616198be15` |
+| `requests-contract/refused-target-field-pr-dequeue.json` | `d315e23ec3dd1e3432d09d01f906d01ce9b9a2fd98eff54d6b0caf6ac21a3e36` |
+| `requests-contract/refused-target-field-pr-enqueue.json` | `f040558a60d074bd0d44b8d03e3bd85c45767a8c1f5fb31146364cc3034abbac` |
+| `requests-contract/refused-top-level-field-pr-dequeue.json` | `97ca91547e2f2b56939fa508bc0517bf998637d496ced91d17f0e09331b77db4` |
+| `requests-contract/refused-top-level-field-pr-enqueue.json` | `1365b090fdfda42b2575da9dbdbeaaaa15fed23698d11d6e8d9f742a138b8eb1` |
 | `requests-contract/refused-unmapped-pr-merge.json` | `9afc6359c61df912cd38933f9ff18b7c8571b8bd35370b0f9ba88f0626589bd9` |
 | `requests-contract/refused-unmapped-verb-pr-merge.json` | `a95f6aec1f164fc4994f4292b7a50f202023c206bf9296319eb3ba32697ec540` |
 | `requests-contract/refused-unresolve-thread-missing-body.json` | `a2ea46fc56074d7cf14412ee689b4d18f6c0e686795d959aee32af7eb15cdaef` |

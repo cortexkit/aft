@@ -262,3 +262,37 @@ Regenerate after an intended reply change, then review the diff:
 ```sh
 PLEXUS_REGENERATE_GH_ROUTE_REPLIES=1 cargo test -p plexus-core --test it v22_reply_contract
 ```
+
+### `bindings-contract/<name>.request.json` and `<name>.reply.json`
+
+These vectors describe binding discovery on the `github` tool, not `gh.route`.
+Each request file is the tool's `arguments` object. Each reply file is the
+real handler's complete `{"result": ...}` or `{"error": ...}` envelope, before
+the tool-result/v1 transport wrapper is added.
+`plexus-module::github_bindings_contract_tests::github_bindings_contract_files_match_handler`
+replays every request through the real tool handler and compares the rendered
+reply byte for byte (sorted keys, pretty JSON, final newline). It also asserts
+the expected rows or refusal independently of the files and checks the audit.
+
+Every case starts with generation 3: `agent-x` owns `app-x`, bound to `o/x`,
+and `agent-y` owns `app-y`, bound to `o/a` and `o/z`. The caller is
+`reserved:prefrontal-core`, with active module invoke grants on both handle
+connections, except `no-grant`, whose caller is `reserved:without-grant` and
+has neither grant. No credentials or GitHub traffic are involved.
+
+- `connection` pins the unchanged `bindings.read` connection selector.
+- `agent` and `other-agent` select only the named registry agent's rows,
+  ordered by repository, without knowing its app handle.
+- `none` and `no-grant` return an empty list with the global generation.
+- `missing-agent-id`, `non-string-agent-id`, `extra-field`, and
+  `secret-extra-field` pin `invalid_request` and its offending field. Even an
+  unexpected credential-shaped key is refused by name, not silently ignored.
+
+Regenerate replies after an intended change, then review the diff:
+
+```sh
+PLEXUS_REGENERATE_GITHUB_BINDINGS_CONTRACT=1 cargo test -p plexus-module --lib github_bindings_contract_tests
+```
+
+Without the variable, the same test only compares. Request files are never
+rewritten. The test refuses missing or unreferenced files in this directory.
