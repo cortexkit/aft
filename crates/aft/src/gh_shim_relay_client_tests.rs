@@ -433,7 +433,7 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
 #[test]
 fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
     let vectors = super::super::plexus_contract_judge::load_reply_vectors();
-    assert_eq!(vectors.len(), 17);
+    assert_eq!(vectors.len(), 26);
     for vector in vectors {
         let name = vector["name"].as_str().unwrap();
         let reply = &vector["reply"];

@@ -1,6 +1,6 @@
 use super::*;
 
-fn manifest() -> Manifest {
+pub(super) fn manifest() -> Manifest {
     let mut manifest = v22_tests::manifest();
     let additions: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/gh_shim/v23-additions.json"
