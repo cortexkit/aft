@@ -178,7 +178,9 @@ fn query_context(root: &Path, storage: &Path) -> AppContext {
     config.indexes.trigram = true;
     config.indexes.semantic = false;
     config.indexes.callgraph = false;
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    let context = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    context.set_canonical_cache_root(root.to_path_buf());
+    context
 }
 
 #[test]
