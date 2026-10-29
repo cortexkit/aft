@@ -41,8 +41,8 @@ def prepare(v22_path: Path, output: Path, issued_at_unix_secs: int) -> bytes:
     if existing & QUEUE_TUPLES or set(manifest["canonicalization"]) & QUEUE_TUPLES:
         raise ValueError("baseline already declares a queue entry")
     for row in additions["tiers"]["governed"]:
-        if row["platform"] != ["macos", "linux", "windows"]:
-            raise ValueError("queue entries must cover all platforms")
+        if row["platform"] != ["macos", "linux"]:
+            raise ValueError("queue entries must use the v22 platforms: macos, linux")
     manifest["tiers"]["governed"].extend(additions["tiers"]["governed"])
     manifest["canonicalization"].update(additions["canonicalization"])
     manifest["manifest_version"] = 23

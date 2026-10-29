@@ -4,12 +4,12 @@
     "governed": [
       {
         "tuple": "pr enqueue",
-        "platform": ["macos", "linux", "windows"],
+        "platform": ["macos", "linux"],
         "reasoning": "Bot-owned pull requests only, pinned to the caller's explicit expected_head_sha. A queue-shaped gh pr merge (optionally --auto) maps to enqueue, never to a direct merge. Plexus checks ownership, open state and the head before enqueuePullRequest; jumping remains operator-only."
       },
       {
         "tuple": "pr dequeue",
-        "platform": ["macos", "linux", "windows"],
+        "platform": ["macos", "linux"],
         "reasoning": "The shim-only gh pr dequeue removes only the bot's own pull request from the merge queue. Plexus checks ownership and open state before dequeuePullRequest. No body is admitted; upstream --disable-auto retains its existing operator classification."
       }
     ]

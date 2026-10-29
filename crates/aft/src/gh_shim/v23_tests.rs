@@ -21,7 +21,7 @@ pub(super) fn manifest() -> Manifest {
 }
 
 #[test]
-fn queue_rows_require_both_v23_and_the_signed_declaration_on_every_platform() {
+fn queue_rows_require_both_v23_and_the_signed_declaration_on_supported_platforms() {
     let sha = "0123456789abcdef0123456789abcdef01234567";
     for (argv, expected) in [
         (
@@ -35,7 +35,15 @@ fn queue_rows_require_both_v23_and_the_signed_declaration_on_every_platform() {
         (vec!["pr", "dequeue", "7"], "pr dequeue"),
     ] {
         let args = argv.iter().map(OsString::from).collect::<Vec<_>>();
-        for platform in ["macos", "linux", "windows"] {
+        for platform in ["windows", "unsupported"] {
+            assert!(!matches!(
+                classify(&args, &manifest(), platform),
+                Classification::Governed { .. }
+            ));
+        }
+        #[cfg(target_os = "windows")]
+        assert_eq!(current_platform(), "unsupported");
+        for platform in ["macos", "linux"] {
             let mut current = manifest();
             assert!(
                 matches!(classify(&args, &current, platform), Classification::Governed { tuple, .. } if tuple == expected)
@@ -147,7 +155,7 @@ assert current['manifest_version'] == 23
 assert current['issued_at_unix_secs'] == 1800000000
 added = current['tiers']['governed'][-2:]
 assert [row['tuple'] for row in added] == ['pr enqueue', 'pr dequeue']
-assert all(row['platform'] == ['macos', 'linux', 'windows'] for row in added)
+assert all(row['platform'] == ['macos', 'linux'] for row in added)
 current['tiers']['governed'] = current['tiers']['governed'][:-2]
 for name in ['pr enqueue', 'pr dequeue']:
     del current['canonicalization'][name]
