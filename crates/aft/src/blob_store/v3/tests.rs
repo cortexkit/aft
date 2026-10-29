@@ -1945,8 +1945,8 @@ fn semantic_batch_lease_metadata_placement() {
     assert_eq!(writer.accounting().unwrap().usage(), before);
     drop(writer);
     drop(lock);
-    // Publication accepts the coordination directory without treating it as a
-    // foreign plane namespace or charging its heartbeat bytes to payloads.
+    // Publication accepts the semantic batch lease directory without treating
+    // it as another blob-data directory or counting heartbeat bytes as payloads.
     publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
     let lock = ReservationLock::acquire(root.path()).unwrap();
     let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();

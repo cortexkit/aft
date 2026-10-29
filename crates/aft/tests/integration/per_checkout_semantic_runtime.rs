@@ -631,8 +631,8 @@ fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
         wait_views_filled(&warm);
         assert_eq!(server.texts(), chunks);
     }
-    // Leave these files checkout-owned unless the scenario below commits one
-    // or both, exercising inherited fills through the same chunk dispatch path.
+    // Keep the new files uncommitted by default. The scenarios below optionally
+    // commit one or both, testing the same chunk in uncommitted and committed files.
     for root in [&repo.main, &repo.linked] {
         write(
             root,
@@ -645,8 +645,9 @@ fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
         git(&repo.main, &["commit", "-m", "new inherited chunk"]);
     }
     if commit_linked {
-        // A different tree gives the second inherited fill its own base claim;
-        // the shared chunk must still use the same family/producer lease.
+        // Different commit trees get independent base-build ownership, but the
+        // new function is identical. Both fills must coordinate on that shared
+        // chunk instead of embedding it twice.
         write(&repo.linked, ".gitignore", "# distinct base tree\n");
         git(&repo.linked, &["add", "src/concurrent.rs", ".gitignore"]);
         git(
