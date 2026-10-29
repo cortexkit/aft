@@ -1,1 +1,0 @@
-- Plugin logs are quieter, with correct diagnostic levels; GitHub-comment edit errors show compact excerpts instead of repeating large inputs (#759, thanks @null-axiom).
