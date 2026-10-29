@@ -165,7 +165,9 @@ fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pin
             quote(&secret)
         ),
     );
-    let output = native["output"].as_str().unwrap();
+    let output = native["output"]
+        .as_str()
+        .unwrap_or_else(|| panic!("native launcher returned no child output: {native:?}"));
     assert!(
         output.contains("sandbox-start"),
         "the native launcher did not reach the shell: {native:?}"
