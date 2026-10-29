@@ -654,7 +654,7 @@ pub struct FileCallData {
     pub default_export_symbol: Option<String>,
     /// Parsed import block for cross-file resolution.
     pub import_block: ImportBlock,
-    /// Lexically selected Python import bindings, keyed by call-expression span.
+    /// Lexically selected Python import bindings, sorted by call-expression span.
     pub python_bindings: Vec<python::CallBinding>,
     /// Language of the file.
     pub lang: LangId,

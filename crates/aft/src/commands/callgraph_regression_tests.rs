@@ -121,7 +121,7 @@ fn callgraph_python_import_reporter_fixture() {
     );
     assert_eq!(
         callers(&store, "mod.py", "test_target", false),
-        "0 callers · 0 file groups"
+        "0 callers · 0 file groups\n1 callers in tests hidden — includeTests: true shows them"
     );
 }
 

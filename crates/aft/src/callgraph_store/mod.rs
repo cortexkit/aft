@@ -16772,11 +16772,13 @@ fn resolve_python_target<I: ResolverIndex>(
     caller_data: &FileCallData,
     raw: &RawRef,
 ) -> Option<(String, String, String)> {
-    if let Some(binding) = caller_data
+    if let Ok(binding_index) = caller_data
         .python_bindings
-        .iter()
-        .find(|binding| binding.byte_start == raw.byte_start && binding.byte_end == raw.byte_end)
+        .binary_search_by_key(&(raw.byte_start, raw.byte_end), |binding| {
+            (binding.byte_start, binding.byte_end)
+        })
     {
+        let binding = &caller_data.python_bindings[binding_index];
         let (module, symbol) = binding.target.as_ref()?;
         let target_file = index.module_target(caller_file, module)?;
         // An import names one module, never every same-named symbol in the project.

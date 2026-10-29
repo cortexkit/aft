@@ -50,7 +50,7 @@ pub(super) fn extract(source: &str, root: Node<'_>) -> (ImportBlock, Vec<CallBin
         calls: Vec::new(),
     };
     extractor.visit(root, 0);
-    let bindings = extractor
+    let mut bindings: Vec<_> = extractor
         .calls
         .iter()
         .filter_map(|(call, scope)| {
@@ -92,6 +92,7 @@ pub(super) fn extract(source: &str, root: Node<'_>) -> (ImportBlock, Vec<CallBin
             })
         })
         .collect();
+    bindings.sort_by_key(|binding| (binding.byte_start, binding.byte_end));
     (
         ImportBlock {
             imports: extractor.imports,
