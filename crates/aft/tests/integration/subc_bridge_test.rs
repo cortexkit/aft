@@ -303,12 +303,44 @@ fn bridge_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-// In-process configure fixtures also resolve storage from the environment.
-// Hold their shared guard until the previous value has been restored.
+// In-process configure fixtures also resolve storage from the environment,
+// so every environment change here must happen while the shared
+// process-settings lock is held, until the previous value is restored.
+//
+// That lock is reentrant per thread only. A bridge runner takes it on its own
+// thread for the whole test and then runs the dispatch closure on another
+// thread; taking it again there would wait on the runner forever. While a
+// runner owns the lock, changes made under it are already excluded from the
+// configure fixtures, so the setters below skip their own acquisition.
+static BRIDGE_RUNNER_OWNS_ENV_LOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Marks the current bridge runner as owner of the process-settings lock.
+/// Declare it after the guard that took the lock so it is released first.
+struct BridgeRunnerEnvLockOwner;
+
+impl BridgeRunnerEnvLockOwner {
+    fn claim() -> Self {
+        BRIDGE_RUNNER_OWNS_ENV_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for BridgeRunnerEnvLockOwner {
+    fn drop(&mut self) {
+        BRIDGE_RUNNER_OWNS_ENV_LOCK.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn process_settings_unless_runner_owns() -> Option<crate::test_helpers::ProcessEnvLockGuard> {
+    (!BRIDGE_RUNNER_OWNS_ENV_LOCK.load(std::sync::atomic::Ordering::SeqCst))
+        .then(crate::test_helpers::process_env_lock)
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
-    _process_settings: crate::test_helpers::ProcessEnvLockGuard,
+    _process_settings: Option<crate::test_helpers::ProcessEnvLockGuard>,
 }
 
 impl Drop for EnvVarGuard {
@@ -322,7 +354,7 @@ impl Drop for EnvVarGuard {
 }
 
 fn set_test_env(key: &'static str, value: &str) -> EnvVarGuard {
-    let process_settings = crate::test_helpers::process_env_lock();
+    let process_settings = process_settings_unless_runner_owns();
     let previous = std::env::var_os(key);
     std::env::set_var(key, value);
     EnvVarGuard {
@@ -333,7 +365,7 @@ fn set_test_env(key: &'static str, value: &str) -> EnvVarGuard {
 }
 
 fn remove_test_env(key: &'static str) -> EnvVarGuard {
-    let process_settings = crate::test_helpers::process_env_lock();
+    let process_settings = process_settings_unless_runner_owns();
     let previous = std::env::var_os(key);
     std::env::remove_var(key);
     EnvVarGuard {
@@ -1725,6 +1757,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let _serial = bridge_test_serial_guard();
     crate::test_helpers::disable_in_process_file_watcher();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
     let _subc_module_id = remove_test_env("SUBC_MODULE_ID");
     let _subc_launch_nonce = remove_test_env("SUBC_LAUNCH_NONCE");
     let _env_guards = env_setup();
@@ -1952,6 +1985,7 @@ where
 {
     let _serial = bridge_test_serial_guard();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
     let conn_dir = tempfile::tempdir().expect("connection tempdir");
     let storage = tempfile::tempdir().expect("storage tempdir");
     let conn_path = conn_dir.path().join("subc-connection.json");
