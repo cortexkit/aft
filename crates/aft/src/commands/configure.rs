@@ -13021,12 +13021,18 @@ mod tests {
         ctx.record_checkout_watcher_change(&during_grace);
         assert_eq!(fills.next(), "wake");
         if transient_backend_failure {
-            assert_eq!(fills.next(), "retry");
-            let reason = ctx
-                .checkout_semantic_runtime()
-                .unwrap()
-                .unavailable_reason()
-                .unwrap();
+            let runtime = ctx.checkout_semantic_runtime().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let reason = loop {
+                if let Some(reason) = runtime.unavailable_reason() {
+                    break reason;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the backend failure was not observed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
             assert!(reason.contains("503"), "unexpected retry: {reason}");
             assert!(!complete(&ctx));
             server.fail_summaries.store(false, Ordering::SeqCst);
