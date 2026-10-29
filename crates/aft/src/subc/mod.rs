@@ -2235,7 +2235,7 @@ fn quiesce_connection_roots(
             quiesce_unbound_root_with(&root_id, live_roots, executor, lsp);
         } else if let Some(ctx) = executor.actor_context(&root_id) {
             ctx.mark_subc_unbound();
-            executor.cancel_queued_maintenance(&root_id);
+            executor.cancel_queued_root_maintenance(&root_id);
             crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
         }
     }
@@ -9779,50 +9779,38 @@ async fn submit_provider_read(
     let project_root = identity.project_root.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
-    // Worker catalogs can materialize persisted launch params even on a
-    // parameterless refetch. Serialize them with grant revocation before replying.
-    let freeze_policy = operation.starts_with("grants.")
-        || remote_policy::key(&identity, body.get("preset").and_then(Value::as_str)).is_some()
-        || body
-            .get("params")
-            .and_then(Value::as_object)
-            .is_some_and(|p| p.contains_key("allow_paths"));
+    let provider_root = identity.root.clone();
+    let received_at = phase_trace.received_at();
+    let admission_deadline = request
+        .deadline
+        .map_or(received_at + Duration::from_secs(2), |deadline| {
+            deadline.at().min(received_at + Duration::from_secs(2))
+        });
     phase_trace.mark_executor_submitted();
     let (trace_tx, trace_rx) = oneshot::channel();
-    let rx = submit_active_tool_call(
+    let mut rx = submit_active_tool_call(
         executor,
         active,
         route,
         corr,
         identity.root.clone(),
-        if freeze_policy {
-            Lane::Mutating
-        } else {
-            Lane::PureRead
-        },
+        Lane::ProviderMetadata,
         request_id.clone(),
-        RouteDetachPolicy::CancelOnDetach,
+        RouteDetachPolicy::RetainForReplay,
         &operation,
         request,
         Box::new(move |ctx| {
             phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
+            } else if job_operation.starts_with("grants.") && ctx.database_runtime_initializing() {
+                Err(subc_protocol::ErrorBody::new(
+                    "grants_unavailable",
+                    "scope persistence unavailable",
+                ))
             } else if job_operation.starts_with("grants.") {
-                crate::database_open::run_staged_open(
-                    ctx,
-                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                    true,
-                );
                 access_grants::operation(body, &job_operation, &identity, ctx)
             } else {
-                if freeze_policy {
-                    crate::database_open::run_staged_open(
-                        ctx,
-                        crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                        true,
-                    );
-                }
                 remote_policy::catalog(body, &identity, ctx)
             };
             if job_operation == "tool.catalog" {
@@ -9859,9 +9847,61 @@ async fn submit_provider_read(
     let tx = tx.clone();
     let metrics = metrics.clone();
     let active = active.clone();
+    let provider_executor = executor.clone();
+    let cancellation = active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(route, corr))
+        .expect("provider call registered before submission")
+        .cancellation
+        .clone();
     tokio::spawn(async move {
-        let response = await_executor_response(rx, request_id).await;
-        let phase_trace = trace_rx.await.ok();
+        let (response, phase_trace) = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(admission_deadline),
+            &mut rx,
+        )
+        .await
+        {
+            Ok(response) => (
+                response.unwrap_or_else(|_| {
+                    Response::error(request_id, "internal_error", "executor dropped")
+                }),
+                trace_rx.await.ok(),
+            ),
+            Err(_) => {
+                match provider_executor.cancel_job_before_execution(&provider_root, &cancellation) {
+                    PreExecutionCancelOutcome::AlreadyStarted => (
+                        await_executor_response(rx, request_id).await,
+                        trace_rx.await.ok(),
+                    ),
+                    PreExecutionCancelOutcome::QueuedRemoved
+                    | PreExecutionCancelOutcome::DispatchedCancelled => {
+                        if let Some(deadline) = request.deadline {
+                            deadline.log_drop(&operation, "provider_admission_timeout");
+                        } else {
+                            log::warn!("queued tool_call dropped name={operation:?} reason=provider_admission_timeout queue_ms={} deadline_ms=none admission_budget_ms=2000",
+                            received_at.elapsed().as_millis());
+                        }
+                        let code = if request
+                            .deadline
+                            .is_some_and(|deadline| deadline.at() <= Instant::now())
+                        {
+                            "deadline_exceeded"
+                        } else {
+                            "provider_busy"
+                        };
+                        (
+                            Response::error(
+                                request_id,
+                                code,
+                                "provider admission deadline exceeded; no operation ran",
+                            ),
+                            None,
+                        )
+                    }
+                }
+            }
+        };
         if !claim_active_tool_call(&active, route, corr) {
             if operation == "tool.catalog" {
                 log::warn!(
@@ -21874,6 +21914,62 @@ mod tests {
                 self._gate.join_storage_sweep_worker();
             }
         }
+    }
+
+    #[test]
+    fn fresh_root_catalog_and_role_describe_do_not_wait_for_view_load_or_index_work() {
+        let mut fixture = HeldConfigureTail::start("view_load");
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let index = fixture.executor.submit_async(
+            fixture.root.clone(),
+            Lane::HeavyInit,
+            "held-index".into(),
+            Box::new(move |_| {
+                let _ = started.send(());
+                let _ = held.recv();
+                Response::success("index", json!({}))
+            }),
+        );
+        running.recv_timeout(Duration::from_secs(3)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(async {
+            for (operation, body) in [
+                ("role.describe", json!({})),
+                ("tool.catalog", json!({"preset":"head"})),
+                ("tool.catalog", json!({"preset":"worker"})),
+            ] {
+                let (writer, mut replies) = mpsc::channel(8);
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+                submit_provider_read(
+                    &writer,
+                    &frame,
+                    route_identity(&fixture.root, "preflight"),
+                    &fixture.executor,
+                    &Arc::default(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    operation,
+                    body,
+                    PhaseTrace::new(Instant::now()),
+                    test_support::test_request_meta(),
+                )
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+                if !matches!(&reply, Ok(Some(frame)) if frame.header.ty == FrameType::Response) {
+                    return false;
+                }
+            }
+            true
+        });
+        release.send(()).unwrap();
+        assert!(index.blocking_recv().unwrap().success);
+        fixture.release_tail();
+        assert!(
+            result,
+            "preflight must answer while real view-load and index work are held"
+        );
     }
 
     /// After a daemon restart every session of a root rebinds at once, while

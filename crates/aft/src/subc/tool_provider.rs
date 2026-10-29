@@ -6611,13 +6611,13 @@ pub(in crate::subc) mod route_tests {
     }
 
     #[tokio::test]
-    async fn catalog_queues_behind_reads_but_not_database_or_cold_builds() {
+    async fn catalog_bypasses_reads_configure_warmup_and_cold_builds() {
         let (_dir, root) = test_support::test_root("catalog-pure-read");
         let (_heavy_dir, heavy_root) = test_support::test_root("catalog-cold-build");
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 6,
             read_cap: 1,
-            actor_cap: 2,
+            actor_cap: 3,
             heavy_permits: 1,
             drr_quantum: 1,
         }));
@@ -6635,6 +6635,19 @@ pub(in crate::subc) mod route_tests {
                 heavy_started.send(()).unwrap();
                 let _ = heavy_release.recv();
                 Response::success("heavy", json!({}))
+            }),
+        );
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (tail_started, started) = std::sync::mpsc::channel();
+        let (release_tail, tail_release) = std::sync::mpsc::channel();
+        let tail = executor.submit_maintenance_async(
+            root.clone(),
+            Lane::MaintenanceCommit,
+            "held-configure-warmup".into(),
+            Box::new(move |_| {
+                tail_started.send(()).unwrap();
+                let _ = tail_release.recv();
+                Response::success("tail", json!({}))
             }),
         );
         started.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -6667,17 +6680,16 @@ pub(in crate::subc) mod route_tests {
         )
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), replies.recv())
-                .await
-                .is_err(),
-            "catalogs must share existing read permits"
-        );
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+        // Release held work even on failure, so a regression cannot hang teardown.
         release_read.send(()).unwrap();
+        release_tail.send(()).unwrap();
+        release_heavy.send(()).unwrap();
         assert!(read.await.unwrap().success);
-        let reply = tokio::time::timeout(Duration::from_secs(3), replies.recv())
-            .await
-            .unwrap()
+        assert!(tail.await.unwrap().success);
+        assert!(heavy.await.unwrap().success);
+        let reply = reply
+            .expect("catalog must answer while index and warmup remain held")
             .unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
         let trace = reply
@@ -6687,33 +6699,10 @@ pub(in crate::subc) mod route_tests {
         let completed = trace
             .finish(now, now, now, reply.frame.body.len(), None)
             .expect("tool.catalog trace must have executor and writer timings");
-        assert!(completed.phases.total > Duration::from_millis(50));
-        assert!(completed.phases.queue > Duration::from_millis(50));
-        let _ = crate::logging::take_slow_tool_call_logs_for_test();
-        crate::log_ctx::with_session(Some(completed.session.clone()), || {
-            crate::logging::note_tool_call_trace(
-                &completed.name,
-                &completed.session,
-                &completed.root,
-                completed.channel,
-                completed.corr,
-                completed.phases,
-                crate::logging::ToolCallCaller::Agent,
-            );
-        });
-        let lines = crate::logging::take_slow_tool_call_logs_for_test();
-        let slow_line = lines
-            .iter()
-            .find(|line| line.contains("slow tool_call name=tool.catalog"))
-            .expect("delayed catalog response should produce a slow tool_call log");
-        assert!(slow_line.contains("session=catalog-session"));
-        assert!(slow_line.contains("queue="));
-        assert!(slow_line.contains("exec="));
-        assert!(slow_line.contains("egress="));
+        assert_eq!(completed.session, "catalog-session");
+        assert!(completed.phases.queue < Duration::from_millis(500));
         assert!(ctx.database_runtime_pending("write"));
         assert_eq!(executor.heavy_permits(), 1);
-        release_heavy.send(()).unwrap();
-        assert!(heavy.await.unwrap().success);
     }
 
     /// Sends `body` through the ledger edge, the frame loop's first stop for a
@@ -8714,5 +8703,163 @@ mod authorization_failure_tests {
     #[tokio::test]
     async fn missing_authorization_database_resolves_one_ask_without_execution() {
         authorization_failure("missing-db").await;
+    }
+}
+
+#[cfg(test)]
+mod metadata_lane_tests {
+    use super::super::*;
+
+    #[tokio::test]
+    async fn provider_admission_errors_keep_their_code_and_send_a_terminal() {
+        for missing_actor in [true, false] {
+            let (_dir, root) = test_support::test_root("provider-admission-error");
+            let executor = Arc::new(Executor::new());
+            if !missing_actor {
+                executor.register_actor(root.clone(), test_support::test_ctx());
+            }
+            let (writer, mut replies) = mpsc::channel(8);
+            let active = Arc::default();
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+            let mut meta = test_support::test_request_meta();
+            if !missing_actor {
+                meta.deadline =
+                    queued_call::Deadline::from_envelope(Instant::now(), &json!({"deadline_ms":1}));
+            }
+            submit_provider_read(
+                &writer,
+                &frame,
+                test_support::route_identity(&root, "preflight"),
+                &executor,
+                &active,
+                &Arc::new(DispatchPathMetrics::new()),
+                "tool.catalog",
+                json!({}),
+                PhaseTrace::new(Instant::now()),
+                meta,
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert_eq!(reply.header.corr, 7);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(
+                body["code"],
+                if missing_actor {
+                    "actor_not_registered"
+                } else {
+                    "deadline_exceeded"
+                },
+                "{body}"
+            );
+            tokio::task::yield_now().await;
+            assert!(active.lock().unwrap().is_empty());
+            assert!(replies.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn started_metadata_keeps_reply_ownership_when_route_is_released() {
+        let (_dir, root) = test_support::test_root("started-metadata");
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), test_support::test_ctx());
+        let active = Arc::default();
+        let route = route_key(41, 1);
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let response = submit_active_tool_call(
+            &executor,
+            &active,
+            route,
+            7,
+            root,
+            Lane::ProviderMetadata,
+            "metadata".into(),
+            RouteDetachPolicy::RetainForReplay,
+            "tool.catalog",
+            test_support::test_request_meta(),
+            Box::new(move |_| {
+                let _ = entered.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                assert!(!crate::executor::current_job_cancelled());
+                Response::success("metadata", json!({"answer":{}}))
+            }),
+        );
+        running.await.unwrap();
+        assert!(queued_call::release_route(
+            &active,
+            &executor,
+            route,
+            &PendingSubcResponses::default()
+        )
+        .is_empty());
+        assert_eq!(
+            apply_route_work_disposition(
+                &active,
+                &executor,
+                route,
+                RouteWorkDisposition::RetainStartedForReplay,
+                "Goodbye"
+            ),
+            1
+        );
+        release.send(()).unwrap();
+        assert!(response.await.unwrap().success);
+        assert!(claim_active_tool_call(&active, route, 7));
+        assert!(finish_active_tool_call(&active, route, 7));
+    }
+
+    #[tokio::test]
+    async fn queued_metadata_admission_budget_sends_a_terminal_without_waiting_for_the_lane() {
+        let (_dir, root) = test_support::test_root("metadata-admission-timeout");
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), test_support::test_ctx());
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = executor.submit_async(
+            root.clone(),
+            Lane::ProviderMetadata,
+            "held-metadata".into(),
+            Box::new(move |_| {
+                let _ = entered.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                Response::success("held", json!({}))
+            }),
+        );
+        running.await.unwrap();
+        let (writer, mut replies) = mpsc::channel(8);
+        let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+        let active = Arc::default();
+        submit_provider_read(
+            &writer,
+            &frame,
+            test_support::route_identity(&root, "preflight"),
+            &executor,
+            &active,
+            &Arc::new(DispatchPathMetrics::new()),
+            "tool.catalog",
+            json!({}),
+            PhaseTrace::new(Instant::now() - Duration::from_secs(2)),
+            test_support::test_request_meta(),
+        )
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+        release.send(()).unwrap();
+        assert!(blocker.await.unwrap().success);
+        let reply = reply
+            .expect("queued metadata must refuse before the held operation finishes")
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "provider_busy", "{body}");
+        tokio::task::yield_now().await;
+        assert!(active.lock().unwrap().is_empty());
+        assert!(replies.try_recv().is_err());
     }
 }

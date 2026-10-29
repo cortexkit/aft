@@ -282,10 +282,20 @@ impl DatabaseWaits {
         {
             // Access settings and scoped catalog preset attestations also use
             // aft.db, even when no saved worker policy needs to be read.
+            let catalog_body = if body.get("op").is_some() {
+                body
+            } else {
+                body.get("arguments").unwrap_or(body)
+            };
             let catalog_wait = operation == "tool.catalog"
                 && ctx.database_runtime_initializing()
-                && remote_policy::catalog_needs_database(body, identity);
-            if catalog_wait || (confine_wait && matches!(operation, "tool.catalog" | "tool.call")) {
+                && remote_policy::catalog_needs_database(catalog_body, identity);
+            let grants_wait =
+                operation.starts_with("grants.") && ctx.database_runtime_initializing();
+            if catalog_wait
+                || grants_wait
+                || (confine_wait && matches!(operation, "tool.catalog" | "tool.call"))
+            {
                 let name = operation.to_string();
                 let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
                 return self.wait(decoded, route, &ctx, name, deadline_ms, true);
@@ -527,7 +537,16 @@ impl DatabaseWaits {
         // A caller may shorten the wait with an absolute Unix-millisecond
         // deadline. The bash timeout limits command execution, not the wait
         // for permission to admit the command.
-        let deadline = wait_deadline(&decoded, deadline_ms);
+        let mut deadline = wait_deadline(&decoded, deadline_ms);
+        if matches!(
+            name.as_str(),
+            "tool.catalog" | "grants.list" | "grants.revoke"
+        ) {
+            // Catalog/grant callers have a short transport budget. Resume after
+            // it expires so an unfinished aft.db open can be refused without
+            // another synchronous open wait on an executor worker.
+            deadline = deadline.min(decoded.phase_trace.received_at() + Duration::from_secs(2));
+        }
         let ctx = Arc::clone(ctx);
         let handle = self.tasks.spawn(async move {
             if any_command {
