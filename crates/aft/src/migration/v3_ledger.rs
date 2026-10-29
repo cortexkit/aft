@@ -762,8 +762,9 @@ pub struct V3ImportReport {
     pub stats: BTreeMap<LegacyArtifact, ReadStats>,
 }
 
-/// Currency of a background import. Checked between bounded reads and rows,
-/// not just before entering the importer, so an unbind stops corpus work.
+/// Whether a background import should continue. Checked between bounded reads
+/// and rows so the importer stops reading files when its checkout loses its last
+/// bound session, rather than checking only before starting the import.
 pub(crate) type ImportControl = Arc<dyn Fn() -> bool + Send + Sync>;
 
 struct Run<'a> {

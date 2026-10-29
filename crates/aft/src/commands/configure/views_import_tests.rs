@@ -1,5 +1,6 @@
-//! Opt-in acquisition on a real checkout. Preparation is outside the measured
-//! process so legacy builds cannot inflate the views-on RSS high-water mark.
+//! Opt-in acquisition on a real checkout. Building the pre-view caches happens
+//! in a separate preparation process so its memory peak is not charged to the
+//! measured views-on acquisition.
 
 use super::*;
 
