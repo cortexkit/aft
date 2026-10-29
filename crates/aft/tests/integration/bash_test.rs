@@ -265,7 +265,10 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
     .to_string_lossy()
     .into_owned();
     let binary = aft_binary();
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", std::ffi::OsStr::new(&requested_path))]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", std::ffi::OsStr::new(&requested_path)),
+        ("AFT_STORAGE_DIR", storage.as_os_str()),
+    ]);
 
     let configure = aft.send(
         &serde_json::json!({
@@ -298,7 +301,13 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
     );
     assert_eq!(response["success"], true, "bash spawn failed: {response:?}");
     let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
-    let shims = storage.join("shims");
+    let start = aft::root_cache::process_start_time_ms(aft.pid()).unwrap();
+    let shims = storage
+        .canonicalize()
+        .unwrap()
+        .join("run")
+        .join(format!("aft-pinned-{}-{start}", aft.pid()))
+        .join("shims");
     assert_eq!(status["status"], "completed", "bash failed: {status:?}");
     assert_eq!(
         status["output_preview"].as_str().unwrap(),
