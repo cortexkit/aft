@@ -318,6 +318,14 @@ def indexed_search_ready(response):
     return lane.get("status") == "ready" or bool(re.search(r"^trigram: ready\s*$", text, re.M))
 
 
+def require_private_connection_parent(state):
+    """Production connection files reject writable ancestors, including mounts."""
+    for parent in (state, *state.parents):
+        if parent.stat().st_mode & 0o022:
+            raise ValueError(f"subc connection parent is group/world writable: {parent}; "
+                             "use a new private directory outside shared target/.cortexkit mounts")
+
+
 async def run_traffic(client, args, variants, start, calls, duration=None, phase="steady", stop=None):
     semaphore = asyncio.Semaphore(args.inflight)
 
@@ -496,6 +504,8 @@ async def main(args):
     if args.phase == "warm-restart" and not state.exists():
         raise ValueError("Warm restart requires a previously warmed --state")
     state.mkdir(parents=True, exist_ok=True)
+    if args.transport == "subc":
+        require_private_connection_parent(state)
     env = {**os.environ, "RUST_LOG": "info", "AFT_PERF_TICK_INTERVAL_MS": "1000",
            "HOME": str(state / "home"), "AFT_STORAGE_DIR": str(state / "storage"),
            "XDG_DATA_HOME": str(state / "data"), "XDG_CACHE_HOME": str(state / "cache"),
@@ -777,6 +787,13 @@ class HarnessTests(unittest.TestCase):
                          {"id": "23", "op": "tool", "channel": 8, "name": "search", "arguments": {}})
         reply = client.decode({"id": "23", "transport_error": True, "body": {"code": "busy"}})
         self.assertIsNotNone(response_error(reply))
+
+    def test_connection_file_rejects_shared_writable_parent(self):
+        private = argparse.Namespace(parents=[], stat=lambda: argparse.Namespace(st_mode=0o40700))
+        require_private_connection_parent(private)
+        private.parents = [argparse.Namespace(stat=lambda: argparse.Namespace(st_mode=0o40775))]
+        with self.assertRaisesRegex(ValueError, "group/world writable"):
+            require_private_connection_parent(private)
 
 
 class DeadlineTests(unittest.IsolatedAsyncioTestCase):

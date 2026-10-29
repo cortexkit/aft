@@ -56,10 +56,15 @@ Semantic and inspect/LSP work are disabled; trigram, callgraph and watchers stay
 
 ## Provision, build and run in one job
 
-Use the shell tool's `runon: "linux,8c,net"` selector to request a remote Linux
-job with eight vCPUs and network access. Never build or load-test on the operator's Mac.
+Use the shell tool's `runon: "linux,12c,net"` selector for jobs compiling AFT:
+the release compiler needs the larger memory allocation. Record that allocation;
+for comparisons to eight-CPU runs, restrict runtime affinity to eight of the
+allocated CPUs **after** building, identically for both binary arms. CPU remains
+measured in absolute cores, with the same 0.8-core budget. Never build or load-test
+on the operator's Mac.
 The fake daemon's `state/connection.json` must have no group/world-writable ancestor. Put results
-under a private directory in the checkout, not a shared `target/` mount; the
+under a newly created private directory in the checkout, not shared `target/` or
+`.cortexkit/` mounts (which may be group-writable on the server); the
 production transport intentionally refuses insecure connection-file parents.
 Build-server snapshots do not preserve ignored binaries/state between jobs.
 Commit the harness first and print `git log -1` at job start. Use a writable,
@@ -70,18 +75,19 @@ in that subject; do not copy a target directory into itself.
 
 ```sh
 git log -1 --oneline
-cargo build --offline --release -p agent-file-tools --bin aft --example views_perf_daemon -j 8
+cargo build --offline --release -p agent-file-tools --bin aft --example views_perf_daemon -j 12
 bun install --frozen-lockfile
 python3 benchmarks/aft-search/provision_corpus.py
 python3 benchmarks/load-check/run.py --self-test
 
 # Baseline and candidate are prebuilt Linux binaries. Both arms run serially
 # against exactly the same subject, deterministic arrivals and CPU allocation.
+mkdir -m 700 .load-check-private
 python3 benchmarks/load-check/run.py \
   --repo /path/to/populated-subject \
   --baseline /path/to/baseline/aft --binary /path/to/candidate/aft \
   --broker target/release/examples/views_perf_daemon \
-  --rate 600 --duration 240 --out /path/to/new-results
+  --rate 600 --duration 240 --out .load-check-private/results
 ```
 
 `--baseline` selects the complete paired matrix: standalone/subc, views off/on,
