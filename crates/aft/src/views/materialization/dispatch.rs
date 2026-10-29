@@ -138,6 +138,7 @@ impl FileFacts {
             default_export_symbol: self.default_export_symbol.clone(),
             exported_symbols: Vec::new(),
             callable_symbols: Vec::new(),
+            python_bindings: Vec::new(),
             imports: self
                 .imports
                 .iter()

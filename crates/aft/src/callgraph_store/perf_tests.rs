@@ -1355,6 +1355,7 @@ fn empty_go_caller_data() -> FileCallData {
         symbol_metadata: HashMap::new(),
         default_export_symbol: None,
         import_block: crate::imports::ImportBlock::empty(),
+        python_bindings: Vec::new(),
         lang: LangId::Go,
     }
 }

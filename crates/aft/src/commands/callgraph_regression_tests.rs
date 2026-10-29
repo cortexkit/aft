@@ -99,14 +99,14 @@ fn callgraph_python_import_reporter_fixture() {
         ("caller_local.py", "run_local"),
     ] {
         let tree = call_tree_result(&store, Path::new(file), symbol, 3, false).unwrap();
-        println!(
-            "call_tree {symbol}:\n{}",
-            crate::subc_format::format_callgraph(
-                "call_tree",
-                &serde_json::to_value(tree).unwrap(),
-                false
-            )
+        let text = crate::subc_format::format_callgraph(
+            "call_tree",
+            &serde_json::to_value(tree).unwrap(),
+            false,
         );
+        println!("call_tree {symbol}:\n{text}");
+        assert!(text.contains("[mod.py:"), "{text}");
+        assert!(!text.contains("unresolved"), "{text}");
     }
     assert!(results[0].starts_with("2 callers"), "{}", results[0]);
     assert!(results[0].contains("same_file_caller:11"), "{}", results[0]);
@@ -118,6 +118,46 @@ fn callgraph_python_import_reporter_fixture() {
         results[2].contains("TestProbe::test_local:4"),
         "{}",
         results[2]
+    );
+    assert_eq!(
+        callers(&store, "mod.py", "test_target", false),
+        "0 callers · 0 file groups"
+    );
+}
+
+#[test]
+fn callgraph_python_import_forms_and_unrelated_names() {
+    let (_temp, store) = fixture(&[
+        ("mod.py", "def f():\n    pass\n"),
+        ("pkg/__init__.py", ""),
+        ("pkg/mod.py", "def f():\n    pass\n"),
+        ("pkg/sub/__init__.py", ""),
+        ("unrelated.py", "def f():\n    pass\n"),
+        ("root_calls.py", "from mod import f as renamed\nimport mod\n\ndef root_named():\n    renamed()\n\ndef root_module():\n    mod.f()\n\ndef local_module():\n    import mod as m\n    m.f()\n"),
+        ("pkg/calls.py", "from pkg.mod import f\nfrom .mod import f as relative_f\nimport pkg.mod\n\ndef absolute():\n    f()\n\ndef relative():\n    relative_f()\n\ndef dotted():\n    pkg.mod.f()\n\ndef local():\n    from .mod import f as local_f\n    local_f()\n\ndef sibling():\n    local_f()\n\ndef shadow(f):\n    f()\n"),
+        ("pkg/sub/calls.py", "from ..mod import f\n\ndef parent():\n    f()\n"),
+        ("missing.py", "from absent import f\n\ndef missing():\n    f()\n"),
+        ("invalid_relative.py", "from .mod import f\n\ndef invalid():\n    f()\n"),
+    ]);
+    let root = callers(&store, "mod.py", "f", true);
+    assert!(root.starts_with("3 callers"), "{root}");
+    for name in ["root_named", "root_module", "local_module"] {
+        assert!(root.contains(name), "{root}");
+    }
+    let package = callers(&store, "pkg/mod.py", "f", true);
+    assert!(package.starts_with("5 callers"), "{package}");
+    for name in ["absolute", "relative", "dotted", "local", "parent"] {
+        assert!(package.contains(&format!("↳ {name}:")), "{package}");
+    }
+    for name in ["sibling", "shadow", "missing", "invalid", "root_named"] {
+        assert!(!package.contains(&format!("↳ {name}:")), "{package}");
+    }
+    let unrelated = callers(&store, "unrelated.py", "f", true);
+    assert!(unrelated.starts_with("Incomplete:"), "{unrelated}");
+    assert!(unrelated.contains("analyzed Python code"), "{unrelated}");
+    assert!(
+        unrelated.ends_with("0 callers · 0 file groups"),
+        "{unrelated}"
     );
 }
 

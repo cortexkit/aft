@@ -217,6 +217,8 @@ pub struct ParseBlob {
     pub exported_symbols: Vec<String>,
     pub callable_symbols: Vec<String>,
     pub imports: Vec<BlobImport>,
+    #[serde(default)]
+    pub python_bindings: Vec<callgraph::python::CallBinding>,
     pub refs: Vec<BlobRef>,
 }
 
@@ -374,6 +376,7 @@ impl CallgraphBlob {
             exported_symbols,
             callable_symbols,
             imports,
+            python_bindings: data.python_bindings,
             refs,
         };
         parse.entry_point_symbols.sort();
@@ -1189,6 +1192,7 @@ impl ParseBlob {
                 imports,
                 byte_range: None,
             },
+            python_bindings: self.python_bindings.clone(),
             lang,
         })
     }

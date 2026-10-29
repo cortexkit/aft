@@ -13059,7 +13059,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v21-rust-module-paths-and-function-references";
+const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -14838,6 +14838,7 @@ fn resolution_caller_data(data: &FileCallData) -> FileCallData {
         symbol_metadata: data.symbol_metadata.clone(),
         default_export_symbol: data.default_export_symbol.clone(),
         import_block: data.import_block.clone(),
+        python_bindings: data.python_bindings.clone(),
         lang: data.lang,
     }
 }
@@ -14877,7 +14878,18 @@ fn resolution_caller_data_weight(rel_path: &str, data: &FileCallData) -> usize {
         .chain(data.exported_symbols.iter())
         .map(|name| ENTRY + name.len())
         .sum::<usize>();
-    ENTRY * 4 + rel_path.len() + imports + metadata + names
+    let python = data
+        .python_bindings
+        .iter()
+        .map(|binding| {
+            ENTRY
+                + binding
+                    .target
+                    .as_ref()
+                    .map_or(0, |(module, symbol)| module.len() + symbol.len())
+        })
+        .sum::<usize>();
+    ENTRY * 4 + rel_path.len() + imports + metadata + names + python
 }
 
 fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
@@ -16338,6 +16350,9 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         Some(LangId::Go) => {
             resolve_go_target(index, &caller_file, full_ref, short_name, caller_data)
         }
+        Some(LangId::Python) => {
+            resolve_python_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
+        }
         Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
             resolve_js_ts_target(index, &caller_file, full_ref, short_name, caller_data)
         }
@@ -16747,6 +16762,30 @@ fn resolve_go_target<I: ResolverIndex>(
     };
     let target = index.go_symbol_target(caller_file, module, short_name)?;
     Some(("resolved".to_string(), target, short_name.to_string()))
+}
+
+fn resolve_python_target<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    full_ref: &str,
+    short_name: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Option<(String, String, String)> {
+    if let Some(binding) = caller_data
+        .python_bindings
+        .iter()
+        .find(|binding| binding.byte_start == raw.byte_start && binding.byte_end == raw.byte_end)
+    {
+        let (module, symbol) = binding.target.as_ref()?;
+        let target_file = index.module_target(caller_file, module)?;
+        // An import names one module, never every same-named symbol in the project.
+        let node = index.node_for_symbol(&target_file, symbol)?;
+        return index
+            .node_is_callable(&target_file, &node)
+            .then(|| ("resolved".to_string(), target_file, symbol.clone()));
+    }
+    resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
 fn resolve_js_ts_target<I: ResolverIndex>(
@@ -23381,6 +23420,13 @@ fn module_ref_target(
         return rust_declared_module_target(project_root, caller_file, module_path, memo, facts);
     }
     let caller_path = project_root.join(caller_file);
+    if caller_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        return python_module_candidates(project_root, &caller_path, module_path)
+            .into_iter()
+            .find(|candidate| facts.is_file(candidate))
+            .map(|path| relative_path(project_root, &path))
+            .filter(|path| is_indexed(path));
+    }
     if Path::new(caller_file)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -23597,6 +23643,13 @@ fn module_dependencies_with_memo(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
+    if abs_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        // Keep missing candidates too, so creating a module rebinds its importers.
+        return python_module_candidates(project_root, abs_path, module_path)
+            .into_iter()
+            .map(|path| relative_path(project_root, &path))
+            .collect();
+    }
     let mut deps = rust_module_dependencies(project_root, abs_path, module_path, memo, facts);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
     if let Some(resolved) =
@@ -23611,6 +23664,43 @@ fn module_dependencies_with_memo(
         }
     }
     deps
+}
+
+/// Absolute Python imports start at the analyzed project root. Relative dots
+/// walk package directories; neither form searches arbitrary same-named files
+/// or guesses runtime changes to sys.path.
+fn python_module_candidates(project_root: &Path, caller: &Path, module: &str) -> Vec<PathBuf> {
+    let dots = module.bytes().take_while(|byte| *byte == b'.').count();
+    let mut base = if dots == 0 {
+        project_root.to_path_buf()
+    } else {
+        let Some(parent) = caller.parent() else {
+            return Vec::new();
+        };
+        parent.to_path_buf()
+    };
+    for _ in 1..dots {
+        let Some(parent) = base.parent() else {
+            return Vec::new();
+        };
+        base = parent.to_path_buf();
+    }
+    if !base.starts_with(project_root) || (dots > 0 && base == project_root) {
+        return Vec::new();
+    }
+    let rest = &module[dots..];
+    if !rest.is_empty() {
+        for segment in rest.split('.') {
+            if segment.is_empty() || !segment.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+                return Vec::new();
+            }
+            base.push(segment);
+        }
+    } else if dots == 0 {
+        return Vec::new();
+    }
+    // A regular package takes precedence over a sibling module, as in Python.
+    vec![base.join("__init__.py"), base.with_extension("py")]
 }
 
 fn rust_module_dependencies(
@@ -24372,6 +24462,7 @@ mod refresh_worker_tests {
             symbol_metadata: HashMap::new(),
             default_export_symbol: None,
             import_block: crate::imports::ImportBlock::empty(),
+            python_bindings: Vec::new(),
             lang: LangId::TypeScript,
         };
         let index = DiskProjectIndex {
@@ -29560,6 +29651,7 @@ export function leaf() {}
                 symbol_metadata: HashMap::new(),
                 default_export_symbol: None,
                 import_block: ImportBlock::empty(),
+                python_bindings: Vec::new(),
                 lang: LangId::TypeScript,
             },
             nodes: vec![node.clone()],
