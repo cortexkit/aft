@@ -253,6 +253,7 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
     let storage = dir.path().join("storage");
     let upstream = dir.path().join("upstream");
     std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&storage).unwrap();
     std::fs::create_dir_all(&upstream).unwrap();
     let real_gh = upstream.join("gh");
     write_executable_shim(&real_gh, "#!/bin/sh\nprintf 'real-gh:%s\\n' \"$*\"\n");
