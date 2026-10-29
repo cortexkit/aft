@@ -3411,6 +3411,140 @@ fn forwarded_changes(root: &std::path::Path, params: &serde_json::Value) -> Vec<
     changes
 }
 
+mod mutation_events {
+    use super::*;
+
+    fn check(command: &str, operation: &str, expected: &[(&str, i64)]) {
+        let (_temp, root, files) = typescript_workspace_with_files(&["importer.ts", "before.ts"]);
+        let importer = &files[0];
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                format_on_edit: false,
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_server_path());
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            importer,
+            "export const importer = 1;\n",
+            Duration::from_secs(15),
+        );
+        assert!(outcome.complete(), "fake server startup: {outcome:?}");
+        ctx.lsp().drain_events();
+
+        let before = root.join("src/before.ts");
+        let after = root.join("src/after.ts");
+        let params = match operation {
+            "write" => serde_json::json!({"file": after, "content": "export const added = 1;\n"}),
+            "edit" => serde_json::json!({"file": before, "content": "export const value = 2;\n"}),
+            "delete" => serde_json::json!({"file": before}),
+            "move" => serde_json::json!({"file": before, "destination": after}),
+            "add hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Add File: {}\n+export const added = 1;\n*** End Patch", after.display())}),
+            "delete hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch", before.display())}),
+            "move hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n-export const value = 1;\n+export const value = 2;\n*** End Patch", before.display(), after.display())}),
+            _ => panic!("unknown operation"),
+        };
+        let req = RawRequest {
+            id: operation.into(),
+            command: command.into(),
+            params,
+            lsp_hints: None,
+        };
+        let response = match command {
+            "write" => handle_write(&req, &ctx),
+            "delete_file" => handle_delete_file(&req, &ctx),
+            "move_file" => handle_move_file(&req, &ctx),
+            "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, &ctx),
+            _ => panic!("unknown command"),
+        };
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["success"], true, "{operation}: {response:#}");
+
+        // The importer is untouched by the mutation. Its acknowledgement is a
+        // protocol barrier: every earlier watched-file event has been echoed.
+        let importer_uri = aft::lsp::position::uri_for_path(importer).unwrap();
+        ctx.lsp()
+            .notify_file_changed(importer, "export const importer = 2;\n", &ctx.config())
+            .unwrap();
+        let mut actual = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        'wait: loop {
+            assert!(Instant::now() < deadline, "missing importer barrier");
+            for event in ctx.lsp().drain_events() {
+                if let LspEvent::Notification {
+                    method,
+                    params: Some(params),
+                    ..
+                } = event
+                {
+                    if method == "custom/watchedFilesChanged" {
+                        actual.extend(forwarded_changes(&root, &params));
+                    } else if method == "custom/documentChanged"
+                        && params["uri"] == importer_uri.as_str()
+                    {
+                        break 'wait;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        actual.sort();
+        let mut expected = expected
+            .iter()
+            .map(|(path, kind)| (path.to_string(), *kind))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "{operation} must report exact lifecycle events"
+        );
+    }
+
+    #[test]
+    fn lsp_mutation_write_created() {
+        check("write", "write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_delete_deleted() {
+        check("delete_file", "delete", &[("src/before.ts", 3)]);
+    }
+    #[test]
+    fn lsp_mutation_move_deleted_created() {
+        check(
+            "move_file",
+            "move",
+            &[("src/after.ts", 1), ("src/before.ts", 3)],
+        );
+    }
+    #[test]
+    fn lsp_mutation_patch_add_created() {
+        check("apply_patch", "add hunk", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_patch_delete_deleted() {
+        check("apply_patch", "delete hunk", &[("src/before.ts", 3)]);
+    }
+    #[test]
+    fn lsp_mutation_patch_move_deleted_created() {
+        check(
+            "apply_patch",
+            "move hunk",
+            &[("src/after.ts", 1), ("src/before.ts", 3)],
+        );
+    }
+    #[test]
+    fn lsp_mutation_existing_content_keeps_document_notifications_only() {
+        check("write", "edit", &[]);
+    }
+}
+
 #[test]
 fn watcher_drain_forwards_only_changes_matching_registered_watchers() {
     let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|root| {
