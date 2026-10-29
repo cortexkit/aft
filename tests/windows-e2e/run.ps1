@@ -724,6 +724,20 @@ function Invoke-AftNdjsonScenario {
 # not the old %TEMP% single file.
 $PluginLog = Join-Path $CacheBase "cortexkit\aft\logs\aft-plugin.log"
 if (Test-Path $PluginLog) { Remove-Item $PluginLog -Force }
+# The engine writes its own aft-<pid>.log beside the plugin log; the plugin
+# does not copy engine lines into its own log. Engine-side checks read both.
+$EngineLogDir = Split-Path $PluginLog -Parent
+Get-ChildItem -Path $EngineLogDir -Filter "aft-*.log*" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^aft-\d+\.log(\.\d+)?$' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+function Get-AftLogPaths {
+    $paths = @()
+    if (Test-Path $PluginLog) { $paths += $PluginLog }
+    $paths += Get-ChildItem -Path $EngineLogDir -Filter "aft-*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^aft-\d+\.log$' } |
+        ForEach-Object { $_.FullName }
+    return $paths
+}
 
 # ---------------------------------------------------------------------------
 # Plugin-log helpers
@@ -959,8 +973,9 @@ if (-not $logExists) {
 # that's intentionally allowed to fail soft. Real fatal crashes still match
 # via "Binary crashed" (from packages/aft-bridge/src/bridge.ts) or SIGABRT.
 Check "no plugin crash" {
-    if (-not (Test-Path $PluginLog)) { return $true }
-    $crashLines = Select-String -Path $PluginLog -Pattern "panicked|SIGABRT|Binary crashed" -ErrorAction SilentlyContinue
+    $logs = Get-AftLogPaths
+    if (-not $logs) { return $true }
+    $crashLines = Select-String -Path $logs -Pattern "panicked|SIGABRT|Binary crashed" -ErrorAction SilentlyContinue
     if (-not $crashLines) { return $true }
     foreach ($line in $crashLines) {
         # Skip known recoverable panics
@@ -974,7 +989,11 @@ Check "no plugin crash" {
 # Every successful binary-resolution path records its source and final executable.
 Check "plugin loaded" { LogContains $PluginLog "Resolved binary from .+: " }
 Check "bridge spawned" { LogContains $PluginLog "started, pid" }
-WarnCheck "search index started" { LogContains $PluginLog "watcher started|search.*index|index.*build" }
+WarnCheck "search index started" {
+    $logs = Get-AftLogPaths
+    if (-not $logs) { return $false }
+    [bool] (Select-String -Path $logs -Pattern "watcher started|search.*index|index.*build" -Quiet -ErrorAction SilentlyContinue)
+}
 
 # Empirical evidence checks: previous iterations passed without ever
 # verifying that aimock's scripted turns actually fired. mock-server.js
