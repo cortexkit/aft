@@ -20,6 +20,37 @@ use std::time::{Duration, Instant};
 
 use crate::lsp::registry::ServerKind;
 
+#[cfg(test)]
+type ShutdownTrace = (Instant, std::thread::ThreadId, &'static str);
+#[cfg(test)]
+static SHUTDOWN_TRACE: std::sync::LazyLock<(
+    crossbeam_channel::Sender<ShutdownTrace>,
+    crossbeam_channel::Receiver<ShutdownTrace>,
+)> = std::sync::LazyLock::new(crossbeam_channel::unbounded);
+#[cfg(test)]
+pub(super) fn shutdown_trace(phase: &'static str) {
+    if std::env::var_os("AFT_SHUTDOWN_TRACE").is_some() {
+        let _ = SHUTDOWN_TRACE
+            .0
+            .send((Instant::now(), std::thread::current().id(), phase));
+    }
+}
+#[cfg(test)]
+fn dump_shutdown_trace() {
+    eprintln!("SHUTDOWN_TARGET {:?}", std::thread::current().id());
+    let events: Vec<_> = SHUTDOWN_TRACE.1.try_iter().collect();
+    if let Some((start, _, _)) = events.first() {
+        for (at, thread, phase) in &events {
+            eprintln!(
+                "SHUTDOWN_TRACE {:?} {:.3} {}",
+                thread,
+                at.duration_since(*start).as_secs_f64() * 1000.,
+                phase
+            );
+        }
+    }
+}
+
 /// How long a freshly spawned child may wait for its `LspClient` to claim it
 /// before the orphan sweep treats it as abandoned. Claiming normally takes
 /// microseconds; the window only has to outlast a slow fork under load while
@@ -170,11 +201,17 @@ impl LspChildRegistry {
         server_root: Option<&Path>,
         kind: Option<&ServerKind>,
     ) -> io::Result<Child> {
+        #[cfg(test)]
+        shutdown_trace("spawn_lock_enter");
         let mut children = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
+        #[cfg(test)]
+        shutdown_trace("spawn_lock_acquired");
         let child = command.spawn()?;
+        #[cfg(test)]
+        shutdown_trace("process_spawn_done");
         // The caller is about to wrap this child in an `LspClient`. Until it
         // calls `mark_client_live`, the child must not look like an orphan:
         // a maintenance sweep blocked on this lock during the fork would
@@ -216,17 +253,27 @@ impl LspChildRegistry {
 
     /// Forget a PID (called when the client is dropped or shut down gracefully).
     pub fn untrack(&self, pid: u32) {
+        #[cfg(test)]
+        shutdown_trace("untrack_lock_enter");
         if let Ok(mut children) = self.inner.lock() {
+            #[cfg(test)]
+            shutdown_trace("untrack_lock_acquired");
             children.remove(&pid);
         }
     }
 
     /// Snapshot of currently-tracked PIDs.
     pub fn pids(&self) -> Vec<u32> {
-        self.tracked_children()
+        #[cfg(test)]
+        shutdown_trace("snapshot_enter");
+        let pids = self
+            .tracked_children()
             .into_iter()
             .map(|(pid, _)| pid)
-            .collect()
+            .collect();
+        #[cfg(test)]
+        shutdown_trace("snapshot_done");
+        pids
     }
 
     fn tracked_children(&self) -> Vec<(u32, TrackedChild)> {
@@ -273,11 +320,17 @@ impl LspChildRegistry {
     /// termination of one server must not delay the kill of the next.
     /// Returns how many groups were sent the kill (or were already gone).
     pub fn force_kill_pids(&self, pids: &[u32]) -> usize {
+        #[cfg(test)]
+        shutdown_trace("kills_enter");
         let mut killed = Vec::new();
         for pid in pids {
+            #[cfg(test)]
+            shutdown_trace("kill_enter");
             if force_kill_child_process_group_nowait(*pid) {
                 killed.push(*pid);
             }
+            #[cfg(test)]
+            shutdown_trace("kill_done");
         }
         // Spawning a child holds the registry mutex across process creation.
         // Send every kill before cleanup can block on that mutex, otherwise a
@@ -285,6 +338,8 @@ impl LspChildRegistry {
         for pid in &killed {
             self.untrack(*pid);
         }
+        #[cfg(test)]
+        shutdown_trace("kills_cleanup_done");
         killed.len()
     }
 
@@ -934,7 +989,12 @@ mod tests {
         let elapsed = started.elapsed();
         release_tx.send(()).ok();
         owner.join().unwrap();
-        assert!(elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150));
+        dump_shutdown_trace();
+        eprintln!("SHUTDOWN_TOTAL wall={elapsed:?} outcome={outcome:?}");
+        assert!(
+            elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
+            "{elapsed:?} {outcome:?}"
+        );
         assert_eq!(outcome.forced, 1, "{outcome:?}");
         assert_eq!(
             outcome.unreaped, 1,
