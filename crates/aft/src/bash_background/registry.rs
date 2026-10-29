@@ -417,7 +417,7 @@ impl KillSettlementTestSamples {
     }
 
     fn diagnostic(&self) -> String {
-        let processes = Command::new("ps")
+        let processes = std::process::Command::new("ps")
             .args(["-axo", "pid,ppid,pgid,state,command"])
             .output()
             .map(|output| {
