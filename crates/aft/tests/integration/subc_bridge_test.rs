@@ -404,26 +404,17 @@ fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_error() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "1");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "1")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_panic() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "panic");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "panic")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_bash_elicitation_ttl_ms(ms: u64) -> EnvVarGuard {
-    let key = "AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, ms.to_string());
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS", &ms.to_string())
 }
 
 fn install_bridge_state(state: Arc<BridgeState>) {
