@@ -28236,8 +28236,9 @@ mod cold_build_insert_tests {
         assert_eq!(result.total_callers, CALLER_COUNT);
         assert_eq!(caller_queries, 1);
         assert_eq!(boundary_queries, 3);
-        // Includes one readiness SELECT, which reads all readiness metadata at once.
-        assert_eq!(total_selects, 7);
+        // Readiness metadata and matching unresolved names each use one SELECT;
+        // the total stays constant as the number of callers grows.
+        assert_eq!(total_selects, 8);
     }
 
     #[test]
