@@ -397,6 +397,47 @@ static KILL_SETTLEMENT_NOTICES: std::sync::OnceLock<
 #[cfg(all(test, unix))]
 thread_local! {
     static KILL_SETTLEMENT_TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static KILL_SETTLEMENT_TEST_SAMPLES: std::cell::RefCell<Option<Arc<Mutex<KillSettlementTestSamples>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+struct KillSettlementTestSamples {
+    pgid: Option<i32>,
+    count: usize,
+    recent: [String; 8],
+}
+
+#[cfg(all(test, unix))]
+impl KillSettlementTestSamples {
+    fn record(&mut self, pgid: i32, sample: String) {
+        self.pgid = Some(pgid);
+        self.recent.rotate_left(1);
+        self.recent[7] = sample;
+        self.count += 1;
+    }
+
+    fn diagnostic(&self) -> String {
+        let processes = std::process::Command::new("ps")
+            .args(["-axo", "pid,ppid,pgid,state,command"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace()
+                            .nth(2)
+                            .and_then(|pgid| pgid.parse().ok())
+                            == self.pgid
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|error| format!("ps failed: {error}"));
+        format!(
+            "settlement pgid={:?}, samples={}, last samples={:#?}\nprocess group:\n{processes}",
+            self.pgid, self.count, self.recent
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -414,6 +455,8 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
         return;
     };
     let started = kill_settlement_now();
+    #[cfg(test)]
+    let diagnostic_started = Instant::now();
     loop {
         let exists = unsafe { libc::killpg(pgid, 0) } == 0;
         if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
@@ -421,7 +464,21 @@ fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
         }
         // Zombies cannot run or retain output pipes. An unreaped orphan may
         // still make killpg(0) succeed, but is not a live descendant to report.
-        if live_process_group_members(pgid).is_ok_and(|listing| listing.is_clean()) {
+        let listing = live_process_group_members(pgid);
+        #[cfg(test)]
+        KILL_SETTLEMENT_TEST_SAMPLES.with(|samples| {
+            if let Some(samples) = samples.borrow().as_ref() {
+                samples.lock().unwrap().record(
+                    pgid,
+                    format!(
+                        "real={:?}, settlement={:?}, exists={exists}, listing={listing:?}",
+                        diagnostic_started.elapsed(),
+                        kill_settlement_now().saturating_duration_since(started)
+                    ),
+                );
+            }
+        });
+        if listing.is_ok_and(|listing| listing.is_clean()) {
             return;
         }
         #[cfg(test)]
@@ -24509,7 +24566,12 @@ mod tests {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("child.sh"),
-            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\necho ready > ready\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
+            // Write `ready` only after the long-lived sleep exists. Otherwise a
+            // TERM sent between `ready` and the first `sleep` launch is
+            // deferred by bash, the sleep is born after the signal, and it
+            // outlives the trapped shell as a survivor this TERM-only kill
+            // then waits for.
+            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\nsleep 30 & sleeper=$!\necho ready > ready\nwait $sleeper\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
         let task_id =
             spawn_unsandboxed_for_kill_test(&registry, dir.path(), "bash child.sh & wait");
         let ready_deadline = Instant::now() + Duration::from_secs(10);
@@ -24534,12 +24596,20 @@ mod tests {
             .unwrap()
             .insert(task_id.clone(), waiting_tx);
         let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let samples = Arc::new(Mutex::new(KillSettlementTestSamples {
+            pgid: None,
+            count: 0,
+            recent: Default::default(),
+        }));
+        let killer_samples = samples.clone();
         let killer_registry = registry.clone();
         let killer_task = task_id.clone();
         let killer = std::thread::spawn(move || {
             // Freeze only this kill's settlement clock: the release handshake,
             // not scheduler speed, decides when the descendant can exit.
             KILL_SETTLEMENT_TEST_NOW.with(|clock| clock.set(Some(Instant::now())));
+            KILL_SETTLEMENT_TEST_SAMPLES
+                .with(|samples| *samples.borrow_mut() = Some(killer_samples));
             let _ = result_tx.send(killer_registry.kill(&killer_task, "session"));
         });
         let premature = crossbeam_channel::select! {
@@ -24555,7 +24625,12 @@ mod tests {
         let snapshot = premature.unwrap_or_else(|| {
             result_rx
                 .recv_timeout(Duration::from_secs(10))
-                .unwrap()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "kill did not settle: {error}; {}",
+                        samples.lock().unwrap().diagnostic()
+                    )
+                })
                 .unwrap()
         });
         killer.join().unwrap();

@@ -1371,7 +1371,16 @@ async fn consent_folder_grant_withdraws_sibling_after_delayed_request_reply() {
     tokio::time::timeout(Duration::from_secs(30), received.notified())
         .await
         .expect("sibling card exists while its request reply is held");
-    let requests = f.fake.calls("consent.request");
+    // The two reads file their requests in either order, so b.txt's held
+    // reply can arrive before a.txt's request has been sent.
+    let requests_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let requests = loop {
+        let requests = f.fake.calls("consent.request");
+        if requests.len() >= 2 || tokio::time::Instant::now() >= requests_deadline {
+            break requests;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert_eq!(requests.len(), 2);
     let key1 = call_key_for_file(&requests, "a.txt");
     let key2 = call_key_for_file(&requests, "b.txt");
@@ -1794,7 +1803,9 @@ async fn consent_deadline_during_settled_application_waits_for_the_real_answer()
         assert_ne!(new_key, original);
         f.fake
             .answer(new_key, json!({"state":"settled", "outcome":"deny"}));
-        let frame = tokio::time::timeout(Duration::from_secs(3), second.recv())
+        // Bounds only the reply after a deny; a loaded runner once took over
+        // 3 s, and a call that never replies still fails here.
+        let frame = tokio::time::timeout(Duration::from_secs(30), second.recv())
             .await
             .unwrap()
             .unwrap();
