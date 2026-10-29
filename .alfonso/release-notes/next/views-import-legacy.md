@@ -1,0 +1,3 @@
+When index views are enabled, AFT now imports compatible existing text and symbol caches in the background even when semantic indexing is disabled. Matching cached content can be reused instead of extracting trigrams or parsing every symbol again. Incompatible or changed content is rebuilt, and unfinished imports remain building. Imports stop when their checkout is unbound. Worktrees configured to only read another checkout's shared caches will not import into that checkout's caches.
+
+Legacy callgraph databases are not yet certified donors for the views graph format; the first views graph still uses the existing rebuild path. Views remain off by default.

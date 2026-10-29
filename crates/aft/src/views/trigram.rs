@@ -65,6 +65,8 @@ pub(crate) struct LexicalView {
     source: Arc<dyn LexicalSnapshotSource>,
     query: std::sync::Mutex<()>,
     ready: std::sync::atomic::AtomicBool,
+    legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
+    current: crate::migration::v3_ledger::ImportControl,
 }
 
 /// Supplies a verified checkout snapshot without exposing its storage layout
@@ -150,14 +152,48 @@ impl LexicalView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && (self.current)()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: TrigramPolicy,
     ) -> Result<Self, String> {
+        Self::new_with_import(
+            root,
+            storage,
+            family,
+            policy,
+            Arc::new(|| true),
+            crate::cold_build_limiter::global_limiter(),
+        )
+    }
+
+    pub(crate) fn new_with_import(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: TrigramPolicy,
+        current: crate::migration::v3_ledger::ImportControl,
+        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    ) -> Result<Self, String> {
+        if !current() {
+            return Err(format!(
+                "{}checkout is unbound",
+                crate::blob_store::v3::BUSY_PREFIX
+            ));
+        }
+        let legacy_import = crate::migration::views_background::BackgroundImport::start(
+            &storage.artifacts,
+            &family,
+            &root,
+            policy,
+            current.clone(),
+            limiter,
+        );
         let scope = crate::path_identity::project_scope_key(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -191,7 +227,10 @@ impl LexicalView {
             scope,
             producers,
         });
-        Ok(Self::with_source(root, storage, family, policy, source))
+        let mut view = Self::with_source(root, storage, family, policy, source);
+        view.legacy_import = legacy_import;
+        view.current = current;
+        Ok(view)
     }
 
     pub(crate) fn with_source(
@@ -209,6 +248,8 @@ impl LexicalView {
             source,
             query: std::sync::Mutex::new(()),
             ready: std::sync::atomic::AtomicBool::new(false),
+            legacy_import: None,
+            current: Arc::new(|| true),
         }
     }
 
@@ -244,6 +285,22 @@ impl LexicalView {
     }
 
     pub(crate) fn snapshot(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+        if !(self.current)() {
+            return Err(format!(
+                "{}checkout is no longer bound to this generation",
+                crate::blob_store::v3::BUSY_PREFIX
+            ));
+        }
+        if self
+            .legacy_import
+            .as_ref()
+            .is_some_and(|job| job.is_building())
+        {
+            return Err(format!(
+                "{}legacy text and symbol import building",
+                crate::blob_store::v3::BUSY_PREFIX
+            ));
+        }
         let result = self.project();
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
@@ -1230,6 +1287,28 @@ pub fn materialize_v3(
     if manifest.header().producers.trigram != policy.fingerprint_hex() {
         return Err(plane_error("trigram producer mismatch"));
     }
+    // Imported rows have the same content-and-policy keys as fresh payloads.
+    // Pin before probing so eviction cannot turn a hit into a missing ready row.
+    let keys: Vec<_> = manifest
+        .entries()
+        .filter_map(|(_, entry)| {
+            let super::manifest_v2::EntryV2::Regular { content, .. } = entry else {
+                return None;
+            };
+            Some(
+                crate::blob_store::v2::TrigramKey {
+                    content: *content,
+                    policy,
+                }
+                .family_key(),
+            )
+        })
+        .collect();
+    live.protect(&keys)
+        .map_err(|error| plane_error(error.to_string()))?;
+    let reader =
+        crate::blob_store::v3::PlaneReader::open_existing(storage, family, FamilyPlane::Trigram)
+            .ok();
     let mut payloads = Vec::new();
     for (path, entry) in manifest.entries() {
         let super::manifest_v2::EntryV2::Regular { content, size, .. } = entry else {
@@ -1246,11 +1325,12 @@ pub fn materialize_v3(
             policy,
         }
         .family_key();
-        payloads.push((
-            path.clone(),
-            key,
-            TrigramPayload::extract(source, &policy).encode(),
-        ));
+        let payload = reader
+            .as_ref()
+            .and_then(|reader| reader.get(&key).ok().flatten())
+            .filter(|payload| TrigramPayload::decode(payload).is_ok())
+            .unwrap_or_else(|| TrigramPayload::extract(source, &policy).encode());
+        payloads.push((path.clone(), key, payload));
     }
     put_v3_payloads(storage, family, manifest, payloads, live)
 }

@@ -4,6 +4,37 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::blob_store::v2::{ContentHash, FamilyKey, TrigramKey};
+
+#[test]
+fn views_import_cancellation_inside_bounded_reads_releases_and_resumes() {
+    let _serial = v3::serial_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let root = checkout(dir.path());
+    let storage = dir.path().join("storage");
+    legacy_trigram(&storage, &root);
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    // The first checks admit the claim; the reader then loses its binding
+    // partway through the donor, before it can publish a complete payload.
+    let control: ImportControl =
+        Arc::new(move || observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12);
+    assert!(matches!(
+        run_v3_import_while(&request(&storage, &root, None), None, control),
+        Err(V3ImportError::Cancelled)
+    ));
+    let row = row_of(&storage, LegacyArtifact::Trigram);
+    assert!(!row.state.is_terminal());
+    assert!(row.owner.is_none());
+    assert!(
+        checks.load(std::sync::atomic::Ordering::Relaxed) <= 16,
+        "iteration must stop at the first observed cancellation"
+    );
+    let report = run_v3_import(&request(&storage, &root, None), None).unwrap();
+    assert!(matches!(
+        outcome(&report, LegacyArtifact::Trigram),
+        ArtifactOutcome::Done { .. }
+    ));
+}
 use crate::migration::v3_import::tests::{
     checkout, deterministic, legacy_semantic, legacy_trigram, producer, snapshot_tree, FAMILY, KEY,
     POLICY,

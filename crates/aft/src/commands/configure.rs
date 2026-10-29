@@ -7637,11 +7637,15 @@ fn start_checkout_semantic_lane(
                 // this background thread, into the family's v3 planes only, so
                 // the lane's fills find its vectors stored rather than
                 // embedding every file again.
-                let current = {
+                let current: crate::migration::v3_ledger::ImportControl = {
                     let slot = weak_slot.clone();
-                    move || slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
+                    let lifecycle = strict_lifecycle.clone();
+                    Arc::new(move || {
+                        lifecycle.is_bound()
+                            && slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
+                    })
                 };
-                import_legacy_set_into_v3(&config, &current);
+                import_legacy_set_into_v3(&config, current);
                 let _pause_currency = crate::semantic_index::PauseRetryScope::new(
                     config.schedule.retry_initial,
                     config.schedule.retry_max,
@@ -7664,14 +7668,17 @@ fn start_checkout_semantic_lane(
 /// Imports a root's legacy (pre-view) set into the family's v3 planes before
 /// its views-on semantic lane fills, through the v3 import ledger. Nothing is
 /// written to the v2 view registry or the v2 stores. A root with no legacy
-/// artifact, or whose v3 import already finished, returns at once; another
-/// process importing the same set is not waited for.
+/// artifact, or whose v3 import already finished, returns at once. A busy
+/// import is observed on this worker until it finishes or the binding ends,
+/// so a concurrent importer does not cause duplicate cold extraction.
 fn import_legacy_set_into_v3(
     config: &crate::views::semantic_runtime::WorkerConfig,
-    keep_going: &dyn Fn() -> bool,
+    keep_going: crate::migration::v3_ledger::ImportControl,
 ) {
     let (storage, key) = (&config.storage.artifacts, &config.family);
-    if !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
+    if !crate::root_cache::ArtifactAccess::for_root(&config.root)
+        .allows_write(key, &storage.join("blobs/v3").join(key))
+        || !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
         || !keep_going()
     {
         return;
@@ -7689,7 +7696,7 @@ fn import_legacy_set_into_v3(
         &config.schedule.limiter,
         "legacy_import",
         &config.root,
-        keep_going,
+        || keep_going(),
     ) else {
         return;
     };
@@ -7702,20 +7709,34 @@ fn import_legacy_set_into_v3(
         crate::migration::per_checkout::legacy_semantic_producer(storage, key, &config.semantic),
     );
     let started = Instant::now();
-    match crate::migration::v3_ledger::run_v3_import(&request, None) {
-        Ok(report) => slog_info!(
-            "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
-            config.root.display(),
-            key,
-            report.outcomes,
-            started.elapsed().as_millis()
-        ),
-        Err(error) => slog_warn!(
-            "legacy v3 import root={} key={} failed: {}",
-            config.root.display(),
-            key,
-            error
-        ),
+    while keep_going() {
+        match crate::migration::v3_ledger::run_v3_import_while(&request, None, keep_going.clone()) {
+            Ok(report)
+                if report.outcomes.values().any(|outcome| {
+                    matches!(
+                        outcome,
+                        crate::migration::v3_ledger::ArtifactOutcome::Busy { .. }
+                    )
+                }) =>
+            {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Ok(report) => slog_info!(
+                "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
+                config.root.display(),
+                key,
+                report.outcomes,
+                started.elapsed().as_millis()
+            ),
+            Err(error) => slog_warn!(
+                "legacy v3 import root={} key={} failed: {}",
+                config.root.display(),
+                key,
+                error
+            ),
+        }
+        break;
     }
 }
 

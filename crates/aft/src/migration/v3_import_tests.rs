@@ -142,6 +142,7 @@ pub(super) fn input<'a>(
         trigram: &POLICY,
         semantic,
         working_set: DEFAULT_WORKING_SET,
+        keep_going: std::sync::Arc::new(|| true),
     }
 }
 
@@ -363,6 +364,7 @@ fn imported_trigram_rows_equal_a_cold_build_and_read_no_checkout_file() {
         &staged.path,
         &staged.hash,
         &mut |_| {},
+        &|| true,
     )
     .unwrap()
     .unwrap();
@@ -419,6 +421,7 @@ fn imported_trigram_rows_equal_a_cold_build_and_read_no_checkout_file() {
         &staged.path,
         &staged.hash,
         &mut |_| {},
+        &|| true,
     )
     .unwrap()
     .unwrap();
@@ -452,6 +455,7 @@ fn a_refused_reservation_is_a_named_storage_gap() {
         &staged.path,
         &staged.hash,
         &mut |_| {},
+        &|| true,
     );
     v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
     assert_eq!(

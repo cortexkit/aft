@@ -596,6 +596,8 @@ pub(crate) struct CallgraphView {
     source: Arc<dyn CallgraphReaderSource>,
     query: std::sync::Mutex<()>,
     ready: std::sync::atomic::AtomicBool,
+    legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
+    current: crate::migration::v3_ledger::ImportControl,
 }
 
 /// The v3 member scope of a checkout's call-graph view.
@@ -618,14 +620,48 @@ impl CallgraphView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && (self.current)()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: crate::blob_store::v2::TrigramPolicy,
     ) -> Result<Self, CallgraphViewError> {
+        Self::new_with_import(
+            root,
+            storage,
+            family,
+            policy,
+            Arc::new(|| true),
+            crate::cold_build_limiter::global_limiter(),
+        )
+    }
+
+    pub(crate) fn new_with_import(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: TrigramPolicy,
+        current: crate::migration::v3_ledger::ImportControl,
+        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    ) -> Result<Self, CallgraphViewError> {
+        if !current() {
+            return Err(CallgraphViewError {
+                reason: "checkout is unbound".into(),
+                busy: true,
+            });
+        }
+        let legacy_import = crate::migration::views_background::BackgroundImport::start(
+            &storage.artifacts,
+            &family,
+            &root,
+            policy,
+            current.clone(),
+            limiter,
+        );
         let scope = view_scope(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -661,7 +697,10 @@ impl CallgraphView {
             scope,
             producers,
         });
-        Ok(Self::with_source(root, storage, family, policy, source))
+        let mut view = Self::with_source(root, storage, family, policy, source);
+        view.legacy_import = legacy_import;
+        view.current = current;
+        Ok(view)
     }
 
     pub(crate) fn with_source(
@@ -679,6 +718,8 @@ impl CallgraphView {
             source,
             query: std::sync::Mutex::new(()),
             ready: std::sync::atomic::AtomicBool::new(false),
+            legacy_import: None,
+            current: Arc::new(|| true),
         }
     }
 
@@ -711,6 +752,22 @@ impl CallgraphView {
     /// serialized so an installed membership and its graph come from the
     /// same reconciliation.
     pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        if !(self.current)() {
+            return Err(CallgraphViewError {
+                reason: "checkout is no longer bound to this generation".into(),
+                busy: true,
+            });
+        }
+        if self
+            .legacy_import
+            .as_ref()
+            .is_some_and(|job| job.is_building())
+        {
+            return Err(CallgraphViewError {
+                reason: "legacy text and symbol import building".into(),
+                busy: true,
+            });
+        }
         let _query = self
             .query
             .lock()

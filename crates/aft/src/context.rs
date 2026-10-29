@@ -12425,7 +12425,14 @@ impl AppContext {
                     .as_ref()
                     .is_some_and(|view| view.matches(&root, &storage, &family, policy))
                 {
-                    match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
+                    match crate::views::trigram::LexicalView::new_with_import(
+                        root,
+                        storage,
+                        family,
+                        policy,
+                        self.views_import_control(),
+                        self.cold_build_limiter(),
+                    ) {
                         Ok(view) => *slot = Some(Arc::new(view)),
                         Err(error) => return Err(error),
                     }
@@ -12484,7 +12491,8 @@ impl AppContext {
     /// (lexical, call graph and semantic) rather than the content-addressed
     /// v1 view or the legacy stores. Such a root runs none of the legacy
     /// views-on writers: no v1 view publication or import, no v1 blob puts
-    /// and no legacy semantic import. An explicitly installed checkout query
+    /// and no import into the old semantic runtime. Compatible pre-view caches
+    /// may still be imported into v3 on background workers. A checkout query
     /// runtime keeps the older route.
     pub(crate) fn views_route_root(&self) -> bool {
         let config = self.config();
@@ -12493,6 +12501,13 @@ impl AppContext {
             && self.heavy_root_work_allowed()
             && self.cache_unavailable_reason().is_none()
             && !self.checkout_query_runtime_active()
+    }
+
+    pub(crate) fn views_import_control(&self) -> crate::migration::v3_ledger::ImportControl {
+        let lifecycle = self.subc_lifecycle_admission();
+        let generation = self.configure_generation_flag();
+        let expected = generation.load(Ordering::Acquire);
+        Arc::new(move || lifecycle.is_bound() && generation.load(Ordering::Acquire) == expected)
     }
 
     pub(crate) fn callgraph_view_is_ready(&self) -> bool {
@@ -12571,7 +12586,14 @@ impl AppContext {
                 .as_ref()
                 .is_some_and(|view| view.matches(&root, &storage, &family, policy))
             {
-                match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
+                match crate::views::callgraph::CallgraphView::new_with_import(
+                    root,
+                    storage,
+                    family,
+                    policy,
+                    self.views_import_control(),
+                    self.cold_build_limiter(),
+                ) {
                     Ok(view) => *slot = Some(Arc::new(view)),
                     Err(error) => {
                         // Like the lexical view, a failed callgraph load fails

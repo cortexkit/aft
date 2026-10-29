@@ -698,7 +698,7 @@ impl V3ImportRequest {
         }
     }
 
-    fn stage_input<'a>(&'a self, dir: &'a Path) -> StageInput<'a> {
+    fn stage_input<'a>(&'a self, dir: &'a Path, keep_going: ImportControl) -> StageInput<'a> {
         StageInput {
             storage: &self.storage,
             legacy_key: &self.legacy_key,
@@ -707,6 +707,7 @@ impl V3ImportRequest {
             trigram: &self.trigram,
             semantic: self.semantic.as_ref(),
             working_set: self.working_set,
+            keep_going,
         }
     }
 }
@@ -761,6 +762,10 @@ pub struct V3ImportReport {
     pub stats: BTreeMap<LegacyArtifact, ReadStats>,
 }
 
+/// Currency of a background import. Checked between bounded reads and rows,
+/// not just before entering the importer, so an unbind stops corpus work.
+pub(crate) type ImportControl = Arc<dyn Fn() -> bool + Send + Sync>;
+
 struct Run<'a> {
     request: &'a V3ImportRequest,
     ledger: V3Ledger,
@@ -768,9 +773,18 @@ struct Run<'a> {
     dir: PathBuf,
     observer: Option<&'a dyn V3ImportObserver>,
     report: V3ImportReport,
+    keep_going: ImportControl,
 }
 
 impl Run<'_> {
+    fn check_current(&mut self, row: &V3ImportRow) -> V3Result<()> {
+        if row.state.is_terminal() || (self.keep_going)() {
+            return Ok(());
+        }
+        // Cancellation is resumable, not a rejection of compatible data.
+        self.ledger.release(&row.key, &self.owner, "cancelled")?;
+        Err(V3ImportError::Cancelled)
+    }
     fn observe(&mut self, artifact: LegacyArtifact, step: V3Step) {
         self.report.steps.push((artifact, step));
         if let Some(observer) = self.observer {
@@ -784,6 +798,7 @@ impl Run<'_> {
     }
 
     fn reject(&mut self, row: &V3ImportRow, reason: String) -> V3Result<ArtifactOutcome> {
+        self.check_current(row)?;
         crate::slog_info!(
             "v3 legacy import {} rejected: {}",
             row.key.describe(),
@@ -810,9 +825,14 @@ impl Run<'_> {
         let artifact = row.key.artifact;
         let mut registered = Registered::default();
         loop {
+            self.check_current(&row)?;
             match row.state {
                 ImportState::Claimed => {
-                    let staged = stage(artifact, &self.request.stage_input(&self.dir))?;
+                    let staged = stage(
+                        artifact,
+                        &self.request.stage_input(&self.dir, self.keep_going.clone()),
+                    )?;
+                    self.check_current(&row)?;
                     let staged = match staged {
                         Ok(staged) => staged,
                         Err(reason) => return self.reject(&row, reason),
@@ -838,16 +858,24 @@ impl Run<'_> {
                         return self.reject(&row, "the row records no staged bundle".to_owned());
                     };
                     let hash = row.staged_hash.expect("staged file implies hash");
-                    if let Err(reason) =
-                        check_staged(artifact, &path, &hash, &self.request.stage_input(&self.dir))
-                    {
+                    if let Err(reason) = check_staged(
+                        artifact,
+                        &path,
+                        &hash,
+                        &self.request.stage_input(&self.dir, self.keep_going.clone()),
+                    ) {
                         return self.reject(&row, reason);
                     }
                     // An older daemon may have replaced its artifact since it
                     // was converted; the bundle then describes bytes that no
                     // longer exist and the plane is built from the checkout.
-                    let current =
-                        source_identity(artifact, &self.request.storage, &self.request.legacy_key);
+                    let current = source_identity(
+                        artifact,
+                        &self.request.storage,
+                        &self.request.legacy_key,
+                        self.keep_going.clone(),
+                    );
+                    self.check_current(&row)?;
                     if current.ok() != row.source_hash.zip(row.source_len) {
                         return self.reject(
                             &row,
@@ -881,7 +909,10 @@ impl Run<'_> {
                                 observer.reached(artifact, V3Step::BatchRegistered(batch));
                             }
                         },
-                    )?;
+                        self.keep_going.as_ref(),
+                    );
+                    self.check_current(&row)?;
+                    let outcome = outcome?;
                     for batch in batches {
                         self.report
                             .steps
@@ -952,6 +983,18 @@ pub fn run_v3_import(
     request: &V3ImportRequest,
     observer: Option<&dyn V3ImportObserver>,
 ) -> V3Result<V3ImportReport> {
+    run_v3_import_while(request, observer, Arc::new(|| true))
+}
+
+/// Cancellable background variant; a released claim can be resumed on rebind.
+pub(crate) fn run_v3_import_while(
+    request: &V3ImportRequest,
+    observer: Option<&dyn V3ImportObserver>,
+    keep_going: ImportControl,
+) -> V3Result<V3ImportReport> {
+    if !keep_going() {
+        return Err(V3ImportError::Cancelled);
+    }
     validate_legacy_key(&request.legacy_key)
         .map_err(|_| V3ImportError::InvalidKey(request.legacy_key.clone()))?;
     let owner = ClaimOwner::new();
@@ -963,8 +1006,12 @@ pub fn run_v3_import(
         dir: staging_dir(&request.storage, &request.family, &request.legacy_key),
         observer,
         report: V3ImportReport::default(),
+        keep_going,
     };
     for key in request.rows() {
+        if !(run.keep_going)() {
+            return Err(V3ImportError::Cancelled);
+        }
         let artifact = key.artifact;
         let existing = run.ledger.row(&key)?;
         if existing.is_none()
