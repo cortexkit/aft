@@ -29211,7 +29211,7 @@ pub fn run() {
         );
         let conn = indexed.conn.lock().unwrap();
         let statuses: Vec<String> = conn
-            .prepare("SELECT status FROM refs WHERE short_name = 'absent'")
+            .prepare("SELECT status FROM refs WHERE callee_last_segment = 'absent'")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
