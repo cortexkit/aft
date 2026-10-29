@@ -120,8 +120,10 @@ const BIND_PROMOTION_AGE: Duration = Duration::from_millis(500);
 /// release a worker. Two, so a cold root's slower full configure does not
 /// serialize every other bind behind it.
 const BIND_RESERVE_WORKERS: usize = 2;
-/// Provider metadata cannot spend a caller's preflight budget waiting for an
-/// index builder, configure writer or maintenance job to release a worker.
+/// Provider metadata (tool catalogs, role descriptions, grants) has reserved
+/// workers, so these short requests never wait for an index builder,
+/// configure writer or maintenance job to free a worker. Callers such as a
+/// worker launch check ask for them under a deadline of a few seconds.
 const PROVIDER_RESERVE_WORKERS: usize = 2;
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
