@@ -911,7 +911,7 @@ fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
         file.write_all(b"\n")
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
-        file.sync_all()
+        crate::durability::sync_file(&file, &temporary)
             .map_err(|error| ViewError::io_at("syncing", &temporary, error))?;
         drop(file);
         fs::hard_link(&temporary, path).map_err(|error| {

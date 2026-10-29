@@ -1049,7 +1049,7 @@ impl StagedWriter {
         self.write(&digest)?;
         let hash = *self.whole.finalize().as_bytes();
         let file = self.file.into_inner().map_err(|error| error.into_error())?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, &self.temporary)?;
         drop(file);
         let path = staged_path(dir, artifact, &hash);
         crate::fs_lock::rename_over(&self.temporary, &path)?;

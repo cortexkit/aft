@@ -7356,7 +7356,7 @@ fn write_seam_state(paths: &StatePaths, state: SeamState) -> io::Result<()> {
     // A governed result is visible only after its self-report transition is
     // durable enough to survive a process exit. Failure stays on the seam path
     // and is surfaced as a refusal instead of falling through to real `gh`.
-    file.sync_data()?;
+    crate::durability::sync_data(&file, &temporary)?;
     fs::rename(temporary, &paths.seam_state)
 }
 
@@ -7694,7 +7694,7 @@ fn append_bypass_audit_record(paths: &StatePaths, record: &Value) -> io::Result<
     file.write_all(&record)?;
     // An operator bypass is allowed only after the audit record is durable enough
     // to survive a process replacement. If this returns an error we do not exec.
-    file.sync_data()
+    crate::durability::sync_data(&file, &paths.bypass_audit)
 }
 
 #[derive(Serialize)]

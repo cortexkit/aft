@@ -610,7 +610,7 @@ impl PinnedDir {
     pub(crate) fn repair_sync(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            self.file.sync_all()?;
+            crate::durability::sync_dir_handle(&self.file, &self.path)?;
         }
         Ok(())
     }
@@ -618,7 +618,7 @@ impl PinnedDir {
     pub(crate) fn repair_write_durable(&self, name: &OsStr, contents: &[u8]) -> io::Result<()> {
         let mut file = self.repair_create_file(name)?;
         file.write_all(contents)?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, &self.path.join(name))?;
         self.repair_sync()
     }
 
@@ -4827,10 +4827,10 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
     atomic_replace(dir, name, content, ReplaceSync::None)
 }
 
-pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
+pub(crate) fn sync_task_file(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     work_counts::record_sync();
-    file.sync_all()
+    crate::durability::sync_file(file, path)
 }
 
 fn atomic_replace(
@@ -4849,14 +4849,16 @@ fn atomic_replace(
         let result = (|| {
             file.write_all(content)?;
             if sync != ReplaceSync::None {
-                sync_task_file(&file)?;
+                sync_task_file(&file, &dir.path().join(&temporary))?;
             }
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
             dir.rename(&temporary, name)?;
             if sync == ReplaceSync::FileAndDirectory {
-                sync_task_file(&dir.file)?;
+                #[cfg(test)]
+                work_counts::record_sync();
+                crate::durability::sync_dir_handle(&dir.file, dir.path())?;
             }
             Ok(())
         })();

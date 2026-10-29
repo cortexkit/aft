@@ -1433,7 +1433,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<[u8; 32]> {
         let mut digest = blake3::Hasher::new();
         digest.update(&bytes);
         digest.update(b"\n");
-        file.sync_all()
+        crate::durability::sync_file(&file, &temporary)
             .map_err(|error| ViewError::io_at("syncing", &temporary, error))?;
         drop(file);
         fs::hard_link(&temporary, path).map_err(|error| {
@@ -1463,9 +1463,9 @@ fn sync_file_and_parent(path: &Path) -> Result<()> {
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    open_file_for_sync(path)
-        .map_err(|error| ViewError::io_at("opening for sync", path, error))?
-        .sync_all()
+    let file = open_file_for_sync(path)
+        .map_err(|error| ViewError::io_at("opening for sync", path, error))?;
+    crate::durability::sync_file(&file, path)
         .map_err(|error| ViewError::io_at("syncing", path, error))?;
     Ok(())
 }
@@ -1532,9 +1532,9 @@ fn sync_parent(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .map_err(|error| ViewError::io_at("opening directory for sync", path, error))?
-        .sync_all()
+    let file = File::open(path)
+        .map_err(|error| ViewError::io_at("opening directory for sync", path, error))?;
+    crate::durability::sync_dir_handle(&file, path)
         .map_err(|error| ViewError::io_at("syncing directory", path, error))?;
     Ok(())
 }

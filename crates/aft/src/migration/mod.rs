@@ -690,7 +690,7 @@ fn create_publication_artifacts(
 
     let trigram_artifact = view_dir.join("trigram.bin");
     let trigram = crate::private_storage::create(&trigram_artifact)?;
-    trigram.sync_all()?;
+    crate::durability::sync_file(&trigram, &trigram_artifact)?;
     drop(trigram);
     crate::fs_lock::sync_parent(&trigram_artifact);
 

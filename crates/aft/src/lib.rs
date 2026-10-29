@@ -87,6 +87,15 @@ pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
 pub(crate) mod durability;
+
+/// Shared durable sync for the standalone CLI's failure marker.
+#[doc(hidden)]
+pub fn sync_cli_failure_marker(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    durability::sync_file(file, path)
+}
 pub mod edit;
 pub mod effective_path;
 pub mod engram_catalog;

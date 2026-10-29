@@ -445,7 +445,7 @@ pub fn write_segment(
                 .map_err(|e| super::io::at("creating segment staging file", &temporary, e))?;
             file.write_all(&segment.bytes)
                 .map_err(|e| super::io::at("writing segment staging file", &temporary, e))?;
-            file.sync_all()
+            crate::durability::sync_file(&file, &temporary)
                 .map_err(|e| super::io::at("syncing segment staging file", &temporary, e))?;
             drop(file);
             crate::fs_lock::rename_over(&temporary, &path).map_err(|e| {

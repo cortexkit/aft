@@ -511,7 +511,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     if kind.is_file() {
         fs::copy(from, to)?;
         #[cfg(not(windows))]
-        fs::File::open(to)?.sync_all()?;
+        crate::durability::sync_file(&fs::File::open(to)?, to)?;
         #[cfg(windows)]
         {
             // FlushFileBuffers requires a writable handle. fs::copy preserves
@@ -526,7 +526,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
             let synced = fs::OpenOptions::new()
                 .write(true)
                 .open(to)
-                .and_then(|file| file.sync_all());
+                .and_then(|file| crate::durability::sync_file(&file, to));
             if permissions.readonly() {
                 fs::set_permissions(to, permissions)?;
             }

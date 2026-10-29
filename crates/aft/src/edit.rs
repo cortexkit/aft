@@ -153,7 +153,7 @@ fn atomic_write_source_with(
         // Writing can clear set-id bits; restore the exact original mode.
         file.set_permissions(metadata.permissions())?;
     }
-    file.sync_all()
+    crate::durability::sync_file(file, &temporary)
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
     cleanup.file.take();
     #[cfg(windows)]
@@ -170,9 +170,7 @@ fn atomic_write_source_with(
     crate::fs_lock::rename_over(&temporary, &destination)?;
     // The replacement has already committed; a directory sync failure cannot
     // be reported as a failed edit without implying the original still exists.
-    if let Ok(directory) = fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
+    let _ = crate::durability::sync_dir(parent);
     Ok(SourceWriteOutcome {
         mode: SourceWriteMode::Replaced,
         warnings,
@@ -243,20 +241,21 @@ fn write_source_in_place(
     };
     fn rewrite(
         file: &mut std::fs::File,
+        destination: &Path,
         content: &[u8],
         writer: &mut dyn FnMut(&mut std::fs::File, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         writer(file, content)?;
-        file.sync_all()
+        crate::durability::sync_file(file, destination)
             .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))
     }
-    if let Err(error) = rewrite(&mut file, bytes, writer) {
+    if let Err(error) = rewrite(&mut file, destination, bytes, writer) {
         let Some(saved) = saved.as_deref() else {
             return Err(error);
         };
-        let restored = rewrite(&mut file, saved, &mut |file, content| {
+        let restored = rewrite(&mut file, destination, saved, &mut |file, content| {
             file.write_all(content)
         });
         return match (restored, copy) {
@@ -930,10 +929,8 @@ mod source_recovery {
         let prepared = (|| {
             make_private(destination, &copy, &file)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
-            if let Ok(directory) = File::open(parent) {
-                let _ = directory.sync_all();
-            }
+            crate::durability::sync_file(&file, &copy)?;
+            let _ = crate::durability::sync_dir(parent);
             Ok(())
         })();
         if let Err(error) = prepared {
