@@ -169,7 +169,7 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
 
         assert_eq!(
             manifest["provenance"]["wire_crate_version"],
-            json!("0.33.3")
+            json!("0.33.5")
         );
         // `build.rs` embeds Git's HEAD only when it recognizes the tracked AFT
         // workspace. Snapshot builds without that metadata can omit the SHA; the

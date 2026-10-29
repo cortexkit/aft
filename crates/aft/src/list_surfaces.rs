@@ -531,8 +531,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics",
-        location_or_primitive: "storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; sweep rows yield before root diagnostics, omitted sweep and retention rows are counted exactly and aggregate counters remain present",
+        location_or_primitive: "root row removal, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
     },
     ExclusionEntry {
         file: "gc/family.rs",
@@ -617,6 +617,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "parse_log",
         location_or_primitive: "bounded log iterator and take(8) metric previews",
         reason: "flow-only telemetry stops at byte or line caps and reports truncated plus scanned counts; top tool and WARN previews disclose tools_total and warn_shapes_total, not a paginated agent list",
+    },
+    ExclusionEntry {
+        file: "subc/diagnostics_findings.rs",
+        enclosing_item: "bounded_body",
+        location_or_primitive: "truncate(5) samples and size >= BODY_LIMIT response trimming",
+        reason: "diagnostics.findings v1 is a bounded diagnosis snapshot, not a paginated ledger; samples are removed first, then tail findings, and retained counts are unchanged as required by the vendored contract",
     },
     ExclusionEntry {
         file: "subc/perf_sweep.rs",

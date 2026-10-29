@@ -1717,6 +1717,19 @@ impl LspManager {
         true
     }
 
+    /// Count currently replayable failed server/root starts without starting a server.
+    pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        let now = self.retry_clock.now();
+        let mut counts = std::collections::BTreeMap::new();
+        for (key, failure) in &self.failed_spawns {
+            if failure.retry_at.is_some_and(|at| now >= at) {
+                continue;
+            }
+            *counts.entry(key.kind.id_str().to_owned()).or_default() += 1;
+        }
+        counts
+    }
+
     /// Resolve every configured server applicable to a root without starting it.
     pub fn resolve_applicable_servers_for_root(
         &self,
@@ -9834,6 +9847,27 @@ mod transient_retry_tests {
             origin + Duration::from_millis(reader.load(Ordering::SeqCst))
         }));
         (manager, offset)
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_counts_replayable_failures_without_starting() {
+        let (mut manager, offset) = manager_with_clock();
+        assert!(manager.cached_start_failure_counts().is_empty());
+        manager.record_failed_spawn(&key(), spawn_failed(), FailureDurability::Transient);
+        let counts = manager.cached_start_failure_counts();
+        assert_eq!(counts.get(ServerKind::Rust.id_str()), Some(&1));
+        offset.store(30_000, Ordering::SeqCst);
+        assert!(manager.cached_start_failure_counts().is_empty());
+        manager.record_failed_spawn(&key(), spawn_failed(), FailureDurability::Permanent);
+        offset.store(3_600_000, Ordering::SeqCst);
+        assert_eq!(
+            manager
+                .cached_start_failure_counts()
+                .get(ServerKind::Rust.id_str()),
+            Some(&1)
+        );
+        manager.note_start_succeeded(&key());
+        assert!(manager.cached_start_failure_counts().is_empty());
     }
 
     fn reason(result: &ServerAttemptResult) -> &str {

@@ -1,0 +1,28 @@
+{
+  "result": {
+    "findings": [
+      {
+        "check": "credential_fences",
+        "count": 1,
+        "first_seen_ms": 1799999400000,
+        "hint": "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {\"credentialId\":\"apikey:inception:main\"}. Routing also admits one probe request on it every 6h.",
+        "key": "inception/apikey:inception:main",
+        "last_seen_ms": 1800000000000,
+        "samples": [
+          {
+            "age_ms": 600000,
+            "code": "billing_exhausted",
+            "credential_id": "apikey:inception:main",
+            "kind": "billing",
+            "observed_at_ms": 1799999400000,
+            "provider_id": "inception"
+          }
+        ],
+        "severity": "warning",
+        "summary": "inception is fenced on credential apikey:inception:main (billing: billing_exhausted), last confirmed 10m ago; routing will not use inception through that credential"
+      }
+    ],
+    "generated_at_ms": 1800000000000,
+    "window_ms": 21600000
+  }
+}

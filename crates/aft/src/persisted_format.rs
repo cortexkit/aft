@@ -730,6 +730,27 @@ fn registry() -> &'static Mutex<Vec<Entry>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Process-wide standing reader-floor refusals, without resolving paths or waiting.
+pub(crate) fn try_floor_refusal_counts() -> Option<std::collections::BTreeMap<String, u64>> {
+    let entries = registry().try_lock().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in entries.iter() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let class = match entry.refusal.source {
+            RefusalSource::Floor => "requires_newer_reader",
+            RefusalSource::FloorUnreadable => "floor_unreadable",
+            _ => continue,
+        };
+        *counts
+            .entry(format!("{}/{class}", entry.refusal.store.name()))
+            .or_default() += 1;
+    }
+    Some(counts)
+}
+
 fn with_registry<T>(f: impl FnOnce(&mut Vec<Entry>) -> T) -> T {
     let mut guard = registry()
         .lock()
@@ -1045,6 +1066,34 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_findings_floor_snapshot_is_nonblocking_and_counts_only_floors() {
+        if !isolated_owner_probe("persisted_format::tests::diagnostics_findings_floor_snapshot_is_nonblocking_and_counts_only_floors") { return; }
+        let path = PathBuf::from("seeded-floor.json");
+        let floor = UnsupportedPersistedFormat::floor(PersistedStore::AftDb, &path, 999);
+        let artifact = UnsupportedPersistedFormat::artifact(PersistedStore::AftDb, &path, 999);
+        {
+            let mut guard = registry().lock().unwrap();
+            guard.push(Entry {
+                scope: path.clone(),
+                root: None,
+                refusal: floor,
+            });
+            guard.push(Entry {
+                scope: path,
+                root: None,
+                refusal: artifact,
+            });
+            assert!(
+                try_floor_refusal_counts().is_none(),
+                "must not wait for a held registry"
+            );
+        }
+        let counts = try_floor_refusal_counts().unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts["aft.db/requires_newer_reader"], 1);
+    }
 
     fn isolated_owner_probe(test: &str) -> bool {
         const CHILD: &str = "AFT_TEST_DIRECT_OWNER_PROBES";
