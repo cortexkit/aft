@@ -61,10 +61,10 @@ pub(super) fn indexed_fixture(shape: &str) -> Fixture {
     indexed_fixture_with_setup(shape, |_| {})
 }
 
-pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&Fixture)) -> Fixture {
+pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fixture)) -> Fixture {
     let mut f = Fixture::new(if shape == "worker" { "worker" } else { "head" });
-    std::fs::write(f.dir.path().join("main.rs"), SOURCE).unwrap();
-    setup(&f);
+    setup(&mut f);
+    std::fs::write(f.policy.project_root.join("main.rs"), SOURCE).unwrap();
     let request: RawRequest = serde_json::from_value(json!({
         "id":"configure-session-reads", "command":"configure", "harness":"runner",
         "project_root":f.policy.project_root, "storage_dir":f.dir.path().join("storage"),

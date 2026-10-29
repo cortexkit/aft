@@ -9,14 +9,29 @@ const VIEWED_CALL: &str = "sample-viewed-call";
 
 fn sample_fixture() -> Fixture {
     read_tests::indexed_fixture_with_setup("head", |f| {
-        // Generated task/cache files and the fixture database are not project
-        // source. Exclude them before starting the indexes and watcher so writes
-        // to these generated files cannot enter the indexed project corpus.
-        std::fs::write(
-            f.policy.project_root.join(".aftignore"),
-            "/storage/\n/aft.db*\n",
-        )
-        .unwrap();
+        // Keep the database, caches and task artifacts outside the watched
+        // project so their writes cannot become new project-indexing work.
+        let project = f.dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let mut config = f.ctx.config().clone();
+        config.project_root = Some(project.clone());
+        let db = f.ctx.db().unwrap();
+        f.ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        f.ctx.set_db(db);
+        for route in [&mut f.carrier, &mut f.policy] {
+            let identity = Arc::get_mut(&mut route.0).unwrap();
+            identity.root = ProjectRootId::from_path(&project).unwrap();
+            identity.project_root = project.clone();
+            if let AuthenticatedPrincipal::RouteBind { project_root, .. } =
+                &mut identity.spawn_principal
+            {
+                *project_root = project.clone();
+            }
+        }
     })
 }
 
