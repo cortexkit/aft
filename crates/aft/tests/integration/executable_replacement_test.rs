@@ -30,17 +30,28 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, mode: &str) {
 }
 
 fn foreground(aft: &mut AftProcess, id: &str, command: &str) -> Value {
-    aft.send_with_timeout(
-        &json!({
-            "id": id, "method": "bash", "session_id": "image-pin-test",
-            "params": {
-                "command": command, "foreground_orchestrate": true,
-                "permissions_requested": true, "compressed": false,
-            },
-        })
-        .to_string(),
-        Duration::from_secs(60),
-    )
+    let mut request = json!({
+        "id": id, "method": "bash", "session_id": "image-pin-test",
+        "params": {
+            "command": command, "foreground_orchestrate": true,
+            "permissions_requested": true, "compressed": false,
+        },
+    });
+    let response = aft.send_with_timeout(&request.to_string(), Duration::from_secs(60));
+    if response["code"] != "permission_required" {
+        return response;
+    }
+    // Approve only the patterns requested by the shell permission gate. This
+    // host approval does not disable the separately configured native sandbox.
+    let approved: Vec<Value> = response["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|ask| ask["patterns"].as_array().unwrap().clone())
+        .collect();
+    assert!(!approved.is_empty(), "{response:?}");
+    request["params"]["permissions_granted"] = json!(approved);
+    aft.send_with_timeout(&request.to_string(), Duration::from_secs(60))
 }
 
 fn pin_directories(storage: &Path) -> Vec<PathBuf> {
