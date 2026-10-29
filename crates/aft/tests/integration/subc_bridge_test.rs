@@ -11380,11 +11380,16 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         }
     }
 
+    // The re-armed nudge follows the product's backoff: 1 s, doubling to a
+    // 30 s cap (BG_WAKE_REARM_*_BACKOFF in subc/push.rs). On a loaded runner
+    // a re-arm may already have landed among the early events above, so the
+    // next one can be several seconds away. Wait past the cap; a wake lane
+    // that never re-arms still fails here.
     let _ = wait_for_bg_event(
         &mut stream,
         provider_channel,
         700,
-        Duration::from_secs(2),
+        Duration::from_secs(40),
         "re-armed bg_events wake before ack",
     )
     .await;
