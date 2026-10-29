@@ -95,6 +95,7 @@ impl StandaloneReads {
         let (tx, rx) = mpsc::sync_channel(1);
         let ask_route = aft::access_policy::capture_ask_route();
         let worker_session = req.session_id.clone();
+        let worker_ctx = Arc::clone(ctx);
         #[cfg(test)]
         let probe = self.probe.clone();
         self.executor.submit_tool_call_with_completion(
@@ -106,8 +107,7 @@ impl StandaloneReads {
                 // Detached view updates must share the process-wide publication
                 // lock used by standalone mutations and maintenance. The executor's
                 // actor lock alone does not protect those inline file mutations.
-                let _publication =
-                    aft::executor::view_publication::install_standalone_scope(Arc::clone(ctx));
+                let _publication = aft::executor::install_standalone_scope(worker_ctx);
                 let _ask_route = ask_route.install();
                 let _config = ctx.pin_config_to(config);
                 if expired(deadline) {
