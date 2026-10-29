@@ -3456,6 +3456,7 @@ mod mutation_events {
             command: command.into(),
             params,
             lsp_hints: None,
+            session_id: None,
         };
         let response = match command {
             "write" => handle_write(&req, &ctx),
