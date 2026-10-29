@@ -509,6 +509,7 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                         stage: crate::gh_shim_speech::REFUSAL_STAGE.into(),
                         message: refusal.text(),
                         generation,
+                        facts: RefusalFacts::from_reply(&result),
                     }
                 }
                 Some("refused") => match facade_refusal_code(&reply) {

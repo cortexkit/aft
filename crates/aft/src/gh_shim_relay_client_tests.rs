@@ -25,6 +25,7 @@ fn assert_approved_background_refusal(
         wire["refusal_code"].as_str().unwrap(),
         wire["stage"].as_str().unwrap(),
         wire["message"].as_str().unwrap(),
+        &RefusalFacts::default(),
     ) {
         RouteOutcome::RelayRefusal { code: actual, text } => {
             assert_eq!(actual, code);
@@ -61,6 +62,7 @@ fn approved_background_render_probe() {
         wire["refusal_code"].as_str().unwrap(),
         wire["stage"].as_str().unwrap(),
         wire["message"].as_str().unwrap(),
+        &RefusalFacts::default(),
     );
     let root = tempfile::tempdir().unwrap();
     let paths = StatePaths::from_root(root.path().to_path_buf());
@@ -770,6 +772,19 @@ fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
                 stage: PLEXUS_REPLY_STAGE.to_string(),
                 message: String::new(),
                 generation,
+                facts: RefusalFacts {
+                    retry_same_nonce: result.get("retry_same_nonce").and_then(Value::as_bool),
+                    legs_sent: result
+                        .get("legs_sent")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                    not_sent: result["transmission"] == "not_sent",
+                    detail_message: result
+                        .pointer("/detail/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
             },
             "completed" => Reply::Completed {
                 generation,
@@ -782,8 +797,11 @@ fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
             let code = result["refusal_code"].as_str().unwrap();
             assert_eq!(result["transmission"], "not_sent");
             assert_eq!(classify_code(code), CodeClass::Unknown);
-            assert_eq!(plexus_refusal_text(code, classify_code(code)),
-                "plexus refused the bot write with a code this shim does not know: review_thread_not_own; it was not retried");
+            let Reply::Refused { facts, .. } = parsed else {
+                panic!("expected refusal");
+            };
+            assert_eq!(plexus_refusal_text(code, &facts),
+                "Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by octocat. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.");
         }
     }
 }
