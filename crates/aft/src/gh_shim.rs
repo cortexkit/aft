@@ -8301,15 +8301,12 @@ fn refuse(code: RefusalCode, text: &str) -> i32 {
 }
 
 fn current_platform() -> &'static str {
-    manifest_platform(std::env::consts::OS)
-}
-
-fn manifest_platform(os: &str) -> &'static str {
-    match os {
-        "macos" => "macos",
-        "linux" => "linux",
-        "windows" => "windows",
-        _ => "unsupported",
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unsupported"
     }
 }
 
