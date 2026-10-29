@@ -8846,7 +8846,10 @@ mod guard_tests {
             outcome_tx.send(outcome).expect("send inspect outcome");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // The inspect thread opens its cache and checks for a reusable result
+        // before it reaches the seed gate; a loaded Windows runner needed more
+        // than 3 s for that. The gate itself is what the test checks.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while manager.tier2_builder_state(InspectCategory::DeadCode)
             != InspectBuilderState::GatedBySemanticSeed
         {
@@ -8854,7 +8857,7 @@ mod guard_tests {
                 Instant::now() < deadline,
                 "inspect must queue while the active seed owns the slot"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
             outcome_rx.try_recv().is_err(),
