@@ -986,6 +986,7 @@ const SECURITY_CONFIG_SECTIONS = new Set([
   "sandbox",
   "indexes",
   "index",
+  "project_detection",
   "remote_exec",
   "disabled_tools",
   "bash",

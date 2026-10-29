@@ -120,6 +120,37 @@ function buildSchema(): Record<string, unknown> {
           "Select the edit/read surface. Hashline mode renders tagged reads and changes edit arguments to exactly { patch }.",
       },
 
+      project_detection: {
+        type: "object",
+        additionalProperties: false,
+        description:
+          "User-only folder admission policy, also allowed in user harness overrides. Reserved for the folder-admission lifecycle; not yet connected to indexing startup.",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["auto", "project", "workspace", "off"],
+            default: "auto",
+          },
+          overrides: {
+            type: "array",
+            default: [],
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["path", "mode"],
+              properties: {
+                path: {
+                  type: "string",
+                  description:
+                    "Existing absolute root path; matches canonical identity only, never descendants. First matching entry wins.",
+                },
+                mode: { type: "string", enum: ["auto", "project", "workspace", "off"] },
+              },
+            },
+          },
+        },
+      },
+
       format_on_edit: {
         type: "boolean",
         default: false,

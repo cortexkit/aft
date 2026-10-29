@@ -992,6 +992,8 @@ pub struct Config {
     pub indexes: IndexesConfig,
     /// User-tier standing roots. Empty by default, so normal session indexing is unchanged.
     pub index: IndexConfig,
+    /// User-only folder admission policy. Independent of per-index switches.
+    pub project_detection: crate::folder_admission::ProjectDetectionConfig,
     /// Content-addressed index view assembly. Disabled by default.
     pub views: ViewsConfig,
     /// Whether `aft_search` is registered, which is exactly "`aft_search` is not
@@ -1134,6 +1136,7 @@ impl Default for Config {
             restrict_to_project_root: false,
             indexes: IndexesConfig::default(),
             index: IndexConfig::default(),
+            project_detection: crate::folder_admission::ProjectDetectionConfig::default(),
             views: ViewsConfig::default(),
             aft_search_registered: true,
             callgraph_chunk_size: 100,

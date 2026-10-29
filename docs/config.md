@@ -564,6 +564,42 @@ A hashline mutation attempts to register every affected path before changing fil
 
 Hashline mode needs both the `read` and `edit` tools. If `disabled_tools` removes either, AFT keeps the ordinary edit/read behavior for the registered tools and emits exactly one configure-time warning per load: `hashline_read_disabled` when `read` is disabled (it takes precedence), otherwise `hashline_edit_disabled`. No other tool is unregistered.
 
+## Folder admission policy (`project_detection`)
+
+The user config at `~/.config/cortexkit/aft.jsonc` accepts this policy, including
+inside `harnesses.<name>`. Project config cannot set it: the resolver drops the
+entire project-tier block, including a project harness override. The policy and
+bounded classifier are available to the core, but are not yet connected to
+configure or indexing startup.
+
+```jsonc
+{
+  "project_detection": {
+    "mode": "auto",
+    "overrides": [
+      { "path": "/absolute/path/to/source-export", "mode": "project" }
+    ]
+  }
+}
+```
+
+- `auto` uses project evidence: three or more immediate directories named Desktop,
+  Downloads, Documents, Pictures, Movies, Music, Library, Applications or Public
+  identify a personal container, taking precedence over Git or root project
+  markers. Otherwise the classifier checks concentrated child projects and a
+  completed small source tree. The default evidence budget is 4,096 entries,
+  100 ms, depth 6 and 256 entries per directory plus a counted look-ahead.
+- `project` explicitly admits the selected root, regardless of its size.
+- `workspace` selects separate child projects rather than a combined parent index.
+- `off` declines background indexing; it does not change file-access permissions.
+
+Only existing absolute override paths match. Matching uses the canonical root
+identity, never a path prefix or descendant inheritance; the first matching
+override wins. An `auto` override opts that exact root back into detection even
+when the global mode is forced. A user harness override replaces the entire
+`project_detection` block rather than appending to its override list. Counts
+from an incomplete probe are lower bounds, not estimates of the unseen tree.
+
 ## Search reranking
 
 `search.rerank` lets a cross-encoder reorder the head of `aft_search` results. It is off by default.

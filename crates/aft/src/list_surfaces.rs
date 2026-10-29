@@ -355,6 +355,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "folder_admission.rs",
+        enclosing_item: "probe_with_read_dir, walk, time_left, validated_git_worktree",
+        location_or_primitive: "ProbeBudgets entries, time, depth, per_directory",
+        reason: "Internal metadata evidence, not a query result list. FolderAdmission carries observed lower bounds and typed coverage/cuts; a cut cannot admit a sampled source tree or claim complete workspace inventory.",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/bash_output.rs",
         enclosing_item: "page, stream_items",
         location_or_primitive: "limit, PAGE_BYTES, ITEM_BYTES",
