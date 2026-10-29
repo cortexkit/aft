@@ -2433,10 +2433,16 @@ fn lock_owner_is_alive(metadata: &LockMetadata) -> bool {
         return false;
     }
 
+    let identity = process_identity(metadata.pid);
+    // An exited process cannot execute protected work, even while its parent
+    // leaves it waitable. Missing or inconclusive identity still fails closed.
+    if identity.as_ref().is_some_and(|identity| identity.exited) {
+        return false;
+    }
     let Some(recorded_start_time) = metadata.process_start_time else {
         return true;
     };
-    let Some(current_identity) = process_identity(metadata.pid) else {
+    let Some(current_identity) = identity else {
         return true;
     };
 
@@ -2454,17 +2460,26 @@ fn lock_owner_is_alive(metadata: &LockMetadata) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_process_stat_identity(stat: &str) -> Option<(u64, bool)> {
+    // Fields 20 and 22 are num_threads and starttime. Split after the final ')'
+    // because the command can contain spaces and parentheses. pthread_exit can
+    // leave a zombie leader while other threads still execute protected work.
+    // Z (zombie) or X (dead) proves exit only with one reported thread. Malformed
+    // fields give no identity, so owner liveness remains conservative.
+    let fields = stat.rsplit_once(") ")?.1.split_ascii_whitespace();
+    let state = fields.clone().next()?;
+    if state.len() != 1 {
+        return None;
+    }
+    let num_threads = fields.clone().nth(17)?.parse::<u64>().ok()?;
+    let start_time = fields.clone().nth(19)?.parse::<u64>().ok()?;
+    Some((start_time, matches!(state, "Z" | "X") && num_threads == 1))
+}
+
+#[cfg(target_os = "linux")]
 fn process_identity(pid: u32) -> Option<ProcessIdentity> {
-    // Field 22 is starttime. Split after the final ')' because a process name is
-    // allowed to contain spaces and parentheses.
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let start_time = stat
-        .rsplit_once(") ")?
-        .1
-        .split_ascii_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()?;
+    let (start_time, exited) = linux_process_stat_identity(&stat)?;
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()?
         .trim()
@@ -2476,10 +2491,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     Some(ProcessIdentity {
         start_time,
         boot_id: Some(boot_id),
-        exited: matches!(
-            stat.rsplit_once(") ")?.1.split_ascii_whitespace().next()?,
-            "Z" | "X"
-        ),
+        exited,
     })
 }
 
@@ -3959,6 +3971,90 @@ mod tests {
         assert!(matches!(result, Err(AcquireError::Timeout)));
 
         remove_lock_file(&path).expect("cleanup synthetic lock");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn semantic_batch_lease_exited_unreaped_owner_is_dead() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for legacy in [false, true] {
+            let (_root, path) = test_lock_path();
+            let mut child = Command::new("sh")
+                .args(["-c", "read gate; exit 0"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let identity = process_identity(child.id()).unwrap();
+            let mut metadata = synthetic_metadata(child.id(), current_hostname(), now_ms());
+            metadata.process_start_time = Some(identity.start_time);
+            metadata.boot_id = identity.boot_id;
+            if legacy {
+                write_legacy_lock(&path, &metadata);
+            } else {
+                write_synthetic_lock(&path, &metadata);
+            }
+            writeln!(child.stdin.take().unwrap(), "exit").unwrap();
+            // WNOWAIT proves exit without reaping: kill(pid, 0) can still see
+            // this PID, but the process can no longer execute protected work.
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::try_from(child.id()).unwrap(),
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            let wait_error = io::Error::last_os_error();
+            let exited = process_identity(child.id()).is_some_and(|identity| identity.exited);
+            let recovered = try_acquire_once(&path);
+            child.wait().unwrap();
+            assert_eq!(observed, 0, "waitid failed: {wait_error}");
+            assert!(exited, "the native identity probe did not observe exit");
+            assert!(
+                recovered.is_ok(),
+                "an exited unreaped owner blocked recovery (legacy={legacy})"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn semantic_batch_lease_linux_stat_requires_quiescent_zombie() {
+        let one =
+            "4242 (worker (lease owner)) Z 1 1 1 0 -1 4194304 10 0 0 0 0 0 0 0 20 0 1 0 1234 0";
+        assert_eq!(linux_process_stat_identity(one), Some((1234, true)));
+        let live_threads = one.replace(" 1 0 1234 ", " 2 0 1234 ");
+        assert_eq!(
+            linux_process_stat_identity(&live_threads),
+            Some((1234, false)),
+            "a zombie leader does not prove its worker threads exited"
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(" 1 0 1234 ", " 0 0 1234 ")),
+            Some((1234, false))
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(") Z ", ") X ")),
+            Some((1234, true))
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(") Z ", ") S ")),
+            Some((1234, false))
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(" 1 0 1234 ", " bad 0 1234 ")),
+            None
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace("1234", "bad")),
+            None
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(") Z ", ") bad ")),
+            None
+        );
     }
 
     #[test]
