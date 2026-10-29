@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-25"
+  ],
+  "note": "Test-only: the semantic view reconnect-grace test waits through legitimate transient fill retries until settlement within one deadline, and adds a deterministic backend-503 recovery case. No search, indexing, query routing or ranking code changes."
+}
