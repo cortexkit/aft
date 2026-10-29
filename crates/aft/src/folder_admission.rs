@@ -942,13 +942,8 @@ mod tests {
     fn git_repo_over_twenty_thousand_tracked_paths_is_still_a_project() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q"]);
-        file(root.path(), "seed.dat");
         for i in 0..20_001 {
-            std::fs::hard_link(
-                root.path().join("seed.dat"),
-                root.path().join(format!("{i}.dat")),
-            )
-            .unwrap();
+            file(root.path(), &format!("{i}.dat"));
         }
         git(root.path(), &["add", "."]);
         let result = classify(root.path());
