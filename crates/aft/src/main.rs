@@ -1,5 +1,6 @@
 mod cli;
 mod standalone_input;
+mod standalone_reads;
 
 #[cfg(test)]
 #[path = "../tests/helpers/context_storage.rs"]
@@ -35,6 +36,7 @@ use standalone_input::{
     HeldInput, InputBudget, InputFrame, OversizedLine, MAX_HELD_BYTES, MAX_HELD_ITEMS,
     MAX_LINE_BYTES, MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS,
 };
+use standalone_reads::StandaloneReads;
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::io::BufRead;
@@ -597,6 +599,7 @@ fn main() {
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
     let pending_poll_interval = standalone_pending_poll_interval();
     let mut pending = PendingResponses::default();
+    let reads = StandaloneReads::new(registry.current());
     let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
     let mut queued_lines = VecDeque::new();
     let input_budget = InputBudget::new(MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS);
@@ -823,7 +826,7 @@ fn main() {
                     let gates_on_validation = offloads_full_validation(&req, runtime);
                     let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
                         log_ctx::with_session(session_id_for_log, || {
-                            dispatch_with_pending_admission(req, runtime, &mut pending)
+                            dispatch_with_pending_admission(req, runtime, &mut pending, &reads)
                         })
                     }));
                     match dispatch_result {
@@ -1837,10 +1840,14 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
     )
 }
 
-fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+fn dispatch_outcome(
+    req: RawRequest,
+    ctx: &Arc<AppContext>,
+    reads: &StandaloneReads,
+) -> DispatchOutcome {
     let mut deferred = None;
     let response = aft::access_policy::with_native_route(req, ctx, |req, _| {
-        match dispatch_outcome_on_route(req, ctx) {
+        match dispatch_outcome_on_route(req, ctx, reads) {
             DispatchOutcome::Immediate(response) => response,
             DispatchOutcome::Deferred(pending) => {
                 deferred = Some(pending);
@@ -1853,7 +1860,11 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
         .unwrap_or(DispatchOutcome::Immediate(response))
 }
 
-fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+fn dispatch_outcome_on_route(
+    req: RawRequest,
+    ctx: &Arc<AppContext>,
+    reads: &StandaloneReads,
+) -> DispatchOutcome {
     if req.worker_session() {
         ctx.disable_rust_cargo_for_worker();
     }
@@ -1862,6 +1873,16 @@ fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> Dispatch
     // snapshot even if a live config reload publishes while it runs.
     let _config_pin = ctx.pin_config();
     aft::commands::tool_call::register_dispatch(dispatch);
+    let command = tool_call_name(&req)
+        .unwrap_or(&req.command)
+        .strip_prefix("aft_")
+        .unwrap_or_else(|| tool_call_name(&req).unwrap_or(&req.command));
+    if let Some(lane) = aft::executor::parallel_tool_lane(command) {
+        // Earlier mutations finish inline. If an edit offloads validation, the
+        // frame loop holds later reads until that edit's reply is delivered.
+        // Admission here preserves the same write-before-read order as search.
+        return reads.dispatch(req, ctx, lane);
+    }
     if is_semantic_search_request(&req) || deferred_tool_call_name(&req).is_some() {
         return handle_dispatch_deferred(req, Arc::clone(ctx));
     }
@@ -1900,6 +1921,7 @@ fn dispatch_with_pending_admission(
     req: RawRequest,
     ctx: &Arc<AppContext>,
     pending: &mut PendingResponses,
+    reads: &StandaloneReads,
 ) -> DispatchOutcome {
     if let Some(response) = duplicate_pending_response(&req, pending) {
         return DispatchOutcome::Immediate(response);
@@ -1907,7 +1929,7 @@ fn dispatch_with_pending_admission(
     if req.command == "cancel_request" {
         DispatchOutcome::Immediate(handle_cancel_request(&req, pending))
     } else {
-        dispatch_outcome(req, ctx)
+        dispatch_outcome(req, ctx, reads)
     }
 }
 
@@ -2403,7 +2425,8 @@ mod core_framing_tests {
             serde_json::json!({"id":"shared-id","session_id":"second-session","command":"ping"}),
         )
         .unwrap();
-        let outcome = dispatch_with_pending_admission(request, &ctx, &mut pending);
+        let reads = StandaloneReads::new(&ctx);
+        let outcome = dispatch_with_pending_admission(request, &ctx, &mut pending, &reads);
         DISPATCH_CONFIG_PROBE.with(|slot| slot.borrow_mut().take());
         assert!(
             !dispatched.load(Ordering::SeqCst),
@@ -2417,7 +2440,7 @@ mod core_framing_tests {
         let reused: RawRequest =
             serde_json::from_value(serde_json::json!({"id":"shared-id","command":"ping"})).unwrap();
         let DispatchOutcome::Immediate(reused) =
-            dispatch_with_pending_admission(reused, &ctx, &mut pending)
+            dispatch_with_pending_admission(reused, &ctx, &mut pending, &reads)
         else {
             panic!("ping is immediate")
         };
@@ -3407,6 +3430,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             slow_search_request("deferred-search"),
             &deferred_ctx,
+            &StandaloneReads::new(&deferred_ctx),
         ));
         deferred_started
             .recv_timeout(Duration::from_secs(10))
@@ -3453,6 +3477,7 @@ mod deferred_semantic_search_tests {
         let mut pending = register_deferred(dispatch_outcome(
             slow_search_request("cancelled-search"),
             &ctx,
+            &StandaloneReads::new(&ctx),
         ));
         started
             .recv_timeout(Duration::from_secs(30))
@@ -3620,7 +3645,11 @@ mod deferred_semantic_search_tests {
             .expect("serialize inline response");
 
         let deferred_ctx = make_ctx();
-        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut pending = register_deferred(dispatch_outcome(
+            make_request(),
+            &deferred_ctx,
+            &StandaloneReads::new(&deferred_ctx),
+        ));
         let mut deferred_bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -3684,7 +3713,11 @@ mod deferred_semantic_search_tests {
             .expect("serialize inline response");
 
         let deferred_ctx = make_ctx();
-        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut pending = register_deferred(dispatch_outcome(
+            make_request(),
+            &deferred_ctx,
+            &StandaloneReads::new(&deferred_ctx),
+        ));
         let mut deferred_bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -3786,7 +3819,11 @@ mod deferred_semantic_search_tests {
 
         std::fs::remove_file(&target).expect("reset parity target");
         let deferred_ctx = make_ctx();
-        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut pending = register_deferred(dispatch_outcome(
+            make_request(),
+            &deferred_ctx,
+            &StandaloneReads::new(&deferred_ctx),
+        ));
         let mut deferred_bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {

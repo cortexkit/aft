@@ -113,6 +113,9 @@ pub(crate) fn is_native_plumbing_call(name: &str, arguments: &Value) -> bool {
 }
 
 pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
+    if let Some(lane) = crate::executor::parallel_tool_lane(command) {
+        return Some(lane);
+    }
     match command {
         "ping"
         | "version"
@@ -132,15 +135,13 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "list_checkpoints"
         | "hashline_preflight"
         | "conflicts"
-        | "glob"
-        | "grep"
         | "git_conflicts"
         | "ast_search" => Some(Lane::PureRead),
 
         // Lazy reads mutate parser/terminal/url caches on a miss, but are still
         // classified onto the reader pool; install races are handled at the
         // individual cache sites.
-        "bash_status" | "outline" | "zoom" => Some(Lane::PureRead),
+        "bash_status" => Some(Lane::PureRead),
 
         // Only validates the call and hands its wait to its own thread.
         "bash_watch" => Some(Lane::PureRead),
@@ -154,10 +155,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "lsp_find_references"
         | "lsp_prepare_rename" => Some(Lane::SerialLspStatus),
 
-        "semantic_search" | "search" | "callgraph" | "callers" | "impact" | "call_tree"
-        | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => {
-            Some(Lane::HeavyInit)
-        }
+        "semantic_search" | "search" | "inspect_tier2_run" => Some(Lane::HeavyInit),
 
         "bash"
         | "powershell"

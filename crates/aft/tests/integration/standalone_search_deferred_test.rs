@@ -1149,6 +1149,60 @@ fn mutation_freshness_fixture() -> (tempfile::TempDir, tempfile::TempDir, AftPro
     fixture
 }
 
+#[test]
+fn standalone_back_to_back_write_then_grep_outline_zoom_observe_write() {
+    let (_project, _storage, mut aft) =
+        mutation_freshness_fixture_with_content("export function before_write() { return 1; }\n");
+    // Populate parser caches before replacing the file through the protocol.
+    let warm = aft.send(r#"{"id":"warm","command":"outline","path":"src/source.ts"}"#);
+    assert_eq!(warm["success"], true, "{warm:?}");
+    for wrapped in [false, true] {
+        let symbol = if wrapped {
+            "after_wrapped_write"
+        } else {
+            "after_bare_write"
+        };
+        aft.send_silent(&json!({
+            "id":"write", "command":"write", "session_id":"ordered-session",
+            "path":"src/source.ts", "content":format!("export function {symbol}() {{ return 2; }}\n"),
+            "validate":"off"
+        }).to_string());
+        for (command, params) in [
+            ("grep", json!({"path":"src/source.ts", "pattern":symbol})),
+            ("outline", json!({"path":"src/source.ts"})),
+            ("zoom", json!({"path":"src/source.ts", "symbol":symbol})),
+        ] {
+            let request = if wrapped {
+                json!({"id":command, "command":"tool_call", "session_id":"ordered-session", "name":format!("aft_{command}"), "arguments":params})
+            } else {
+                let mut request = params;
+                request["id"] = json!(command);
+                request["command"] = json!(command);
+                request["session_id"] = json!("ordered-session");
+                request
+            };
+            aft.send_silent(&request.to_string());
+        }
+        let mut remaining = std::collections::HashSet::from(["write", "grep", "outline", "zoom"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !remaining.is_empty() {
+            let frame = aft.try_read_next_timeout(Duration::from_millis(100));
+            assert!(Instant::now() < deadline, "missing replies: {remaining:?}");
+            let Some(frame) = frame else { continue };
+            let Some(id) = frame["id"].as_str() else {
+                continue;
+            };
+            if remaining.remove(id) {
+                assert_eq!(frame["success"], true, "{frame:?}");
+                if id != "write" {
+                    assert!(frame.to_string().contains(symbol), "stale {id}: {frame:?}");
+                }
+            }
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
 fn mutation_freshness_fixture_with_content(
     content: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
