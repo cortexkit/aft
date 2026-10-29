@@ -4959,10 +4959,10 @@ pub(crate) fn checkout_view_callgraph_access(
 ) -> CallgraphStoreAccess {
     match reader {
         Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+        Some(Err(error)) if error.completion_busy => CallgraphStoreAccess::Building,
         // Transient contention while opening a view (a locked derived
-        // database, or another driver finishing the shared base) says nothing
-        // about the graph. Report SQLite's busy error, which every caller
-        // already presents as busy/pending with a retry.
+        // database or ledger) says nothing about the graph. Report SQLite's
+        // busy error, which every caller presents as busy/pending with a retry.
         Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),

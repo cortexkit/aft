@@ -374,6 +374,7 @@ impl PlaneAdapter for CallgraphPlane {
 pub(crate) struct CallgraphViewError {
     pub reason: String,
     pub busy: bool,
+    pub completion_busy: bool,
 }
 
 impl From<String> for CallgraphViewError {
@@ -381,6 +382,7 @@ impl From<String> for CallgraphViewError {
         Self {
             reason,
             busy: false,
+            completion_busy: false,
         }
     }
 }
@@ -396,11 +398,15 @@ impl From<PlaneError> for CallgraphViewError {
         let reason = reason
             .strip_prefix("family registry I/O error: ")
             .unwrap_or(reason);
+        let completion_busy = reason
+            .strip_prefix(V3_BASE_COMPLETION_BUSY)
+            .is_some_and(|outcome| outcome.starts_with(": Busy {"));
         Self {
             busy: reason.starts_with(DERIVED_STORE_BUSY)
                 || reason.starts_with(V3_STORE_BUSY)
                 || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX)
-                || reason.starts_with(V3_BASE_COMPLETION_BUSY),
+                || completion_busy,
+            completion_busy,
             reason: error.to_string(),
         }
     }
@@ -594,8 +600,14 @@ pub(crate) struct CallgraphView {
     family: String,
     policy: crate::blob_store::v2::TrigramPolicy,
     source: Arc<dyn CallgraphReaderSource>,
-    query: std::sync::Mutex<()>,
+    query: std::sync::Mutex<CompletionRetry>,
     ready: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct CompletionRetry {
+    pending: Option<(std::time::Instant, CallgraphViewError)>,
+    delay: std::time::Duration,
 }
 
 /// The v3 member scope of a checkout's call-graph view.
@@ -677,7 +689,7 @@ impl CallgraphView {
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(()),
+            query: std::sync::Mutex::new(CompletionRetry::default()),
             ready: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -711,11 +723,36 @@ impl CallgraphView {
     /// serialized so an installed membership and its graph come from the
     /// same reconciliation.
     pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
-        let _query = self
+        self.reader_with_clock(std::time::Instant::now)
+    }
+
+    fn reader_with_clock(
+        &self,
+        now: impl Fn() -> std::time::Instant,
+    ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        let mut retry = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((deadline, error)) = &retry.pending {
+            if now() < *deadline {
+                return Err(error.clone());
+            }
+        }
         let result = self.source.acquire();
+        match &result {
+            Err(error) if error.completion_busy => {
+                // Match configure's lexical ViewLoad retry backoff (1 to 30
+                // seconds) without blocking a request behind a live base owner.
+                retry.delay = if retry.delay.is_zero() {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    (retry.delay * 2).min(std::time::Duration::from_secs(30))
+                };
+                retry.pending = Some((now() + retry.delay, error.clone()));
+            }
+            _ => *retry = CompletionRetry::default(),
+        }
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
         result
@@ -937,6 +974,20 @@ mod tests {
     }
 
     #[test]
+    fn base_completion_refusal_is_not_live_owner_contention() {
+        let error = CallgraphViewError::from(PlaneError::loader(
+            super::super::contracts::LoaderStage::Driver,
+            format!("{V3_BASE_COMPLETION_BUSY}: CapReached {{ live_bases: 4 }}"),
+        ));
+        assert!(!error.busy);
+        assert!(!error.completion_busy);
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(error))),
+            crate::context::CallgraphStoreAccess::Error(_)
+        ));
+    }
+
+    #[test]
     fn v3_base_completion_owned_by_another_driver_answers_building_then_ready() {
         use super::super::base_builder::{build_base, BaseBuild, BaseBuildInput};
         use super::super::eviction::DiskBudget;
@@ -983,7 +1034,8 @@ mod tests {
         };
         assert_eq!(owner_pid, std::process::id());
         let graph = view(&root, &storage);
-        let error = graph.reader().unwrap_err();
+        let mut now = std::time::Instant::now();
+        let error = graph.reader_with_clock(|| now).unwrap_err();
         assert!(error.busy, "{error}");
         assert!(error.reason.contains(V3_BASE_COMPLETION_BUSY), "{error}");
         assert!(
@@ -998,13 +1050,40 @@ mod tests {
             crate::context::CallgraphStoreAccess::Building
         ));
 
+        for (attempt, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            assert!(graph
+                .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
+                .is_err());
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            now = deadline;
+            if attempt < 6 {
+                assert!(matches!(
+                    crate::context::checkout_view_callgraph_access(Some(
+                        graph.reader_with_clock(|| now)
+                    )),
+                    crate::context::CallgraphStoreAccess::Building
+                ));
+            }
+        }
+
         claim.release().unwrap();
         let crate::context::CallgraphStoreAccess::Ready(ready) =
-            crate::context::checkout_view_callgraph_access(Some(graph.reader()))
+            crate::context::checkout_view_callgraph_access(Some(graph.reader_with_clock(|| now)))
         else {
             panic!("the completed base must serve a ready call graph")
         };
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        assert!(graph.query.lock().unwrap().pending.is_none());
+        assert!(graph.query.lock().unwrap().delay.is_zero());
     }
 
     #[test]
