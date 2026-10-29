@@ -2890,13 +2890,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -17707,6 +17706,23 @@ mod tests {
         assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
         assert!(!executor.actor_registered(&root));
         assert!(!live_roots.contains_key(&root));
+    }
+
+    #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
     }
 
     #[test]
