@@ -2152,9 +2152,13 @@ impl CheckoutDriver {
                         let _ = previous.release();
                     }
                 }
-                outcome => return Err(SiblingLoader::error(format!(
-                    "v3 base plane completion is owned elsewhere: {outcome:?} (base_scope={scope})"
-                ))),
+                outcome => {
+                    let reason =
+                        format!("v3 base plane completion is owned elsewhere: {outcome:?}");
+                    return Err(SiblingLoader::error(format!(
+                        "{reason} (base_scope={scope})"
+                    )));
+                }
             }
         }
         let claim = held.as_ref().expect("claim held above");
