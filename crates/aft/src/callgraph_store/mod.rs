@@ -5443,6 +5443,102 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+mod rust_module_work {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    pub(super) struct Work {
+        pub parent_lookups: usize,
+        pub parent_scans: usize,
+        pub parent_file_visits: usize,
+        pub caller_requests: usize,
+        pub caller_walks: usize,
+        pub parent_time: Duration,
+        pub caller_time: Duration,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Work>> = const { RefCell::new(None) };
+        static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn disabled() -> bool {
+        DISABLED.with(std::cell::Cell::get)
+    }
+
+    pub(super) fn note(update: impl FnOnce(&mut Work)) {
+        ACTIVE.with(|active| {
+            if let Some(work) = active.borrow_mut().as_mut() {
+                update(work);
+            }
+        });
+    }
+
+    pub(super) struct Session;
+
+    impl Session {
+        pub fn start(disabled: bool) -> Self {
+            ACTIVE.with(|active| {
+                assert!(active.borrow().is_none(), "nested module profiling session");
+                *active.borrow_mut() = Some(Work::default());
+            });
+            DISABLED.with(|flag| flag.set(disabled));
+            Self
+        }
+
+        pub fn finish(self) -> Work {
+            ACTIVE.with(|active| active.borrow_mut().take().unwrap())
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.borrow_mut().take());
+            DISABLED.with(|flag| flag.set(false));
+        }
+    }
+
+    pub(super) struct Timing {
+        started: Option<Instant>,
+        parent: bool,
+    }
+
+    impl Timing {
+        pub fn parent() -> Self {
+            note(|work| work.parent_lookups += 1);
+            Self::start(true)
+        }
+
+        pub fn caller() -> Self {
+            note(|work| work.caller_requests += 1);
+            Self::start(false)
+        }
+
+        fn start(parent: bool) -> Self {
+            Self {
+                started: ACTIVE.with(|active| active.borrow().is_some().then(Instant::now)),
+                parent,
+            }
+        }
+    }
+
+    impl Drop for Timing {
+        fn drop(&mut self) {
+            if let Some(started) = self.started {
+                let elapsed = started.elapsed();
+                note(|work| {
+                    if self.parent {
+                        work.parent_time += elapsed;
+                    } else {
+                        work.caller_time += elapsed;
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// Answers to the two Rust lookups that otherwise scan every indexed file on
 /// each call (`module_parent`, `inline_scoped_target`), precomputed from an
 /// in-memory file set. Lookups return exactly what the scans return.
@@ -5596,6 +5692,8 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        let _timing = rust_module_work::Timing::parent();
         match self.crate_scans() {
             Some(memo) => memo.module_parents.get(target_file).cloned(),
             None => self.module_parent_by_scan(target_file),
@@ -5732,10 +5830,14 @@ impl ProjectIndex<'_> {
     /// `(declaring file, module name)` pair whose declared target is
     /// `target_file`.
     fn module_parent_by_scan(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        rust_module_work::note(|work| work.parent_scans += 1);
         let mut parents = self
             .scan_paths(LazyDbFileIndexes::module_declaring_files)
             .into_iter()
             .filter_map(|file| {
+                #[cfg(test)]
+                rust_module_work::note(|work| work.parent_file_visits += 1);
                 let index = self.file_index(&file)?;
                 let modules = index
                     .declared_module_targets
@@ -6166,6 +6268,8 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        let _timing = rust_module_work::Timing::parent();
         if self.memoize_resolver_indexes {
             return self.module_parents().get(target_file).cloned();
         }
@@ -17217,6 +17321,10 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
 }
 
 fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
+    #[cfg(test)]
+    let _timing = rust_module_work::Timing::caller();
+    #[cfg(test)]
+    rust_module_work::note(|work| work.caller_walks += 1);
     if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file) {
         Vec::new()
     } else {
@@ -31936,6 +32044,90 @@ mod crate_scan_memo_tests {
 
     fn segments(path: &[&str]) -> Vec<String> {
         path.iter().map(|segment| segment.to_string()).collect()
+    }
+
+    fn copy_rust_corpus(from: &Path, to: &Path, files: &mut Vec<PathBuf>) {
+        fs::create_dir_all(to).unwrap();
+        let mut entries = fs::read_dir(from)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for source in entries {
+            let name = source.file_name().unwrap();
+            if source.is_dir() {
+                if name != "target" && name != ".git" {
+                    copy_rust_corpus(&source, &to.join(name), files);
+                }
+            } else if source.extension().is_some_and(|ext| ext == "rs") {
+                let destination = to.join(name);
+                fs::copy(&source, &destination).unwrap();
+                files.push(destination);
+            } else if name == "Cargo.toml" {
+                fs::copy(&source, to.join(name)).unwrap();
+            }
+        }
+    }
+
+    /// Compare identical source inventories and edits, including every stored
+    /// edge column, without changing the checkout being measured.
+    #[test]
+    #[ignore]
+    fn bench_rust_module_paths_whole_crate_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("corpus");
+        let mut files = Vec::new();
+        copy_rust_corpus(Path::new(env!("CARGO_MANIFEST_DIR")), &root, &mut files);
+        assert!(
+            files.len() > 500,
+            "benchmark must cover the whole Rust crate"
+        );
+        let changed = root.join("src/callgraph_store/mod.rs");
+        let original = fs::read_to_string(&changed).unwrap();
+        let mut baseline = None;
+        for disabled in [true, false] {
+            fs::write(&changed, &original).unwrap();
+            let store = CallGraphStore::open(
+                dir.path().join(if disabled { "baseline" } else { "memo" }),
+                root.clone(),
+            )
+            .unwrap();
+            let session = rust_module_work::Session::start(disabled);
+            let stats = store.cold_build(&files).unwrap();
+            let cold_work = session.finish();
+            let cold_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
+            fs::write(
+                &changed,
+                format!("{original}\npub fn aft_module_path_refresh_probe() {{}}\n"),
+            )
+            .unwrap();
+            let session = rust_module_work::Session::start(disabled);
+            let mut profile = RefreshFilesProfile::default();
+            let refresh = store
+                .refresh_files_profiled(std::slice::from_ref(&changed), &mut profile)
+                .unwrap();
+            let refresh_work = session.finish();
+            assert!(
+                refresh.refreshed_own_files > 0,
+                "edit must re-resolve references"
+            );
+            let refreshed_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
+            println!(
+                "RUST_MODULE_PATHS disabled={disabled} files={} refs={} cold_edges={} refreshed_edges={} cold_ms={} cold_work={cold_work:?} refresh_profile={} refresh_work={refresh_work:?}",
+                stats.files, stats.refs, cold_edges.len(), refreshed_edges.len(),
+                stats.elapsed_ms, profile.report(),
+            );
+            if let Some((expected_cold, expected_refresh)) = &baseline {
+                assert_eq!(&cold_edges, expected_cold, "whole-crate cold edge rows");
+                assert_eq!(
+                    &refreshed_edges, expected_refresh,
+                    "whole-crate refreshed edge rows"
+                );
+                println!("RUST_MODULE_PATHS whole-crate edge rows identical before and after edit");
+            } else {
+                baseline = Some((cold_edges, refreshed_edges));
+            }
+        }
     }
 
     /// Compares every memo answer with the scan over the same index and
