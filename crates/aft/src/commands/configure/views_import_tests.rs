@@ -3,6 +3,69 @@
 
 use super::*;
 
+const KEY: &str = "0011223344556677";
+const LIMIT: u64 = 1_048_576;
+
+fn warm_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let checkout = tempfile::tempdir().unwrap();
+    let root = checkout.path().canonicalize().unwrap();
+    std::fs::write(root.join("lib.rs"), "pub fn alpha() { beta(); }\nfn beta() {}\n").unwrap();
+    std::fs::write(root.join("other.rs"), "pub fn gamma() { }\n").unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let index = SearchIndex::build_with_limit_to_cache_dir(&root, LIMIT, &storage.path().join("index").join(KEY));
+    let mut parser = crate::parser::FileParser::new();
+    let mut cache = crate::parser::SymbolCache::new();
+    cache.set_project_root(root.clone());
+    for entry in search_index_symbol_files(&index).iter() {
+        let symbols = parser.extract_symbols(&entry.path).unwrap();
+        cache.insert(entry.path.clone(), entry.modified, entry.size, entry.content_hash, symbols);
+    }
+    crate::symbol_cache_disk::write_to_disk(&cache, storage.path(), KEY).unwrap();
+    (checkout, storage, root)
+}
+
+fn lexical_snapshot(root: &Path, storage: &Path) -> crate::search_index::SearchIndexSnapshot {
+    let view = crate::views::trigram::LexicalView::new(
+        root.to_path_buf(), crate::root_cache::StoragePaths::same(storage), KEY.into(),
+        crate::blob_store::v2::TrigramPolicy { max_file_size: LIMIT },
+    ).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match view.snapshot() {
+            Ok(snapshot) => return snapshot,
+            Err(error) if crate::views::trigram::bind_is_busy(&error) && Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+#[test]
+fn views_import_warm_trigram_donor_avoids_full_extraction() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    use crate::views::segment_store::TrigramPayload;
+    let before = TrigramPayload::extraction_count();
+    let _snapshot = lexical_snapshot(&root, storage.path());
+    assert_eq!(TrigramPayload::extraction_count() - before, 0, "warm donor must bypass trigram extraction");
+    let _cold = TrigramPayload::extract(b"counter control", &crate::blob_store::v2::TrigramPolicy { max_file_size: LIMIT });
+    assert!(TrigramPayload::extraction_count() > before, "counter must observe real work");
+}
+
+#[test]
+fn views_import_warm_symbol_donor_avoids_full_extraction() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let _snapshot = lexical_snapshot(&root, storage.path());
+    let index = SearchIndex::read_from_disk(&storage.path().join("index").join(KEY), &root).unwrap();
+    let cache = Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+    let generation = cache.read().unwrap().generation();
+    let before = crate::parser::work_counters::cached_parser_parses();
+    let report = prewarm_symbol_cache_from_view(storage.path(), KEY, &cache, generation, &search_index_symbol_files(&index));
+    assert_eq!(report.reused, 2);
+    assert_eq!(report.stored, 0);
+    assert_eq!(crate::parser::work_counters::cached_parser_parses() - before, 0);
+}
+
 fn benchmark_paths() -> (PathBuf, PathBuf, String) {
     let root = PathBuf::from(std::env::var_os("AFT_IMPORT_BENCH_ROOT").expect("benchmark root"))
         .canonicalize()
