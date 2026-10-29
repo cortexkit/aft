@@ -76,6 +76,52 @@ fn callgraph_empty_receiver_note_reports_lower_bound_at_cap() {
 }
 
 #[test]
+fn callgraph_python_import_reporter_fixture() {
+    let (_temp, store) = fixture(&[
+        ("mod.py", "def toplevel_target():\n    pass\n\ndef local_target():\n    pass\n\ndef test_target():\n    pass\n\ndef same_file_caller():\n    toplevel_target()\n"),
+        ("caller_toplevel.py", "from mod import toplevel_target\n\ndef run_toplevel():\n    toplevel_target()\n"),
+        ("caller_local.py", "def run_local():\n    from mod import local_target\n    local_target()\n"),
+        ("tests/test_probe.py", "class TestProbe:\n    def test_local(self):\n        from mod import test_target\n        test_target()\n"),
+    ]);
+    let results = [
+        callers(&store, "mod.py", "toplevel_target", false),
+        callers(&store, "mod.py", "local_target", false),
+        callers(&store, "mod.py", "test_target", true),
+    ];
+    for (target, result) in ["toplevel_target", "local_target", "test_target"]
+        .iter()
+        .zip(&results)
+    {
+        println!("callers {target}:\n{result}");
+    }
+    for (file, symbol) in [
+        ("caller_toplevel.py", "run_toplevel"),
+        ("caller_local.py", "run_local"),
+    ] {
+        let tree = call_tree_result(&store, Path::new(file), symbol, 3, false).unwrap();
+        println!(
+            "call_tree {symbol}:\n{}",
+            crate::subc_format::format_callgraph(
+                "call_tree",
+                &serde_json::to_value(tree).unwrap(),
+                false
+            )
+        );
+    }
+    assert!(results[0].starts_with("2 callers"), "{}", results[0]);
+    assert!(results[0].contains("same_file_caller:11"), "{}", results[0]);
+    assert!(results[0].contains("run_toplevel:4"), "{}", results[0]);
+    assert!(results[1].starts_with("1 caller"), "{}", results[1]);
+    assert!(results[1].contains("run_local:3"), "{}", results[1]);
+    assert!(results[2].starts_with("1 caller"), "{}", results[2]);
+    assert!(
+        results[2].contains("TestProbe::test_local:4"),
+        "{}",
+        results[2]
+    );
+}
+
+#[test]
 fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
     for (file, source, entry) in [
         (
