@@ -13647,8 +13647,10 @@ mod v3_collector_tests {
         for name in names {
             fill_view_dir(&view_dir(&storage, name));
         }
-        // Settle the registry's own write-ahead log and shared-memory allocation
-        // before choosing a threshold that requires exactly one view to go.
+        // Hold the registry connection across both inventories: closing the
+        // last handle removes its shared-memory file and changes disk usage.
+        let ledger = v3::LedgerReader::open_existing(&storage, FAMILY).unwrap();
+        // Settle registry bookkeeping before choosing a one-view threshold.
         pass(&storage);
         let family = v3::family_dir(&storage, FAMILY).unwrap();
         let before = v3::allocated_bytes(&family).unwrap();
@@ -13672,14 +13674,11 @@ mod v3_collector_tests {
         assert!(!view_dir(&storage, "z-oldest").exists());
         assert!(roots.iter().all(|root| root.exists()));
         assert!(v3::allocated_bytes(&family).unwrap() <= bounds.soft_bytes);
+        let charged = ledger.accounting().unwrap().usage();
+        assert!(charged <= bounds.soft_bytes);
         #[cfg(unix)]
         {
             let disk = inventory(&family);
-            let charged = v3::LedgerReader::open_existing(&storage, FAMILY)
-                .unwrap()
-                .accounting()
-                .unwrap()
-                .usage();
             assert!(
                 charged.abs_diff(disk) <= 16 * 1024,
                 "ledger={charged} disk={disk}"
