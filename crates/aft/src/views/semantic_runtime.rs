@@ -2155,8 +2155,9 @@ where
                 };
                 let mut embedding = |texts| {
                     // Inflight memory stays admitted, but HTTP must not occupy
-                    // cold CPU capacity. Chunk persistence runs under S/G without
-                    // cold; the fill readmits only after releasing S/G and claims.
+                    // cold CPU capacity. Chunk persistence holds the semantic
+                    // batch lease and local gate but no cold slot; the fill
+                    // releases both and all claims before cold readmission.
                     cold_permit.borrow_mut().take();
                     crate::cold_build_limiter::progress::stage("waiting for embedding backend");
                     let result = embed(texts);
@@ -2242,7 +2243,8 @@ where
                 if report.pending == Some(super::semantic::FillPending::LocalContention) {
                     // refresh, its file claims and all scoped permits have
                     // returned. Park only this background worker, checking lane
-                    // cancellation at a bounded interval, never under U/S/G.
+                    // cancellation at a bounded interval, outside refresh and
+                    // both semantic exclusion guards.
                     std::thread::park_timeout(
                         schedule.retry_initial.min(Duration::from_millis(100)),
                     );

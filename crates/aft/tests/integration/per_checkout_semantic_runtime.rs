@@ -606,6 +606,20 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
 /// A second provider arrival is a failure, never a condition for releasing it.
 #[test]
 fn views_on_two_processes_single_flight_checkout_chunk() {
+    two_process_single_flight(false, false);
+}
+
+#[test]
+fn views_on_two_processes_single_flight_separate_base_scopes() {
+    two_process_single_flight(true, true);
+}
+
+#[test]
+fn views_on_two_processes_single_flight_inherited_and_checkout_chunk() {
+    two_process_single_flight(true, false);
+}
+
+fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
     let _settings = crate::test_helpers::without_storage_override();
     let gate = Arc::new(EmbeddingGate::default());
     let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
@@ -617,13 +631,27 @@ fn views_on_two_processes_single_flight_checkout_chunk() {
         wait_views_filled(&warm);
         assert_eq!(server.texts(), chunks);
     }
-    // The committed base is already filled. Identical uncommitted files belong
-    // to each checkout's own fill, which does not take the shared base claim.
+    // Leave these files checkout-owned unless the scenario below commits one
+    // or both, exercising inherited fills through the same chunk dispatch path.
     for root in [&repo.main, &repo.linked] {
         write(
             root,
             "src/concurrent.rs",
             "pub fn concurrent_paid_chunk() -> u64 { 424242 }\n",
+        );
+    }
+    if commit_main {
+        git(&repo.main, &["add", "src/concurrent.rs"]);
+        git(&repo.main, &["commit", "-m", "new inherited chunk"]);
+    }
+    if commit_linked {
+        // A different tree gives the second inherited fill its own base claim;
+        // the shared chunk must still use the same family/producer lease.
+        write(&repo.linked, ".gitignore", "# distinct base tree\n");
+        git(&repo.linked, &["add", "src/concurrent.rs", ".gitignore"]);
+        git(
+            &repo.linked,
+            &["commit", "-m", "different base with shared chunk"],
         );
     }
     let mut main = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
@@ -677,7 +705,7 @@ fn views_on_two_processes_single_flight_checkout_chunk() {
         let deadline = Instant::now() + DEADLINE;
         loop {
             let status = process.send(r#"{"id":"ready","command":"status"}"#);
-            if status["data"]["semantic_index"]["status"] == "ready" {
+            if status["semantic_index"]["status"] == "ready" {
                 break;
             }
             assert!(

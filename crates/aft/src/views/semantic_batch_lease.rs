@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::fs_lock::{self, AcquireError, LockGuard};
 
-// Approval placeholder for agent-visible pending status, not a backend failure.
+// Placeholder reason for pending semantic work, not a backend failure.
 pub(crate) const PENDING_REASON: &str = "SEMANTIC_BATCH_PENDING_APPROVAL";
 
 pub(crate) fn path(storage: &Path, family: &str, producer: &str) -> PathBuf {
