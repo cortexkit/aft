@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "pi": {
+      "project_detection": {
+        "mode": "project"
+      }
+    }
+  }
+}
