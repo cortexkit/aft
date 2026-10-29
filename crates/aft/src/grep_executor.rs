@@ -1468,9 +1468,10 @@ fn diagnose_scope_counts_unbounded(
         false,
         Some(filter_root),
     ) else {
-        return None;
+        return Some(counts);
     };
     let mut directories = HashMap::<PathBuf, HashSet<std::ffi::OsString>>::new();
+    directories.insert(search_root.to_path_buf(), HashSet::new());
     for entry in builder.build() {
         if !within_budget(counts.entries_visited) {
             return None;
