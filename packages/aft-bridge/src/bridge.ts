@@ -1913,10 +1913,11 @@ export class BinaryBridge implements AftProjectTransport {
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[aft(?:-lsp)?\] (INFO|WARN|ERROR|DEBUG) /.exec(
         line,
       )?.[1];
-    if (level === "WARN") this.warnVia(tagged);
-    else if (level === "ERROR") this.errorVia(tagged);
-    else if (level === "DEBUG") this.debugVia(tagged);
-    else this.logVia(tagged);
+    const meta: LogMeta | undefined = level ? { engineRecord: true } : undefined;
+    if (level === "WARN") this.warnVia(tagged, meta);
+    else if (level === "ERROR") this.errorVia(tagged, meta);
+    else if (level === "DEBUG") this.debugVia(tagged, meta);
+    else this.logVia(tagged, meta);
     this.pushStderrLine(tagged);
   }
 

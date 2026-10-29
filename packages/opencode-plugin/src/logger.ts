@@ -1,4 +1,4 @@
-import { RotatingLogSink, resolvePluginLogPath } from "@cortexkit/aft-bridge";
+import { type LogMeta, RotatingLogSink, resolvePluginLogPath } from "@cortexkit/aft-bridge";
 
 const TAG = "[aft-plugin]";
 
@@ -129,16 +129,20 @@ export function flushLog(): void {
  * its `LogMeta.sessionId` into our internal session-prefix shape.
  */
 export const bridgeLogger = {
-  debug(message: string, meta?: { sessionId?: string }) {
+  debug(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     sessionDebug(meta?.sessionId, message);
   },
-  log(message: string, meta?: { sessionId?: string }) {
+  log(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     sessionLog(meta?.sessionId, message);
   },
-  warn(message: string, meta?: { sessionId?: string }) {
+  warn(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     sessionWarn(meta?.sessionId, message);
   },
-  error(message: string, meta?: { sessionId?: string }) {
+  error(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     sessionError(meta?.sessionId, message);
   },
   getLogFilePath: () => logFile,
