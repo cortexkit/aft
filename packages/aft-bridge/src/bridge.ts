@@ -806,6 +806,19 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
+  private debugVia(message: string, meta?: LogMeta): void {
+    const logger = this.logger ?? getActiveLogger();
+    try {
+      if (logger?.debug) logger.debug(message, meta);
+      else console.error(`[aft-bridge] DEBUG: ${message}`);
+    } catch (err) {
+      console.error(
+        `[aft-bridge] ERROR: logger debug threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(`[aft-bridge] ${message}`);
+    }
+  }
+
   private warnVia(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
     if (logger) {
@@ -1895,7 +1908,15 @@ export class BinaryBridge implements AftProjectTransport {
     this.stderrBuffer = "";
     if (!line || !shouldSurfaceStderrLine(line)) return;
     const tagged = tagStderrLine(line);
-    this.logVia(tagged);
+    // Only the engine's own formatter supplies a trustworthy severity prefix.
+    const level =
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[aft(?:-lsp)?\] (INFO|WARN|ERROR|DEBUG) /.exec(
+        line,
+      )?.[1];
+    if (level === "WARN") this.warnVia(tagged);
+    else if (level === "ERROR") this.errorVia(tagged);
+    else if (level === "DEBUG") this.debugVia(tagged);
+    else this.logVia(tagged);
     this.pushStderrLine(tagged);
   }
 

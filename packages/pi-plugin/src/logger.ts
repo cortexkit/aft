@@ -118,6 +118,9 @@ export async function flushLogs(): Promise<void> {
  * for the shared bridge package.
  */
 export const bridgeLogger = {
+  debug(message: string, meta?: { sessionId?: string }) {
+    write("DEBUG", message, undefined, meta?.sessionId);
+  },
   log(message: string, meta?: { sessionId?: string }) {
     if (meta?.sessionId) sessionLog(meta.sessionId, message);
     else write("INFO", message);
