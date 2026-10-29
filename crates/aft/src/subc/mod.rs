@@ -3967,21 +3967,24 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
-    // A released handle cannot receive queued work. Cancel only before the
-    // executor's start transition; already-running mutations keep their result.
-    let queued =
-        queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
-    for (corr, request) in queued {
-        let terminal = build_error_frame(
-            request.ver,
-            channel.channel,
-            channel.epoch,
-            corr,
-            request.flags,
-            "route_released",
-            "route released before execution; the tool did not run",
-        )?;
-        send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+    // A replacement project route keeps replayable calls, even those still
+    // waiting in the executor. Release queued calls only when no project route
+    // replaces the old handle; already-running mutations keep their result.
+    if replacement_root.is_none() {
+        let queued =
+            queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+        for (corr, request) in queued {
+            let terminal = build_error_frame(
+                request.ver,
+                channel.channel,
+                channel.epoch,
+                corr,
+                request.flags,
+                "route_released",
+                "route released before execution; the tool did not run",
+            )?;
+            send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+        }
     }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch allocation is a new daemon route/client handle. AFT retains
