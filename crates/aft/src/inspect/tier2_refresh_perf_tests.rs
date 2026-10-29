@@ -30,6 +30,7 @@ fn profile_tier2_unchanged_checkout() {
     crate::root_cache::configure_artifact_access(&root, &key, false);
     let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
     let graph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
+    eprintln!("tier2_probe building graph files={}", files.len());
     let (store, _) =
         CallGraphStore::cold_build_with_lease(graph_dir, root.clone(), &files).unwrap();
     drop(store);
@@ -45,7 +46,7 @@ fn profile_tier2_unchanged_checkout() {
         Arc::clone(&job.config),
         Arc::clone(&job.symbol_cache),
     );
-    let scope = JobScope::from_roots(root.clone(), vec![root.join("crates/aft/src/inspect")]);
+    let scope = JobScope::from_roots(root.clone(), vec![root.join("packages/aft-bridge/src")]);
     let cpu = cpu_ms();
     let started = Instant::now();
     let graph = manager
