@@ -14311,6 +14311,8 @@ mod tests {
             "{:?}",
             search.data
         );
+        // A refused view fails the call, like grep and aft_search: glob must
+        // not answer from a fallback walk while the checkout view is down.
         let glob = crate::commands::glob::handle_glob(
             &RawRequest {
                 id: "lexical-refused-glob".into(),
@@ -14322,12 +14324,125 @@ mod tests {
             &ctx,
         );
         assert!(
-            glob.success && glob.data["text"].as_str().unwrap().contains("visible.ts"),
+            !glob.success && glob.data.to_string().contains("deliberately refused"),
             "{:?}",
             glob.data
         );
-        assert_eq!(glob.data["fallback"], "filesystem");
         assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+    }
+
+    #[test]
+    fn lexical_view_load_failure_counts_and_degrades_until_recovery() {
+        // Holds the process environment lock for the whole test, like the
+        // other lexical views tests above.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused;
+        impl crate::views::trigram::LexicalSnapshotSource for Refused {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                Err("lexical source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("visible.ts"),
+            "export function outlined() { return \"needle\"; }\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let degraded = || {
+            ctx.degraded_reasons()
+                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string())
+        };
+        assert!(!degraded());
+        // Keep the working source: recovery reinstalls it, proving the next
+        // successful load clears the degraded flag.
+        let working = ctx.lexical_source_for_test();
+        ctx.install_lexical_source_for_test(Arc::new(Refused));
+
+        // Every lexical lane fails with the view error, never an empty
+        // success and never a fallback walk.
+        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(
+            !grep.success && grep.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            grep.data
+        );
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("needle"),
+            &ctx,
+        );
+        assert!(
+            !search.success && search.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            search.data
+        );
+        let glob = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob-health".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts"}),
+            },
+            &ctx,
+        );
+        assert!(
+            !glob.success && glob.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            glob.data
+        );
+
+        // Outline parses the file itself and never loads the view.
+        let outline = crate::commands::outline::handle_outline(
+            &serde_json::from_value(json!({
+                "id": "lexical-refused-outline",
+                "command": "outline",
+                "file": root.join("visible.ts"),
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(outline.success, "{:?}", outline.data);
+        assert!(
+            outline.data["text"].as_str().unwrap().contains("outlined"),
+            "{:?}",
+            outline.data
+        );
+
+        // Health counts every failed load by plane and cause, keeps the last
+        // error, and marks the project degraded.
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.get("trigram:other"), Some(&3));
+        let last = health.view_load_failure_last.expect("last failure kept");
+        assert_eq!(
+            (last.plane.as_str(), last.cause.as_str()),
+            ("trigram", "other")
+        );
+        assert_eq!((last.count, last.total), (3, 3));
+        assert!(last.error.contains("deliberately refused"));
+        assert!(degraded());
+
+        // Recovery: the next successful load clears the degraded flag but
+        // keeps the history count.
+        ctx.install_lexical_source_for_test(working);
+        let recovered = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(!degraded());
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.get("trigram:other"), Some(&3));
+        assert!(health
+            .view_load_failure_last
+            .is_some_and(|last| last.error.contains("deliberately refused")));
     }
 
     #[test]
@@ -14800,6 +14915,152 @@ mod tests {
             "{:?}",
             legacy_answers[0].1.data
         );
+    }
+
+    #[test]
+    fn callgraph_view_load_failure_fails_every_graph_op_and_counts() {
+        // Holds the process environment lock for the whole test, like the
+        // other callgraph views tests above.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused;
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                Err("callgraph source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        ctx.install_callgraph_source_for_test(Arc::new(Refused));
+
+        // Every graph operation fails with the view error, never an empty
+        // success and never another store's answer.
+        let file = root.join("a.ts").to_string_lossy().into_owned();
+        let ops: Vec<(
+            &str,
+            serde_json::Value,
+            fn(&RawRequest, &AppContext) -> Response,
+        )> = vec![
+            (
+                "callers",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::callers::handle_callers,
+            ),
+            (
+                "impact",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::impact::handle_impact,
+            ),
+            (
+                "call_tree",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::call_tree::handle_call_tree,
+            ),
+            (
+                "trace_to",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::trace_to::handle_trace_to,
+            ),
+            (
+                "trace_to_symbol",
+                json!({"file": file, "symbol": "target", "toSymbol": "caller"}),
+                crate::commands::trace_to_symbol::handle_trace_to_symbol,
+            ),
+            (
+                "trace_data",
+                json!({"file": file, "symbol": "caller", "expression": "target"}),
+                crate::commands::trace_data::handle_trace_data,
+            ),
+        ];
+        for (command, params, handle) in &ops {
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": format!("callgraph-refused-{command}"),
+                "command": *command,
+            }))
+            .unwrap();
+            let mut request = request;
+            request.params = params.clone();
+            let answer = handle(&request, &ctx);
+            assert!(
+                !answer.success && answer.data.to_string().contains("deliberately refused"),
+                "{command}: {:?}",
+                answer.data
+            );
+        }
+
+        // Zoom keeps its file-local answer but names the view failure in its
+        // explicit callgraph field; without callgraph:true it needs no view.
+        let zoom_with_graph = crate::commands::zoom::handle_zoom(
+            &serde_json::from_value(json!({
+                "id": "callgraph-refused-zoom",
+                "command": "zoom",
+                "target": file,
+                "symbols": ["target"],
+                "callgraph": true,
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(zoom_with_graph.success, "{:?}", zoom_with_graph.data);
+        assert_eq!(
+            zoom_with_graph.data["callgraph"]["code"],
+            "callgraph_unavailable"
+        );
+        assert!(
+            zoom_with_graph
+                .data
+                .to_string()
+                .contains("deliberately refused"),
+            "{:?}",
+            zoom_with_graph.data
+        );
+        let zoom_local = crate::commands::zoom::handle_zoom(
+            &serde_json::from_value(json!({
+                "id": "callgraph-refused-zoom-local",
+                "command": "zoom",
+                "target": file,
+                "symbols": ["target"],
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(zoom_local.success, "{:?}", zoom_local.data);
+        assert!(zoom_local.data.get("callgraph").is_none());
+
+        // Health counts every failed load by plane and cause and marks the
+        // project degraded.
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(
+            health.view_load_failures.get("callgraph:other"),
+            Some(&(ops.len() as u64 + 1))
+        );
+        let last = health.view_load_failure_last.expect("last failure kept");
+        assert_eq!(
+            (last.plane.as_str(), last.cause.as_str()),
+            ("callgraph", "other")
+        );
+        assert!(last.error.contains("deliberately refused"));
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
     }
 
     /// What a root's storage holds outside the v3 namespace: content-addressed

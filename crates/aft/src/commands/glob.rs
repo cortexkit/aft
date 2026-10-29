@@ -176,7 +176,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             0,
         )
     } else if search_roots.len() == 1 {
-        let discovery = discover_glob_root(
+        let discovery = match discover_glob_root(
             named_ignored_roots[0].as_deref(),
             ctx,
             &project_root,
@@ -188,7 +188,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .get("path")
                 .and_then(|value| value.as_str())
                 .map(|_| req.session()),
-        );
+        ) {
+            Ok(discovery) => discovery,
+            // A failed view load fails the call, like grep: no fallback
+            // walk may answer for a checkout view. The error text is the
+            // view's own, naming the cause.
+            Err(error) => return Response::error(&req.id, "internal_error", error),
+        };
         indexed_mtimes = discovery.indexed_mtimes;
         (
             discovery.files,
@@ -202,26 +208,31 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             discovery.skipped_foreign_mounts,
         )
     } else {
-        let discoveries: Vec<GlobDiscovery> = search_roots
+        let mut discoveries = Vec::with_capacity(search_roots.len());
+        for ((root, ignored), named) in search_roots
             .iter()
             .zip(&ignored_targets)
             .zip(&named_ignored_roots)
-            .map(|((root, ignored), named)| {
-                discover_glob_root(
-                    named.as_deref(),
-                    ctx,
-                    &project_root,
-                    root,
-                    pattern,
-                    DEFAULT_MAX_RESULTS + 1,
-                    *ignored,
-                    req.params
-                        .get("path")
-                        .and_then(|value| value.as_str())
-                        .map(|_| req.session()),
-                )
-            })
-            .collect();
+        {
+            match discover_glob_root(
+                named.as_deref(),
+                ctx,
+                &project_root,
+                root,
+                pattern,
+                DEFAULT_MAX_RESULTS + 1,
+                *ignored,
+                req.params
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(|_| req.session()),
+            ) {
+                Ok(discovery) => discoveries.push(discovery),
+                // A failed view load fails the call, like grep: no fallback
+                // walk may answer for a checkout view.
+                Err(error) => return Response::error(&req.id, "internal_error", error),
+            }
+        }
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let walk_time_limit_reached = discoveries.iter().any(|d| d.walk_time_limit_reached);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -503,7 +514,7 @@ fn discover_glob_root(
     max_results: usize,
     ignored_target: bool,
     explicit_session: Option<&str>,
-) -> GlobDiscovery {
+) -> Result<GlobDiscovery, String> {
     if let Some(named_root) = named_ignored_root {
         let filters = build_path_filters(&[pattern.to_owned()], &[]).unwrap_or_default();
         let started = Instant::now();
@@ -512,7 +523,7 @@ fn discover_glob_root(
             named_root,
             &filters,
         );
-        return GlobDiscovery {
+        return Ok(GlobDiscovery {
             scope_has_files: !outcome.files.is_empty()
                 || outcome.walk_truncated
                 || outcome.skipped_foreign_mounts > 0,
@@ -525,7 +536,7 @@ fn discover_glob_root(
             walk_time: started.elapsed(),
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: outcome.skipped_foreign_mounts,
-        };
+        });
     }
     glob_root(
         ctx,
@@ -558,9 +569,14 @@ fn glob_root(
     max_results: usize,
     ignored_target: bool,
     explicit_session: Option<&str>,
-) -> GlobDiscovery {
+) -> Result<GlobDiscovery, String> {
     if crate::context::confinement::active() {
-        return fallback_glob(project_root, search_root, pattern, ignored_target);
+        return Ok(fallback_glob(
+            project_root,
+            search_root,
+            pattern,
+            ignored_target,
+        ));
     }
     if let Some(outputs) = explicit_session.and_then(|session| {
         ctx.bash_background()
@@ -577,7 +593,7 @@ fn glob_root(
             .into_iter()
             .filter(|path| filters.matches(filter_root, path))
             .collect();
-        return GlobDiscovery {
+        return Ok(GlobDiscovery {
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
@@ -588,7 +604,7 @@ fn glob_root(
             walk_time: Duration::ZERO,
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: 0,
-        };
+        });
     }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
@@ -596,9 +612,10 @@ fn glob_root(
         .then(|| ctx.lexical_view_snapshot("glob"))
         .flatten();
     let indexed_snapshot = if let Some(snapshot) = view_snapshot {
-        // Failed view acquisition uses the bounded current-tree walk, never a
-        // borrowed legacy snapshot that may describe another checkout.
-        snapshot.ok()
+        // A failed view load fails the call, like grep: answering from a
+        // fallback walk would hide the outage, and the legacy snapshot may
+        // describe another checkout.
+        Some(snapshot?)
     } else {
         let search_index = ctx
             .search_index()
@@ -638,8 +655,7 @@ fn glob_root(
             skipped_foreign_mounts: 0,
         }
     });
-
-    match indexed {
+    Ok(match indexed {
         Some(discovery)
             if index_covers_root
                 || crate::grep_executor::is_same_directory(&search_scope.root, project_root) =>
@@ -665,7 +681,7 @@ fn glob_root(
                     let walk_time = walk_started.elapsed();
                     let scope_started = Instant::now();
                     let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
-                    return GlobDiscovery {
+                    return Ok(GlobDiscovery {
                         files: outcome.files,
                         indexed_mtimes: HashMap::new(),
                         walk_truncated: outcome.walk_truncated,
@@ -676,12 +692,12 @@ fn glob_root(
                         scope_has_files,
                         scope_probe: scope_started.elapsed(),
                         skipped_foreign_mounts: 0,
-                    };
+                    });
                 }
             }
             fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
         }
-    }
+    })
 }
 
 /// Runs one `glob_root` discovery and returns the files it found, the source
@@ -704,7 +720,8 @@ pub(crate) fn glob_root_files_for_test(
         max_results,
         false,
         explicit_session,
-    );
+    )
+    .expect("test glob discovery without a view failure");
     (discovery.files, discovery.source, discovery.entries_visited)
 }
 
@@ -968,16 +985,20 @@ mod tests {
         assert!(index.snapshot().has_file_in_scope(&file));
         *ctx.search_index().write().unwrap() = Some(index);
 
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None);
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None)
+            .expect("ready index answers without a view");
         assert_eq!(discovery.source, "index");
         assert!(!discovery.walk_truncated);
         assert_eq!(discovery.files, vec![file.clone()]);
         assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false, None).files,
+            glob_root(&ctx, &project, &file, "*.ts", 100, false, None)
+                .expect("glob answers without a view")
+                .files,
             vec![file.clone()]
         );
         assert!(
             glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
+                .expect("glob answers without a view")
                 .files
                 .is_empty()
         );
@@ -988,16 +1009,20 @@ mod tests {
         let (_dir, ctx, project, file) = exact_file_glob_fixture();
         assert!(ctx.search_index().read().unwrap().is_none());
 
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None);
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None)
+            .expect("fallback answers without a view");
         assert_eq!(discovery.source, "fallback");
         assert!(!discovery.walk_truncated);
         assert_eq!(discovery.files, vec![file.clone()]);
         assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false, None).files,
+            glob_root(&ctx, &project, &file, "*.ts", 100, false, None)
+                .expect("glob answers without a view")
+                .files,
             vec![file.clone()]
         );
         assert!(
             glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
+                .expect("glob answers without a view")
                 .files
                 .is_empty()
         );

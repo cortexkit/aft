@@ -1123,6 +1123,75 @@ pub struct ViewHealthSnapshot {
     pub callgraph_readiness_deferred: Option<&'static str>,
 }
 
+/// Degraded reason recorded while a project's checkout view fails to load.
+/// Cleared by the next successful load; the history counts are kept.
+/// Rendered as-is by status surfaces, like the other degraded reasons.
+pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
+
+/// Error-level log throttle: one line per project and plane per minute.
+/// Repeats inside the window are counted and reported on the next emission.
+const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The most recent checkout view load failure of a project. Planes are the
+/// query planes a failed load serves: `trigram` for the lexical view behind
+/// grep, glob and aft_search, `callgraph` for the graph behind navigation,
+/// zoom and inspect. Semantic lane failures stay lane-level (the lane reports
+/// `unavailable` with its cause and the query continues lexically), so they
+/// are not load failures here.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ViewLoadFailure {
+    pub plane: String,
+    /// Bucketed cause (`busy`, `io`, `invalid`, `unavailable` or `other`);
+    /// the full error stays in `error`.
+    pub cause: String,
+    pub error: String,
+    /// Failures with this plane and cause since this process started.
+    pub count: u64,
+    /// All view load failures since this process started.
+    pub total: u64,
+    pub last_at_ms: u64,
+}
+
+/// Per-project checkout view load health. Counts every load attempt the
+/// queries actually made (grep, glob, aft_search binds for the lexical view;
+/// navigation, zoom and inspect for the callgraph view), so a persistent
+/// outage keeps counting while it keeps failing queries.
+#[derive(Debug, Default)]
+struct ViewLoadHealth {
+    by_cause: BTreeMap<(String, String), u64>,
+    total: u64,
+    last: Option<ViewLoadFailure>,
+    /// Last error-level log per plane with the repeats suppressed since.
+    log_state: BTreeMap<String, (Instant, u64)>,
+}
+
+/// Bucket a view load error into a stable short cause. I/O failures already
+/// name their path and operation; verification and manifest problems name
+/// what mismatches or is missing; the full text stays in the recorded error.
+fn view_load_cause(error: &str) -> &'static str {
+    let error = error.to_lowercase();
+    if error.contains("busy") {
+        "busy"
+    } else if error.contains("view i/o failed") {
+        "io"
+    } else if error.contains("invalid")
+        || error.contains("mismatch")
+        || error.contains("missing")
+        || error.contains("unverified")
+        || error.contains("verification")
+    {
+        "invalid"
+    } else if error.contains("unavailable")
+        || error.contains("not ready")
+        || error.contains("not built")
+        || error.contains("disabled")
+    {
+        "unavailable"
+    } else {
+        "other"
+    }
+}
+
 /// Why a root's view publications keep failing; see
 /// [`ViewHealthSnapshot::publication_failure`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1199,6 +1268,16 @@ pub struct RootHealthSnapshot {
     pub callgraph_pages_or_bytes_written_60s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub views: Option<ViewHealthSnapshot>,
+    /// Checkout view loads that failed for this project since this process
+    /// started, keyed `"plane:cause"` (for example `"trigram:unavailable"`
+    /// or `"callgraph:busy"). A failed load fails the query that attempted
+    /// it; there is no fallback walk or legacy-index answer. Kept as history:
+    /// a later successful load clears the degraded flag but never resets these.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub view_load_failures: BTreeMap<String, u64>,
+    /// The most recent view load failure, if any load has failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_load_failure_last: Option<ViewLoadFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1215,6 +1294,8 @@ pub(crate) struct RootHealthSummary {
     semantic_index: Option<SemanticHealthComponentSnapshot>,
     callgraph_store_status: Option<&'static str>,
     views: Option<ViewHealthSnapshot>,
+    view_load_failures: BTreeMap<String, u64>,
+    view_load_failure_last: Option<ViewLoadFailure>,
     tier2_status: Option<&'static str>,
     tier2_completion_generation: Option<u64>,
     tier2_stale_since_ms: Option<u64>,
@@ -1234,6 +1315,8 @@ impl RootHealthSummary {
             semantic_index: None,
             callgraph_store_status: None,
             views: None,
+            view_load_failures: BTreeMap::new(),
+            view_load_failure_last: None,
             tier2_status: None,
             tier2_completion_generation: None,
             tier2_stale_since_ms: None,
@@ -1305,6 +1388,8 @@ impl RootHealthSummary {
             callgraph_commits_60s,
             callgraph_pages_or_bytes_written_60s,
             views: self.views,
+            view_load_failures: self.view_load_failures,
+            view_load_failure_last: self.view_load_failure_last,
             tier2: self.tier2_status.map(|status| Tier2HealthSnapshot {
                 status,
                 completion_generation: self.tier2_completion_generation.unwrap_or_default(),
@@ -1333,6 +1418,8 @@ impl RootHealthSnapshot {
             callgraph_commits_60s: None,
             callgraph_pages_or_bytes_written_60s: None,
             views: None,
+            view_load_failures: BTreeMap::new(),
+            view_load_failure_last: None,
             tier2: None,
             bash: None,
             suspended_domains: Vec::new(),
@@ -4588,6 +4675,9 @@ pub struct AppContext {
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
     callgraph_view_read_diagnostics: parking_lot::Mutex<CallgraphViewReadDiagnostics>,
+    /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
+    /// Read by the health snapshot; written by every query that loads a view.
+    view_load_health: parking_lot::Mutex<ViewLoadHealth>,
     callgraph_view_routes: AtomicU64,
     /// Files whose symbols a views-routed root's prewarm reused from, or
     /// stored into, the family's v3 symbol plane.
@@ -5496,6 +5586,7 @@ impl AppContext {
             callgraph_view_read_diagnostics: parking_lot::Mutex::new(
                 CallgraphViewReadDiagnostics::default(),
             ),
+            view_load_health: parking_lot::Mutex::new(ViewLoadHealth::default()),
             callgraph_view_routes: AtomicU64::new(0),
             symbol_view_routes: Arc::default(),
             checkout_semantic: Arc::default(),
@@ -5887,6 +5978,20 @@ impl AppContext {
         } else {
             None
         };
+        // View load failures are recorded on every query that loads a view,
+        // independent of the v1 publication runtime above: checkout-routed
+        // roots report them even while `views` is `None`.
+        let (view_load_failures, view_load_failure_last) = match self.view_load_health.try_lock() {
+            Some(health) => (
+                health
+                    .by_cause
+                    .iter()
+                    .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
+                    .collect(),
+                health.last.clone(),
+            ),
+            None => return RootHealthSummary::busy(),
+        };
         let search_index = match self.search_index.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -6135,6 +6240,8 @@ impl AppContext {
             semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
             views,
+            view_load_failures,
+            view_load_failure_last,
             tier2_status: Some(tier2_status),
             tier2_completion_generation: Some(successful_tier2_completions),
             tier2_stale_since_ms,
@@ -9635,6 +9742,92 @@ impl AppContext {
         true
     }
 
+    /// Drop one degraded reason, keeping the order of the rest.
+    /// Returns whether it was present.
+    pub(crate) fn remove_degraded_reason(&self, reason: &str) -> bool {
+        let mut reasons = self.degraded_reasons.lock();
+        let Some(index) = reasons.iter().position(|existing| existing == reason) else {
+            return false;
+        };
+        reasons.remove(index);
+        true
+    }
+
+    /// Record a checkout view load that failed for a query on this project.
+    /// The agent-visible error is returned unchanged by the caller; this only
+    /// counts the failure (by plane and cause), keeps the last error and
+    /// time, marks the project degraded until the next successful load, and
+    /// logs at error level at most once a minute per plane.
+    pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
+        let cause = view_load_cause(error);
+        let now = Instant::now();
+        let (count, _total, suppressed) = {
+            let mut health = self.view_load_health.lock();
+            let count = health
+                .by_cause
+                .entry((plane.to_string(), cause.to_string()))
+                .or_default();
+            *count = count.saturating_add(1);
+            health.total = health.total.saturating_add(1);
+            let last_at_ms = semantic_health_unix_millis();
+            health.last = Some(ViewLoadFailure {
+                plane: plane.to_string(),
+                cause: cause.to_string(),
+                error: error.to_string(),
+                count: *count,
+                total: health.total,
+                last_at_ms,
+            });
+            let entry = health
+                .log_state
+                .entry(plane.to_string())
+                .or_insert((now, 0));
+            if now.duration_since(entry.0) < VIEW_LOAD_LOG_INTERVAL {
+                entry.1 = entry.1.saturating_add(1);
+                (*count, health.total, None)
+            } else {
+                let suppressed = std::mem::take(&mut entry.1);
+                entry.0 = now;
+                (*count, health.total, Some(suppressed))
+            }
+        };
+        self.add_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
+        if let Some(suppressed) = suppressed {
+            let root = self
+                .canonical_cache_root_opt()
+                .unwrap_or_default()
+                .display()
+                .to_string();
+            crate::slog_error!(
+                "view load failed root={} plane={} cause={} failures={} suppressed={} error={}",
+                root,
+                plane,
+                cause,
+                count,
+                suppressed,
+                error
+            );
+        }
+    }
+
+    /// A checkout view load succeeded: the project is no longer degraded for
+    /// view loads. History counts and the last error are kept.
+    pub(crate) fn note_view_load_success(&self) {
+        self.remove_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
+    }
+
+    /// Suppressed error-log repeats for `plane` since its last emission.
+    /// Tests use it to prove the per-minute throttle without wall-clock waits.
+    #[cfg(test)]
+    pub(crate) fn view_load_suppressed_for_test(&self, plane: &str) -> u64 {
+        self.view_load_health
+            .lock()
+            .log_state
+            .get(plane)
+            .map(|(_, suppressed)| *suppressed)
+            .unwrap_or(0)
+    }
+
     /// Snapshot of current degraded-mode reasons. Order is stable
     /// (insertion order from `set_degraded_reasons`) so UI rendering and
     /// snapshot diffs are deterministic.
@@ -12233,7 +12426,14 @@ impl AppContext {
         });
         let result = match acquired {
             Ok(result) => result,
-            Err(error) => return Some(Err(error)),
+            Err(error) => {
+                // A failed load fails the query: no fallback walk or legacy
+                // index may answer for a checkout view. The error text is
+                // returned unchanged; the counter, degraded flag and log are
+                // recorded here.
+                self.note_view_load_failure("trigram", &error);
+                return Some(Err(error));
+            }
         };
         if pinned_config_for(self.config_pin_key()).is_some() {
             LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
@@ -12249,6 +12449,10 @@ impl AppContext {
                 _ => 2,
             };
             self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
+        }
+        match &result {
+            Ok(_) => self.note_view_load_success(),
+            Err(error) => self.note_view_load_failure("trigram", error),
         }
         Some(result)
     }
@@ -12358,7 +12562,12 @@ impl AppContext {
             {
                 match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
                     Ok(view) => *slot = Some(Arc::new(view)),
-                    Err(error) => return Some(Err(error.into())),
+                    Err(error) => {
+                        // Like the lexical view, a failed callgraph load fails
+                        // the query: no legacy store may answer for the view.
+                        self.note_view_load_failure("callgraph", &error.reason);
+                        return Some(Err(error));
+                    }
                 }
             }
             slot.as_ref().unwrap().clone()
@@ -12374,6 +12583,9 @@ impl AppContext {
         }
         if result.is_ok() {
             self.callgraph_view_routes.fetch_add(1, Ordering::Relaxed);
+            self.note_view_load_success();
+        } else if let Err(error) = &result {
+            self.note_view_load_failure("callgraph", &error.reason);
         }
         Some(result)
     }
@@ -22381,6 +22593,161 @@ mod health_warming_honesty_tests {
         ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(false);
 
         assert_eq!(health_tier2_status(&ctx), "stale");
+    }
+}
+
+#[cfg(test)]
+mod view_load_health_tests {
+    use super::*;
+    use crate::parser::TreeSitterProvider;
+
+    fn ctx() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    fn degraded(ctx: &AppContext) -> bool {
+        ctx.degraded_reasons()
+            .contains(&VIEW_LOAD_DEGRADED_REASON.to_string())
+    }
+
+    #[test]
+    fn view_load_cause_buckets_errors_by_kind() {
+        // Transient contention, whatever database reports it.
+        assert_eq!(
+            view_load_cause("callgraph derived store is busy: database is locked"),
+            "busy"
+        );
+        assert_eq!(
+            view_load_cause("view loader [driver]: v3 store busy: members.sqlite: checkpoint WAL"),
+            "busy"
+        );
+        // I/O errors name their path and operation.
+        assert_eq!(
+            view_load_cause(
+                "view loader [driver]: view I/O failed reading /root/a.ts: No such file"
+            ),
+            "io"
+        );
+        // Verification and manifest problems.
+        assert_eq!(
+            view_load_cause("invalid view manifest: duplicate member"),
+            "invalid"
+        );
+        assert_eq!(
+            view_load_cause("view producer mismatch: trigram policy changed"),
+            "invalid"
+        );
+        assert_eq!(
+            view_load_cause("view generation abc manifest unreadable: gone"),
+            "invalid"
+        );
+        assert_eq!(
+            view_load_cause("manifest references missing trigram blob deadbeef"),
+            "invalid"
+        );
+        assert_eq!(
+            view_load_cause("lexical view has unverified writes"),
+            "invalid"
+        );
+        // Loads that cannot serve yet or anymore.
+        assert_eq!(
+            view_load_cause("lexical payload not ready: /root/a.ts"),
+            "unavailable"
+        );
+        assert_eq!(
+            view_load_cause(
+                "callgraph view unavailable: view loader [reconciliation]: walked away"
+            ),
+            "unavailable"
+        );
+        assert_eq!(
+            view_load_cause(
+                "call graph is disabled (indexes.callgraph=false): this view generation was published without call graph data"
+            ),
+            "unavailable"
+        );
+        assert_eq!(
+            view_load_cause("lexical source deliberately refused"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn view_load_failure_marks_project_degraded_until_a_successful_load() {
+        let ctx = ctx();
+        let root = Path::new("/tmp/view-load-health-test");
+        let snapshot = ctx.try_health_snapshot(root);
+        assert!(snapshot.view_load_failures.is_empty());
+        assert!(snapshot.view_load_failure_last.is_none());
+        assert!(!degraded(&ctx));
+
+        let ((), lines) = crate::logging::capture_log_lines(|| {
+            ctx.note_view_load_failure("trigram", "lexical source deliberately refused");
+        });
+        assert_eq!(
+            lines.len(),
+            1,
+            "one error line per minute per plane: {lines:?}"
+        );
+        assert!(lines[0].starts_with("ERROR "), "{lines:?}");
+        for part in [
+            "plane=trigram",
+            "cause=other",
+            "suppressed=0",
+            "deliberately refused",
+        ] {
+            assert!(lines[0].contains(part), "{lines:?}");
+        }
+        assert!(degraded(&ctx));
+
+        // A repeat inside the minute is counted but not logged again.
+        let ((), repeat_lines) = crate::logging::capture_log_lines(|| {
+            ctx.note_view_load_failure("trigram", "lexical source deliberately refused");
+        });
+        assert!(repeat_lines.is_empty(), "{repeat_lines:?}");
+        assert_eq!(ctx.view_load_suppressed_for_test("trigram"), 1);
+        assert!(degraded(&ctx));
+
+        // A later successful load clears the flag but keeps the history.
+        ctx.note_view_load_success();
+        assert!(!degraded(&ctx));
+        let snapshot = ctx.try_health_snapshot(root);
+        assert_eq!(snapshot.view_load_failures.get("trigram:other"), Some(&2));
+        let last = snapshot.view_load_failure_last.expect("last failure kept");
+        assert_eq!(last.plane, "trigram");
+        assert_eq!(last.cause, "other");
+        assert_eq!(last.count, 2);
+        assert_eq!(last.total, 2);
+        assert!(last.error.contains("deliberately refused"));
+        assert!(last.last_at_ms > 0);
+    }
+
+    #[test]
+    fn view_load_failures_group_by_plane_and_cause() {
+        let ctx = ctx();
+        ctx.note_view_load_failure("trigram", "lexical payload not ready: /root/a.ts");
+        ctx.note_view_load_failure(
+            "callgraph",
+            "callgraph v3 store is busy: members.sqlite checkpoint WAL",
+        );
+        ctx.note_view_load_failure("trigram", "lexical payload not ready: /root/b.ts");
+        let snapshot = ctx.try_health_snapshot(Path::new("/tmp/view-load-health-planes"));
+        assert_eq!(
+            snapshot.view_load_failures.get("trigram:unavailable"),
+            Some(&2)
+        );
+        assert_eq!(snapshot.view_load_failures.get("callgraph:busy"), Some(&1));
+        let last = snapshot.view_load_failure_last.expect("last failure");
+        assert_eq!(last.plane, "trigram");
+        assert_eq!(last.cause, "unavailable");
+        assert_eq!((last.count, last.total), (2, 3));
+        assert!(degraded(&ctx));
+        // The health report carries the same map and last error.
+        let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
+        assert_eq!(json["view_load_failures"]["trigram:unavailable"], 2);
+        assert!(json["view_load_failure_last"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("/root/b.ts")));
     }
 }
 
