@@ -32143,6 +32143,7 @@ mod crate_scan_memo_tests {
             files.len() > 500,
             "benchmark must cover the whole Rust crate"
         );
+        eprintln!("RUST_MODULE_PATHS inventory_files={}", files.len());
         let changed = root.join("src/callgraph_store/mod.rs");
         let original = fs::read_to_string(&changed).unwrap();
         let mut baseline = None;
@@ -32153,15 +32154,22 @@ mod crate_scan_memo_tests {
                 root.clone(),
             )
             .unwrap();
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} starting cold build");
+            set_cold_build_phase_observer(Some(Arc::new(move |phase| {
+                eprintln!("RUST_MODULE_PATHS disabled={disabled} cold_phase={phase}");
+            })));
             let session = rust_module_work::Session::start(disabled);
             let stats = store.cold_build(&files).unwrap();
             let cold_work = session.finish();
+            set_cold_build_phase_observer(None);
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} cold_ms={} files={} failed_files={} undecodable_files={}", stats.elapsed_ms, stats.files, stats.failed_files.len(), stats.undecodable_files.len());
             let cold_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
             fs::write(
                 &changed,
                 format!("{original}\npub fn aft_module_path_refresh_probe() {{}}\n"),
             )
             .unwrap();
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} starting refresh");
             let session = rust_module_work::Session::start(disabled);
             let (refresh, profile) = store
                 .refresh_files_profiled(std::slice::from_ref(&changed))
