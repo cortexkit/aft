@@ -10004,6 +10004,10 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
 }
 
 #[cfg(test)]
+#[path = "configure/views_import_tests.rs"]
+mod views_import_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
