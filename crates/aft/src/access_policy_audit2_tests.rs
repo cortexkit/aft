@@ -1957,3 +1957,57 @@ fn audit11_outside_zoom_batch_entry_asks_then_answers_with_the_approval() {
     assert!(text.contains("outside_fn"), "{text}");
     assert!(!text.contains("permission_required"), "{text}");
 }
+
+#[test]
+fn outside_grep_grant_round_trip_plain_directory() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.outside.join("packages")).unwrap();
+    std::fs::write(f.outside.join("packages/probe.rs"), "outside_grep_canary\n").unwrap();
+    assert_outside_grep_round_trip(&f, &f.outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_grep_grant_round_trip_symlinked_parent() {
+    let f = Fixture::new();
+    let scratch = f._dir.path().join("CortexKit-scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::os::unix::fs::symlink(&f.outside, scratch.join("antigravity-auth-314-prs")).unwrap();
+    std::fs::create_dir(f.outside.join("packages")).unwrap();
+    std::fs::write(f.outside.join("packages/probe.rs"), "outside_grep_canary\n").unwrap();
+    assert_outside_grep_round_trip(&f, &scratch.join("antigravity-auth-314-prs"));
+}
+
+fn assert_outside_grep_round_trip(f: &Fixture, folder: &Path) {
+    f.ctx.set_harness(crate::harness::Harness::Opencode);
+    let run = |path: &Path, tokens: Vec<String>| {
+        crate::access_policy::with_native_route(
+            request(
+                "grep",
+                json!({"path": path, "pattern": "outside_grep_canary", "permissions_granted": tokens}),
+            ),
+            &f.ctx,
+            |req, ctx| crate::commands::grep::handle_grep(&req, ctx),
+        )
+    };
+    for path in [folder.to_path_buf(), folder.join("packages")] {
+        let asked = run(folder, Vec::new());
+        assert_eq!(
+            asked.data["code"], "permission_required",
+            "{:?}",
+            asked.data
+        );
+        assert_eq!(asked.data["asks"][0]["operation"], "read");
+        let token = asked.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let answered = run(&path, vec![token]);
+        assert!(answered.success, "{}: {:?}", path.display(), answered.data);
+        assert!(
+            answered.data.to_string().contains("outside_grep_canary"),
+            "{:?}",
+            answered.data
+        );
+    }
+}
