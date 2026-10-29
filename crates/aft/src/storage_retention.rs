@@ -5473,6 +5473,21 @@ enum V3IdleStep {
     Unknown(String),
 }
 
+fn report_v3_idle_unknown(
+    view_dir: &Path,
+    error: &io::Error,
+    report: &mut SweepReport,
+    domain: &mut DomainReport,
+) {
+    domain.skipped_unknown += 1;
+    report.stopped_early |= is_retention_deadline(error);
+    if report.errors.len() < 16 {
+        report
+            .errors
+            .push(format!("{}: {error}", view_dir.display()));
+    }
+}
+
 fn v3_mark_idle_evicting(
     tx: &rusqlite::Transaction<'_>,
     observed: &V3Member,
@@ -5616,8 +5631,7 @@ fn collect_v3_idle(
         match step {
             V3IdleStep::Held => domain.skipped_protected += 1,
             V3IdleStep::Unknown(reason) => {
-                domain.skipped_unknown += 1;
-                report_candidate_error(&view_dir, &io::Error::other(reason), report);
+                report_v3_idle_unknown(&view_dir, &io::Error::other(reason), report, domain);
             }
             V3IdleStep::Evicting => {
                 let bytes = retention_tree_bytes(&view_dir, deadline).ok();
@@ -5637,8 +5651,7 @@ fn collect_v3_idle(
                         usage = registry.accounting().map_err(v3)?.usage();
                     }
                     Err(error) => {
-                        domain.skipped_unknown += 1;
-                        report_candidate_error(&view_dir, &error, report);
+                        report_v3_idle_unknown(&view_dir, &error, report, domain);
                     }
                 }
             }
@@ -13634,6 +13647,9 @@ mod v3_collector_tests {
         for name in names {
             fill_view_dir(&view_dir(&storage, name));
         }
+        // Settle the registry's own write-ahead log and shared-memory allocation
+        // before choosing a threshold that requires exactly one view to go.
+        pass(&storage);
         let family = v3::family_dir(&storage, FAMILY).unwrap();
         let before = v3::allocated_bytes(&family).unwrap();
         // Leave room for registry bookkeeping, but require one whole view to go.
@@ -13673,6 +13689,7 @@ mod v3_collector_tests {
     }
 
     fn idle_pass(storage: &Path, bounds: V3Bounds) -> SweepReport {
+        crate::root_cache::register_durable_owner(&StoragePaths::same(storage)).unwrap();
         let lock = ReservationLock::acquire(storage).unwrap();
         let mut registry = RegistryWriter::open_existing(storage, FAMILY, &lock).unwrap();
         let mut report = SweepReport::default();
@@ -13760,6 +13777,8 @@ mod v3_collector_tests {
         assert_eq!(idle.skipped_protected, 5, "{report:?}");
         assert_eq!(idle.skipped_unknown, 1, "{report:?}");
         assert_eq!(idle.removed_roots, 1, "{report:?}");
+        assert_eq!(report.skipped_protected, 5, "{report:?}");
+        assert_eq!(report.skipped_unknown, 1, "{report:?}");
         assert_eq!(report.errors.len(), 1, "{report:?}");
         assert!(report.errors[0].contains("malformed pin"), "{report:?}");
         assert_eq!(member_scopes(&storage), &names[..6]);
