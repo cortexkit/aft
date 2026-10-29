@@ -24548,7 +24548,12 @@ mod tests {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("child.sh"),
-            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\necho ready > ready\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
+            // Write `ready` only after the long-lived sleep exists. Otherwise a
+            // TERM sent between `ready` and the first `sleep` launch is
+            // deferred by bash, the sleep is born after the signal, and it
+            // outlives the trapped shell as a survivor this TERM-only kill
+            // then waits for.
+            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\nsleep 30 & sleeper=$!\necho ready > ready\nwait $sleeper\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
         let task_id =
             spawn_unsandboxed_for_kill_test(&registry, dir.path(), "bash child.sh & wait");
         let ready_deadline = Instant::now() + Duration::from_secs(10);
