@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-23"
+  ],
+  "note": "Test-only flake fixes. No changed path matches RANKING_FENCE_PREFIXES."
+}

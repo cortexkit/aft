@@ -18,6 +18,8 @@ base=origin/main
 full=0
 filter=
 filter_set=0
+test_target=
+features=
 timeout_minutes=60
 show_status=0
 plan_only=0
@@ -30,12 +32,18 @@ while (($#)); do
     --filter)
       if (($# < 2)); then echo "--filter requires a test filter" >&2; exit 2; fi
       filter=$2; filter_set=1; shift 2 ;;
+    --test-target)
+      if (($# < 2)) || [[ -z "$2" ]]; then echo "--test-target requires a target" >&2; exit 2; fi
+      test_target=$2; shift 2 ;;
+    --features)
+      if (($# < 2)) || [[ -z "$2" ]]; then echo "--features requires a feature list" >&2; exit 2; fi
+      features=$2; shift 2 ;;
     --timeout-minutes)
       if (($# < 2)); then echo "--timeout-minutes requires a positive integer" >&2; exit 2; fi
       timeout_minutes=$2; shift 2 ;;
     --status) show_status=1; shift ;;
     --plan) plan_only=1; shift ;;
-    --help|-h) echo 'Run with runon windows; options: --base, --full, --filter, --timeout-minutes, --status, --plan'; exit 0 ;;
+    --help|-h) echo 'Run with runon windows; options: --base, --full, --filter, --test-target, --features, --timeout-minutes, --status, --plan'; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -52,6 +60,10 @@ if ((timeout_minutes < 1)); then
 fi
 if ((filter_set)) && [[ -z "$filter" ]]; then
   echo "filter must not be empty" >&2
+  exit 2
+fi
+if ((full)) && [[ -n "$test_target" ]]; then
+  echo '--full and --test-target cannot be combined' >&2
   exit 2
 fi
 
@@ -100,7 +112,9 @@ select_path() {
   esac
 }
 
-if [[ -n "$filter" ]]; then
+if [[ -n "$test_target" ]]; then
+  plan_label="explicit test target $test_target"
+elif [[ -n "$filter" ]]; then
   plan_label='explicit filter'
 else
   base_sha="$(git rev-parse --verify "$base^{commit}")"
@@ -128,6 +142,10 @@ if [[ -n "$filter" ]]; then
   job_kinds=(); job_targets=(); job_filters=()
   add_job lib '' "$filter"
   if ((full)); then add_job test integration "$filter"; fi
+fi
+if [[ -n "$test_target" ]]; then
+  job_kinds=(); job_targets=(); job_filters=()
+  add_job test "$test_target" "$filter"
 fi
 
 selected_kinds=(); selected_targets=(); selected_filters=()
@@ -159,11 +177,13 @@ print_job() {
   local kind=$1 target=$2 test_filter=$3
   local -a args=(test --locked -j 4 -p agent-file-tools "--$kind")
   [[ -z "$target" ]] || args+=("$target")
+  [[ -z "$features" ]] || args+=(--features "$features")
   [[ -z "$test_filter" ]] || args+=("$test_filter")
   args+=(-- --test-threads 4)
   printf '  cargo'; printf ' %q' "${args[@]}"; printf '\n'
 }
-printf '  storage preflight: cargo test --locked -j 4 -p agent-file-tools --lib gate_hermeticity_tests::gate_resolves_every_user_config_and_state_path_under_the_gate_homes -- --test-threads 4\n'
+printf '  storage preflight:\n'
+print_job lib '' gate_hermeticity_tests::gate_resolves_every_user_config_and_state_path_under_the_gate_homes
 for ((i = 0; i < ${#job_kinds[@]}; i++)); do print_job "${job_kinds[$i]}" "${job_targets[$i]}" "${job_filters[$i]}"; done
 if ((plan_only)); then exit 0; fi
 
@@ -219,6 +239,7 @@ run_job() {
   local kind=$1 target=$2 test_filter=$3 label=$4 remaining output code
   local -a args=(test --locked -j 4 -p agent-file-tools "--$kind")
   [[ -z "$target" ]] || args+=("$target")
+  [[ -z "$features" ]] || args+=(--features "$features")
   [[ -z "$test_filter" ]] || args+=("$test_filter")
   args+=(-- --test-threads 4)
   remaining=$((timeout_minutes * 60 - (SECONDS - started)))

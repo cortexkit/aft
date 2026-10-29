@@ -602,6 +602,15 @@ pub struct FillBudget {
     pub shared_wait: Duration,
 }
 
+/// Resource-admission phases for a fill, independent of vector readiness.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillAdmission {
+    Preparation,
+    Cold,
+    SuspendCold,
+    ResumeCold,
+}
+
 impl Default for FillBudget {
     fn default() -> Self {
         Self {
@@ -1380,7 +1389,7 @@ impl SemanticPlane {
             budget,
             embed,
             current,
-            &mut || Ok(()),
+            &mut |_| Ok(()),
             false,
         )
     }
@@ -1392,7 +1401,7 @@ impl SemanticPlane {
         budget: FillBudget,
         embed: &mut F,
         current: &dyn Fn() -> Snapshot,
-        before_embed: &mut dyn FnMut() -> Result<(), String>,
+        before_embed: &mut dyn FnMut(FillAdmission) -> Result<(), String>,
         bounded_reads: bool,
     ) -> Result<FillReport, PlaneError>
     where
@@ -1892,9 +1901,13 @@ impl SemanticPlane {
         }
 
         for (item, relative, key) in waiting {
+            // The claim owner may need cold admission after its backend returns.
+            // Do not keep that admission occupied while waiting for its run.
+            before_embed(FillAdmission::SuspendCold).map_err(plane_error)?;
             let wait_started = Instant::now();
             arena.wait_released(&key, budget.shared_wait);
             report.timing.shared_wait += wait_started.elapsed();
+            before_embed(FillAdmission::ResumeCold).map_err(plane_error)?;
             let lookup_started = Instant::now();
             let run = match arena.get(&key) {
                 Some(run) => Some(run),
@@ -1956,7 +1969,7 @@ impl SemanticPlane {
         texts: Vec<String>,
         embed: &mut F,
         report: &mut FillReport,
-        before_embed: &mut dyn FnMut() -> Result<(), String>,
+        before_embed: &mut dyn FnMut(FillAdmission) -> Result<(), String>,
         canonical_chunks: &mut Vec<Arc<[f32]>>,
     ) -> Result<Vec<crate::semantic_index::BuildEmbeddingRow>, String>
     where
@@ -1977,7 +1990,19 @@ impl SemanticPlane {
         let mut admitted = false;
         let (_gate, mut rows, misses, checked_at) = loop {
             let wait_started = Instant::now();
-            let gate = arena.chunk_batch();
+            let gate = match arena.try_chunk_batch() {
+                Some(gate) => gate,
+                None => {
+                    // The gate owner may be returning from a model call and
+                    // need cold admission before it can persist and unlock.
+                    // Never hold a cold slot while waiting for that owner.
+                    before_embed(FillAdmission::SuspendCold)?;
+                    drop(arena.chunk_batch());
+                    report.timing.chunk_wait += wait_started.elapsed();
+                    before_embed(FillAdmission::ResumeCold)?;
+                    continue;
+                }
+            };
             report.timing.chunk_wait += wait_started.elapsed();
             let lookup_started = Instant::now();
             // Read before any chunk row below is read or stored: a vector
@@ -2015,7 +2040,7 @@ impl SemanticPlane {
                 // a slotted build may need that gate to finish and free a slot.
                 // Recheck after admission because a sibling may fill the misses.
                 drop(gate);
-                before_embed()?;
+                before_embed(FillAdmission::Cold)?;
                 admitted = true;
                 continue;
             }
@@ -4264,7 +4289,7 @@ mod tests {
                 vec![text.into()],
                 &mut |_| Ok(vec![vector.clone()]),
                 &mut FillReport::default(),
-                &mut || Ok(()),
+                &mut |_| Ok(()),
                 &mut Vec::new(),
             )
             .unwrap();
@@ -4361,7 +4386,7 @@ mod tests {
                 vec![text.into()],
                 &mut |texts| Model::default().embed("model-a", texts),
                 &mut report,
-                &mut || Ok(()),
+                &mut |_| Ok(()),
                 &mut Vec::new(),
             )
             .unwrap();

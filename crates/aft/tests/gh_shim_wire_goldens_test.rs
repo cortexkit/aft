@@ -23,6 +23,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -1928,6 +1929,16 @@ fn run_v22_row_with_reply(
     agent_id: &str,
     reply: Vec<u8>,
 ) -> V22Run {
+    run_v22_row_with_input(row, manifest_bytes, agent_id, reply, "")
+}
+
+fn run_v22_row_with_input(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+    input: &str,
+) -> V22Run {
     let bindings = serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
         "status": "ok",
@@ -1975,13 +1986,20 @@ fn run_v22_row_with_reply(
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GH_SHIM_BYPASS")
         .env_remove("GH_REPO")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for name in WORKER_BROKER_ENV {
         command.env_remove(name);
     }
-    let output = command.output().expect("run gh shim");
+    let mut child = command.spawn().expect("run gh shim");
+    child
+        .stdin
+        .take()
+        .expect("shim stdin")
+        .write_all(input.as_bytes())
+        .expect("write shim stdin");
+    let output = child.wait_with_output().expect("wait for gh shim");
     let routed = holder
         .captured()
         .into_iter()
@@ -2226,6 +2244,401 @@ fn v22_speech_rows_route_exactly_the_declared_requests_and_lookalikes_never_rout
     for row in v22_rows() {
         let run = run_v22_row(&row, &manifest, "alfonso-aft");
         check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn api_typed_patch_body_file_reaches_the_real_relay_as_contents() {
+    let temp = tempfile::tempdir().expect("body fixture");
+    let path = temp.path().join("ship-note.md");
+    let contents = "Ship note with **formatting**.\nSecond line.\n";
+    fs::write(&path, contents).expect("write body fixture");
+    let row = V22Row {
+        name: "api-typed-patch-body-file",
+        argv: vec![
+            "api",
+            "-X",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/1",
+            "-F",
+            leak(format!("body=@{}", path.display())),
+        ],
+        expect: routed(
+            "api:PATCH:/repos/*/*/issues/comments/*",
+            json!({"comment_id": "1"}),
+            json!({"body": contents}),
+            true,
+        ),
+    };
+    let run = run_v22_row(&row, &synthetic_v22_manifest(unix_seconds()), "alfonso-aft");
+    check_v22_row(&row, &run, "alfonso-aft");
+}
+
+#[test]
+fn api_comment_field_wire_goldens_preserve_file_stdin_and_raw_semantics() {
+    let temp = tempfile::tempdir().expect("body fixtures");
+    let path = temp.path().join("body.md");
+    let contents = "true\nA Unicode ship note: 🚢\n";
+    fs::write(&path, contents).expect("write body fixture");
+    let document = temp.path().join("body.json");
+    fs::write(
+        &document,
+        serde_json::to_vec(&json!({"body": contents})).unwrap(),
+    )
+    .expect("write JSON fixture");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for (method, endpoint, action, target, own) in [
+        (
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/1",
+            "api:PATCH:/repos/*/*/issues/comments/*",
+            json!({"comment_id": "1"}),
+            true,
+        ),
+        (
+            "POST",
+            "repos/cortexkit/aft/pulls/1/comments/1/replies",
+            "api:POST:/repos/*/*/pulls/*/comments/*/replies",
+            json!({"number": "1", "comment_id": "1"}),
+            false,
+        ),
+    ] {
+        for (flag, value, input, expected) in [
+            ("-F", format!("body=@{}", path.display()), "", contents),
+            ("--field", format!("body=@{}", path.display()), "", contents),
+            ("-F", "body=@-".into(), contents, contents),
+            ("-f", "body=@literal".into(), "", "@literal"),
+            ("--raw-field", "body=@literal".into(), "", "@literal"),
+            ("--input", document.to_str().unwrap().into(), "", contents),
+            (
+                "--input",
+                "-".into(),
+                "{\"body\":\"stdin document\"}",
+                "stdin document",
+            ),
+        ] {
+            let row = V22Row {
+                name: leak(format!("{method}-{flag}-{value}")),
+                argv: vec!["api", "-X", method, endpoint, flag, leak(value)],
+                expect: routed(action, target.clone(), json!({"body": expected}), own),
+            };
+            let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+                .expect("success response");
+            let run = run_v22_row_with_input(&row, &manifest, "alfonso-aft", reply, input);
+            check_v22_row(&row, &run, "alfonso-aft");
+        }
+        for source in [temp.path().join("missing.md"), temp.path().to_path_buf()] {
+            let row = V22Row {
+                name: "unreadable-typed-comment-file",
+                argv: vec![
+                    "api",
+                    "-X",
+                    method,
+                    endpoint,
+                    "-F",
+                    leak(format!("body=@{}", source.display())),
+                ],
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            };
+            let run = run_v22_row(&row, &manifest, "alfonso-aft");
+            check_v22_row(&row, &run, "alfonso-aft");
+            assert!(
+                run.stderr.contains("could not read body file"),
+                "{}",
+                run.stderr
+            );
+        }
+        for scalar in ["true", "false", "null", "123", "-2", "+03"] {
+            let row = V22Row {
+                name: "non-string-typed-comment-body",
+                argv: vec![
+                    "api",
+                    "-X",
+                    method,
+                    endpoint,
+                    "-F",
+                    leak(format!("body={scalar}")),
+                ],
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            };
+            let run = run_v22_row(&row, &manifest, "alfonso-aft");
+            check_v22_row(&row, &run, "alfonso-aft");
+            assert!(
+                run.stderr.contains("needs body as a string"),
+                "{}",
+                run.stderr
+            );
+        }
+        for flags in [
+            vec!["--input", document.to_str().unwrap(), "-f", "body=query"],
+            vec!["-f", "body=query", "--input", document.to_str().unwrap()],
+            vec![
+                "--input",
+                document.to_str().unwrap(),
+                "--input",
+                document.to_str().unwrap(),
+            ],
+        ] {
+            let mut argv = vec!["api", "-X", method, endpoint];
+            argv.extend(flags.into_iter().map(|value| leak(value.to_string())));
+            let row = V22Row {
+                name: "input-query-fields-not-representable",
+                argv,
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            };
+            let run = run_v22_row(&row, &manifest, "alfonso-aft");
+            check_v22_row(&row, &run, "alfonso-aft");
+            assert!(run.stderr.contains("--input cannot"), "{}", run.stderr);
+        }
+    }
+}
+
+#[test]
+fn api_other_governed_rows_keep_types_or_refuse_before_relay() {
+    let temp = tempfile::tempdir().expect("API fixtures");
+    let path = temp.path().join("title.md");
+    fs::write(&path, "true").expect("write string-looking scalar fixture");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    let mut rows = vec![
+        V22Row {
+            name: "pull-edit-typed-file-is-still-a-string",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                leak(format!("title=@{}", path.display())),
+            ],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "true"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "pull-edit-typed-boolean-is-not-prose",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title=true",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+        V22Row {
+            name: "pull-edit-raw-placeholder-is-literal",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-f",
+                "title={repo}",
+            ],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "{repo}"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "pull-edit-typed-placeholder-is-not-guessed",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title={repo}",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+        V22Row {
+            name: "pull-edit-cannot-replay-stdin-twice",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title=@-",
+                "--field",
+                "body=@-",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+    ];
+    for (endpoint, action, target) in [
+        (
+            "repos/cortexkit/aft/stacks",
+            "api:POST:/repos/*/*/stacks",
+            json!({}),
+        ),
+        (
+            "repos/cortexkit/aft/stacks/1/add",
+            "api:POST:/repos/*/*/stacks/*/add",
+            json!({"stack_number": "1"}),
+        ),
+    ] {
+        for (integer, expected) in [("1", 1_i64), ("+02", 2), ("9223372036854775807", i64::MAX)] {
+            rows.push(V22Row {
+                name: "stack-typed-decimal-integer",
+                argv: vec![
+                    "api",
+                    endpoint,
+                    "-F",
+                    leak(format!("pull_requests[]={integer}")),
+                ],
+                expect: routed(
+                    action,
+                    target.clone(),
+                    json!({"pull_requests": [expected]}),
+                    false,
+                ),
+            });
+        }
+        for (flag, value) in [
+            ("-f", "1"),
+            ("-F", "true"),
+            ("-F", "false"),
+            ("-F", "null"),
+            ("-F", "1.5"),
+            ("-F", "9223372036854775808"),
+        ] {
+            rows.push(V22Row {
+                name: "stack-non-integer-is-not-coerced",
+                argv: vec![
+                    "api",
+                    endpoint,
+                    flag,
+                    leak(format!("pull_requests[]={value}")),
+                ],
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            });
+        }
+    }
+    for field in [
+        "id=true",
+        "id=false",
+        "id=null",
+        "id=123",
+        "id=@-",
+        "id={repo}",
+    ] {
+        rows.push(V22Row {
+            name: "graphql-variable-rewrite-is-refused",
+            argv: vec!["api", "graphql", "-f", V22_UNRESOLVE, "-F", field],
+            expect: V22Expect::Refused("gh_shim_unbound_target"),
+        });
+    }
+    for row in rows {
+        let run = run_v22_row(&row, &manifest, "alfonso-aft");
+        check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn command_body_file_wire_goldens_read_paths_and_stdin_not_api_fields() {
+    let temp = tempfile::tempdir().expect("command body fixtures");
+    let path = temp.path().join("command-body.md");
+    let contents = "Command body from file or stdin.\n";
+    fs::write(&path, contents).expect("write command body");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for (head, action, target, own, extra) in [
+        (
+            vec!["issue", "comment", "1"],
+            "issue comment",
+            json!({"number": "1"}),
+            false,
+            json!({}),
+        ),
+        (
+            vec!["pr", "comment", "1"],
+            "pr comment",
+            json!({"number": "1"}),
+            false,
+            json!({}),
+        ),
+        (
+            vec!["issue", "create", "--title", "probe"],
+            "issue create",
+            json!({}),
+            false,
+            json!({"title": "probe"}),
+        ),
+        (
+            vec!["issue", "edit", "1"],
+            "issue edit",
+            json!({"number": "1"}),
+            true,
+            json!({}),
+        ),
+        (
+            vec![
+                "pr", "create", "--title", "probe", "--base", "main", "--head", "topic",
+            ],
+            "pr create",
+            json!({}),
+            false,
+            json!({"title": "probe", "base": "main", "head": "topic", "draft": false}),
+        ),
+        (
+            vec!["pr", "edit", "1"],
+            "pr edit",
+            json!({"number": "1"}),
+            true,
+            json!({}),
+        ),
+        (
+            vec!["pr", "review", "1", "--comment"],
+            "pr review",
+            json!({"number": "1"}),
+            false,
+            json!({"event": "COMMENT"}),
+        ),
+    ] {
+        for (flag, source, input) in [
+            ("--body-file", path.to_str().unwrap(), ""),
+            ("-F", path.to_str().unwrap(), ""),
+            ("--body-file", "-", contents),
+            ("-F", "-", contents),
+        ] {
+            let mut argv = head.clone();
+            argv.extend([flag, leak(source.to_string())]);
+            let mut body = extra.clone();
+            body["body"] = json!(contents);
+            let row = V22Row {
+                name: leak(format!("{action}-{flag}-{source}")),
+                argv,
+                expect: routed(action, target.clone(), body, own),
+            };
+            let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+                .expect("success response");
+            let run = run_v22_row_with_input(&row, &manifest, "alfonso-aft", reply, input);
+            check_v22_row(&row, &run, "alfonso-aft");
+        }
+        let mut argv = head.clone();
+        argv.extend([
+            "--body-file",
+            leak(temp.path().join("missing.md").display().to_string()),
+        ]);
+        let row = V22Row {
+            name: "missing-command-body-file",
+            argv,
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        };
+        let run = run_v22_row(&row, &manifest, "alfonso-aft");
+        check_v22_row(&row, &run, "alfonso-aft");
+        assert!(
+            run.stderr.contains("could not read body file"),
+            "{}",
+            run.stderr
+        );
     }
 }
 

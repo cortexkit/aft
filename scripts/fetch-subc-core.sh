@@ -130,10 +130,25 @@ stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/subc-core-fetch.XXXXXX")"
 trap 'rm -rf "$stage_dir"' EXIT
 
 echo "Fetching $TARBALL_NAME from $SUBC_REPO@$SUBC_CORE_TAG" >&2
-gh release download "$SUBC_CORE_TAG" \
+# A CI runner's connection to api.github.com can drop for a moment, and one
+# failed download would otherwise fail the whole job. The checksum below still
+# verifies whatever a retry downloads.
+max_attempts=4
+attempt=1
+delay=5
+until gh release download "$SUBC_CORE_TAG" \
   --repo "$SUBC_REPO" \
   --dir "$stage_dir" \
-  --pattern "$TARBALL_NAME"
+  --pattern "$TARBALL_NAME"; do
+  if (( attempt >= max_attempts )); then
+    fail "Could not download $TARBALL_NAME from $SUBC_REPO@$SUBC_CORE_TAG after $max_attempts attempts"
+  fi
+  echo "Download attempt $attempt of $max_attempts failed; retrying in ${delay}s" >&2
+  rm -f "$stage_dir/$TARBALL_NAME"
+  sleep "$delay"
+  attempt=$((attempt + 1))
+  delay=$((delay * 3))
+done
 
 [[ -f "$stage_dir/$TARBALL_NAME" ]] || fail "Missing downloaded asset: $TARBALL_NAME"
 printf '%s\n' "$EXPECTED_SHA256" > "$stage_dir/$SIDECAR_NAME"

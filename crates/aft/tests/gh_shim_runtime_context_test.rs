@@ -485,6 +485,9 @@ fn shim_command(
 #[path = "gh_shim/rename_guard.rs"]
 mod rename_guard;
 
+#[path = "gh_shim/manifest_unavailable.rs"]
+mod manifest_unavailable;
+
 #[test]
 fn gh_shim_child_override_leaves_operator_state_canary_untouched() {
     let temp = tempfile::tempdir().expect("create test root");
@@ -2302,6 +2305,10 @@ struct SlowTestDaemon {
 
 impl SlowTestDaemon {
     fn spawn(config: SlowDaemonConfig) -> Self {
+        Self::spawn_with_manifest_removal(config, None)
+    }
+
+    fn spawn_with_manifest_removal(config: SlowDaemonConfig, manifest: Option<PathBuf>) -> Self {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test daemon");
         std_listener.set_nonblocking(true).expect("set nonblocking");
         let port = std_listener.local_addr().expect("local addr").port();
@@ -2329,6 +2336,7 @@ impl SlowTestDaemon {
                                 let Ok((mut stream, _)) = accepted else { break; };
                                 let k = key_clone.clone();
                                 let d = daemon_id_clone;
+                                let manifest = manifest.clone();
                                 let first_connection = connection_count == 0;
                                 connection_count += 1;
                                 let hs_delay = if config.first_connection_only && !first_connection {
@@ -2402,6 +2410,9 @@ impl SlowTestDaemon {
                                                 .and_then(|v| v.get("op").and_then(Value::as_str).map(String::from));
 
                                             if op.as_deref() == Some("catalog.list") {
+                                                if let Some(path) = &manifest {
+                                                    fs::remove_file(path).expect("remove manifest during discovery");
+                                                }
                                                 if !cat_delay.is_zero() {
                                                     tokio::time::sleep(cat_delay).await;
                                                 }

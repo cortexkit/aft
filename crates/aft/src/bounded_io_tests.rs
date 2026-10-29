@@ -607,13 +607,13 @@ fn queued_time_does_not_consume_running_access_budget() {
     let caller = std::thread::spawn(move || {
         result_tx
             .send(with_budget(
-                Some(Budget::after(Duration::from_secs(5))),
+                Some(Budget::after(Duration::from_secs(30))),
                 || {
                     run_with_timeout(
                         &path,
                         None,
                         Limiter::new(1),
-                        Duration::from_secs(1),
+                        Duration::from_secs(6),
                         None,
                         move |_| {
                             started_tx.send(()).unwrap();
@@ -626,16 +626,19 @@ fn queued_time_does_not_consume_running_access_budget() {
             .unwrap();
     });
     gate.reached.recv_timeout(IO_BUDGET).unwrap();
-    // Model a loaded runner that schedules the helper late, then a healthy
-    // operation taking less than its own access budget, but not the leftover.
-    assert!(result_rx.recv_timeout(Duration::from_millis(750)).is_err());
+    // A three-second queue leaves ample scheduling margin. Four seconds of
+    // running work fit the six-second access cap, but not a cap begun at enqueue.
+    assert!(result_rx.recv_timeout(Duration::from_secs(3)).is_err());
     drop(gate);
     let started = started_rx.recv_timeout(IO_BUDGET);
-    let early = result_rx.recv_timeout(Duration::from_millis(500));
+    let early = result_rx.recv_timeout(Duration::from_secs(4));
     let _ = release_tx.send(());
     caller.join().unwrap();
-    started.expect("the filesystem operation must actually start");
     let result = early.unwrap_or_else(|_| result_rx.recv_timeout(IO_BUDGET).unwrap());
+    assert!(
+        started.is_ok(),
+        "the filesystem operation must actually start: {started:?}; run_with_timeout returned {result:?}"
+    );
     assert_eq!(
         result.unwrap(),
         42,

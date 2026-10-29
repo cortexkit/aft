@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "v3-floor-before-namespace"
+  ],
+  "note": "Raises the durable v3 reader floor before the reservation lock creates blobs/v3. Touches blob_store/v3.rs and storage_retention.rs tests only; no changed path matches RANKING_FENCE_PREFIXES."
+}

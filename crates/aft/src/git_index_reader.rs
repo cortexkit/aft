@@ -711,7 +711,13 @@ impl GitQueries {
             .env("LC_ALL", "C");
         #[cfg(test)]
         crate::test_env::apply_hermetic_git_env(&mut command);
-        pump(&mut command, input, self.timeout, &self.spawned)
+        pump(&mut command, input, self.timeout, &self.spawned).map_err(|error| {
+            crate::views::io::at(
+                &format!("running git {} in", args.join(" ")),
+                &self.root,
+                error,
+            )
+        })
     }
 }
 

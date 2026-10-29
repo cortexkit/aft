@@ -8176,8 +8176,10 @@ mod deferred_terminal_tests {
             DispatchOutcome::Deferred(pending) => pending,
             DispatchOutcome::Immediate(_) => panic!("inspect must defer"),
         };
+        // The detached inspect blocks at the gate until released, so a slow
+        // (loaded) runner can only make it arrive late; 30 s still bounds a hang.
         started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("detached inspect reaches body gate");
 
         let mut registry = crate::response_finalize::PendingResponses::default();

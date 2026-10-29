@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -355,28 +355,136 @@ fn configure_context_with_views(
     ctx
 }
 
+#[derive(Debug, Default)]
+struct IndexWaitDiagnostics {
+    status: BTreeMap<&'static str, String>,
+    view_status: BTreeMap<&'static str, BTreeMap<String, usize>>,
+    last_error: BTreeMap<&'static str, String>,
+}
+
+impl IndexWaitDiagnostics {
+    fn observe_views(&mut self, ctx: &AppContext) {
+        use aft::blob_store::v2::FamilyPlane;
+        use aft::views::readiness::PlaneState;
+
+        if let Some(error) = ctx.callgraph_view_read_diagnostics().last_error {
+            self.last_error.insert("callgraph", error);
+        }
+        if let Some(runtime) = ctx.checkout_semantic_runtime() {
+            if let Some(error) = runtime.unavailable_reason() {
+                self.last_error.insert("semantic", error);
+            }
+            let snapshot = runtime.installed();
+            let membership = snapshot.membership();
+            for (name, plane) in [
+                ("callgraph", FamilyPlane::Callgraph),
+                ("semantic", FamilyPlane::Semantic),
+                ("lexical", FamilyPlane::Trigram),
+            ] {
+                let mut counts = BTreeMap::new();
+                for path in membership.keys() {
+                    let state = snapshot.plane_readiness(path, plane);
+                    let status = match state {
+                        Some(PlaneState::Ready { .. }) => "ready".to_owned(),
+                        Some(PlaneState::Pending { reason }) => format!("pending: {reason:?}"),
+                        Some(PlaneState::Failed { .. }) => {
+                            self.last_error
+                                .insert(name, format!("{path:?}: {state:#?}"));
+                            "failed".to_owned()
+                        }
+                        None => "unset".to_owned(),
+                    };
+                    *counts.entry(status).or_insert(0) += 1;
+                }
+                self.view_status.insert(name, counts);
+            }
+        }
+    }
+
+    fn observe_lexical(&mut self, answer: &Value) {
+        self.status
+            .insert("lexical", answer["index_status"].to_string());
+        if answer["success"] == false || !answer["index_read_gap"].is_null() {
+            self.last_error.insert("lexical", format!("{answer:#}"));
+        }
+    }
+
+    fn report(&self, ctx: &AppContext) -> String {
+        // Diagnostics only sample passive state. Running another query here
+        // could wake a retry and hide the state that exhausted the deadline.
+        let health = ctx.try_health_snapshot(&ctx.canonical_cache_root());
+        let planes: BTreeMap<_, _> = ["callgraph", "semantic", "lexical"]
+            .into_iter()
+            .map(|plane| {
+                (
+                    plane,
+                    json!({
+                        "final_status": self.status.get(plane),
+                        "semantic_member_readiness": self.view_status.get(plane),
+                        "last_error": self.last_error.get(plane),
+                    }),
+                )
+            })
+            .collect();
+        format!(
+            "planes={:#}\ncallgraph_view_reads={:#}\nsemantic_slot={}\nlast_callgraph_reconcile={:#?}\nhealth={:#}",
+            json!(planes),
+            json!(ctx.callgraph_view_read_diagnostics()),
+            ctx.checkout_semantic().describe(),
+            ctx.last_callgraph_reconcile(),
+            json!(health),
+        )
+    }
+}
+
 fn wait_until_ready(ctx: &AppContext) -> Arc<aft::callgraph_store::ReadonlyCallGraphStore> {
-    let deadline = Instant::now() + ROW_DEADLINE;
+    wait_until_ready_observed(ctx, &mut IndexWaitDiagnostics::default())
+}
+
+fn wait_until_ready_observed(
+    ctx: &AppContext,
+    diagnostics: &mut IndexWaitDiagnostics,
+) -> Arc<aft::callgraph_store::ReadonlyCallGraphStore> {
+    let started = Instant::now();
+    let deadline = started + ROW_DEADLINE;
     loop {
         aft::runtime_drain::drain_watcher_events(ctx);
         aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_callgraph_store_events(ctx);
         aft::runtime_drain::drain_semantic_index_events(ctx);
         aft::runtime_drain::drain_semantic_refresh_events(ctx);
-        let callgraph = match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => Some(store),
-            CallgraphStoreAccess::Building => None,
+        let mut failure = None;
+        let (callgraph_status, callgraph) = match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => ("ready", Some(store)),
+            CallgraphStoreAccess::Building => ("building", None),
             CallgraphStoreAccess::Suspended(reason) => {
-                panic!("callgraph suspended while waiting: {reason:?}")
+                failure = Some(format!("callgraph suspended while waiting: {reason:?}"));
+                ("suspended", None)
             }
-            CallgraphStoreAccess::Unavailable => panic!("callgraph unavailable while waiting"),
-            CallgraphStoreAccess::Off => panic!("callgraph index off while waiting"),
+            CallgraphStoreAccess::Unavailable => {
+                failure = Some("callgraph unavailable while waiting".to_owned());
+                ("unavailable", None)
+            }
+            CallgraphStoreAccess::Off => {
+                failure = Some("callgraph index off while waiting".to_owned());
+                ("off", None)
+            }
             // The view reader opens without a busy wait, so a publication
             // checkpointing the derived database can briefly lock it. Commands
-            // report that as a retryable `callgraph_building`; wait it out too.
-            CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => None,
-            CallgraphStoreAccess::Error(error) => panic!("callgraph failed while waiting: {error}"),
+            // expose a retryable SQLite busy error; wait it out too.
+            CallgraphStoreAccess::Error(error) => {
+                diagnostics
+                    .last_error
+                    .insert("callgraph", format!("{error}\n{error:#?}"));
+                if !error.is_transient_lock_contention() {
+                    failure = Some(format!("callgraph failed while waiting: {error}"));
+                }
+                ("error", None)
+            }
         };
+        diagnostics
+            .status
+            .insert("callgraph", callgraph_status.to_owned());
         // With views on, grep and glob read the checkout's lexical view on
         // demand and no legacy search index is ever built; their readiness
         // is checked by the grep answers the callers wait for.
@@ -387,17 +495,42 @@ fn wait_until_ready(ctx: &AppContext) -> Arc<aft::callgraph_store::ReadonlyCallG
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .is_some_and(|index| index.ready);
+        diagnostics.status.insert(
+            "lexical",
+            if ctx.config().views.enabled {
+                "views-on; query readiness checked by grep".to_owned()
+            } else {
+                format!("legacy ready={search_ready}")
+            },
+        );
+        let semantic_status = ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        diagnostics
+            .status
+            .insert("semantic", format!("{semantic_status:#?}"));
+        if let SemanticIndexStatus::Failed(error) = &semantic_status {
+            diagnostics.last_error.insert("semantic", error.clone());
+        }
         let semantic_ready = matches!(
-            &*ctx
-                .semantic_index_status()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &semantic_status,
             SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
         );
+        diagnostics.observe_views(ctx);
+        if let Some(failure) = failure {
+            panic!("{failure}\n{}", diagnostics.report(ctx));
+        }
         if let Some(store) = callgraph.filter(|_| search_ready && semantic_ready) {
             return store;
         }
-        assert!(Instant::now() < deadline, "indexes did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "indexes did not become ready after {:?}\n{}",
+            started.elapsed(),
+            diagnostics.report(ctx)
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -526,11 +659,19 @@ fn run_row(label: &str, row: impl FnOnce()) {
 fn wait_for_views_branch(ctx: &AppContext, root: &Path, branch: char) {
     let other = if branch == 'A' { 'B' } else { 'A' };
     let deadline = Instant::now() + ROW_DEADLINE;
+    let mut diagnostics = IndexWaitDiagnostics::default();
     loop {
-        let _ = wait_until_ready(ctx);
+        let _ = wait_until_ready_observed(ctx, &mut diagnostics);
         let present = grep(ctx, &format!("target{branch}"));
         let absent = grep(ctx, &format!("target{other}"));
         let caller_result = callers(ctx, root, branch);
+        diagnostics.observe_lexical(&present);
+        diagnostics.observe_lexical(&absent);
+        if caller_result["success"] == false {
+            diagnostics
+                .last_error
+                .insert("callgraph", format!("{caller_result:#}"));
+        }
         if present["index_status"] == "Ready"
             && present["total_matches"].as_u64().unwrap_or(0) > 0
             && absent["total_matches"] == 0
@@ -541,7 +682,7 @@ fn wait_for_views_branch(ctx: &AppContext, root: &Path, branch: char) {
         }
         assert!(
             Instant::now() < deadline,
-            "views branch {branch} did not converge: present={present:#} absent={absent:#} callers={caller_result:#}"
+            "views branch {branch} did not converge: present={present:#} absent={absent:#} callers={caller_result:#}\n{}", diagnostics.report(ctx)
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -613,13 +754,20 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
 /// semantic file of the checkout as it is on disk.
 fn wait_for_semantic_view(ctx: &AppContext) {
     let deadline = Instant::now() + ROW_DEADLINE;
+    let mut diagnostics = IndexWaitDiagnostics::default();
     loop {
         aft::runtime_drain::drain_watcher_events(ctx);
         let runtime = ctx.checkout_semantic_runtime();
         let complete = runtime.as_ref().is_some_and(|runtime| {
-            runtime
-                .search(&[1.0, 0.0, 0.0], 1, &|_| true)
-                .is_ok_and(|answer| answer.complete())
+            match runtime.search(&[1.0, 0.0, 0.0], 1, &|_| true) {
+                Ok(answer) => answer.complete(),
+                Err(error) => {
+                    diagnostics
+                        .last_error
+                        .insert("semantic", format!("{error:#?}"));
+                    false
+                }
+            }
         });
         // A switch the watcher has not delivered yet looks complete for the
         // previous branch; the reconciled snapshot must match the disk too.
@@ -640,12 +788,17 @@ fn wait_for_semantic_view(ctx: &AppContext) {
                             .is_some_and(|state| state.is_pending())
                     })
         });
+        diagnostics
+            .status
+            .insert("semantic", format!("complete={complete} current={current}"));
+        diagnostics.observe_views(ctx);
         if complete && current {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "views-on semantic view never caught up"
+            "views-on semantic view never caught up\n{}",
+            diagnostics.report(ctx)
         );
         thread::sleep(Duration::from_millis(25));
     }

@@ -268,6 +268,7 @@ pub(in crate::subc) async fn submit(
     dispatch: DispatchFn,
     capabilities: ProofCapabilities,
     request_meta: RequestFrameMeta,
+    reply_budget: crate::commands::blocking_wait::ReplyBudget,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let id = format!("subc-{}-{}", route.channel, frame.header.corr);
@@ -279,6 +280,10 @@ pub(in crate::subc) async fn submit(
         .to_owned();
     let entry = operation.entry.clone();
     let reply_entry = entry.clone();
+    let watch = Arc::new(super::bash_watch::Watch::new(reply_budget));
+    let dispatched_watch = watch.clone();
+    let watch_ctx = executor.actor_context(&carrier.root);
+    let dispatch_watch_ctx = watch_ctx.clone();
     let io_budget = crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr));
     let ledger_key = serde_json::from_slice::<Value>(&frame.body)
         .ok()
@@ -338,14 +343,6 @@ pub(in crate::subc) async fn submit(
                     )
                 }
             };
-            // Watch dispatch is connected separately so it can enforce its
-            // absolute reply budget without inheriting the worker wait window.
-            if entry["id"] == "bash_watch" {
-                return Response::success(
-                    job_id,
-                    json!({"body":super::carrier::error_body("operation_version_unsupported")}),
-                );
-            }
             let args = match operation
                 .translate_query(task_id.as_deref(), ctx.config().bash.watch_sync_max_ms)
             {
@@ -380,6 +377,15 @@ pub(in crate::subc) async fn submit(
             let result = log_ctx::with_session(Some(identity.session.clone()), || {
                 session
                     .with_policy(ctx, &job_id, &name, args, |args| {
+                        if let Err(response) = super::session_reads::preflight(
+                            ctx,
+                            &job_id,
+                            &identity.session,
+                            &name,
+                            &args,
+                        ) {
+                            return crate::bounded_io::finish_response(response);
+                        }
                         let observe = |request: RawRequest, ctx: &AppContext| {
                             if entry["id"] == "bash_output" {
                                 super::bash_output::handle(
@@ -387,6 +393,14 @@ pub(in crate::subc) async fn submit(
                                     ctx,
                                     &identity.harness,
                                     &operation.arguments,
+                                )
+                            } else if name == "bash_watch" {
+                                dispatched_watch.start(
+                                    &request,
+                                    dispatch_watch_ctx
+                                        .as_ref()
+                                        .expect("registered actor")
+                                        .clone(),
                                 )
                             } else if name == "bash_status" {
                                 crate::commands::bash_status::handle_with_observation_only(
@@ -410,6 +424,9 @@ pub(in crate::subc) async fn submit(
                     })
                     .unwrap_or_else(|response| response)
             });
+            if dispatched_watch.is_pending() {
+                return Response::success(job_id, json!({}));
+            }
             tool_provider::note_native_outcome(ctx, ledger_key.as_ref(), &result);
             Response::success(
                 job_id,
@@ -422,7 +439,15 @@ pub(in crate::subc) async fn submit(
     let active = active.clone();
     let request = frame.clone();
     tokio::spawn(async move {
-        let response = await_executor_response(rx, id).await;
+        let mut response = await_executor_response(rx, id).await;
+        if let Some(ctx) = watch_ctx {
+            if let Some(result) = watch.finish(&ctx).await {
+                response = Response::success(
+                    response.id,
+                    json!({"body":super::carrier::response_body(&reply_entry, &result)}),
+                );
+            }
+        }
         if !claim_active_tool_call(&active, route, request.header.corr) {
             return;
         }

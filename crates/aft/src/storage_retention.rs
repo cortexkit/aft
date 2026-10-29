@@ -5451,8 +5451,10 @@ fn reservation_lock_busy(error: &crate::blob_store::v3::Error) -> bool {
         crate::blob_store::v3::Error::Io(error)
             if error
                 .get_ref()
-                .and_then(|source| source.downcast_ref::<crate::fs_lock::AcquireError>())
-                .is_some_and(|source| matches!(source, crate::fs_lock::AcquireError::Timeout))
+                .and_then(|source| {
+                    source.downcast_ref::<crate::blob_store::v3::ReservationLockError>()
+                })
+                .is_some_and(crate::blob_store::v3::ReservationLockError::is_timeout)
     )
 }
 
@@ -13950,6 +13952,97 @@ mod v3_collector_tests {
     impl crate::migration::prune_legacy::ProcessCensus for NoProcesses {
         fn take(&self) -> Result<Vec<crate::migration::prune_legacy::CensusFinding>, String> {
             Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn v3_first_registration_and_lock_raise_floor_before_namespace() {
+        use crate::persisted_format::PersistedStore;
+
+        for entry in ["registration", "lock", "deadline-lock"] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = fs::canonicalize(temp.path()).unwrap();
+            fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+            let boundaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&boundaries);
+            let root = storage.clone();
+            let _hook = observe_test_hook(
+                &storage,
+                Arc::new(move |step| {
+                    if step == "v3-floor-raising" {
+                        crate::durability::take();
+                    } else if step.starts_with("v3-floor-raised:")
+                        && observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                    {
+                        assert!(
+                            !root.join("blobs/v3").exists(),
+                            "{entry}: namespace created before the first durable floor boundary"
+                        );
+                        let floor = crate::reader_floor::read(&root).unwrap().unwrap();
+                        for domain in [
+                            PersistedStore::ViewsV3Registry,
+                            PersistedStore::ViewsV3Store,
+                        ] {
+                            assert!(floor.get(domain).is_some_and(|version| version >= 1));
+                        }
+                        #[cfg(unix)]
+                        assert!(crate::durability::take().contains(&(
+                            crate::durability::EventKind::DirectorySync,
+                            root.clone(),
+                        )));
+                    }
+                }),
+            );
+            // Registration must be safe even when no semantic or callgraph
+            // publisher has won the race to raise the floor first.
+            match entry {
+                "registration" => {
+                    crate::views::base_refs::with_base_barrier(&storage, FAMILY, |_| Ok(()))
+                        .unwrap();
+                }
+                "lock" => drop(ReservationLock::acquire(&storage).unwrap()),
+                "deadline-lock" => {
+                    drop(ReservationLock::acquire_until(&storage, Instant::now()).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(boundaries.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert!(storage.join("blobs/v3").is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_first_lock_sync_failure_leaves_no_namespace_and_retry_must_sync() {
+        for timed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = fs::canonicalize(temp.path()).unwrap();
+            fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+            let acquire = || {
+                if timed {
+                    ReservationLock::acquire_until(&storage, Instant::now())
+                } else {
+                    ReservationLock::acquire(&storage)
+                }
+            };
+            // The first failure leaves a replaced but unsynced floor. A retry
+            // must not mistake its covering versions for a durability proof.
+            for _ in 0..2 {
+                crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+                    *slot.borrow_mut() = Some(storage.clone());
+                });
+                assert!(
+                    acquire().is_err(),
+                    "floor sync failure must refuse the lock"
+                );
+                assert!(!storage.join("blobs/v3").exists());
+                assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+            }
+            crate::durability::take();
+            let _lock = acquire().unwrap();
+            assert!(crate::durability::take()
+                .contains(&(crate::durability::EventKind::DirectorySync, storage.clone(),)));
+            assert!(storage.join("blobs/v3/reservations.lock").is_file());
         }
     }
 

@@ -792,6 +792,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "macro note site truncate",
         reason: "summary line under the callers list that carries its own count and 'shown N of M' wording; the callers list itself keeps its envelope",
     },
+    ExclusionEntry {
+        file: "callgraph_store/mod.rs",
+        enclosing_item: "unresolved_call_site_count",
+        location_or_primitive: "UNRESOLVED_CALL_SITE_COUNT_LIMIT, SQL LIMIT",
+        reason: "bounded count for the empty-callers and impact incompleteness note, not a list cut; the note says 'at least N' at the limit and the result lists keep their own envelopes",
+    },
     // The borrowed-graph coverage note on callgraph answers is one summary
     // line: it names the first few files the borrowed graph does not reflect
     // and says how many more there are.

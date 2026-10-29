@@ -1404,7 +1404,7 @@ fn v22_stack_writes_carry_only_the_stack_and_pull_request_numbers() {
                 "--input",
                 "-",
             ],
-            r#"{"pull_requests":[7,8,"9"]}"#,
+            r#"{"pull_requests":[7,8,9]}"#,
         )
         .unwrap(),
     );
@@ -1434,6 +1434,18 @@ fn v22_stack_writes_carry_only_the_stack_and_pull_request_numbers() {
     );
     assert_eq!(unstack["target"], json!({ "stack_number": "3" }));
     assert_eq!(unstack["body"], json!({}));
+    assert!(api_request(
+        &[
+            "api",
+            "-X",
+            "POST",
+            "repos/cortexkit/aft/stacks",
+            "--input",
+            "-"
+        ],
+        r#"{"pull_requests":[7,8,"9"]}"#,
+    )
+    .is_err());
     for (raw, stdin) in [
         (
             vec![

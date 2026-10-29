@@ -38,6 +38,42 @@ test("watch progress dedups folded lines and cumulative counters after admission
   expect(unseen.skipped_long_lines).toBe(1);
 });
 
+test("retry gap-only batches are admitted once while newer gap versions remain visible", () => {
+  const progress = new WatchBatchProgress();
+  const first: BashWatchLineBatch = {
+    ...snapshot(),
+    lines: [],
+    dropped_lines: 0,
+    skipped_long_lines: 0,
+    retry_gap: { reason: "retry_overflow", dropped_notifications: 2, known_missing_occurrences: 1 },
+  };
+  expect(watchBatchHasContent(progress.unseen(first))).toBe(true);
+  progress.admit(first);
+  expect(watchBatchHasContent(progress.unseen(first))).toBe(false);
+  const next = {
+    ...first,
+    version: 2,
+    retry_gap: { ...first.retry_gap!, dropped_notifications: 3, known_missing_occurrences: 2 },
+  };
+  expect(progress.unseen(next).retry_gap?.dropped_notifications).toBe(1);
+  expect(progress.unseen(next).retry_gap?.known_missing_occurrences).toBe(1);
+  progress.admit(next);
+  expect(watchBatchHasContent(progress.unseen(next))).toBe(false);
+});
+
+test("legacy scalar output retained beside a retry gap is not repeated", () => {
+  const progress = new WatchBatchProgress();
+  const batch = snapshot();
+  batch.lines[0].stream = "output";
+  batch.retry_gap = {
+    reason: "retry_overflow",
+    dropped_notifications: 1,
+    known_missing_occurrences: 0,
+  };
+  progress.admit(batch);
+  expect(watchBatchHasContent(progress.unseen(batch))).toBe(false);
+});
+
 test("watch progress does not reserve rows before admission or across pending generations", () => {
   const progress = new WatchBatchProgress();
   expect(progress.unseen(snapshot()).lines).toHaveLength(1);

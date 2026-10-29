@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rich-ui-s10-session-reads"
+  ],
+  "note": "Rich UI phone session reads (read, outline, zoom) with media refusal inside the carried policy. Changes only crates/aft/src/subc/rich_ui/; no path matches RANKING_FENCE_PREFIXES."
+}

@@ -157,7 +157,10 @@ jobs:
   build-darwin-arm64:
     name: Build macOS ARM64
     runs-on: macos-26
-    timeout-minutes: 120
+    # The shipped-profile library codegen alone took 87 minutes for v0.63.0
+    # and ran past 120 for v0.63.1, so 120 cancelled the release. The x64 build
+    # on the same runner type already gets the 360-minute job default.
+    timeout-minutes: 240
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     permissions:

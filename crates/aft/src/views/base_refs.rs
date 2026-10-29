@@ -81,6 +81,7 @@ pub enum BaseRefError {
 impl fmt::Display for BaseRefError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Store(error) if error.is_busy() => write!(f, "{}{error}", v3::BUSY_PREFIX),
             Self::Store(error) => write!(f, "v3 store: {error}"),
             Self::View(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
@@ -474,7 +475,10 @@ fn member_row(
     scope: &str,
 ) -> Result<Option<(String, String, String)>> {
     let registry = v3::family_dir(storage, family)?.join("members.sqlite");
-    if !registry.try_exists()? {
+    if !registry
+        .try_exists()
+        .map_err(|e| super::io::at("checking base registry", &registry, e))?
+    {
         return Ok(None);
     }
     Ok(LedgerReader::open_existing(storage, family)?.member(scope)?)

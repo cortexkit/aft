@@ -432,6 +432,15 @@ impl SemanticArena {
         lock(&self.chunk_batch)
     }
 
+    /// A cold-admitted fill must yield its slot rather than block on this gate.
+    pub(crate) fn try_chunk_batch(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.chunk_batch.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_resources_are_free(&self) -> bool {
         self.chunk_batch.try_lock().is_ok() && lock(&self.inflight).is_empty()

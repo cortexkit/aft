@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "watch-gap-notice"
+  ],
+  "note": "bash_watch delivery-gap notice and health counters; no changed path matches RANKING_FENCE_PREFIXES."
+}

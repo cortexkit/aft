@@ -218,7 +218,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   ): Promise<Record<string, unknown>> {
     const launched = await h.bridge.send("bash", args);
     expect(launched.success).toBe(true);
-    expect(launched.status).toBe("running");
+    // A fast command (git init, git status) can finish before the launch
+    // reply is built, so the reply may already say completed. Either way the
+    // task id is there, and bash_status below reads the same final status.
+    expect(["running", "completed"]).toContain(launched.status);
+    expect(typeof launched.task_id).toBe("string");
     const taskId = launched.task_id as string;
     const started = Date.now();
     // A positive wait for a short command to finish. Windows runners start

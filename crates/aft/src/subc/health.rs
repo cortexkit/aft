@@ -558,6 +558,7 @@ struct FrameOperation {
 }
 
 pub(super) struct DispatchPathMetrics {
+    pub(super) watch_delivery: Arc<super::watch_delivery::WatchDelivery>,
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -620,6 +621,7 @@ pub(super) struct DispatchPathMetrics {
 impl DispatchPathMetrics {
     pub(super) fn new() -> Self {
         Self {
+            watch_delivery: Arc::default(),
             unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
@@ -1423,6 +1425,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
+            "reliable_push": self.watch_delivery.health(),
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
@@ -3971,7 +3974,14 @@ fn build_health_report_with_snapshots(
     metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
-    let warning = if scheduler_busy {
+    let gap_health = dispatch_path_metrics.watch_delivery.health();
+    let watch_gap_unresolved = gap_health["status"] != "ok";
+    let warning = if watch_gap_unresolved {
+        Some(format!(
+            "watch delivery is degraded: {}",
+            gap_health["reason"].as_str().unwrap_or("retry_overflow")
+        ))
+    } else if scheduler_busy {
         Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string())
     } else {
         rollup.detail.clone()
@@ -3984,7 +3994,7 @@ fn build_health_report_with_snapshots(
         (None, warning) => warning,
     };
     HealthReport {
-        status: if scheduler_busy {
+        status: if scheduler_busy || watch_gap_unresolved {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()
@@ -9110,7 +9120,12 @@ mod tests {
         std::os::unix::fs::symlink(retargeted.path(), &link).expect("retarget standing symlink");
 
         let metrics = DispatchPathMetrics::new();
-        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        // A loaded runner can report scheduler contention instead of the root
+        // rows; wait that out like the other health tests do.
+        let report = health_report_after_scheduler_contention(
+            "standing_health_names_resolved_path_drift_without_re_recording",
+            || test_health_report(&executor, &HashMap::new(), &metrics, &app),
+        );
         assert_eq!(report.status, HealthStatus::Degraded);
         let metrics = report.metrics.expect("health metrics");
         let root_row = metrics["roots"]
@@ -9557,5 +9572,77 @@ mod observability_retention_tests {
         let events = metrics.bg_events.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.keys().all(|key| key.session != "inactive"));
+    }
+}
+
+#[cfg(test)]
+mod watch_gap_tests {
+
+    #[test]
+    fn retry_overflow_health_keeps_evictions_separate_and_clears_after_ack() {
+        use crate::bash_background::watch_lines::{LineBatch, RetryGap};
+        use crate::db::bash_watches::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        let batch = LineBatch {
+            retry_gap: Some(RetryGap {
+                reason: "retry_overflow".into(),
+                dropped_notifications: 3,
+                known_missing_occurrences: 1,
+                ..Default::default()
+            }),
+            version: Some(5),
+            ..Default::default()
+        };
+        let row = BashPatternWatchRow {
+            harness: "opencode".into(),
+            session_id: "session".into(),
+            task_id: "task".into(),
+            watch_id: "watch".into(),
+            pattern_kind: "substring".into(),
+            pattern: "READY".into(),
+            once: false,
+            each_line: false,
+            match_batch: Some(serde_json::to_string(&batch).unwrap()),
+            created_at: 0,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            pty_offset: 0,
+            scanning: true,
+            pending_match: true,
+            match_text: Some("watch delivery gap".into()),
+            match_offset: Some(5),
+            match_context: None,
+        };
+        upsert_delivery_gap(&conn, &row).unwrap();
+        let (gaps, missing, uncertain) = watch_gap_health_for(&conn);
+        assert_eq!((gaps, missing, uncertain), (1, 1, false));
+        let health = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["reason"], "retry_overflow");
+        assert_eq!(health["outstanding_watch_gaps"], 1);
+        assert_eq!(health["known_missing_occurrences"], 1);
+        assert!(health["evicted_transport_copies_total"].is_u64());
+        acknowledge_delivery(
+            &conn,
+            "opencode",
+            "session",
+            "task",
+            "watch",
+            5,
+            batch.retry_gap.as_ref(),
+        )
+        .unwrap();
+        delete_delivery_gap(&conn, "opencode", "session", "task", "watch").unwrap();
+        let (gaps, missing, uncertain) = watch_gap_health_for(&conn);
+        let cleared = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
+        assert_eq!(cleared["status"], "ok");
+        assert!(cleared["reason"].is_null());
+        assert_eq!(cleared["outstanding_watch_gaps"], 0);
+        assert_eq!(cleared["known_missing_occurrences"], 0);
+        let unconfirmed = super::super::watch_delivery::health_from_census(0, 0, true, 1);
+        assert_eq!(unconfirmed["status"], "degraded");
+        assert_eq!(unconfirmed["reason"], "watch_gap_persistence_unconfirmed");
     }
 }

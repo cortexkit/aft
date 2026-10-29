@@ -4454,6 +4454,156 @@ pub struct ReadonlyCallGraphStore {
     _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
 }
 
+/// Bound the work spent counting possible callers for an empty reverse graph.
+pub const UNRESOLVED_CALL_SITE_COUNT_LIMIT: usize = 1_000;
+
+const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end
+        FROM refs r
+        JOIN files f ON f.path = r.caller_file
+        LEFT JOIN nodes n ON n.id = r.caller_node
+        WHERE r.status = 'unresolved'
+          AND r.kind IN ('call', 'construction')
+          AND f.lang = ?1
+          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
+        LIMIT ?3
+    )";
+
+fn unresolved_call_site_count(
+    conn: &Connection,
+    language: LangId,
+    include_tests: bool,
+) -> Result<usize> {
+    Ok(conn
+        .prepare_cached(UNRESOLVED_CALL_SITE_COUNT_SQL)?
+        .query_row(
+            params![
+                lang_label(language),
+                include_tests,
+                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64
+            ],
+            |row| row.get(0),
+        )?)
+}
+
+#[cfg(test)]
+mod callgraph_unresolved_count_tests {
+    use super::*;
+
+    fn fixture() -> (Connection, Arc<std::sync::atomic::AtomicUsize>) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE files(path TEXT PRIMARY KEY, lang TEXT);
+            CREATE TABLE nodes(id TEXT PRIMARY KEY, is_test INTEGER);
+            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT);
+            CREATE TABLE edges(ref_id TEXT, kind TEXT);
+            INSERT INTO files VALUES ('lib.rs', 'rust');").unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        conn.create_scalar_function(
+            "aft_is_test_file",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                counted.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?))
+            },
+        )
+        .unwrap();
+        (conn, reads)
+    }
+
+    #[test]
+    fn callgraph_unresolved_count_stops_reading_at_cap_inside_sql() {
+        let (conn, reads) = fixture();
+        for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
+            conn.execute(
+                "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
+                params![i.to_string(), i as i64],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, false).unwrap(),
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT,
+            "the SQL subquery must stop, not count or collect all rows before clamping"
+        );
+    }
+
+    #[test]
+    fn callgraph_unresolved_count_preserves_site_identity_and_exclusions() {
+        let (conn, _) = fixture();
+        conn.execute_batch(
+            "INSERT INTO files VALUES ('other.ts', 'typescript');
+            INSERT INTO nodes VALUES ('test_node', 1);
+            INSERT INTO refs VALUES
+                ('a', 'lib.rs', NULL, 1, 2, 'unresolved', 'call'),
+                ('duplicate', 'lib.rs', NULL, 1, 2, 'unresolved', 'construction'),
+                ('b', 'lib.rs', NULL, 2, 3, 'unresolved', 'construction'),
+                ('resolved', 'lib.rs', NULL, 3, 4, 'resolved', 'call'),
+                ('edge', 'lib.rs', NULL, 4, 5, 'unresolved', 'call'),
+                ('mention', 'lib.rs', NULL, 5, 6, 'unresolved', 'macro_mention'),
+                ('lang', 'other.ts', NULL, 6, 7, 'unresolved', 'call'),
+                ('inline_test', 'lib.rs', 'test_node', 7, 8, 'unresolved', 'call');
+            INSERT INTO edges VALUES ('edge', 'call'), ('a', 'reference');",
+        )
+        .unwrap();
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, false).unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            3
+        );
+        // Paths without enclosing nodes still use the shared test-file classifier.
+        for (i, path) in [
+            "tests/helper.rs",
+            "src/__tests__/unit.rs",
+            "src/__test__/unit.rs",
+            "src\\tests\\unit.rs",
+            "src/unit.TEST.ts",
+            "src/unit.spec.ts",
+            "src/unit_test.rs",
+            "src/unit_test.go",
+            "src/unit_test.py",
+            "src/unit_test.rb",
+            "src/unit_test.exs",
+            "src/unit_spec.rb",
+            "src/test_unit.py",
+            "src/UnitTest.java",
+            "src/UnitTests.kt",
+            "src/UnitTest.cs",
+            "src/UnitTests.swift",
+            "src/UnitSpec.scala",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute("INSERT INTO files VALUES (?1, 'rust')", [path])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO refs VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
+                params![format!("test_{i}"), path],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, false).unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            21
+        );
+    }
+}
+
 pub trait CallGraphRead {
     fn project_root(&self) -> &Path;
     fn project_key(&self) -> &str;
@@ -4526,6 +4676,12 @@ pub trait CallGraphRead {
     ) -> Result<Vec<StoreRefSite>> {
         let _ = (name, language);
         Ok(Vec::new())
+    }
+    /// Count unresolved invocation sites, stopping at `UNRESOLVED_CALL_SITE_COUNT_LIMIT`.
+    /// A count at the limit is a lower bound, not an exact total.
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        let _ = (language, include_tests);
+        Ok(0)
     }
     fn call_tree(
         &self,
@@ -8949,6 +9105,22 @@ impl CallGraphStore {
             .map_err(Into::into)
     }
 
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        // Reuse the path classifier so SQL filtering follows the same conventions
+        // as callers and impact, including test files with no enclosing node.
+        conn.create_scalar_function(
+            "aft_is_test_file",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?)),
+        )?;
+        unresolved_call_site_count(&conn, language, include_tests)
+    }
+
     pub fn call_tree(
         &self,
         file_rel: &Path,
@@ -9671,6 +9843,9 @@ impl CallGraphRead for CallGraphStore {
     ) -> Result<Vec<StoreRefSite>> {
         CallGraphStore::unresolved_method_sites_named(self, name, language)
     }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        CallGraphStore::unresolved_call_site_count(self, language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -9792,6 +9967,9 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     ) -> Result<Vec<StoreRefSite>> {
         (**self).unresolved_method_sites_named(name, language)
     }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        (**self).unresolved_call_site_count(language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -9912,6 +10090,10 @@ impl CallGraphRead for ReadonlyCallGraphStore {
         language: LangId,
     ) -> Result<Vec<StoreRefSite>> {
         self.inner.unresolved_method_sites_named(name, language)
+    }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.inner
+            .unresolved_call_site_count(language, include_tests)
     }
     fn call_tree(
         &self,
@@ -12543,7 +12725,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v20-callback-constructor-inline-test-items";
+const BUILD_OUTPUT_VERSION: &str = "v21-rust-module-paths-and-function-references";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -16401,11 +16583,35 @@ fn resolve_rust_target<I: ResolverIndex>(
         }
     }
     if full_ref.contains("::") {
+        // Self names the enclosing impl or trait, not a module on disk. Keep
+        // private associated helpers in the same graph as their public callers.
+        if let Some(member) = full_ref.strip_prefix("Self::") {
+            if let Some(caller) = raw.caller_symbol.as_deref().filter(|caller| {
+                caller_data
+                    .symbol_metadata
+                    .get(*caller)
+                    .is_some_and(|meta| meta.kind == SymbolKind::Method)
+            }) {
+                if let Some((owner, _)) = caller.rsplit_once("::") {
+                    let symbol = format!("{owner}::{member}");
+                    if index.node_for_symbol(caller_file, &symbol).is_some() {
+                        return Some((
+                            "resolved_local".to_string(),
+                            caller_file.to_string(),
+                            symbol,
+                        ));
+                    }
+                }
+            }
+        }
         if let Some((target_file, target_symbol)) =
             rust_target_for_qualified(index, caller_file, full_ref, short_name, caller_data, raw)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
+        // An unresolved qualifier must not bind an unrelated unqualified import
+        // that happens to share the final function name.
+        return None;
     }
 
     // A file-level function of the caller's own file wins over imports. Rust
@@ -16421,7 +16627,7 @@ fn resolve_rust_target<I: ResolverIndex>(
 
     for import in &caller_data.import_block.imports {
         if let Some((target_file, target_symbol)) =
-            rust_target_for_use(index, caller_file, import, short_name, caller_data)
+            rust_target_for_use(index, caller_file, import, short_name, caller_data, raw)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
@@ -16520,9 +16726,10 @@ fn rust_target_for_qualified<I: ResolverIndex>(
 
         // A path that does not resolve under one reading may under another, and
         // a later alias candidate may still match, so try them all in order.
-        for module_segments in
-            rust_resolve_segment_candidates_with_index(index, caller_file, &path_refs)
-        {
+        for module_segments in rust_resolve_segment_candidates_from(
+            rust_reference_module_segments(index, caller_file, caller_data, raw),
+            &path_refs,
+        ) {
             if let Some(target) =
                 rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
             {
@@ -16694,6 +16901,7 @@ fn rust_target_for_use<I: ResolverIndex>(
     import: &ImportStatement,
     short_name: &str,
     caller_data: &FileCallData,
+    raw: &RawRef,
 ) -> Option<(String, String)> {
     let imports = &caller_data.import_block.imports;
     let path = rust_use_body(&import.raw_text)
@@ -16701,6 +16909,16 @@ fn rust_target_for_use<I: ResolverIndex>(
         .trim()
         .trim_end_matches(';');
     if let Some(module) = path.strip_suffix("::*") {
+        if let Some((file, symbol)) = rust_target_for_qualified(
+            index,
+            caller_file,
+            &format!("{module}::{short_name}"),
+            short_name,
+            caller_data,
+            raw,
+        ) {
+            return index.has_export(&file, &symbol).then_some((file, symbol));
+        }
         let segments = module.split("::").collect::<Vec<_>>();
         let file = rust_use_module_file(index, caller_file, &segments, imports)?;
         let (file, symbol) =
@@ -16715,6 +16933,16 @@ fn rust_target_for_use<I: ResolverIndex>(
                 .then(|| crate::imports::specifier_imported_name(name).to_string())
         });
         if let Some(imported) = imported {
+            if let Some(target) = rust_target_for_qualified(
+                index,
+                caller_file,
+                &format!("{prefix}::{imported}"),
+                &imported,
+                caller_data,
+                raw,
+            ) {
+                return Some(target);
+            }
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
             let inline_segments = prefix_segments
                 .iter()
@@ -16746,6 +16974,16 @@ fn rust_target_for_use<I: ResolverIndex>(
     }
     if segments.len() < 2 {
         return None;
+    }
+    if let Some(target) = rust_target_for_qualified(
+        index,
+        caller_file,
+        path_without_alias,
+        segments.last().copied().unwrap_or(short_name),
+        caller_data,
+        raw,
+    ) {
+        return Some(target);
     }
     let module_segments = segments[..segments.len() - 1]
         .iter()
@@ -16987,16 +17225,45 @@ fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -
     }
 }
 
-/// Module paths a path's leading segments can denote, most likely first. A
-/// bare first segment (`registry::f()` inside `bash_background/mod.rs`) is, in
-/// Rust 2018, relative to the current module, so a child module is tried
-/// before the crate-relative sibling reading `rust_resolve_segments_from` uses.
-fn rust_resolve_segment_candidates_with_index<I: ResolverIndex>(
+fn rust_reference_module_segments<I: ResolverIndex>(
     index: &I,
     caller_file: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Vec<String> {
+    let mut modules = rust_caller_module_segments(index, caller_file);
+    let Some(caller) = raw.caller_symbol.as_deref() else {
+        return modules;
+    };
+    let mut scope = caller.split("::").collect::<Vec<_>>();
+    scope.pop();
+    if caller_data
+        .symbol_metadata
+        .get(caller)
+        .is_some_and(|meta| meta.kind == SymbolKind::Method)
+    {
+        scope.pop();
+    }
+    // Scoped names include inline modules as well as enclosing functions and
+    // impl owners. Only the module prefix changes the meaning of self/super.
+    for (position, segment) in scope.iter().enumerate() {
+        if caller_data
+            .symbol_metadata
+            .contains_key(&scope[..=position].join("::"))
+        {
+            break;
+        }
+        modules.push((*segment).to_string());
+    }
+    modules
+}
+
+/// A bare path is relative to the current module; try its child modules before
+/// the sibling-module interpretation retained for imported paths.
+fn rust_resolve_segment_candidates_from(
+    caller_segments: Vec<String>,
     segments: &[&str],
 ) -> Vec<Vec<String>> {
-    let caller_segments = rust_caller_module_segments(index, caller_file);
     let mut candidates = Vec::new();
     if segments
         .first()
@@ -17032,8 +17299,14 @@ fn rust_resolve_segments_from(
         }
         "super" => {
             let mut resolved = caller_segments;
-            resolved.pop();
-            resolved.extend(segments[1..].iter().map(|item| item.to_string()));
+            let parents = segments
+                .iter()
+                .take_while(|segment| **segment == "super")
+                .count();
+            for _ in 0..parents {
+                resolved.pop()?;
+            }
+            resolved.extend(segments[parents..].iter().map(|item| item.to_string()));
             Some(resolved)
         }
         _ => {

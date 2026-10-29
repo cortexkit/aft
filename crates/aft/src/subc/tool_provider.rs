@@ -591,8 +591,8 @@ pub(super) fn validate_catalog_request(
             return Err(errors::invalid_request(
                 "system_text.preset",
                 format!(
-                    "AFT serves the {:?} system text beside the {:?} catalog preset, or the legacy \"broca\" text",
-                    preset.name(), preset.name()
+                    "AFT serves the {:?} system text beside the {:?} catalog preset, or the legacy \"broca\" text; this request asked for {:?}",
+                    preset.name(), preset.name(), text_preset
                 ),
             ));
         }

@@ -371,7 +371,8 @@ impl BuildClaim {
                 self.token,
                 super::base_refs::fresh_nonce()
             ));
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| super::io::at("creating base staging directory", &dir, e))?;
         Ok(dir)
     }
     /// `derived-<generation>-a<attempt>-<owner_token>.sqlite`.
@@ -424,11 +425,18 @@ impl BuildClaim {
         let temporary = store
             .view_dir()
             .join(format!(".derived-{generation}.ref.tmp"));
-        std::fs::write(&temporary, owner.as_bytes())?;
+        std::fs::write(&temporary, owner.as_bytes())
+            .map_err(|e| super::io::at("writing derived reference", &temporary, e))?;
         // Windows refuses FlushFileBuffers on a read-only handle, so sync
         // through the views helper, which opens the file for writing there.
         super::sync_file(&temporary)?;
-        std::fs::rename(&temporary, &reference)?;
+        std::fs::rename(&temporary, &reference).map_err(|e| {
+            super::io::at(
+                &format!("renaming derived reference {} to", temporary.display()),
+                &reference,
+                e,
+            )
+        })?;
         super::sync_directory(store.view_dir())?;
         Ok(())
     }
@@ -441,12 +449,16 @@ impl BuildClaim {
         let entries = match std::fs::read_dir(&staging) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(super::io::at("listing dead base staging", &staging, error).into())
+            }
         };
         for entry in entries {
-            let entry = entry?;
+            let entry =
+                entry.map_err(|e| super::io::at("reading dead base staging entry", &staging, e))?;
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                std::fs::remove_dir_all(entry.path())?;
+                std::fs::remove_dir_all(entry.path())
+                    .map_err(|e| super::io::at("removing dead base staging", &entry.path(), e))?;
             }
         }
         Ok(())
@@ -557,18 +569,27 @@ pub fn read_stable(path: &Path) -> std::io::Result<Vec<u8>> {
         )
     }
     for _ in 0..STABLE_READ_ATTEMPTS {
-        let before = std::fs::symlink_metadata(path)?;
+        let before = std::fs::symlink_metadata(path)
+            .map_err(|e| super::io::at("reading base source metadata", path, e))?;
         if !before.is_file() {
-            return Err(std::io::Error::other("not a regular file"));
+            return Err(super::io::at(
+                "reading base source",
+                path,
+                std::io::Error::other("not a regular file"),
+            ));
         }
-        let bytes = std::fs::read(path)?;
-        let after = std::fs::symlink_metadata(path)?;
+        let bytes =
+            std::fs::read(path).map_err(|e| super::io::at("reading base source", path, e))?;
+        let after = std::fs::symlink_metadata(path)
+            .map_err(|e| super::io::at("reading base source metadata", path, e))?;
         if stamp(&before) == stamp(&after) && bytes.len() as u64 == after.len() {
             return Ok(bytes);
         }
     }
-    Err(std::io::Error::other(
-        "file kept changing during strict reads",
+    Err(super::io::at(
+        "reading stable base source",
+        path,
+        std::io::Error::other("file kept changing during strict reads"),
     ))
 }
 

@@ -764,6 +764,15 @@ export function createV2RuntimeConsumer(
       return attempt;
     },
     completion: async (completion, bridge, acknowledge = true) => {
+      if (
+        !v2SessionDeleted(context, completion.session_id) &&
+        (await resolveIsSubagent(context, completion.session_id))
+      ) {
+        await awaitV2ExecutionSettlement(context, completion.session_id);
+      }
+      // Settlement may be released by Location disposal or session deletion,
+      // not just execution end. Do not admit a wake into a released Location.
+      if (disposed) return false;
       // The host deleted this session. Holding or delivering the completion
       // would recreate notification state nothing releases again, so drop it
       // here. It is still acknowledged so the bridge does not deliver it again;
@@ -776,9 +785,6 @@ export function createV2RuntimeConsumer(
           });
         }
         return true;
-      }
-      if (await resolveIsSubagent(context, completion.session_id)) {
-        await awaitV2ExecutionSettlement(context, completion.session_id);
       }
       if (
         (await resolveIsSubagent(context, completion.session_id)) &&

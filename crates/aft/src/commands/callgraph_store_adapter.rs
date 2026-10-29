@@ -8,7 +8,7 @@ use tree_sitter::{Node, Parser};
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
-    MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND,
+    MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
@@ -121,16 +121,17 @@ fn empty_receiver_note(
     if count != 0 {
         return Ok(None);
     }
-    let sites = store.unresolved_method_sites_named("", target.lang)?;
-    let unresolved_call_sites = sites
-        .iter()
-        .filter(|s| include_tests || !(is_test_file(&s.file) || s.is_test == Some(true)))
-        .count();
+    let unresolved_call_sites = store.unresolved_call_site_count(target.lang, include_tests)?;
+    let count_text = if unresolved_call_sites == UNRESOLVED_CALL_SITE_COUNT_LIMIT {
+        format!("at least {unresolved_call_sites}")
+    } else {
+        unresolved_call_sites.to_string()
+    };
     Ok((unresolved_call_sites > 0).then(|| StoreIncompleteNote {
         complete: false,
         unresolved_call_sites,
         incomplete_reason: UNRESOLVED_CALLERS_NOTE
-            .replace("{count}", &unresolved_call_sites.to_string())
+            .replace("{count}", &count_text)
             .replace(
                 "{plural}",
                 if unresolved_call_sites == 1 { "" } else { "s" },

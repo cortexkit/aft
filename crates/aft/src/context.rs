@@ -4587,6 +4587,7 @@ pub struct AppContext {
     lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    callgraph_view_read_diagnostics: parking_lot::Mutex<CallgraphViewReadDiagnostics>,
     callgraph_view_routes: AtomicU64,
     /// Files whose symbols a views-routed root's prewarm reused from, or
     /// stored into, the family's v3 symbol plane.
@@ -4949,6 +4950,47 @@ pub enum CallgraphStoreAccess {
     Unavailable,
     /// A store open/build check failed with a real error (DB/IO).
     Error(CallGraphStoreError),
+}
+
+pub(crate) fn checkout_view_callgraph_access(
+    reader: Option<
+        Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>,
+    >,
+) -> CallgraphStoreAccess {
+    match reader {
+        Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+        // Transient contention while opening a view (a locked derived
+        // database, or another driver finishing the shared base) says nothing
+        // about the graph. Report SQLite's busy error, which every caller
+        // already presents as busy/pending with a retry.
+        Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some(error.reason),
+            ),
+        )),
+        Some(Err(error))
+            if error
+                .reason
+                .contains(crate::views::read::CALLGRAPH_DISABLED) =>
+        {
+            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
+        }
+        Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(format!(
+            "callgraph view unavailable: {error}"
+        ))),
+        None => CallgraphStoreAccess::Unavailable,
+    }
+}
+
+/// Acquisition diagnostics for the checkout callgraph view, including the full
+/// cause of retryable SQLite contention and time spent acquiring readers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CallgraphViewReadDiagnostics {
+    pub attempts: u64,
+    pub last_attempt_ms: u64,
+    pub total_attempt_ms: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -5451,6 +5493,9 @@ impl AppContext {
             lexical_view: parking_lot::Mutex::new(None),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_view_read_diagnostics: parking_lot::Mutex::new(
+                CallgraphViewReadDiagnostics::default(),
+            ),
             callgraph_view_routes: AtomicU64::new(0),
             symbol_view_routes: Arc::default(),
             checkout_semantic: Arc::default(),
@@ -11041,7 +11086,13 @@ impl AppContext {
                 crate::views::contracts::WaitOutcome::Installed(snapshot)
                 | crate::views::contracts::WaitOutcome::TimedOut { snapshot, .. } => snapshot,
             };
-            return match runtime.callgraph.reader(&runtime.access, snapshot) {
+            let started = Instant::now();
+            let reader = runtime.callgraph.reader(&runtime.access, snapshot);
+            self.note_callgraph_view_read(
+                started.elapsed(),
+                reader.as_ref().err().map(ToString::to_string),
+            );
+            return match reader {
                 Ok(reader) => CallgraphStoreAccess::Ready(Arc::clone(&reader.store)),
                 Err(error) if error.reason == crate::views::read::CALLGRAPH_DISABLED => {
                     CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
@@ -11055,29 +11106,16 @@ impl AppContext {
             if !demand {
                 return CallgraphStoreAccess::Building;
             }
-            return match self.callgraph_view_reader() {
-                Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
-                // A lock held on the view's database says nothing about the
-                // graph: report SQLite's busy error, which callers present as
-                // building, retry shortly.
-                Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(
-                    CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                        Some(error.reason),
-                    )),
-                ),
-                Some(Err(error))
-                    if error
-                        .reason
-                        .contains(crate::views::read::CALLGRAPH_DISABLED) =>
-                {
-                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
-                }
-                Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
-                    format!("callgraph view unavailable: {error}"),
-                )),
-                None => CallgraphStoreAccess::Unavailable,
-            };
+            let started = Instant::now();
+            let reader = self.callgraph_view_reader();
+            self.note_callgraph_view_read(
+                started.elapsed(),
+                reader
+                    .as_ref()
+                    .and_then(|reader| reader.as_ref().err())
+                    .map(ToString::to_string),
+            );
+            return checkout_view_callgraph_access(reader);
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
             let on_demand = self.callgraph_build_on_demand();
@@ -12267,6 +12305,23 @@ impl AppContext {
                 source,
             ),
         ));
+    }
+
+    /// Passive diagnostic state, including the last acquisition error. A
+    /// successful retry does not erase that error.
+    pub fn callgraph_view_read_diagnostics(&self) -> CallgraphViewReadDiagnostics {
+        self.callgraph_view_read_diagnostics.lock().clone()
+    }
+
+    fn note_callgraph_view_read(&self, elapsed: Duration, error: Option<String>) {
+        let mut diagnostics = self.callgraph_view_read_diagnostics.lock();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        diagnostics.attempts = diagnostics.attempts.saturating_add(1);
+        diagnostics.last_attempt_ms = elapsed_ms;
+        diagnostics.total_attempt_ms = diagnostics.total_attempt_ms.saturating_add(elapsed_ms);
+        if error.is_some() {
+            diagnostics.last_error = error;
+        }
     }
 
     /// The call-graph reader of this checkout's view, acquired once per
@@ -18606,6 +18661,70 @@ mod callgraph_store_for_ops_tests {
         )
         .unwrap();
         store.sqlite_path().to_path_buf()
+    }
+
+    #[test]
+    fn callgraph_view_diagnostics_preserve_busy_cause_and_retry_on_the_same_context() {
+        use crate::blob_store::v3;
+        use crate::db::file_identity::IdentityConnection;
+
+        let _serial = v3::serial_for_test();
+        let (_dirs, ctx) = cold_build_context();
+        let mut config = (*ctx.config()).clone();
+        config.views.enabled = true;
+        ctx.set_config(config);
+        let root = ctx.callgraph_project_root().unwrap();
+        ctx.set_canonical_cache_root(root.clone());
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        ctx.callgraph_view.lock().take();
+
+        let storage = ctx.storage_paths().artifacts;
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let path = v3::family_dir(&storage, &family)
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = IdentityConnection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "callgraph-view-diagnostics-blocker",
+        )
+        .unwrap();
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        let CallgraphStoreAccess::Error(error) = ctx.callgraph_store_for_ops() else {
+            panic!("a locked view must retain the SQLite busy verdict");
+        };
+        assert!(
+            matches!(
+                &error,
+                CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.extended_code == rusqlite::ffi::SQLITE_BUSY
+            ),
+            "{error}"
+        );
+        assert!(error.is_transient_lock_contention(), "{error}");
+        let busy = ctx.callgraph_view_read_diagnostics();
+        assert_eq!(busy.attempts, 2);
+        let detail = busy
+            .last_error
+            .as_deref()
+            .expect("SQLite busy must retain its acquisition cause");
+        assert!(detail.contains("reservation_ledger_busy"), "{detail}");
+        assert!(detail.contains("read initialization marker"), "{detail}");
+        assert!(detail.contains("members.sqlite"), "{detail}");
+        assert!(detail.contains("database is locked"), "{detail}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        let ready = ctx.callgraph_view_read_diagnostics();
+        assert_eq!(ready.attempts, 3);
+        assert_eq!(ready.last_error, busy.last_error);
+        assert!(ready.total_attempt_ms >= ready.last_attempt_ms);
     }
 
     #[test]

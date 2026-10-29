@@ -1,0 +1,1 @@
+- When a stalled connection drops `bash_watch` match notices, the next notice for that watch says how many were lost and points at the task output, and health reports the gap until it is acknowledged; a gap notice alone never uses up a one-shot watch.

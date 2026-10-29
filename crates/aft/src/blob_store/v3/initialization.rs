@@ -4,32 +4,43 @@
 
 use super::*;
 
-fn has_marker(c: &Connection) -> bool {
-    c.query_row("SELECT 1 FROM format_meta WHERE singleton=1", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .is_ok()
+fn has_marker(c: &Connection, path: &Path) -> Result<bool> {
+    Ok(format_read(
+        c.query_row("SELECT 1 FROM format_meta WHERE singleton=1", [], |r| {
+            r.get::<_, i64>(0)
+        }),
+        path,
+        "read initialization marker",
+    )?
+    .is_some())
 }
-fn has_any_seed(c: &Connection, kind: Kind) -> bool {
+fn has_any_seed(c: &Connection, path: &Path, kind: Kind) -> Result<bool> {
     let sql = match kind {
         Kind::Registry => "SELECT 1 FROM accounting WHERE singleton=1",
         Kind::Plane(_) => "SELECT 1 FROM store_meta WHERE singleton=1",
     };
-    c.query_row(sql, [], |r| r.get::<_, i64>(0)).is_ok()
+    Ok(format_read(
+        c.query_row(sql, [], |r| r.get::<_, i64>(0)),
+        path,
+        "read initialization seed",
+    )?
+    .is_some())
 }
-pub(super) fn has_seed(c: &Connection, kind: Kind) -> bool {
+pub(super) fn has_seed(c: &Connection, kind: Kind) -> rusqlite::Result<bool> {
     match kind {
-        Kind::Registry => has_any_seed(c, kind),
+        Kind::Registry => c.query_row("SELECT 1 FROM accounting WHERE singleton=1", [], |_| {
+            Ok(true)
+        }),
         Kind::Plane(plane) => c
             .query_row("SELECT plane FROM store_meta WHERE singleton=1", [], |r| {
                 r.get::<_, String>(0)
             })
-            .is_ok_and(|stored| stored == plane.as_str()),
+            .map(|stored| stored == plane.as_str()),
     }
 }
 
-fn resumable(c: &Connection, kind: Kind) -> Result<bool> {
-    let Ok(rows) = schema_rows(c) else {
+fn resumable(c: &Connection, path: &Path, kind: Kind) -> Result<bool> {
+    let Some(rows) = format_read(schema_rows(c), path, "read bootstrap schema")? else {
         return Ok(false);
     };
     let app: i64 = c.pragma_query_value(None, "application_id", |r| r.get(0))?;
@@ -121,10 +132,10 @@ fn resumable(c: &Connection, kind: Kind) -> Result<bool> {
 }
 
 pub(super) fn ensure(c: &mut IdentityConnection, path: &Path, kind: Kind) -> Result<()> {
-    if has_marker(c) && has_any_seed(c, kind) {
+    if has_marker(c, path)? && has_any_seed(c, path, kind)? {
         return Ok(());
     }
-    if !resumable(c, kind)? {
+    if !resumable(c, path, kind)? {
         return Ok(());
     }
     // SQLite must select pointer-map mode before the first write transaction.
@@ -133,10 +144,10 @@ pub(super) fn ensure(c: &mut IdentityConnection, path: &Path, kind: Kind) -> Res
     #[cfg(test)]
     tests::initialization_hook(kind, "auto_vacuum");
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if has_marker(&tx) && has_any_seed(&tx, kind) {
+    if has_marker(&tx, path)? && has_any_seed(&tx, path, kind)? {
         return Ok(());
     }
-    if !resumable(&tx, kind)? {
+    if !resumable(&tx, path, kind)? {
         return Ok(());
     }
     // Old interrupted bootstraps can contain a prefix of the schema. Only

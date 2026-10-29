@@ -766,7 +766,10 @@ async fn refused_shell_start_fails_fast_with_the_terminal_reason() {
     let mut request = shell(None, false, 15);
     request["arguments"]["env"] = json!({"PATH":"blocked"});
     let corr = daemon.start(1, 1, request).await;
-    tokio::time::timeout(Duration::from_secs(2), running_task(&mut daemon, 1, corr))
+    // The refusal must arrive as its own terminal reply, well before the 15 s
+    // startup timeout; 10 s keeps that proof while a loaded macOS runner, which
+    // took over 2 s, still fits.
+    tokio::time::timeout(Duration::from_secs(10), running_task(&mut daemon, 1, corr))
         .await
         .expect("startup refusal was ignored instead of reporting its terminal reason");
 }

@@ -8092,6 +8092,8 @@ struct ConfigureMaintenanceContinuation {
     semantic_waits_for_callgraph_start: bool,
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
+    lexical_bind_retry_at: Option<Instant>,
+    lexical_bind_retry_delay: Duration,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -8105,13 +8107,23 @@ impl ConfigureMaintenanceContinuation {
             semantic_waits_for_callgraph_start: false,
             view_load: None,
             replay_retry_at: None,
+            lexical_bind_retry_at: None,
+            lexical_bind_retry_delay: Duration::from_secs(1),
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
     }
 
     fn retry_at(&self) -> Option<Instant> {
-        self.callgraph_upgrade_retry_at.or(self.replay_retry_at)
+        self.callgraph_upgrade_retry_at
+            .or(self.lexical_bind_retry_at)
+            .or(self.replay_retry_at)
+    }
+
+    fn defer_lexical_bind(&mut self, now: Instant) {
+        self.lexical_bind_retry_at = Some(now + self.lexical_bind_retry_delay);
+        self.lexical_bind_retry_delay =
+            (self.lexical_bind_retry_delay * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -8986,6 +8998,7 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
+            let retrying = continuation.lexical_bind_retry_at.take().is_some();
             if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
@@ -9007,6 +9020,18 @@ fn run_configure_maintenance_unit_inner(
                     ctx.clear_view_runtime();
                 }
                 match ctx.lexical_view_snapshot("bind") {
+                    Some(Err(error)) if crate::views::trigram::bind_is_busy(&error) => {
+                        if !retrying {
+                            slog_warn!(
+                                "lexical checkout view busy; configure maintenance will retry: {}",
+                                error
+                            );
+                        }
+                        // A parent only reads child publications; it cannot
+                        // recover a dropped child bind by querying that child.
+                        continuation.defer_lexical_bind(Instant::now());
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
                     Some(Err(error)) => {
                         slog_warn!("lexical checkout view unavailable: {}", error);
                     }
@@ -9016,6 +9041,7 @@ fn run_configure_maintenance_unit_inner(
                     }
                     _ => {}
                 }
+                continuation.lexical_bind_retry_delay = Duration::from_secs(1);
             } else {
                 ctx.clear_view_runtime();
             }
@@ -17022,6 +17048,173 @@ mod tests {
         lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         lock
+    }
+
+    #[test]
+    fn lexical_bind_busy_markers_do_not_retry_terminal_failures() {
+        for reason in [
+            "family registry I/O error: reservation_ledger_busy: read format: database is locked",
+            "[driver]: v3 store busy: reservation lock timeout",
+            "[driver]: v3 base build busy; retain direct-scan coverage and retry",
+        ] {
+            assert!(crate::views::trigram::bind_is_busy(reason), "{reason}");
+        }
+        for reason in [
+            "reservation_ledger_unreadable: permission denied",
+            "live_sqlite_file_replaced",
+            "a file named busy.rs is unreadable",
+        ] {
+            assert!(!crate::views::trigram::bind_is_busy(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn busy_lexical_bind_retries_until_parent_can_read_child_trigram() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let projects = base.join("projects");
+        let root = projects.join("alpha");
+        let storage = base.join("storage");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let response = super::handle_configure(
+            &configure_request_with_params(json!({
+                "project_root": root,
+                "harness": "opencode",
+                "storage_dir": storage,
+                "config": [user_tier(json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": true },
+                }))],
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        assert!(ctx.artifact_identity_provisional_reason().is_none());
+        assert!(ctx.views_route_root());
+        let family = ctx.cached_artifact_cache_key(&root).unwrap();
+        let mut state = super::ConfigureMaintenanceState::default();
+        state.absorb_enqueued(&ctx);
+        while state.jobs.front().unwrap().stage != super::ConfigureMaintenanceStage::ViewLoad {
+            assert!(super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+        }
+
+        let parent = test_context();
+        parent.update_config(|config| {
+            config.project_root = Some(projects.clone());
+            config.views.enabled = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        parent.set_canonical_cache_root(projects.clone());
+        let planes = crate::views::parent::RequestedPlanes {
+            trigram: true,
+            semantic: false,
+            callgraph: false,
+        };
+        assert!(crate::views::parent::prepare(&projects, planes));
+        assert!(crate::views::parent::activate(
+            &parent,
+            &projects,
+            &storage,
+            &parent.config().semantic
+        ));
+        let session = crate::views::parent::session_for_root(&projects).unwrap();
+        assert!(session.wait_rounds(1, Duration::from_secs(30)));
+        assert!(!session.children()[0].trigram_ready());
+
+        {
+            let reservation = crate::blob_store::v3::ReservationLock::acquire(&storage).unwrap();
+            crate::blob_store::v3::open_base_refs_registry(&storage, &family, &reservation, None)
+                .unwrap();
+        }
+        let ledger = crate::blob_store::v3::family_dir(&storage, &family)
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = rusqlite::Connection::open(ledger).unwrap();
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        // Only the configure tail may publish the child; the parent never binds it.
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(!session.children()[0].trigram_ready());
+        assert_eq!(
+            state.jobs.len(),
+            1,
+            "busy lexical bind was dropped instead of parked"
+        );
+        assert_eq!(
+            state.jobs[0].stage,
+            super::ConfigureMaintenanceStage::ViewLoad
+        );
+        let retry_at = state.jobs[0]
+            .retry_at()
+            .expect("busy bind needs a retry deadline");
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(2)
+        );
+        state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+        assert!(!state.has_ready_job());
+        // Check every backoff step without spending SQLite's busy timeout on
+        // each attempt. The real locked bind above arms the same continuation.
+        for seconds in [2, 4, 8, 16, 30, 30] {
+            let now = Instant::now();
+            state.jobs[0].defer_lexical_bind(now);
+            let retry_at = state.jobs[0].retry_at().unwrap();
+            assert_eq!(retry_at, now + Duration::from_secs(seconds));
+            state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+            assert!(!state.has_ready_job());
+            assert_eq!(
+                state.jobs[0].stage,
+                super::ConfigureMaintenanceStage::ViewLoad
+            );
+        }
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let query: RawRequest = serde_json::from_value(json!({
+            "id": "parent-busy-lexical",
+            "command": "semantic_search",
+            "query": "tracked",
+        }))
+        .unwrap();
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
+        state.replay_retry_cutoff = state.jobs[0].retry_at();
+        assert!(state.has_ready_job());
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert!(state.jobs[0].lexical_bind_retry_at.is_none());
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(1)
+        );
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(state.jobs.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !session.children()[0].trigram_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "parent never saw the retried lexical publication"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {

@@ -5502,13 +5502,46 @@ pub fn format_watch_line_batch(
         };
         text.push_str(&format!("{} matching lines dropped.{incomplete} Read them with bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
     }
+    if let Some(gap) = &batch.retry_gap {
+        let missing = match gap.known_missing_occurrences {
+            0 => "Some matches may be missing.".to_string(),
+            1 => "At least 1 match is missing.".to_string(),
+            count => format!("At least {count} matches are missing."),
+        };
+        let cursor = if gap.stream.as_deref() == Some("stderr") {
+            "stderr_offset"
+        } else {
+            "output_offset"
+        };
+        text.push_str(&format!("Some watch notices were lost: a stalled connection dropped {} of them, and they cannot be recovered. {missing} Read the task output with bash_status({{ task_id: {}, {cursor}: {} }}).\n", gap.dropped_notifications, serde_json::to_string(task_id).unwrap_or_default(), gap.first_offset.unwrap_or(0)));
+    }
     text.trim_end().to_string()
 }
 
 #[cfg(test)]
 mod watch_line_format_tests {
     use super::format_watch_line_batch;
-    use crate::bash_background::watch_lines::{LineBatch, WatchLine};
+    use crate::bash_background::watch_lines::{LineBatch, RetryGap, WatchLine};
+
+    #[test]
+    fn retry_gap_wording_golden() {
+        for (notices, missing, expected) in [
+            (2, 1, "Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+            (1, 0, "Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. Some matches may be missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+            (1, 1, "Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+            (2, 3, "Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 3 matches are missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+        ] {
+            let batch = LineBatch {
+                retry_gap: Some(RetryGap {
+                    reason: "retry_overflow".into(), dropped_notifications: notices,
+                    known_missing_occurrences: missing, first_offset: Some(16), stream: Some("stderr".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(format_watch_line_batch("bash-gap", &batch), expected);
+        }
+    }
 
     #[test]
     fn each_line_row_wording_golden() {
