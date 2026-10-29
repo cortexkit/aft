@@ -1803,7 +1803,9 @@ async fn consent_deadline_during_settled_application_waits_for_the_real_answer()
         assert_ne!(new_key, original);
         f.fake
             .answer(new_key, json!({"state":"settled", "outcome":"deny"}));
-        let frame = tokio::time::timeout(Duration::from_secs(3), second.recv())
+        // Bounds only the reply after a deny; a loaded runner once took over
+        // 3 s, and a call that never replies still fails here.
+        let frame = tokio::time::timeout(Duration::from_secs(30), second.recv())
             .await
             .unwrap()
             .unwrap();
