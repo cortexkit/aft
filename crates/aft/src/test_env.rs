@@ -32,6 +32,16 @@ fn process_env_mutex() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Probe from a sibling test thread without waiting on the process-settings
+/// guard. Used to verify that an environment fixture holds the shared mutex.
+#[allow(dead_code)] // The integration helper copy uses this probe.
+pub(crate) fn process_env_lock_is_available() -> bool {
+    !matches!(
+        process_env_mutex().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
 /// Acquire a test-only serialization mutex without cascading a prior test panic.
 /// These locks serialize test setup rather than protect data invariants, so the
 /// next test must proceed after a poisoned holder instead of manufacturing a
