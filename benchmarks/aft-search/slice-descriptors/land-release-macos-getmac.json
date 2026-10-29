@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-macos-getmac"
+  ],
+  "note": "Release workflow runner labels only. No changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -156,10 +156,12 @@ jobs:
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
-    runs-on: macos-26
-    # The shipped-profile library codegen alone took 87 minutes for v0.63.0
-    # and ran past 120 for v0.63.1, so 120 cancelled the release. The x64 build
-    # on the same runner type already gets the 360-minute job default.
+    # GetMac's M4 runners replace GitHub's hosted macOS runners for the two
+    # shipped macOS builds only: on macos-26 the shipped-profile library
+    # codegen took 87 minutes for v0.63.0 and ran past 120 for v0.63.1.
+    # Other macOS jobs (shipped E2E, CI) stay on GitHub's runners.
+    runs-on: getmac
+    # GetMac allows a job up to 6 hours.
     timeout-minutes: 240
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
@@ -235,7 +237,9 @@ jobs:
 
   build-darwin-x64:
     name: Build macOS x64
-    runs-on: macos-26
+    # Cross-compiled on a GetMac ARM64 runner, like build-darwin-arm64.
+    runs-on: getmac
+    timeout-minutes: 240
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
