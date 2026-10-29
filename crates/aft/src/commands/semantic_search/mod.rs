@@ -806,6 +806,7 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _cost = telemetry::CostRequest::start(&req.id);
     let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
@@ -1477,6 +1478,7 @@ fn split_semantic_results(
         Err(error) => return SplitSemantic::from_gap(semantic_embed_gap(&error)),
     };
     let fetch_limit = SEMANTIC_ENUMERATION_LIMIT.saturating_add(1);
+    let ann_cost = telemetry::CostPhase::start("ann");
     let mut checkout_gaps = None;
     let mut results = if let Some(runtime) = checkout_semantic.as_ref() {
         match runtime.search(&query_vector, fetch_limit, &|file| {
@@ -1510,6 +1512,7 @@ fn split_semantic_results(
         results.retain(|result| result.file.is_file());
     }
     let more_available = results.len() > SEMANTIC_ENUMERATION_LIMIT;
+    drop(ann_cost);
     results.truncate(SEMANTIC_ENUMERATION_LIMIT);
     SplitSemantic {
         results,
@@ -4637,6 +4640,7 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
+    let _cost = telemetry::CostPhase::start("matching_line");
     let source = std::fs::read_to_string(file).ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
@@ -4976,6 +4980,7 @@ fn run_engine_ranking(
         });
     let index_ready = view_snapshot.is_some() || index.is_ready();
     let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
+    let lexical_cost = telemetry::CostPhase::start("lexical");
     let content_tokens = query_shape::extract_content_tokens(query);
     let token_refs = content_tokens
         .iter()
@@ -5041,6 +5046,8 @@ fn run_engine_ranking(
         })
         .collect::<Vec<_>>();
     let exact_input = plan.exact_input.as_deref().unwrap_or(query);
+    drop(lexical_cost);
+    let exact_cost = telemetry::CostPhase::start("exact_and_path");
     let retain_definition_evidence = plan.shape == SearchShape::Identifier
         || (plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token);
     // The exact pass reads only files able to hold evidence kept below, so its
@@ -5330,6 +5337,8 @@ fn run_engine_ranking(
     }
 
     let audit_enabled = recall_audit::enabled();
+    drop(exact_cost);
+    let fusion_cost = telemetry::CostPhase::start("fusion");
     // The audit keeps every semantic chunk the lane returned, because the loop
     // below lets only each file's best chunk into the ranking.
     let audit_semantic_chunks =
@@ -5707,6 +5716,8 @@ fn run_engine_ranking(
     // list commits the order (or the decision to skip) and later pages of the
     // same list reuse it. It re-cuts the page itself, before anything reads
     // the page.
+    drop(fusion_cost);
+    let rerank_cost = telemetry::CostPhase::start("rerank");
     let rerank_note = rerank::rerank_canonical_head(
         &mut page.reply,
         page_request.offset(),
@@ -5720,6 +5731,8 @@ fn run_engine_ranking(
             path_scope: path_scope.as_ref(),
         },
     )?;
+    drop(rerank_cost);
+    let fusion_cost = telemetry::CostPhase::start("fusion");
     // A split request then reorders the first block, which every request
     // builds, before any page is cut from it (see
     // `split_query::query_primary_order`), so every page size and offset sees
@@ -5887,6 +5900,8 @@ fn run_engine_ranking(
         _ => trailer.shared_envelope_projection(),
     };
 
+    drop(fusion_cost);
+    let _snippet_cost = telemetry::CostPhase::start("snippet");
     let mut results = Vec::with_capacity(page.reply.page.len());
     for entry in &page.reply.page {
         let ranked = &entry.result;
@@ -7580,6 +7595,7 @@ fn search_index_ready(ctx: &AppContext) -> bool {
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
+    let _cost = telemetry::CostPhase::start("embedding");
     #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
     crate::semantic_index::observe_query_embedding_phase("embed_query_entry");
     let index_dimension = {
@@ -8807,6 +8823,7 @@ fn enrich_snippets_from_source_with_context(
     project_root: &Path,
     ctx: Option<&AppContext>,
 ) -> bool {
+    let _cost = telemetry::CostPhase::start("snippet");
     let (plans, rank0_targets) = snippet_read_plans(results, project_root, ctx);
     let file_lines = plans
         .into_iter()
