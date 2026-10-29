@@ -1925,6 +1925,7 @@ async fn exercise_catalog_remote_bash(
         "tool.catalog",
         fetch(&plan("broca-worker")),
         PhaseTrace::new(Instant::now()),
+        test_support::test_request_meta(),
     )
     .await
     .unwrap();

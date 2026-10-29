@@ -248,6 +248,7 @@ mod persistence;
 #[cfg(test)]
 mod prepared_bind_tests;
 mod push;
+mod queued_call;
 mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
@@ -559,6 +560,7 @@ enum RouteDetachPolicy {
 struct RequestFrameMeta {
     ver: u8,
     flags: Flags,
+    deadline: Option<queued_call::Deadline>,
 }
 
 #[derive(Clone)]
@@ -578,6 +580,7 @@ impl AdmissionWait {
             meta: RequestFrameMeta {
                 ver: decoded.frame.header.ver,
                 flags: decoded.frame.header.flags,
+                deadline: None,
             },
             bare_name: bare_name.to_owned(),
             held_since: decoded.phase_trace.received_at(),
@@ -979,25 +982,32 @@ fn submit_active_tool_call(
     request: RequestFrameMeta,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let job = queued_call::guard(request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
-    let (rx, cancellation) =
-        executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
-    active
+    let cancellation = JobCancellation::new();
+    let mut calls = active
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (route, corr),
-            ActiveToolCall {
-                root_id,
-                cancellation,
-                detach_policy,
-                tool: tool.to_string(),
-                started_at: Instant::now(),
-                request,
-                answering: false,
-            },
-        );
-    rx
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    calls.insert(
+        (route, corr),
+        ActiveToolCall {
+            root_id: root_id.clone(),
+            cancellation: cancellation.clone(),
+            detach_policy,
+            tool: tool.to_string(),
+            started_at: Instant::now(),
+            request,
+            answering: false,
+        },
+    );
+    executor.submit_tool_call_with_cancellation_async(
+        root_id,
+        lane,
+        request_id,
+        tool,
+        job,
+        cancellation,
+    )
 }
 
 /// Run a tracked call's job again (after a consent answer) as that call's
@@ -1016,25 +1026,24 @@ fn resubmit_active_tool_call(
     tool: &str,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let mut calls = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(call) = calls.get_mut(&(route, corr)).filter(|call| !call.answering) else {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Response::error(
+            request_id,
+            "route_released",
+            "call ended before resubmission",
+        ));
+        return rx;
+    };
+    let job = queued_call::guard(call.request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
     let (rx, cancellation) =
         executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
-    let registered = {
-        let mut calls = active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match calls.get_mut(&(route, corr)) {
-            Some(call) if !call.answering => {
-                call.cancellation = cancellation.clone();
-                call.root_id = root_id.clone();
-                true
-            }
-            _ => false,
-        }
-    };
-    if !registered {
-        executor.cancel_job(&root_id, &cancellation);
-    }
+    call.cancellation = cancellation;
+    call.root_id = root_id;
     rx
 }
 
@@ -3948,6 +3957,22 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    // A released handle cannot receive queued work. Cancel only before the
+    // executor's start transition; already-running mutations keep their result.
+    let queued =
+        queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+    for (corr, request) in queued {
+        let terminal = build_error_frame(
+            request.ver,
+            channel.channel,
+            channel.epoch,
+            corr,
+            request.flags,
+            "route_released",
+            "route released before execution; the tool did not run",
+        )?;
+        send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+    }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch allocation is a new daemon route/client handle. AFT retains
     // scoped permission work by its call identity, not by that old route handle.
@@ -6144,6 +6169,7 @@ where
                         let cancelled_deferred = pending_responses.cancel_request(channel, corr);
                         if cancelled_call.is_some() || cancelled_deferred {
                             let request = cancelled_call.unwrap_or(RequestFrameMeta {
+                                deadline: None,
                                 ver: frame.header.ver,
                                 flags: frame.header.flags,
                             });
@@ -9740,6 +9766,7 @@ async fn submit_provider_read(
     operation: &str,
     body: Value,
     mut phase_trace: PhaseTrace,
+    request: RequestFrameMeta,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
@@ -9776,7 +9803,7 @@ async fn submit_provider_read(
         request_id.clone(),
         RouteDetachPolicy::CancelOnDetach,
         &operation,
-        RequestFrameMeta { ver, flags },
+        request,
         Box::new(move |ctx| {
             phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
@@ -9851,6 +9878,8 @@ async fn submit_provider_read(
             (FrameType::Error, error.clone())
         } else if let Some(answer) = response.data.get("answer") {
             (FrameType::Response, answer.clone())
+        } else if !response.success {
+            (FrameType::Error, response.data.clone())
         } else {
             (
                 FrameType::Error,
@@ -10484,6 +10513,11 @@ async fn handle_tool_call_with_capabilities(
         phase_trace.received_at(),
         &envelope,
     );
+    let request_meta = RequestFrameMeta {
+        ver: frame.header.ver,
+        flags: frame.header.flags,
+        deadline: queued_call::Deadline::from_envelope(phase_trace.received_at(), &envelope),
+    };
     if let Some(error) = occipital_session_refusal(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
@@ -10576,6 +10610,7 @@ async fn handle_tool_call_with_capabilities(
                 operation,
                 body,
                 phase_trace,
+                request_meta,
             )
             .await;
         }
@@ -10640,6 +10675,7 @@ async fn handle_tool_call_with_capabilities(
                     operation,
                     dispatch,
                     rich_ui_proofs,
+                    request_meta,
                 )
                 .await;
             }
@@ -11590,10 +11626,7 @@ async fn handle_tool_call_with_capabilities(
             request_id.clone(),
             RouteDetachPolicy::CancelOnDetach,
             &bare_name,
-            RequestFrameMeta {
-                ver: frame.header.ver,
-                flags: frame.header.flags,
-            },
+            request_meta,
             job,
         );
 
@@ -11800,10 +11833,7 @@ async fn handle_tool_call_with_capabilities(
         request_id.clone(),
         RouteDetachPolicy::RetainForReplay,
         &bare_name_for_frame,
-        RequestFrameMeta {
-            ver: frame.header.ver,
-            flags: frame.header.flags,
-        },
+        request_meta,
         job,
     );
     let completion_tx = tx.clone();
@@ -12624,6 +12654,7 @@ pub(crate) mod test_support {
         RequestFrameMeta {
             ver: PROTOCOL_VERSION,
             flags: Flags::new(false, Priority::Interactive, false),
+            deadline: None,
         }
     }
 
@@ -16763,6 +16794,7 @@ mod tests {
                     request: RequestFrameMeta {
                         ver: PROTOCOL_VERSION,
                         flags: control_flags(),
+                        deadline: None,
                     },
                     answering: false,
                 },

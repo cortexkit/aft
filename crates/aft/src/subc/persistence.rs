@@ -909,6 +909,7 @@ mod tests {
             "tool.catalog",
             body,
             decoded.phase_trace,
+            test_support::test_request_meta(),
         )
         .await
         .unwrap();

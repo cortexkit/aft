@@ -6663,6 +6663,7 @@ pub(in crate::subc) mod route_tests {
             "tool.catalog",
             json!({}),
             PhaseTrace::new(Instant::now()),
+            test_support::test_request_meta(),
         )
         .await
         .unwrap();
