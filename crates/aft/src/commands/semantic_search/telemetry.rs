@@ -228,7 +228,7 @@ mod cost_trace {
     impl Drop for Request {
         fn drop(&mut self) {
             if self.enabled {
-                let phases = PHASES.with(|phases| phases.borrow_mut().take());
+                let phases = PHASES.with(|phases| std::mem::take(&mut *phases.borrow_mut()));
                 eprintln!(
                     "AFT_SEARCH_COST {}",
                     serde_json::json!({
