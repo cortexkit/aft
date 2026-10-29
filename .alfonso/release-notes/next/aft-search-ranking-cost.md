@@ -1,1 +1,1 @@
-Concurrent searches reuse source preparation to reduce CPU work and tail latency without changing ranked results.
+Parallel `aft_search` calls use less CPU and finish sooner, with unchanged results.
