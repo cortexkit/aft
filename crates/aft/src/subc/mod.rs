@@ -5103,6 +5103,9 @@ where
     // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
     // accepted; absent for non-reserved/self-connect.
     let launch_nonce = crate::launch_nonce::current();
+    // Compile immutable call validators before HELLO makes this module available.
+    // Discovery only needs catalog entries and must not pay this first-use cost.
+    tool_provider::prepare_admission();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
     let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
