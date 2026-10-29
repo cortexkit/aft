@@ -4533,10 +4533,15 @@ mod tests {
             serde_json::to_vec(&oversized).unwrap().len()
         );
         assert!(oversized["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
-        let mut cached = json!({"roots":[{"detail":"r".repeat(12000)}]})
-            .as_object()
-            .unwrap()
-            .clone();
+        let mut cached = json!({"roots":[{
+            "project_root": "ordinary", "state": "ready",
+            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "ready"}, "tier2": {"status": "ready"},
+            "detail":"r".repeat(11800)
+        }]})
+        .as_object()
+        .unwrap()
+        .clone();
         super::budget_health_metrics(&mut cached);
         assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
         cached.insert("fresh_liveness".into(), json!("f".repeat(1000)));
@@ -4608,7 +4613,10 @@ mod tests {
 
     #[test]
     fn health_budget_trims_every_sweep_before_root_detail() {
-        let roots = json!([{"root":"standing", "standing_health":{"status":"ready"}, "detail":"r".repeat(13000)}]);
+        let roots = json!([{
+            "project_root": "standing", "state": "ready", "standing": true,
+            "standing_refusal": "resolved-path-drift refusal", "detail":"r".repeat(13000)
+        }]);
         let mut metrics = json!({
             "roots": roots,
             "root_details_omitted": 0,
@@ -4621,8 +4629,14 @@ mod tests {
         super::budget_health_metrics(&mut metrics);
         assert_eq!(metrics["v2_family_sweeps"], json!([]));
         assert_eq!(metrics["v2_family_sweeps_omitted"], 5);
-        assert_eq!(metrics["root_details_omitted"], 1);
-        assert_eq!(metrics["roots"], json!([]));
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(
+            metrics["roots"],
+            json!([{
+                "project_root": "standing", "state": "ready", "standing": true,
+                "standing_refusal": "resolved-path-drift refusal", "abbreviated": true
+            }])
+        );
     }
 
     #[test]
@@ -6153,8 +6167,12 @@ mod tests {
         );
         let bounded = report.metrics.expect("bounded health metrics");
         assert_eq!(bounded["root_count"], 2);
-        assert_eq!(bounded["root_details_omitted"], 2);
-        assert!(bounded["roots"].as_array().unwrap().is_empty());
+        assert_eq!(bounded["root_details_omitted"], 1);
+        let roots = bounded["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["abbreviated"], true);
+        assert_eq!(roots[0]["semantic_index"]["status"], "building");
+        assert!(bounded["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
     }
 
     #[cfg(unix)]
@@ -9547,10 +9565,12 @@ mod tests {
                 .tempdir_in(&base)
                 .expect("standing directory")
         };
-        let storage = directory();
+        // Keep the database short so SQLite's path limit does not prevent the
+        // long-path variant from reaching health budgeting.
+        let storage = tempfile::tempdir().expect("standing storage directory");
         let original = directory();
         let retargeted = directory();
-        let link = storage.path().join("standing-link");
+        let link = base.join("standing-link");
         std::os::unix::fs::symlink(original.path(), &link).expect("initial standing symlink");
         let config = standing_config(&link, storage.path());
         let literal_path = config.index.roots[0].path.clone();
