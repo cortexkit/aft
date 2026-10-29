@@ -4594,6 +4594,21 @@ const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
         LIMIT ?3
     )";
 
+const UNRESOLVED_NAMED_CALL_SITE_COUNT_SQL: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end
+        FROM refs r
+        JOIN files f ON f.path = r.caller_file
+        LEFT JOIN nodes n ON n.id = r.caller_node
+        WHERE r.status = 'unresolved'
+          AND r.kind IN ('call', 'construction')
+          AND f.lang = ?1
+          AND r.short_name = ?4
+          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
+        LIMIT ?3
+    )";
+
 #[cfg(test)]
 fn unresolved_call_site_count(
     conn: &Connection,
@@ -4609,17 +4624,20 @@ fn unresolved_call_site_count_filtered(
     include_tests: bool,
     name: Option<&str>,
 ) -> Result<usize> {
-    Ok(conn
-        .prepare_cached(UNRESOLVED_CALL_SITE_COUNT_SQL)?
-        .query_row(
-            params![
-                lang_label(language),
-                include_tests,
-                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64,
-                name
-            ],
-            |row| row.get(0),
-        )?)
+    let sql = if name.is_some() {
+        UNRESOLVED_NAMED_CALL_SITE_COUNT_SQL
+    } else {
+        UNRESOLVED_CALL_SITE_COUNT_SQL
+    };
+    Ok(conn.prepare_cached(sql)?.query_row(
+        params![
+            lang_label(language),
+            include_tests,
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64,
+            name
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 #[cfg(test)]
@@ -4722,6 +4740,15 @@ mod callgraph_unresolved_count_tests {
             unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
             3
         );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("target")).unwrap(),
+            3
+        );
         // Paths without enclosing nodes still use the shared test-file classifier.
         for (i, path) in [
             "tests/helper.rs",
@@ -4760,6 +4787,15 @@ mod callgraph_unresolved_count_tests {
         );
         assert_eq!(
             unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            21
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("target")).unwrap(),
             21
         );
     }
