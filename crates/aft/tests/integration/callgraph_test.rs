@@ -68,7 +68,7 @@ fn callgraph_python_imports_resolve_without_same_name_fallback() {
     for (file, symbol, include_tests, count) in [
         ("mod.py", "toplevel_target", false, 3),
         ("mod.py", "local_target", false, 1),
-        ("mod.py", "test_target", false, 0),
+        ("mod.py", "test_target", false, 1),
         ("mod.py", "test_target", true, 1),
         ("pkg/mod.py", "toplevel_target", false, 2),
         ("unrelated.py", "toplevel_target", true, 0),
@@ -76,7 +76,7 @@ fn callgraph_python_imports_resolve_without_same_name_fallback() {
         let response = aft.send(
             &serde_json::json!({
                 "id": "python-callers", "command": "callers", "file": root.join(file),
-                "symbol": symbol, "depth": 1, "include_tests": include_tests,
+                "symbol": symbol, "depth": 1, "includeTests": include_tests,
             })
             .to_string(),
         );
@@ -84,6 +84,16 @@ fn callgraph_python_imports_resolve_without_same_name_fallback() {
         assert_eq!(
             response["total_callers"], count,
             "{file}::{symbol}: {response:#}"
+        );
+        let visible = if symbol == "test_target" && !include_tests {
+            0
+        } else {
+            count
+        };
+        assert_eq!(
+            flattened_caller_entries(&response).len(),
+            visible as usize,
+            "{response:#}"
         );
         assert!(
             flattened_caller_entries(&response)

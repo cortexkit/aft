@@ -16783,6 +16783,11 @@ fn resolve_python_target<I: ResolverIndex>(
         let target_file = index.module_target(caller_file, module)?;
         // An import names one module, never every same-named symbol in the project.
         let node = index.node_for_symbol(&target_file, symbol)?;
+        // Bare-name lookup also finds methods; `from mod import f` requires
+        // the module-level function, not a class's same-named method.
+        if node != node_id(&target_file, "function", symbol) {
+            return None;
+        }
         return index
             .node_is_callable(&target_file, &node)
             .then(|| ("resolved".to_string(), target_file, symbol.clone()));

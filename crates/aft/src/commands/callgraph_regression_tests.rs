@@ -133,6 +133,8 @@ fn callgraph_python_import_forms_and_unrelated_names() {
         ("pkg/mod.py", "def f():\n    pass\n"),
         ("pkg/sub/__init__.py", ""),
         ("unrelated.py", "def f():\n    pass\n"),
+        ("method_only.py", "class Only:\n    def f(self):\n        pass\n"),
+        ("not_importable.py", "from method_only import f\n\ndef not_importable():\n    f()\n"),
         ("root_calls.py", "from mod import f as renamed\nimport mod\n\ndef root_named():\n    renamed()\n\ndef root_module():\n    mod.f()\n\ndef local_module():\n    import mod as m\n    m.f()\n"),
         ("pkg/calls.py", "from pkg.mod import f\nfrom .mod import f as relative_f\nimport pkg.mod\n\ndef absolute():\n    f()\n\ndef relative():\n    relative_f()\n\ndef dotted():\n    pkg.mod.f()\n\ndef local():\n    from .mod import f as local_f\n    local_f()\n\ndef sibling():\n    local_f()\n\ndef shadow(f):\n    f()\n"),
         ("pkg/sub/calls.py", "from ..mod import f\n\ndef parent():\n    f()\n"),
@@ -159,6 +161,9 @@ fn callgraph_python_import_forms_and_unrelated_names() {
         unrelated.ends_with("0 callers · 0 file groups"),
         "{unrelated}"
     );
+    let method = callers(&store, "method_only.py", "Only::f", true);
+    assert!(method.starts_with("Incomplete:"), "{method}");
+    assert!(method.ends_with("0 callers · 0 file groups"), "{method}");
 }
 
 #[test]
