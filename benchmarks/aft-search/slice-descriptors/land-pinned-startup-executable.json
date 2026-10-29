@@ -1,12 +1,13 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/lib.rs"
   ],
   "slices": [
     "pinned-startup-executable"
   ],
-  "note": "Child processes re-execute a private copy of the startup binary. No changed path matches RANKING_FENCE_PREFIXES."
+  "note": "The ranking fence hit is crates/aft/src/lib.rs, which only gains the module declaration for pinned_executable. Child processes (sandbox launch, the gh shim, login-shell PATH refresh, the profile helper) re-execute a private copy of the startup binary instead of the deployment path. No search, indexing, query routing or ranking code changes; ranked rows must remain byte-identical to the committed reference."
 }
