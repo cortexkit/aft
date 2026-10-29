@@ -9,6 +9,9 @@ pub mod policy;
 mod reply;
 mod request;
 mod stream;
+pub(crate) use client::LaunchTimings;
+#[cfg(unix)]
+pub(crate) use client::RunDiagnostics;
 pub use client::{ExecRemoteClient, RemoteStream, StreamProgress};
 pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
 // Only the Unix remote-dispatch path filters environment names.
