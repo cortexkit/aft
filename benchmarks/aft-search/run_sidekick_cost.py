@@ -73,7 +73,14 @@ class Broker:
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, env={**os.environ, "AFT_SEARCH_COST_TRACE": "1"})
         self.buffer = b""
-        self.pid = self.read()["pid"]
+        try:
+            self.pid = self.read()["pid"]
+        except BaseException:
+            self.proc.kill()
+            self.proc.wait()
+            self.log.close()
+            print((runtime / "broker.log").read_text()[-4000:])
+            raise
 
     def read(self):
         deadline = time.monotonic() + 1800
@@ -175,6 +182,8 @@ def run(args):
                 ready = []
                 for channel in range(1, args.concurrency + 1):
                     status = broker.call("tool", channel=channel, name="status", arguments={})
+                    if status.get("isError"):
+                        raise RuntimeError(status)
                     status = status.get("structuredContent", status)
                     if status.get("semantic_index", {}).get("status") == "failed":
                         raise RuntimeError(status)
@@ -227,6 +236,7 @@ def run(args):
             phases[name].append(totals[name])
             per_repeat[index // len(selected)][name].append(totals[name])
     result = {"concurrency": args.concurrency, "queries": selected, "rerank_fixture": args.rerank,
+              "ready_index": {name: status.get(name) for name in ("semantic_index", "search_index")},
               "cpu_seconds_per_query": cpu / len(records), "requests": len(records),
               "cpu_seconds_per_query_by_repeat": cpu_by_repeat,
               "latency_ms": distribution([row["latency_ms"] for row in records]),
