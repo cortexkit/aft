@@ -97,6 +97,17 @@ fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pin
     std::fs::write(&secret, "PRIVATE_IMAGE_PIN_SENTINEL").unwrap();
     let deploy = root.join("aft-deploy");
     copy_and_warm_aft(&deploy);
+    #[cfg(target_os = "linux")]
+    {
+        let support = Command::new(&deploy)
+            .args(["sandbox-launch", "--support"])
+            .output()
+            .unwrap();
+        assert!(
+            support.status.success(),
+            "native Landlock support is required: {support:?}"
+        );
+    }
     let original = deploy.metadata().unwrap();
 
     // The replacement is a different native image, not another path to AFT.
