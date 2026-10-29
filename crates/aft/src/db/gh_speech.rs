@@ -374,6 +374,61 @@ impl Store {
         Ok(value)
     }
 
+    /// The caller holds admission through this read and the final send gate.
+    /// Only sealing and activation may advance a foreground authority while its
+    /// provider preflight is in flight; neither may change its launch authority.
+    pub(crate) fn revalidate_authority(
+        &self,
+        previous: &StoredAuthority,
+        ticket_digest: &[u8; 32],
+        foreground: bool,
+    ) -> Result<StoredAuthority, Refusal> {
+        let current = self.get(&previous.record.incarnation)?;
+        let invalid = |check| {
+            unavailable(
+                "db::gh_speech::revalidate_authority",
+                check,
+                serde_json::json!({"incarnation": previous.record.incarnation, "generation": current.generation, "expected_generation": previous.generation}),
+            )
+        };
+        let mut immutable = current.record.clone();
+        immutable.seal = previous.record.seal.clone();
+        if immutable != previous.record {
+            return Err(invalid("authority_fields_changed"));
+        }
+        let sealed = previous.record.seal.is_none() && current.record.seal.is_some();
+        if previous.record.seal != current.record.seal
+            && !(foreground
+                && sealed
+                && current.record.seal.as_ref().is_some_and(|seal| {
+                    seal.child_pid != 0
+                        && seal.child_start_time_ms != 0
+                        && !seal.birth_identity.is_empty()
+                }))
+        {
+            return Err(invalid("seal_changed"));
+        }
+        let activated = foreground
+            && previous.phase == "candidate"
+            && current.phase == "active"
+            && previous.ticket_digest.is_none()
+            && current.ticket_digest.as_deref() == Some(ticket_digest.as_slice());
+        if (current.phase != previous.phase || current.ticket_digest != previous.ticket_digest)
+            && !activated
+        {
+            return Err(invalid("activation_changed"));
+        }
+        if (activated && current.record.seal.is_none())
+            || previous
+                .generation
+                .checked_add(i64::from(sealed) + i64::from(activated))
+                != Some(current.generation)
+        {
+            return Err(invalid("unclassified_generation_change"));
+        }
+        Ok(current)
+    }
+
     pub(crate) fn find_digest(
         &self,
         digest: &[u8; 32],

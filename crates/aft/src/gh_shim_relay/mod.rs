@@ -977,7 +977,11 @@ async fn post_captured(
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("ticket_not_string"))?;
     let warm = crate::gh_shim_ticket::speech_for_ticket(ticket);
-    let stored = if let Some(warm) = &warm {
+    let (stored, foreground) = if let Some(warm) = &warm {
+        let _local = service
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(error) = warm
             .failure
             .lock()
@@ -995,20 +999,23 @@ async fn post_captured(
         if warm.prepared.context.service.store.path() != service.store.path() {
             return Err(invalid("store_path_mismatch"));
         }
-        service.store.get(&warm.incarnation)?
+        (
+            service.store.get(&warm.incarnation)?,
+            !warm.background.load(std::sync::atomic::Ordering::SeqCst),
+        )
     } else {
-        service.store.find_digest(
-            &crate::gh_shim_ticket::speech_digest(ticket)
-                .ok_or_else(|| invalid("ticket_digest"))?,
-            crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
-        )?
+        (
+            service.store.find_digest(
+                &crate::gh_shim_ticket::speech_digest(ticket)
+                    .ok_or_else(|| invalid("ticket_digest"))?,
+                crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
+            )?,
+            false,
+        )
     };
     if &stored.record.launch != launch {
         return Err(invalid("launch_mismatch"));
     }
-    let foreground = warm
-        .as_ref()
-        .is_some_and(|warm| !warm.background.load(std::sync::atomic::Ordering::SeqCst));
     if foreground
         && !routes.origin_live(
             launch.origin.as_ref(),
@@ -1151,6 +1158,8 @@ async fn post_captured(
         &body.expect_json(),
     )?;
     let dispatch_generation = service.generation();
+    #[cfg(test)]
+    service.test_before_final_gate();
     let queued = {
         let _local = service
             .admission
@@ -1161,6 +1170,12 @@ async fn post_captured(
             launch,
             &redeemed.session_id,
             &redeemed.task_id,
+        )?;
+        let stored = service.store.revalidate_authority(
+            &stored,
+            &crate::gh_shim_ticket::speech_digest(ticket)
+                .ok_or_else(|| invalid("ticket_digest"))?,
+            foreground,
         )?;
         let send = || {
             for (role, scope) in launch.required_scopes() {
@@ -1178,8 +1193,6 @@ async fn post_captured(
             }
             slot.send()
         };
-        #[cfg(test)]
-        service.test_before_final_gate();
         let queued = if foreground {
             service.store.final_foreground_gate(
                 &stored.record.incarnation,

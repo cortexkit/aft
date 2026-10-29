@@ -25,6 +25,77 @@ fn database_error_warning_does_not_include_raw_error_values() {
     );
 }
 
+#[test]
+fn authority_refresh_accepts_only_exact_foreground_seal_and_activation_steps() {
+    let (_dir, store, record) = fixture();
+    store
+        .initialize_policy(record.policy.as_ref().unwrap(), 20)
+        .unwrap();
+    store.capture(&record).unwrap();
+    let initial = store.get(&record.incarnation).unwrap();
+    store
+        .seal(
+            &record.incarnation,
+            &ExecutionSeal {
+                child_pid: 123,
+                child_start_time_ms: 456,
+                birth_identity: "child".into(),
+            },
+        )
+        .unwrap();
+    let sealed = store
+        .revalidate_authority(&initial, &[7; 32], true)
+        .unwrap();
+    assert_eq!(sealed.generation, initial.generation + 1);
+    assert_eq!(
+        store
+            .revalidate_authority(&initial, &[7; 32], false)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+    store
+        .activate(&record.incarnation, &[7; 32], &record.minting_run)
+        .unwrap();
+    assert_eq!(
+        store
+            .revalidate_authority(&initial, &[7; 32], true)
+            .unwrap()
+            .generation,
+        initial.generation + 2
+    );
+    assert_eq!(
+        store
+            .revalidate_authority(&sealed, &[7; 32], true)
+            .unwrap()
+            .phase,
+        "active"
+    );
+    assert_eq!(
+        store
+            .revalidate_authority(&sealed, &[8; 32], true)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+    let active = store.get(&record.incarnation).unwrap();
+    store
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE gh_speech_authorities SET generation=generation+1",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .revalidate_authority(&active, &[7; 32], true)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+}
+
 fn stamp() -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Reserved {
