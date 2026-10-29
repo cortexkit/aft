@@ -170,12 +170,23 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
 #[cfg(unix)]
 const REMOTE_REATTACH_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// ck-motor's default queue wait limit, used for a request that sets no
-/// `queue_wait_limit_s` (AFT never sets one).
-/// Time a job waits only behind its own workspace's earlier job is not counted
-/// against it, so this bounds the ordinary case, not every wait.
+/// ck-motor's queue wait for jobs eligible for Boat (at most eight vCPUs,
+/// without outbound networking). Hosted-only jobs may wait longer. AFT leaves
+/// `queue_wait_limit_s` unset so the runner chooses its capacity-aware default.
+/// This baseline also caps retries after a proven terminal refusal.
 #[cfg(unix)]
 const RUNNER_QUEUE_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// Bound queue time without duplicating ck-motor's routing decisions. Its
+/// default admission policy allows 300 seconds for Boat-eligible jobs, or
+/// min(1800 seconds, the run timeout) for hosted-only jobs. The larger of 300
+/// seconds and the run timeout therefore covers either queue before execution
+/// consumes its separate runtime budget. Both re-attach and submission-key
+/// recovery must allow that time before declaring a job's outcome unknown.
+#[cfg(unix)]
+fn recovery_queue_wait_allowance(run_timeout: Duration) -> Duration {
+    RUNNER_QUEUE_WAIT_LIMIT.max(run_timeout)
+}
 
 /// The first pause before re-attaching after a lost stream; each failed attempt
 /// without progress doubles it, up to [`REATTACH_BACKOFF_MAX`].
@@ -480,9 +491,9 @@ fn local_os_name() -> &'static str {
 /// Bounds how long AFT keeps re-attaching to an accepted job whose stream it
 /// lost. Silence on an open stream is never bounded; only recovery attempts
 /// that bring no record are. While the job may still be queued or running on
-/// the runner, AFT keeps trying: it stops only once the job's own limits (the
-/// runner's queue wait limit plus the command's run timeout, counted from AFT's
-/// latest submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
+/// the runner, AFT keeps trying: it stops only once a conservative queue
+/// allowance plus the command's run timeout (counted from AFT's latest
+/// submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
 /// after recovery began. Accepted jobs can disappear with a wiped runner state;
 /// AFT must not resubmit them.
 #[cfg(unix)]
@@ -509,8 +520,8 @@ struct ReattachBudget {
 #[cfg(unix)]
 impl ReattachBudget {
     fn new(_root: &Path, metadata: &PersistedTask) -> Self {
-        let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
         let (until_job_end, recorded_timeout, run_timeout) = Self::until_job_end(metadata);
+        let queue_wait = recovery_queue_wait_allowance(run_timeout);
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
@@ -522,7 +533,7 @@ impl ReattachBudget {
             None => (grace, until_job_end),
         };
         let limit_note = format!(
-            "ck-motor's queue wait limit of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
+            "a queue wait allowance of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
             retry_duration(duration_ms(queue_wait)),
             if recorded_timeout.is_some() { "" } else { "assumed " },
             retry_duration(duration_ms(run_timeout)),
@@ -569,7 +580,7 @@ impl ReattachBudget {
             .and_then(|retry| retry.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
         let job_end_ms = submitted_at
-            .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT))
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
             .saturating_add(duration_ms(run_timeout));
         (
             Duration::from_millis(job_end_ms.saturating_sub(unix_millis())),
@@ -902,24 +913,24 @@ pub(crate) struct KeyedSubmission {
 #[cfg(unix)]
 impl KeyedSubmission {
     fn expires_at(&self, metadata: &PersistedTask) -> u64 {
+        let run_timeout = metadata
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_BG_TIMEOUT);
         let submitted_at = metadata
             .remote
             .as_ref()
             .and_then(|r| r.retry.as_ref())
             .and_then(|r| r.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
+        // Admission can wait before execution starts; that wait does not
+        // consume the runner's execution timeout.
+        let job_end_ms = submitted_at
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
+            .saturating_add(duration_ms(run_timeout));
         self.created_at_ms
             .saturating_add(SUBMISSION_RETENTION_MS)
-            .min(
-                submitted_at.saturating_add(
-                    metadata
-                        .timeout_ms
-                        .unwrap_or(duration_ms(DEFAULT_BG_TIMEOUT))
-                        // Admission can wait before execution starts; that wait
-                        // does not consume the runner's execution timeout.
-                        .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT)),
-                ),
-            )
+            .min(job_end_ms)
     }
 }
 

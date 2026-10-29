@@ -2304,7 +2304,7 @@ async fn exec_remote_bash_route_outage_gives_up_after_the_jobs_own_limits() {
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
     assert!(
         done.output_preview.contains(&format!(
-            "job {} could not be re-attached before its own time limit passed (ck-motor's queue wait limit of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun",
+            "job {} could not be re-attached before its own time limit passed (a queue wait allowance of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun",
             id()
         )),
         "{}",
@@ -7534,8 +7534,8 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
             .as_secs_f64()
             / 60.0
     };
-    // 5 minutes of queue wait plus 30 of run, counted from the submission.
-    let full_window = 35.0;
+    // A conservative 30-minute queue allowance plus 30 of run, counted from submission.
+    let full_window = 60.0;
 
     let mut budget = ReattachBudget::new(dir.path(), &metadata);
     let before = minutes_left(&budget);
