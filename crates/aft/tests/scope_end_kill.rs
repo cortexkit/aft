@@ -1470,3 +1470,24 @@ async fn file_read_exact_on_tool_provider_v1_route_without_flow_scope_is_refused
     assert_eq!(body(&reply)["code"], "file_read_exact_route_not_admitted");
     assert_eq!(body(&reply)["message"], "Route not admitted: owner.");
 }
+
+#[tokio::test]
+async fn file_read_exact_refusal_leaves_route_ready_for_next_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("module");
+    let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    daemon
+        .bind_route(2, 1, "basal", None, false, "head-session", true)
+        .await;
+    for _ in 0..2 {
+        let reply = daemon
+            .call(2, json!({"op":"file.read_exact","path":"absent.txt"}))
+            .await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{}", body(&reply));
+        assert_eq!(body(&reply)["code"], "file_read_exact_route_not_admitted");
+        let next = daemon
+            .call(2, json!({"name":"late_results","arguments":{}}))
+            .await;
+        assert_eq!(next.header.ty, FrameType::Response, "{}", body(&next));
+    }
+}

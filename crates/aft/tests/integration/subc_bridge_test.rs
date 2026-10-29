@@ -404,26 +404,17 @@ fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_error() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "1");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "1")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_panic() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "panic");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "panic")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_bash_elicitation_ttl_ms(ms: u64) -> EnvVarGuard {
-    let key = "AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, ms.to_string());
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS", &ms.to_string())
 }
 
 fn install_bridge_state(state: Arc<BridgeState>) {
@@ -8051,23 +8042,45 @@ async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemo
             .expect("rebind submission barrier ping"),
     )
     .await;
-    let rebind_barrier = read_frame_timeout(&mut stream, "rebind submission barrier pong").await;
-    assert_eq!(rebind_barrier.header.ty, FrameType::Pong);
-    assert_eq!(rebind_barrier.header.corr, 124);
+    let mut released_terminal = false;
+    let mut rebind_barrier = false;
+    let mut bind_ack = None;
+    // Goodbye must settle the queued call's request credit, not merely remove
+    // the job. Pong has its own writer priority, so accept either reply order.
+    while !released_terminal || !rebind_barrier {
+        let frame = read_frame_timeout(&mut stream, "released call terminal and rebind pong").await;
+        match (frame.header.ty, frame.header.channel, frame.header.corr) {
+            (FrameType::Error, 1, 121) => {
+                assert!(!released_terminal, "queued call received two terminals");
+                assert_eq!(frame.header.epoch, 1);
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["code"], "route_released", "{body}");
+                released_terminal = true;
+            }
+            (FrameType::Pong, 0, 124) => rebind_barrier = true,
+            (FrameType::Response, 0, 220) => bind_ack = Some(frame),
+            other => panic!("unexpected reply before releasing heavy work: {other:?}"),
+        }
+    }
 
     state.release_heavy();
     state.release_epoch_reads();
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut bind_ack = None;
-    while let Some(frame) =
-        read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
-    {
-        if frame.header.channel == 0
-            && frame.header.corr == 220
-            && frame.header.ty == FrameType::Response
+    if bind_ack.is_none() {
+        while let Some(frame) =
+            read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
         {
-            bind_ack = Some(frame);
-            break;
+            assert!(
+                frame.header.channel != 1 || frame.header.corr != 121,
+                "queued call received a second terminal after release"
+            );
+            if frame.header.channel == 0
+                && frame.header.corr == 220
+                && frame.header.ty == FrameType::Response
+            {
+                bind_ack = Some(frame);
+                break;
+            }
         }
     }
     assert!(
@@ -13341,6 +13354,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "page.collect",
             "page.read",
             "page.release",
+            "diagnostics.findings",
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(

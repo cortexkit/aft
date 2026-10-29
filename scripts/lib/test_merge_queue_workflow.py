@@ -444,6 +444,73 @@ class SkewedQueueHistoryTests(unittest.TestCase):
             queue.first_parent_between(self.pr_head, self.group_base)
 
 
+class PullRequestBaseBehindMergedMainTest(unittest.TestCase):
+    """A PR event's base SHA can predate a main the branch later merged in.
+    Main's own landed commits must not count as the PR's commits."""
+
+    COAUTHOR = "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="aft-pr-base-")
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Owner")
+        self.git("config", "user.email", "1+owner@users.noreply.github.com")
+        self.git("config", "commit.gpgsign", "false")
+        self.commit("root")
+        self.event_base = self.commit("main before the PR")
+        self.git("checkout", "-qb", "land/feature")
+        self.commit(f"agent change\n\n{self.COAUTHOR}")
+        self.git("checkout", "-q", "main")
+        # Landed later on main by the owner, without the agent trailer.
+        self.landed = self.commit("owner change landed on main")
+        self.git("update-ref", "refs/remotes/origin/main", self.landed)
+        self.git("checkout", "-q", "land/feature")
+        self.git("merge", "-q", "--no-ff", "-m", f"Merge main\n\n{self.COAUTHOR}", "main")
+        self.head = self.git("rev-parse", "HEAD")
+
+    def git(self, *args: str) -> str:
+        # Agent shells inject a commit hook (GIT_CONFIG_* plus AFT_GIT_CO_AUTHOR)
+        # that adds the agent trailer to every commit; this fixture must control
+        # which commits carry it.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("GIT_CONFIG_") and key != "AFT_GIT_CO_AUTHOR"}
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", *args],
+            cwd=self.repo, env=env, text=True, check=True, capture_output=True,
+        ).stdout.strip()
+
+    def commit(self, message: str) -> str:
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def payload(self) -> dict:
+        return {"pull_request": {"base": {"sha": self.event_base},
+                                 "head": {"sha": self.head, "ref": "land/feature"}}}
+
+    def test_main_commits_merged_into_the_branch_are_not_the_prs(self) -> None:
+        sys.path.insert(0, str(ROOT / "scripts/lib"))
+        import landing_policy
+
+        previous = Path.cwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, previous)
+        # The agent commit and the merge commit are the PR's; main's is not.
+        self.assertEqual(landing_policy.check_event("pull_request", self.payload()), 2)
+
+    def test_without_fetched_main_the_event_base_alone_still_refuses(self) -> None:
+        sys.path.insert(0, str(ROOT / "scripts/lib"))
+        import landing_policy
+
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        previous = Path.cwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, previous)
+        with self.assertRaisesRegex(ValueError, "missing alfonso-aft co-author trailer"):
+            landing_policy.check_event("pull_request", self.payload())
+
+
 def import_queue_search():
     spec = importlib.util.spec_from_file_location(
         "merge_queue_search", ROOT / "scripts/merge-queue-search.py"

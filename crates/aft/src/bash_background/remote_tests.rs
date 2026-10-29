@@ -150,6 +150,24 @@ fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
 }
 
+type RemoteLaunchLogCapture = Arc<Mutex<Vec<String>>>;
+
+fn remote_launch_log_captures() -> &'static Mutex<HashMap<PathBuf, RemoteLaunchLogCapture>> {
+    static CAPTURES: std::sync::OnceLock<Mutex<HashMap<PathBuf, RemoteLaunchLogCapture>>> =
+        std::sync::OnceLock::new();
+    CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn capture_remote_launch_logs<R>(task: &BgTask, run: impl FnOnce() -> R) -> R {
+    let root = task.state.lock().unwrap().metadata.project_root.clone();
+    let capture = root.and_then(|root| remote_launch_log_captures().lock().unwrap().remove(&root));
+    if let Some(capture) = capture {
+        crate::logging::capture_log_lines_into(capture, run)
+    } else {
+        run()
+    }
+}
+
 fn exited_remote_workers() -> &'static Mutex<HashSet<String>> {
     static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
     TASKS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -4888,6 +4906,7 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
                             capture_pipeline: false,
                         },
                     )),
+                    None,
                 )
                 .unwrap();
         }
@@ -5747,6 +5766,136 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
         rendered.ends_with("changed files: not reported by the runner"),
         "{rendered}"
     );
+}
+
+#[tokio::test]
+async fn runon_launch_logs_send_phases_and_acceptance_capture_time() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(dir.path().canonicalize().unwrap(), capture.clone());
+    let command = "printf runon-diagnostic-command";
+    let secret = "runon-diagnostic-secret-value";
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": command,
+            "runon": "linux",
+            "env": {"DIAGNOSTIC_TOKEN": secret},
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    wait_for(
+        "exec.run sent must be logged before the executor accepts",
+        || {
+            capture
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("runon: exec.run sent "))
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(!capture
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("runon: remote task accepted ")));
+    daemon.acceptance_gate.notify_one();
+    wait_for("executor acceptance must be logged", || {
+        capture
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("runon: remote task accepted "))
+            .then_some(())
+    })
+    .await;
+    let registry = ctx.bash_background().clone();
+    let kill_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || registry.kill(&kill_id, "session"))
+        .await
+        .unwrap()
+        .unwrap();
+    terminal(ctx.bash_background(), task_id).await;
+    remote_worker_exited(task_id).await;
+    let lines = capture.lock().unwrap().clone();
+    let sent: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("runon: exec.run sent "))
+        .collect();
+    assert_eq!(sent.len(), 1, "{lines:?}");
+    let (sent_index, sent) = sent[0];
+    assert!(sent.starts_with("INFO "), "{sent}");
+    assert!(
+        sent.contains(&format!("task_id={task_id} session=session ")),
+        "{sent}"
+    );
+    let (_, timings) = sent.split_once("pre_send_ms=").unwrap();
+    let (total, phases) = timings.split_once(" phases=").unwrap();
+    let total: u128 = total.parse().unwrap();
+    let phases: Vec<_> = phases
+        .split(',')
+        .map(|phase| {
+            let (name, millis) = phase.split_once(':').unwrap();
+            (name, millis.parse::<u128>().unwrap())
+        })
+        .collect();
+    for required in [
+        "secret_preflight",
+        "workdir_return_paths",
+        "permission_preflight",
+        "sandbox_preflight",
+        "changed_files_baseline",
+        "workdir_repository_git",
+        "cd_snapshot_git",
+        "worker_dispatch",
+        "connect_route",
+        "supports_submission_key",
+        "submission_persistence",
+        "send",
+    ] {
+        assert!(
+            phases.iter().any(|(name, _)| *name == required),
+            "missing {required}: {sent}"
+        );
+    }
+    let phase_total: u128 = phases.iter().map(|(_, millis)| millis).sum();
+    assert!(
+        phase_total <= total && total - phase_total < phases.len() as u128,
+        "{sent}"
+    );
+    let (accepted_index, accepted) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains("runon: remote task accepted "))
+        .unwrap();
+    assert!(sent_index < accepted_index, "{lines:?}");
+    assert!(
+        accepted.contains(&format!(
+            "task_id={task_id} session=session job_id={}",
+            id()
+        )),
+        "{accepted}"
+    );
+    accepted
+        .split_once("capture_ms=")
+        .unwrap()
+        .1
+        .parse::<u128>()
+        .unwrap();
+    for line in [sent, accepted] {
+        assert!(!line.contains(command) && !line.contains(secret), "{line}");
+    }
 }
 
 #[tokio::test]

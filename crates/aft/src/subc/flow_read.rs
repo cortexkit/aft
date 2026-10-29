@@ -259,6 +259,7 @@ async fn dispatch_with_wait(
     let request = RequestFrameMeta {
         ver: frame.header.ver,
         flags: frame.header.flags,
+        deadline: queued_call::Deadline::from_envelope(Instant::now(), &envelope),
     };
     active
         .lock()

@@ -267,6 +267,7 @@ pub(in crate::subc) async fn submit(
     operation: super::admission::Operation,
     dispatch: DispatchFn,
     capabilities: ProofCapabilities,
+    request_meta: RequestFrameMeta,
     reply_budget: crate::commands::blocking_wait::ReplyBudget,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
@@ -301,10 +302,7 @@ pub(in crate::subc) async fn submit(
         id.clone(),
         RouteDetachPolicy::RetainForReplay,
         &name.clone(),
-        RequestFrameMeta {
-            ver: frame.header.ver,
-            flags: frame.header.flags,
-        },
+        request_meta,
         Box::new(move |ctx| {
             let _config_pin = ctx.pin_config();
             let _io = crate::bounded_io::enter(Some(io_budget));

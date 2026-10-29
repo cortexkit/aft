@@ -72,6 +72,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     // 3. crates/aft/src/subc_format.rs
     files_to_scan.push(src_dir.join("subc_format.rs"));
     files_to_scan.push(src_dir.join("subc/bind_log.rs"));
+    files_to_scan.push(src_dir.join("subc/diagnostics_findings.rs"));
     // Remote downloads and the emergency rendered-reply ceiling also cut
     // bytes and must remain registered even though they are not list payloads.
     files_to_scan.push(src_dir.join("url_fetch.rs"));
@@ -86,6 +87,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "budget.exhausted()",
         ".take(",
         "truncate(",
+        "size >= BODY_LIMIT",
         "DEFAULT_MAX_RESULTS",
         "HUB_SUMMARY_LIMIT",
         "TRACE_TO_EXPANSION_BUDGET",
