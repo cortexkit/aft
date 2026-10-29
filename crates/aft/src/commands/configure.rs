@@ -14366,6 +14366,10 @@ mod tests {
         assert!(!degraded());
         // Keep the working source: recovery reinstalls it, proving the next
         // successful load clears the degraded flag.
+        let initialized = ctx
+            .lexical_view_snapshot("bind")
+            .expect("bind loads a snapshot");
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
         let working = ctx.lexical_source_for_test();
         ctx.install_lexical_source_for_test(Arc::new(Refused));
 
@@ -15012,7 +15016,7 @@ mod tests {
             &serde_json::from_value(json!({
                 "id": "callgraph-refused-zoom",
                 "command": "zoom",
-                "target": file,
+                "file": file,
                 "symbols": ["target"],
                 "callgraph": true,
             }))
@@ -15036,7 +15040,7 @@ mod tests {
             &serde_json::from_value(json!({
                 "id": "callgraph-refused-zoom-local",
                 "command": "zoom",
-                "target": file,
+                "file": file,
                 "symbols": ["target"],
             }))
             .unwrap(),

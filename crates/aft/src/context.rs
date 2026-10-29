@@ -1162,7 +1162,7 @@ struct ViewLoadHealth {
     total: u64,
     last: Option<ViewLoadFailure>,
     /// Last error-level log per plane with the repeats suppressed since.
-    log_state: BTreeMap<String, (Instant, u64)>,
+    log_state: BTreeMap<String, (Option<Instant>, u64)>,
 }
 
 /// Bucket a view load error into a stable short cause. I/O failures already
@@ -1177,6 +1177,7 @@ fn view_load_cause(error: &str) -> &'static str {
     } else if error.contains("invalid")
         || error.contains("mismatch")
         || error.contains("missing")
+        || error.contains("unreadable")
         || error.contains("unverified")
         || error.contains("verification")
     {
@@ -9781,16 +9782,16 @@ impl AppContext {
                 total: health.total,
                 last_at_ms,
             });
-            let entry = health
-                .log_state
-                .entry(plane.to_string())
-                .or_insert((now, 0));
-            if now.duration_since(entry.0) < VIEW_LOAD_LOG_INTERVAL {
+            let entry = health.log_state.entry(plane.to_string()).or_default();
+            if entry
+                .0
+                .is_some_and(|last| now.duration_since(last) < VIEW_LOAD_LOG_INTERVAL)
+            {
                 entry.1 = entry.1.saturating_add(1);
                 (count, None)
             } else {
                 let suppressed = std::mem::take(&mut entry.1);
-                entry.0 = now;
+                entry.0 = Some(now);
                 (count, Some(suppressed))
             }
         };
