@@ -156,7 +156,10 @@ jobs:
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
-    runs-on: macos-26
+    # Blacksmith's M4 runner has 24 GB; the shipped-profile library compile
+    # peaks near 12 GB and swaps for hours on GitHub's 7 GB macos-26 runner.
+    # Temporary until the self-hosted release runner on our own Mac is live.
+    runs-on: blacksmith-6vcpu-macos-26
     # The shipped-profile library codegen alone took 87 minutes for v0.63.0
     # and ran past 120 for v0.63.1, so 120 cancelled the release. The x64 build
     # on the same runner type already gets the 360-minute job default.
@@ -235,7 +238,8 @@ jobs:
 
   build-darwin-x64:
     name: Build macOS x64
-    runs-on: macos-26
+    # Same runner as the ARM64 build; see the note there.
+    runs-on: blacksmith-6vcpu-macos-26
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache

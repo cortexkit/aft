@@ -1,1 +1,0 @@
-- Bash commands with `bash.linux_scope` enabled now preserve shell variables and run correctly on newer systemd versions (#1134, thanks @iceteaSA).

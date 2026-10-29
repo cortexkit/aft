@@ -4,6 +4,7 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
 
 import type { AftConfig } from "../../src/config.js";
+import { normalizeToolArgSchemas } from "../../src/normalize-schemas.js";
 import {
   buildAftToolDefinitions,
   registerAftTools,
@@ -212,6 +213,67 @@ describe("OpenCode V2 tool surface", () => {
     expect(projected.get("patch")?.options?.permission).toBe("edit");
     // OpenCode 2 evaluates shell-command rules under `shell`.
     expect(projected.get("shell")?.options?.permission).toBe("shell");
+  });
+
+  test("exposes described V2 arguments through Standard JSON Schema without changing validation", async () => {
+    const definition: ToolDefinition = normalizeToolArgSchemas({
+      description: "Read a filePath",
+      args: {
+        filePath: tool.schema
+          .string()
+          .min(1)
+          .describe("File to read")
+          .meta({
+            examples: ["sample.txt"],
+          }),
+        limit: tool.schema.number().int().positive().optional().describe("Maximum lines"),
+      },
+      execute: async () => "ok",
+    });
+    const projected = projectV2Tool("read", definition, LOCATION);
+    const input = projected.input;
+    const standard = input["~standard"];
+
+    expect(input).toBeInstanceOf(tool.schema.ZodObject);
+    expect(standard.version).toBe(1);
+    expect(standard.vendor).toBe("zod");
+    const schema = standard.jsonSchema.input({ target: "draft-2020-12" });
+    expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
+    expect(schema.properties).toMatchObject({
+      path: { type: "string", minLength: 1, description: "File to read", examples: ["sample.txt"] },
+      limit: { type: "integer", description: "Maximum lines" },
+    });
+    expect(schema.properties).not.toHaveProperty("filePath");
+    expect(schema.required).toEqual(["path"]);
+    expect(schema).not.toHaveProperty("additionalProperties");
+    expect(standard.jsonSchema.output({ target: "draft-2020-12" })).toEqual({
+      ...schema,
+      additionalProperties: false,
+    });
+    for (const target of ["draft-07", "openapi-3.0", "unsupported"]) {
+      expect(() => standard.jsonSchema.input({ target })).toThrow(
+        `Unsupported JSON Schema target: ${target}`,
+      );
+      expect(() => standard.jsonSchema.output({ target })).toThrow(
+        `Unsupported JSON Schema target: ${target}`,
+      );
+    }
+
+    const valid = { path: "sample.txt", limit: 3 };
+    expect(input.parse(valid)).toEqual(valid);
+    expect(await standard.validate(valid)).toEqual({ value: valid });
+    for (const invalid of [{}, { path: "" }, { path: "sample.txt", limit: "3" }]) {
+      expect(input.safeParse(invalid).success).toBe(false);
+      expect(await standard.validate(invalid)).toHaveProperty("issues");
+    }
+    expect(definition.args).toHaveProperty("filePath");
+    expect(definition.args).not.toHaveProperty("path");
+
+    definition.args.limit = tool.schema.number().int().positive().describe("Required lines");
+    const updated = projected.input["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+    expect(updated.required).toEqual(["path", "limit"]);
+    expect(updated.properties).toHaveProperty("limit.description", "Required lines");
+    expect(schema.required).toEqual(["path"]);
   });
 
   test("maps canonical V2 path input back to the shared executor field", async () => {

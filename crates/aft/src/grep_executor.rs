@@ -35,6 +35,7 @@ thread_local! {
     /// a request answered without walking the project, which a reply's
     /// wall-clock time cannot show on a loaded machine.
     static FALLBACK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TARGET_WALK_BUILDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Records that a fallback filesystem walk started on this thread.
@@ -1223,6 +1224,8 @@ fn target_walk_builder(
     ignore_ancestors: bool,
     filter_root: Option<&Path>,
 ) -> WalkBuilder {
+    #[cfg(test)]
+    TARGET_WALK_BUILDERS.with(|count| count.set(count.get() + 1));
     let mut builder = WalkBuilder::new(search_root);
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
     // A confined walk loads none of the crate's ignore files (see
@@ -1396,9 +1399,10 @@ fn target_is_ignored_unbounded(path: &Path) -> bool {
 }
 
 /// The crate hides rejected entries before filter_entry is called. Only an
-/// empty reply needs their count: compare one directory's accepted children
-/// with its immediate on-disk entries, then recurse only through accepted
-/// directories. No ignored directory is opened to count its contents. The
+/// empty reply needs their count: collect accepted children with one walker,
+/// then compare each accepted directory with its immediate on-disk entries.
+/// One walker shares ignore state instead of reloading ancestor rules for
+/// every directory. No ignored directory is opened to count its contents. The
 /// walk stops at the caller's deadline (with a margin to return), so an
 /// oversized scope reports unknown instead of keeping a filesystem helper
 /// occupied after the caller has given up.
@@ -1457,34 +1461,46 @@ fn diagnose_scope_counts_unbounded(
         }
         return Some(counts);
     }
-    let mut pending = vec![search_root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
+    let Some(builder) = fallback_target_walk_builder(
+        search_root,
+        Arc::clone(&skipped),
+        ignored_target,
+        false,
+        Some(filter_root),
+    ) else {
+        return Some(counts);
+    };
+    let mut directories = HashMap::<PathBuf, HashSet<std::ffi::OsString>>::new();
+    directories.insert(search_root.to_path_buf(), HashSet::new());
+    for entry in builder.build() {
         if !within_budget(counts.entries_visited) {
             return None;
         }
-        let mut accepted = HashSet::new();
-        let Some(mut builder) = fallback_target_walk_builder(
-            &directory,
-            Arc::clone(&skipped),
-            ignored_target,
-            false,
-            Some(filter_root),
-        ) else {
-            continue;
-        };
-        builder.max_depth(Some(1));
-        for entry in builder.build() {
-            if !within_budget(counts.entries_visited) {
-                return None;
-            }
-            counts.entries_visited += 1;
-            let entry = entry.ok()?;
-            if entry.depth() > 0 {
-                accepted.insert(entry.file_name().to_os_string());
+        counts.entries_visited += 1;
+        let entry = entry.ok()?;
+        if entry.depth() > 0 {
+            if let Some(parent) = entry.path().parent() {
+                directories
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .insert(entry.file_name().to_os_string());
             }
         }
-        if skipped.load(Ordering::Relaxed) > 0 {
+        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            directories.entry(entry.into_path()).or_default();
+        }
+    }
+    if skipped.load(Ordering::Relaxed) > 0 {
+        return None;
+    }
+    for (directory, accepted) in directories {
+        if !within_budget(counts.entries_visited) {
             return None;
+        }
+        // Account for the directory roots visited by the former depth-one
+        // walkers too, keeping the diagnostic's entry allowance unchanged.
+        if directory != search_root {
+            counts.entries_visited += 1;
         }
         for entry in std::fs::read_dir(&directory).ok()? {
             if !within_budget(counts.entries_visited) {
@@ -1501,9 +1517,7 @@ fn diagnose_scope_counts_unbounded(
                 continue;
             }
             let path = entry.path();
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file() {
+            if kind.is_file() {
                 if filters.matches(filter_root, &path) {
                     counts.eligible += 1;
                 } else {
@@ -3585,6 +3599,54 @@ mod tests {
         assert_eq!(counts.examined, 4);
         // One ignored file and the three fixed-skip directories, not their files.
         assert_eq!(counts.ignored, 4);
+    }
+
+    #[test]
+    fn empty_scope_shared_walker_builds_once_per_probe_and_keeps_counts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".aftignore"), "skip.log\n").unwrap();
+        for index in 0..32 {
+            let child = dir.path().join(format!("child-{index}"));
+            std::fs::create_dir_all(child.join("nested")).unwrap();
+            std::fs::write(child.join("nested/leaf.rs"), "fn leaf() {}\n").unwrap();
+            std::fs::create_dir(child.join("target")).unwrap();
+            std::fs::write(child.join("target/hidden.rs"), "not examined\n").unwrap();
+        }
+        let filters = build_path_filters(&["*.nomatch".to_string()], &[]).unwrap();
+        let before = TARGET_WALK_BUILDERS.with(std::cell::Cell::get);
+        let probe = || {
+            diagnose_scope_counts_unbounded(
+                dir.path(),
+                dir.path(),
+                &filters,
+                false,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap()
+        };
+        let first = probe();
+        assert_eq!(TARGET_WALK_BUILDERS.with(std::cell::Cell::get) - before, 1);
+        assert_eq!(
+            (
+                first.examined,
+                first.filtered,
+                first.eligible,
+                first.ignored
+            ),
+            (33, 33, 0, 32)
+        );
+        std::fs::write(dir.path().join("skip.log"), "new ignored child\n").unwrap();
+        let second = probe();
+        assert_eq!(TARGET_WALK_BUILDERS.with(std::cell::Cell::get) - before, 2);
+        assert_eq!(
+            (
+                second.examined,
+                second.filtered,
+                second.eligible,
+                second.ignored
+            ),
+            (34, 33, 0, 33)
+        );
     }
 
     #[test]

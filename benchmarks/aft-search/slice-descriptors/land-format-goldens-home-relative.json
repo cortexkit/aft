@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "format-goldens-home-relative"
+  ],
+  "note": "Test-only: the subc_format golden comparison normalizes the ~-relative spelling of the project root. No product code changes."
+}
