@@ -381,13 +381,6 @@ if [[ "$unit_runner" != "cargo" && "$unit_runner" != "nextest" ]]; then
   exit 2
 fi
 
-# Keep focused phase selections byte-for-byte compatible: lint is part of the
-# default all-phases gate, while an explicit subset remains responsible only for
-# the phases it names (CI already runs the workspace lint separately).
-if [[ "${AFT_GATE_PHASES:-all}" == "all" ]]; then
-  run_phase "bunx biome check ." bunx biome check .
-fi
-
 if [[ "$runner" == "cargo" ]]; then
   if [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
     run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
@@ -507,6 +500,12 @@ if phase_enabled lib-shard \
 fi
 
 if phase_enabled lib; then
+  # Native shell audit tests launch the real CLI, not the library harness.
+  # Archive consumers already carry that executable and must not rebuild it.
+  if [[ -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
+    run_phase "cargo build -p agent-file-tools --bin aft (native library-test prerequisite)" \
+      gate_cargo build -p agent-file-tools --bin aft
+  fi
   # The platform-verifier TLS test spawns a subprocess whose keychain trust
   # evaluation is unbounded on Macs with third-party root CAs (NordVPN: ~10s
   # quiet, minutes under full-suite load — blew a 600s budget twice on

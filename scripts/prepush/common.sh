@@ -13,6 +13,11 @@ prepush_init() {
   lane_start=$SECONDS
   failures=()
   if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    if [[ -n "${PREPUSH_COMMIT:-}" && "$PREPUSH_COMMIT" != "$(git rev-parse HEAD)" ]]; then
+      echo 'Printed lane belongs to a different commit; regenerate --print-lanes after committing.'
+      echo "GATE FAILED: $lane provenance"
+      return 2
+    fi
     git log -1 --format='%H %s'
     git log -1 >> "$lane_log"
   else

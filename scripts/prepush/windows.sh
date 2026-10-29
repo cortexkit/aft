@@ -13,13 +13,14 @@ export AFT_GATE_LOG_DIR="$log_dir"
 prepush_step tool-versions bash -c 'set -euo pipefail; cargo --version; rustc --version; cargo nextest --version; bun --version'
 prepush_step python-version python -c 'import sys; print(sys.version); assert sys.version_info >= (3, 14), "CI archive probes require Python 3.14+"'
 prepush_step storage-preflight bash scripts/windows-gate.sh --filter gate_hermeticity_tests::gate_resolves_every_user_config_and_state_path_under_the_gate_homes
-export AFT_NEXTEST_ARCHIVE_FILE="$PWD/target/prepush-windows-nextest.tar.zst"
+AFT_NEXTEST_ARCHIVE_FILE="$(cygpath -m "$PWD/target/prepush-windows-nextest.tar.zst")"
+export AFT_NEXTEST_ARCHIVE_FILE
 prepush_step archive cargo nextest archive --workspace \
   -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' \
   --archive-file "$AFT_NEXTEST_ARCHIVE_FILE"
 prepush_step tls python scripts/ci-windows-probes.py --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --probe tls || true
 prepush_step backtrace python scripts/ci-windows-probes.py --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --probe backtrace || true
-prepush_step inventory env AFT_UNIT_PARTITION_COUNT=6 python3 scripts/rust-test-inventory-proof.py
+prepush_step inventory env AFT_UNIT_PARTITION_COUNT=6 python scripts/rust-test-inventory-proof.py
 for shard in 1 2 3 4 5 6; do
   prepush_step "unit-$shard" env AFT_GATE_PHASES=lib-shard AFT_NEXTEST_PARTITION="hash:$shard/6" \
     bash scripts/rust-test-gate.sh || true

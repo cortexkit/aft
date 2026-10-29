@@ -7,6 +7,7 @@ prepush_init fast-compile
 trap 'prepush_abort $?' EXIT
 prepush_step platform prepush_require_platform linux
 prepush_step versions bash -c 'set -euo pipefail; cargo --version; rustc --version; python3 --version'
+prepush_step workflow-tools bash -c 'command -v zstd'
 prepush_step feature-inventory python3 scripts/prepush/check-feature-matrix.py
 prepush_step linux-default cargo check --workspace --tests --locked
 for features in test-timing-hooks test-sandbox-launcher test-conformance-result-inputs \
