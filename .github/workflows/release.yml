@@ -113,11 +113,13 @@ jobs:
         # fallback silently masks the version-mismatch bug (we try to publish
         # vN, it already exists, we say success even though we wanted vN+1).
         #
-        # `agent-file-tools` depends on `aft-tokenizer` by path; cargo refuses
-        # to publish a crate whose path-only dep has no `version =`. Both
-        # crates therefore declare versions (synced by version-sync.mjs) and
-        # we publish `aft-tokenizer` first so `agent-file-tools` can resolve
-        # the published version on crates.io. The `--no-verify` flag on the
+        # `agent-file-tools` depends on `aft-tokenizer` and `aft-secret-rules`
+        # by path; cargo refuses to publish a crate whose path-only dep has no
+        # `version =` or isn't on crates.io. All three crates therefore declare
+        # versions (synced by version-sync.mjs) and we publish the two leaf
+        # crates first so `agent-file-tools` can resolve them on crates.io.
+        # scripts/lib/test_native_release_workflow.py fails when a new path
+        # dependency is added without a publish line here. The `--no-verify` flag on the
         # tokenizer publish skips the build step (saves ~30s for a leaf crate
         # with no consumers in workspace until `agent-file-tools` resolves it
         # from crates.io after publish settles).
@@ -136,7 +138,9 @@ jobs:
           # already existed, agent-file-tools never published.)
           cargo publish --package aft-tokenizer \
             || { ec=$?; cargo publish --package aft-tokenizer --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
-          # Wait briefly for the new tokenizer version to become visible on
+          cargo publish --package aft-secret-rules \
+            || { ec=$?; cargo publish --package aft-secret-rules --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+          # Wait briefly for the new leaf crate versions to become visible on
           # crates.io's sparse index before publishing `agent-file-tools` —
           # otherwise the verify step in the second publish can race against
           # index propagation and fail with "no matching package found".
