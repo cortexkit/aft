@@ -8,7 +8,9 @@ trap 'prepush_abort $?' EXIT
 prepush_step platform prepush_require_platform linux
 export CI=1
 unset AFT_STORAGE_DIR AFT_CACHE_DIR
+prepush_step prerequisites bash scripts/prepush/require-tools.sh linux bun node cargo npm rg docker timeout gh unzip
 prepush_step tool-versions bash -c 'set -euo pipefail; bun --version; node --version; cargo --version; rg --version'
+prepush_step docker-daemon bash scripts/prepush/require-tools.sh linux --probe 'Docker daemon' docker version
 prepush_step dependencies bun install --frozen-lockfile
 prepush_step bridge bun run --cwd packages/aft-bridge build
 prepush_step pi bun run --cwd packages/pi-plugin build

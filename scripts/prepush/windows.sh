@@ -10,8 +10,10 @@ export CI=1 AFT_SKIP_BOX_GATE=1 AFT_TEST_DIAG=1
 export CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only
 export NEXTEST_TEST_THREADS=4 AFT_UNIT_TEST_RUNNER=nextest AFT_GATE_SKIP_RELEASE_STORM=1
 export AFT_GATE_LOG_DIR="$log_dir"
+prepush_step prerequisites bash scripts/prepush/require-tools.sh windows cargo rustc cargo-nextest bun node npm python cygpath timeout pwsh
 prepush_step tool-versions bash -c 'set -euo pipefail; cargo --version; rustc --version; cargo nextest --version; bun --version'
-prepush_step python-version python -c 'import sys; print(sys.version); assert sys.version_info >= (3, 14), "CI archive probes require Python 3.14+"'
+prepush_step python-version bash scripts/prepush/require-tools.sh windows --probe 'Python 3.14+' \
+  python -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 14) else 1)'
 prepush_step storage-preflight bash scripts/windows-gate.sh --filter gate_hermeticity_tests::gate_resolves_every_user_config_and_state_path_under_the_gate_homes
 AFT_NEXTEST_ARCHIVE_FILE="$(cygpath -m "$PWD/target/prepush-windows-nextest.tar.zst")"
 export AFT_NEXTEST_ARCHIVE_FILE

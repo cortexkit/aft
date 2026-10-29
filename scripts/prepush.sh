@@ -9,8 +9,7 @@ fi
 if [[ "${1:-fast}" != fast || $# -gt 1 ]]; then
   echo 'Usage: scripts/prepush.sh [fast | --print-lanes]'
   echo 'Runs local fast and prints numbered remote commands; this script never submits jobs.'
-  echo 'Server fast phase: scripts/prepush/fast-compile.sh (linux,4c)'
-  echo 'Full lanes: scripts/prepush/{linux-rust,linux-typescript,linux-search,windows,macos}.sh'
+  echo 'Remote lanes: scripts/prepush/{linux,windows,macos}.sh'
   exit 2
 fi
 prepush_init fast

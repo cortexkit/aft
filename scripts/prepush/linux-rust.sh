@@ -11,13 +11,16 @@ export CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-ta
 export NEXTEST_TEST_THREADS=num-cpus AFT_UNIT_TEST_RUNNER=nextest
 export AFT_GATE_SKIP_RELEASE_STORM=1 AFT_TEST_REQUIRE_RUST_ANALYZER=1
 export AFT_GATE_LOG_DIR="$log_dir"
+export CARGO_NET_OFFLINE=true
+prepush_step prerequisites bash scripts/prepush/require-tools.sh linux cargo rustc rustup cargo-nextest bun node npm python3
 prepush_step tool-versions bash -c 'set -euo pipefail; cargo --version; rustc --version; cargo nextest --version; bun --version; printf "HOME=%s TMPDIR=%s\n" "$HOME" "${TMPDIR:-}"'
+prepush_step rust-analyzer bash scripts/prepush/require-tools.sh linux --probe rust-analyzer rust-analyzer --version
+prepush_step msrv-toolchain bash scripts/prepush/require-tools.sh linux --probe 'Rust 1.92.0 toolchain' rustup run 1.92.0 cargo --version
 prepush_step sandbox-capability python3 scripts/prepush/linux-capabilities.py
-prepush_step rust-analyzer rust-analyzer --version
-prepush_step dependencies bun install --frozen-lockfile
-prepush_step pyright npm install --prefix target/prepush-pyright --no-save pyright@1.1.411
+prepush_step dependencies bun install --frozen-lockfile --offline
+prepush_step pyright-cache npm install --prefix target/prepush-pyright --no-save --offline pyright@1.1.411
 export PATH="$PWD/target/prepush-pyright/node_modules/.bin:$PATH"
-prepush_step typescript-servers bash scripts/install-typescript-test-servers.sh "$PWD/target/prepush-typescript"
+prepush_step typescript-server-cache bash scripts/install-typescript-test-servers.sh "$PWD/target/prepush-typescript" --offline
 export AFT_TEST_TS7_NODE_MODULES="$PWD/target/prepush-typescript/ts7/node_modules"
 export AFT_TEST_TS5_NODE_MODULES="$PWD/target/prepush-typescript/ts5/node_modules"
 prepush_step debug-binary cargo build -p agent-file-tools --bin aft
@@ -42,7 +45,6 @@ prepush_step linux-contracts bash scripts/prepush/linux-contracts.sh || true
 prepush_step storm-build cargo test --profile ci-storm --locked -p agent-file-tools --test integration --no-run --timings || true
 prepush_step storm-inventory bash -c 'set -euo pipefail; cargo nextest list --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E "test(subc_storm)" -T json > target/storm-inventory.json; python3 scripts/ci-storm-inventory.py --check-inventory target/storm-inventory.json' || true
 prepush_step storm cargo nextest run --no-fail-fast --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)' || true
-prepush_step msrv-toolchain rustup run 1.92.0 cargo --version || true
 prepush_step msrv rustup run 1.92.0 cargo check --workspace --all-targets --locked || true
 trap - EXIT
 prepush_finish

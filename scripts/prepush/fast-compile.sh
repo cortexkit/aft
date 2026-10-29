@@ -6,8 +6,9 @@ source scripts/prepush/common.sh
 prepush_init fast-compile
 trap 'prepush_abort $?' EXIT
 prepush_step platform prepush_require_platform linux
+prepush_step prerequisites bash scripts/prepush/require-tools.sh linux cargo rustc rustup python3 zstd
 prepush_step versions bash -c 'set -euo pipefail; cargo --version; rustc --version; python3 --version'
-prepush_step workflow-tools bash -c 'command -v zstd'
+export CARGO_NET_OFFLINE=true
 prepush_step feature-inventory python3 scripts/prepush/check-feature-matrix.py
 prepush_step linux-default cargo check --workspace --tests --locked
 for features in test-timing-hooks test-sandbox-launcher test-conformance-result-inputs \
@@ -17,7 +18,8 @@ for features in test-timing-hooks test-sandbox-launcher test-conformance-result-
 done
 # Linux cross-checks catch Windows cfg/type errors; native MSVC runtime tests
 # and strict warnings checks remain mandatory in the Windows lane.
-prepush_step windows-target rustup target add x86_64-pc-windows-gnu
+prepush_step windows-target bash scripts/prepush/require-tools.sh linux --probe 'Rust target x86_64-pc-windows-gnu' \
+  bash -c 'set -o pipefail; rustup target list --installed | grep -Fx x86_64-pc-windows-gnu'
 prepush_step windows-default env RUSTFLAGS='-D warnings' cargo check --workspace --tests --locked --target x86_64-pc-windows-gnu
 prepush_step windows-test-timing-hooks env RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --tests --locked \
   --features test-timing-hooks,test-sandbox-launcher,test-conformance-result-inputs --target x86_64-pc-windows-gnu

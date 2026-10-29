@@ -6,6 +6,8 @@ source scripts/prepush/common.sh
 prepush_init linux-search
 trap 'prepush_abort $?' EXIT
 prepush_step platform prepush_require_platform linux
+prepush_step prerequisites bash scripts/prepush/require-tools.sh linux cargo rustc python3 git
+prepush_step tool-versions bash -c 'set -euo pipefail; cargo --version; python3 --version; git --version'
 prepush_step imports scripts/telemetry/imports-resolve.sh --spec benchmarks/aft-search/B1.md --snapshot 30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17
 prepush_step harness scripts/telemetry/cost-gate.sh --search-quality --self-test
 prepush_step mode-tests python3 benchmarks/aft-search/ci_quality_mode.py --self-test

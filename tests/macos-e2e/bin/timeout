@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Bound the shared E2E harness's --signal=KILL command without GNU coreutils."""
+import math
+import os
+import signal
+import subprocess
+import sys
+
+
+def main(args):
+    if args == ["--version"]:
+        print("AFT E2E Python timeout (SIGKILL process-group deadline)")
+        return 0
+    if args[:1] == ["--signal=KILL"]:
+        args = args[1:]
+    else:
+        print("timeout fallback requires --signal=KILL SECONDS COMMAND [ARGS...]", file=sys.stderr)
+        return 125
+    if len(args) < 2:
+        print("timeout fallback requires a duration and command", file=sys.stderr)
+        return 125
+    try:
+        seconds = float(args[0])
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError()
+    except ValueError:
+        print("timeout fallback duration must be non-negative seconds", file=sys.stderr)
+        return 125
+    try:
+        child = subprocess.Popen(args[1:], start_new_session=True)
+    except FileNotFoundError:
+        return 127
+    except PermissionError:
+        return 126
+
+    def kill_group():
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def interrupted(signum, _frame):
+        # The child has its own session; cancellation must not leave it alive.
+        kill_group()
+        child.wait()
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, interrupted)
+    try:
+        status = child.wait(timeout=seconds if seconds else None)
+        return status if status >= 0 else 128 - status
+    except subprocess.TimeoutExpired:
+        kill_group()
+        child.wait()
+        # Match GNU timeout's KILL result, which the shared harness recognizes.
+        return 137
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

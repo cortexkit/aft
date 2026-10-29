@@ -8,10 +8,12 @@ import sys
 
 
 LANES = (
-    ("fast-compile", "linux,4c,net", 4, 2700),
-    ("linux-rust", "linux,16c,net", 16, 2700),
-    ("linux-typescript", "linux,16c,net", 16, 2700),
-    ("linux-search", "linux,16c,net", 16, 5400),
+    # Fast-compile and Rust use caches only. The later TypeScript/Docker and
+    # search steps fetch images, packages and pinned corpora, so this single
+    # job needs net: network access is granted per job, not per shell step.
+    # One workspace runs one job at a time. Run all Linux phases sequentially
+    # in one allocation, including fast-compile in the 16-vCPU total.
+    ("linux", "linux,16c,net", 16, 7200),
     ("windows", "windows", None, 2700),
     ("macos", "macos", 4, 2700),
 )
@@ -34,7 +36,7 @@ def plan():
         ])
         item = {"number": number, "lane": lane, "command": command, "runon": runon, "vcpus": cpus, "timeout": seconds * 1000}
         if runon.startswith("linux,"):
-            item["return_paths"] = [f".cortexkit/internal-docs/investigations/prepush/{lane}.log"]
+            item["return_paths"] = [f".cortexkit/internal-docs/investigations/prepush/{name}.log" for name in ("linux", "fast-compile", "linux-rust", "linux-typescript", "linux-search")]
         yield item
 
 

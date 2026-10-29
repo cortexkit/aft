@@ -16,7 +16,14 @@ TS7_VERSION="7.0.2"
 TS5_VERSION="5.9.3"
 TSLS_VERSION="6.0.1"
 
-dest="${1:?usage: install-typescript-test-servers.sh <dir>}"
+dest="${1:?usage: install-typescript-test-servers.sh <dir> [--offline]}"
+# The prepush Rust phase passes --offline; CI keeps its network-enabled default.
+install_flags=()
+case "${2:-}" in
+  '') ;;
+  --offline) install_flags=(--offline) ;;
+  *) echo 'usage: install-typescript-test-servers.sh <dir> [--offline]' >&2; exit 2 ;;
+esac
 mkdir -p "$dest"
 dest="$(cd "$dest" && pwd)"
 
@@ -32,7 +39,7 @@ install_into() {
   rm -rf "$dir"
   mkdir -p "$dir"
   printf '{"name":"%s","private":true}\n' "$(basename "$dir")" >"$dir/package.json"
-  (cd "$dir" && bun add --exact --dev "$@")
+  (cd "$dir" && bun add ${install_flags[@]+"${install_flags[@]}"} --exact --dev "$@")
 }
 
 ts7="$dest/ts7"

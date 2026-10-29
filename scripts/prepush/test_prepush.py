@@ -157,17 +157,63 @@ class PrepushTests(unittest.TestCase):
             result = subprocess.run(["bash", str(HERE.parent / "prepush.sh"), "--print-lanes"], env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = [json.loads(line) for line in result.stdout.splitlines()]
-            self.assertEqual(len(rows), 6)
-            self.assertEqual([row["number"] for row in rows], [1, 2, 3, 4, 5, 6])
-            self.assertEqual([row["lane"] for row in rows], ["fast-compile", "linux-rust", "linux-typescript", "linux-search", "windows", "macos"])
-            self.assertEqual(rows[0]["vcpus"], 4)
-            self.assertEqual({r["runon"] for r in rows}, {"linux,4c,net", "linux,16c,net", "windows", "macos"})
+            self.assertEqual(len(rows), 3)
+            self.assertEqual([row["number"] for row in rows], [1, 2, 3])
+            self.assertEqual([row["lane"] for row in rows], ["linux", "windows", "macos"])
+            self.assertEqual([row["vcpus"] for row in rows], [16, None, 4])
+            self.assertEqual([row["runon"] for row in rows], ["linux,16c,net", "windows", "macos"])
+            self.assertLessEqual(sum(row["vcpus"] for row in rows if row["runon"].startswith("linux,")), 16)
             for row in rows:
                 self.assertIn("PREPUSH_COMMIT=", row["command"])
                 self.assertIn("PREPUSH_BASE=", row["command"])
                 self.assertIn("PREPUSH_BRANCH=", row["command"])
                 self.assertNotIn("ck motor", row["command"])
             self.assertFalse(marker.exists())
+
+    def test_linux_budget_includes_fast_compile_and_runs_phases_in_order(self):
+        wrapper = (HERE / "linux.sh").read_text()
+        phases = ["prepush_step fast-compile", "prepush_step rust", "prepush_step typescript", "prepush_step search"]
+        self.assertEqual([wrapper.index(phase) for phase in phases], sorted(wrapper.index(phase) for phase in phases))
+        self.assertNotIn("background", wrapper)
+        self.assertNotIn("ck motor", wrapper)
+
+    def test_missing_tool_names_the_runner_without_a_deep_failure(self):
+        result = subprocess.run(["bash", str(HERE / "require-tools.sh"), "linux", "aft-prepush-deliberately-missing-tool"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stderr.splitlines(), ["PREREQUISITE FAILED: runner=linux missing required tool: aft-prepush-deliberately-missing-tool"])
+
+    def test_unusable_tool_probe_names_the_required_installation(self):
+        result = subprocess.run(["bash", str(HERE / "require-tools.sh"), "windows", "--probe", "Python 3.14+", sys.executable, "-c", "raise SystemExit(7)"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stderr.splitlines(), ["PREREQUISITE FAILED: runner=windows required tool unavailable: Python 3.14+"])
+
+    def test_offline_lanes_do_not_install_rust_targets_or_fetch_packages(self):
+        compile_lane = (HERE / "fast-compile.sh").read_text()
+        rust_lane = (HERE / "linux-rust.sh").read_text()
+        self.assertIn("export CARGO_NET_OFFLINE=true", compile_lane)
+        self.assertIn("export CARGO_NET_OFFLINE=true", rust_lane)
+        self.assertNotIn("rustup target add", compile_lane)
+        self.assertIn("bun install --frozen-lockfile --offline", rust_lane)
+        self.assertIn("--no-save --offline pyright@", rust_lane)
+        self.assertIn('"$PWD/target/prepush-typescript" --offline', rust_lane)
+
+    def test_typescript_server_installer_only_requests_offline_when_selected(self):
+        scratch = Path("target/scratch")
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temp:
+            temp = Path(temp).resolve()
+            calls = temp / "calls"
+            bun = temp / "bun"
+            bun.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\nexit 47\n")
+            bun.chmod(0o755)
+            env = {**os.environ, "PATH": f"{temp}{os.pathsep}{os.environ['PATH']}"}
+            installer = HERE.parent / "install-typescript-test-servers.sh"
+            for name, flags in (("ci", []), ("cached", ["--offline"])):
+                result = subprocess.run(["bash", str(installer), str(temp / name), *flags], env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 47)
+            lines = calls.read_text().splitlines()
+            self.assertTrue(lines[0].startswith("add --exact --dev typescript@"))
+            self.assertTrue(lines[1].startswith("add --offline --exact --dev typescript@"))
 
     def test_script_submit_mode_does_not_exist(self):
         result = subprocess.run(["bash", str(HERE.parent / "prepush.sh"), "--submit"], text=True, capture_output=True)
