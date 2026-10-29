@@ -5399,21 +5399,32 @@ pub(crate) fn capture_speech_policy() -> Result<
 }
 
 fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
-    use crate::gh_shim_speech::{Code, Refusal};
-    let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
-    let envelope: SignedManifest = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-    if envelope.artifact_id != MANIFEST_ARTIFACT_ID || envelope.envelope_version != ENVELOPE_VERSION
-    {
-        return Err(invalid());
+    let invalid = |check| {
+        crate::gh_shim_speech::snapshot_invalid(
+            "gh_shim::verified_speech_manifest",
+            check,
+            json!({"envelope_bytes": bytes.len()}),
+        )
+    };
+    let envelope: SignedManifest =
+        serde_json::from_slice(bytes).map_err(|_| invalid("envelope_json"))?;
+    if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
+        return Err(invalid("artifact_id"));
+    }
+    if envelope.envelope_version != ENVELOPE_VERSION {
+        return Err(invalid("envelope_version"));
     }
     let verified = verify_manifest_envelope(&envelope, compiled_manifest_trust_set())
-        .map_err(|_| invalid())?;
+        .map_err(|_| invalid("envelope_verification"))?;
     let manifest = verified.manifest;
-    manifest.validate().map_err(|_| invalid())?;
-    if manifest.schema_floor < SCHEMA_FLOOR
-        || manifest.issued_at_unix_secs > unix_seconds() + ISSUED_AT_FUTURE_SKEW.as_secs()
-    {
-        return Err(invalid());
+    manifest
+        .validate()
+        .map_err(|_| invalid("manifest_validation"))?;
+    if manifest.schema_floor < SCHEMA_FLOOR {
+        return Err(invalid("schema_floor"));
+    }
+    if manifest.issued_at_unix_secs > unix_seconds() + ISSUED_AT_FUTURE_SKEW.as_secs() {
+        return Err(invalid("issued_at_in_future"));
     }
     Ok(manifest)
 }

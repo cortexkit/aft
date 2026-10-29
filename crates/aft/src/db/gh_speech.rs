@@ -89,26 +89,42 @@ pub(crate) struct StoredAuthority {
     pub(crate) generation: i64,
 }
 
-fn unavailable() -> Refusal {
-    Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid")
+fn unavailable(site: &str, check: &str, identifiers: serde_json::Value) -> Refusal {
+    crate::gh_shim_speech::snapshot_invalid(site, check, identifiers)
 }
 
 fn db_error(error: rusqlite::Error) -> Refusal {
     if super::is_busy_error(&error) {
         Refusal::new(Code::AuthorityUnavailable, "storage_busy")
     } else {
-        log::warn!("speech authority database operation failed: {error}");
-        unavailable()
+        unavailable(
+            "db::gh_speech::db_error",
+            "database_operation",
+            serde_json::json!({"sqlite_code": format!("{:?}", error.sqlite_error_code())}),
+        )
     }
 }
 
 fn encoded(record: &AuthorityRecord) -> Result<(String, Vec<u8>), Refusal> {
-    let text = serde_json::to_string(record).map_err(|_| unavailable())?;
+    let text = serde_json::to_string(record).map_err(|_| {
+        unavailable(
+            "db::gh_speech::encoded",
+            "record_encoding",
+            serde_json::json!({"incarnation": record.incarnation}),
+        )
+    })?;
     let hash = blake3::hash(text.as_bytes()).as_bytes().to_vec();
     Ok((text, hash))
 }
 
 fn load(conn: &rusqlite::Connection, incarnation: &str) -> Result<StoredAuthority, Refusal> {
+    let invalid = |check| {
+        unavailable(
+            "db::gh_speech::load",
+            check,
+            serde_json::json!({"incarnation": incarnation}),
+        )
+    };
     let row: Option<(String, Vec<u8>, Option<Vec<u8>>, String, i64, String, String, String, String)> = conn
         .query_row(
             "SELECT record_json,record_digest,ticket_digest,phase,generation,minting_run,harness,session_id,task_id
@@ -119,12 +135,13 @@ fn load(conn: &rusqlite::Connection, incarnation: &str) -> Result<StoredAuthorit
     let Some((text, digest, ticket_digest, phase, generation, minting_run, harness, session, task)) =
         row
     else {
-        return Err(unavailable());
+        return Err(invalid("authority_row_missing"));
     };
     if digest.as_slice() != blake3::hash(text.as_bytes()).as_bytes() {
-        return Err(unavailable());
+        return Err(invalid("record_digest_mismatch"));
     }
-    let record: AuthorityRecord = serde_json::from_str(&text).map_err(|_| unavailable())?;
+    let record: AuthorityRecord =
+        serde_json::from_str(&text).map_err(|_| invalid("record_decode"))?;
     record.launch.validate()?;
     if record.incarnation != incarnation
         || record.minting_run != minting_run
@@ -132,7 +149,17 @@ fn load(conn: &rusqlite::Connection, incarnation: &str) -> Result<StoredAuthorit
         || record.session_id != session
         || record.task_id != task
     {
-        return Err(unavailable());
+        return Err(invalid(if record.incarnation != incarnation {
+            "incarnation_mismatch"
+        } else if record.minting_run != minting_run {
+            "minting_run_mismatch"
+        } else if record.harness != harness {
+            "harness_mismatch"
+        } else if record.session_id != session {
+            "session_mismatch"
+        } else {
+            "task_mismatch"
+        }));
     }
     Ok(StoredAuthority {
         record,
@@ -192,8 +219,20 @@ impl Store {
         let mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .map_err(db_error)?;
-        if mode != "wal" || super::current_schema_version(&conn).map_err(db_error)? < 22 {
-            return Err(unavailable());
+        if mode != "wal" {
+            return Err(unavailable(
+                "db::gh_speech::connect",
+                "journal_not_wal",
+                serde_json::json!({}),
+            ));
+        }
+        let schema = super::current_schema_version(&conn).map_err(db_error)?;
+        if schema < 22 {
+            return Err(unavailable(
+                "db::gh_speech::connect",
+                "schema_too_old",
+                serde_json::json!({"schema": schema}),
+            ));
         }
         Ok(conn)
     }
@@ -206,7 +245,21 @@ impl Store {
             || record.session_id.is_empty()
             || record.seal.is_some()
         {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::capture",
+                if record.incarnation.is_empty() {
+                    "incarnation_empty"
+                } else if record.minting_run.is_empty() {
+                    "minting_run_empty"
+                } else if record.task_id.is_empty() {
+                    "task_empty"
+                } else if record.session_id.is_empty() {
+                    "session_empty"
+                } else {
+                    "already_sealed"
+                },
+                serde_json::json!({"incarnation": record.incarnation, "session_id": record.session_id, "task_id": record.task_id}),
+            ));
         }
         let (text, digest) = encoded(record)?;
         let mut conn = self.connect()?;
@@ -239,7 +292,15 @@ impl Store {
         check_scopes(&tx, &stored.record.launch)?;
         if stored.phase != "candidate" || stored.record.seal.as_ref().is_some_and(|old| old != seal)
         {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::seal",
+                if stored.phase != "candidate" {
+                    "not_candidate"
+                } else {
+                    "seal_mismatch"
+                },
+                serde_json::json!({"incarnation": incarnation, "generation": stored.generation}),
+            ));
         }
         stored.record.seal = Some(seal.clone());
         let (text, digest) = encoded(&stored.record)?;
@@ -265,7 +326,17 @@ impl Store {
             || stored.phase != "candidate"
             || stored.record.seal.is_none()
         {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::activate",
+                if stored.record.minting_run != minting_run {
+                    "minting_run_mismatch"
+                } else if stored.phase != "candidate" {
+                    "not_candidate"
+                } else {
+                    "seal_missing"
+                },
+                serde_json::json!({"incarnation": incarnation, "generation": stored.generation}),
+            ));
         }
         if let Some(reason) = &stored.record.ineligible_reason {
             return Err(Refusal::new(Code::AuthorityUnavailable, reason));
@@ -317,7 +388,16 @@ impl Store {
             )
             .optional()
             .map_err(db_error)?;
-        let stored = load(&conn, &incarnation.ok_or_else(unavailable)?)?;
+        let stored = load(
+            &conn,
+            &incarnation.ok_or_else(|| {
+                unavailable(
+                    "db::gh_speech::find_digest",
+                    "ticket_row_missing",
+                    serde_json::json!({}),
+                )
+            })?,
+        )?;
         check_scopes(&conn, &stored.record.launch)?;
         check_not_revoked(&conn, &stored.record.incarnation)?;
         if stored.record.minting_run == current_run
@@ -326,7 +406,21 @@ impl Store {
             || stored.record.seal.is_none()
             || stored.record.ineligible_reason.is_some()
         {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::find_digest",
+                if stored.record.minting_run == current_run {
+                    "same_minting_run"
+                } else if stored.phase != "active" {
+                    "not_active"
+                } else if stored.ticket_digest.as_deref() != Some(digest.as_slice()) {
+                    "ticket_digest_mismatch"
+                } else if stored.record.seal.is_none() {
+                    "seal_missing"
+                } else {
+                    "ineligible"
+                },
+                serde_json::json!({"incarnation": stored.record.incarnation, "generation": stored.generation}),
+            ));
         }
         Ok(stored)
     }
@@ -386,7 +480,17 @@ impl Store {
         expect_json: &str,
     ) -> Result<(), Refusal> {
         if nonce.is_empty() || nonce.len() > 256 || incarnation.is_empty() {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::prepare_request",
+                if nonce.is_empty() {
+                    "nonce_empty"
+                } else if nonce.len() > 256 {
+                    "nonce_too_long"
+                } else {
+                    "incarnation_empty"
+                },
+                serde_json::json!({"incarnation": incarnation, "nonce_bytes": nonce.len()}),
+            ));
         }
         let mut conn = self.connect()?;
         let tx = conn
@@ -399,7 +503,19 @@ impl Store {
         match existing {
             Some((owner, digest, expect))
                 if owner == incarnation && digest == payload_digest && expect == expect_json => {}
-            Some(_) => return Err(unavailable()),
+            Some((owner, digest, _)) => {
+                return Err(unavailable(
+                    "db::gh_speech::prepare_request",
+                    if owner != incarnation {
+                        "nonce_owner_mismatch"
+                    } else if digest != payload_digest {
+                        "nonce_payload_mismatch"
+                    } else {
+                        "nonce_expect_mismatch"
+                    },
+                    serde_json::json!({"incarnation": incarnation}),
+                ))
+            }
             None => {
                 tx.execute("INSERT INTO gh_speech_requests(request_nonce,incarnation,payload_digest,expect_json,prepared_at_ms) VALUES(?1,?2,?3,?4,?5)",
                     params![nonce,incarnation,payload_digest.as_slice(),expect_json,super::call_ledger::now_ms()]).map_err(db_error)?;
@@ -499,16 +615,34 @@ fn validate_gate(
     if (stored.phase != "active" && !(allow_candidate && stored.phase == "candidate"))
         || stored.generation != expected_generation
     {
-        return Err(unavailable());
+        return Err(unavailable(
+            "db::gh_speech::validate_gate",
+            if stored.phase != "active" && !(allow_candidate && stored.phase == "candidate") {
+                "phase_mismatch"
+            } else {
+                "authority_generation_mismatch"
+            },
+            serde_json::json!({"incarnation": incarnation, "generation": stored.generation, "expected_generation": expected_generation, "allow_candidate": allow_candidate}),
+        ));
     }
     let prepared: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM gh_speech_requests WHERE request_nonce=?1 AND incarnation=?2)",
         params![nonce,incarnation], |row| row.get(0),
     ).map_err(db_error)?;
     if !prepared {
-        return Err(unavailable());
+        return Err(unavailable(
+            "db::gh_speech::validate_gate",
+            "request_not_prepared",
+            serde_json::json!({"incarnation": incarnation}),
+        ));
     }
-    let start = stored.record.policy.as_ref().ok_or_else(unavailable)?;
+    let start = stored.record.policy.as_ref().ok_or_else(|| {
+        unavailable(
+            "db::gh_speech::validate_gate",
+            "start_policy_missing",
+            serde_json::json!({"incarnation": incarnation}),
+        )
+    })?;
     if current_policy.artifact_id != start.artifact_id || current_policy.version < start.version {
         return Err(rollback());
     }

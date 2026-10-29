@@ -1,5 +1,37 @@
 use super::*;
 
+pub(crate) fn assert_snapshot_warning(
+    operation: impl FnOnce() -> Refusal,
+    site: &str,
+    check: &str,
+    identifiers: Value,
+) {
+    let (refusal, lines) = crate::logging::capture_log_lines(operation);
+    assert_eq!(
+        refusal,
+        Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid")
+    );
+    assert_eq!(lines.len(), 1, "one warning per refusal: {lines:?}");
+    let diagnostic = lines[0]
+        .strip_prefix("gh speech snapshot invalid: ")
+        .unwrap();
+    assert!(!diagnostic.contains(['\n', '\r']));
+    assert_eq!(
+        serde_json::from_str::<Value>(diagnostic).unwrap(),
+        json!({"site": site, "check": check, "identifiers": identifiers}),
+    );
+}
+
+#[test]
+fn snapshot_warning_is_single_line_and_kept_out_of_the_refusal() {
+    assert_snapshot_warning(
+        || snapshot_invalid("test_site", "test_check", json!({"task_id": "task\n\"one"})),
+        "test_site",
+        "test_check",
+        json!({"task_id": "task\n\"one"}),
+    );
+}
+
 #[test]
 fn approved_identity_template_is_exact() {
     assert_eq!(IDENTITY_TEXT, "this command's bot identity no longer matches the repository's bot ({reason}); start the command again from a live session.");
