@@ -677,7 +677,7 @@ fn views_on_two_processes_single_flight_checkout_chunk() {
         let deadline = Instant::now() + DEADLINE;
         loop {
             let status = process.send(r#"{"id":"ready","command":"status"}"#);
-            if status.to_string().contains("semantic: ready") {
+            if status["data"]["semantic_index"]["status"] == "ready" {
                 break;
             }
             assert!(

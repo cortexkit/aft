@@ -494,6 +494,9 @@ impl CheckoutSemantic {
                     true,
                 )
                 .map_err(|error| RefreshError::classify(error.to_string()))?;
+            if report.pending.is_some() {
+                return Ok((report, false));
+            }
             let keys = self
                 .plane
                 .completed_keys(&self.owner, &draft, &pending)
@@ -595,7 +598,9 @@ impl CheckoutSemantic {
         self.refresh_with_admission(budget, embed, &mut |phase| match phase {
             FillAdmission::Preparation => admit(true),
             FillAdmission::Cold => admit(false),
-            FillAdmission::SuspendCold | FillAdmission::ResumeCold => Ok(()),
+            FillAdmission::SuspendCold
+            | FillAdmission::ResumeCold
+            | FillAdmission::CheckCurrent => Ok(()),
         })
     }
 
@@ -644,6 +649,9 @@ impl CheckoutSemantic {
         // Inherited base entries first: once their successor is published,
         // every checkout of the base serves them, not only this one.
         let base_report = self.fill_base(budget, embed, admit)?;
+        if base_report.pending.is_some() {
+            return Ok(base_report);
+        }
         if base_report != FillReport::default() {
             snapshot = self.installed();
         }
@@ -1758,6 +1766,8 @@ enum FillOutcome {
         progress: bool,
         reason: Option<String>,
     },
+    /// Coordination is pending, not a failed/unavailable semantic backend.
+    Contended,
     /// The lane is no longer this worker's.
     Stop,
     /// The lane is still this worker's, but its root lost its route while the
@@ -1875,6 +1885,8 @@ fn serve_fills_with_status<F>(
     let mut backoff = schedule.retry_initial;
     let mut retry_after = None;
     let mut first = true;
+    let mut contention_started = None;
+    let mut contention_attempts = 0u64;
     loop {
         if !first {
             let woke = match retry_after {
@@ -1931,12 +1943,62 @@ fn serve_fills_with_status<F>(
         };
         match outcome {
             FillOutcome::Stop => return,
+            FillOutcome::Contended => {
+                let started = *contention_started.get_or_insert_with(Instant::now);
+                contention_attempts += 1;
+                // Capped, non-FIFO jitter avoids synchronized process convoys.
+                let salt = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64
+                    ^ u64::from(std::process::id())
+                    ^ contention_attempts;
+                let half = backoff / 2;
+                let jitter =
+                    Duration::from_nanos(salt % (half.as_nanos().min(u64::MAX as u128) as u64 + 1));
+                let wait = (half + jitter).min(schedule.retry_max);
+                schedule_retry(
+                    slot,
+                    epoch,
+                    super::semantic_batch_lease::PENDING_REASON,
+                    wait,
+                    schedule.retry_initial,
+                );
+                retry_after = Some((wait, true));
+                if let Some(runtime) = slot.upgrade().and_then(|slot| slot.runtime()) {
+                    runtime.clear_unavailable();
+                }
+                if let Some(status) = status {
+                    set_status(
+                        slot,
+                        epoch,
+                        status,
+                        crate::context::SemanticIndexStatus::Building {
+                            stage: super::semantic_batch_lease::PENDING_REASON.into(),
+                            files: None,
+                            entries_done: None,
+                            entries_total: None,
+                        },
+                    );
+                }
+                crate::slog_info!(
+                    "semantic batch pending retry_count={} wait_age_ms={} retry_ms={}",
+                    contention_attempts,
+                    started.elapsed().as_millis(),
+                    wait.as_millis()
+                );
+                #[cfg(test)]
+                observe_fill(&schedule.root, "contended");
+                backoff = (backoff * 2).min(schedule.retry_max);
+            }
             FillOutcome::Parked => {
                 #[cfg(test)]
                 observe_fill(&schedule.root, "parked");
                 retry_after = None;
             }
             FillOutcome::Settled => {
+                contention_started = None;
+                contention_attempts = 0;
                 clear_retry(slot, epoch);
                 if let Some(status) = status {
                     let value = match slot
@@ -2092,17 +2154,23 @@ where
                     permit.ok_or_else(|| "semantic lane superseded".to_owned())
                 };
                 let mut embedding = |texts| {
+                    // Inflight memory stays admitted, but HTTP must not occupy
+                    // cold CPU capacity. Chunk persistence runs under S/G without
+                    // cold; the fill readmits only after releasing S/G and claims.
                     cold_permit.borrow_mut().take();
                     crate::cold_build_limiter::progress::stage("waiting for embedding backend");
                     let result = embed(texts);
-                    // Chunk-gate waiters release cold admission before blocking,
-                    // so they cannot keep cold slots while the gate owner resumes.
-                    *cold_permit.borrow_mut() = Some(acquire(&schedule.limiter, LIMITER_KIND)?);
                     crate::cold_build_limiter::progress::stage("storing embeddings");
                     result
                 };
                 let report = runtime
                     .refresh_with_admission(budget, &mut embedding, &mut |phase| {
+                        if !is_current(slot, epoch) {
+                            return Err("semantic lane superseded".into());
+                        }
+                        if phase == FillAdmission::CheckCurrent {
+                            return Ok(());
+                        }
                         if phase == FillAdmission::SuspendCold {
                             cold_permit.borrow_mut().take();
                             crate::cold_build_limiter::progress::stage(
@@ -2171,6 +2239,22 @@ where
         }
         match refresh {
             Ok(report) => {
+                if report.pending == Some(super::semantic::FillPending::LocalContention) {
+                    // refresh, its file claims and all scoped permits have
+                    // returned. Park only this background worker, checking lane
+                    // cancellation at a bounded interval, never under U/S/G.
+                    std::thread::park_timeout(
+                        schedule.retry_initial.min(Duration::from_millis(100)),
+                    );
+                    continue;
+                }
+                if let Some(pending) = &report.pending {
+                    crate::slog_debug!(
+                        "semantic batch refresh pending root={} outcome={pending:?}",
+                        schedule.root.display()
+                    );
+                    return FillOutcome::Contended;
+                }
                 if report.model_calls > 0
                     || report.installed > 0
                     || !report.errors.is_empty()

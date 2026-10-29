@@ -2454,6 +2454,180 @@ fn semantic_fill_releases_cold_slot_during_model_call_and_readmits_before_store(
     assert!(query(&runtime, "delayed vector").complete());
 }
 
+#[test]
+fn semantic_batch_lease_durable_chunks_reused_during_cold_readmission() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let sibling_root = tempfile::tempdir().unwrap();
+    for root in [root.path(), sibling_root.path()] {
+        write_tree(root, &[("file.rs", "pub fn readmission_chunk() {}\n")]);
+    }
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Model::default().embed(texts)
+                },
+            )
+        })
+    };
+    entered_rx.recv().unwrap();
+    // Provider I/O holds neither root publication nor a registry write barrier.
+    crate::blob_store::v3::publish(storage.path(), "family", 0, None, |_| Ok(())).unwrap();
+    let non_semantic = limiter.try_acquire().expect("HTTP released cold admission");
+    release_tx.send(()).unwrap();
+    assert!(
+        wait_for_fill_queue(&limiter),
+        "owner must readmit after saving chunks"
+    );
+    assert_eq!(
+        SemanticRows::of(&runtime).usage().unwrap().rows,
+        1,
+        "only the protected chunk, not its file run, is durable yet"
+    );
+    // Disable resident shortcuts so reuse must read the saved chunk row.
+    runtime.plane().arena("family").set_chunk_shortcut(false);
+    let sibling = CheckoutSemantic::new(
+        &crate::root_cache::StoragePaths::same(storage.path()),
+        "family",
+        "readmission-sibling",
+        sibling_root.path(),
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
+    sibling.load().unwrap();
+    let report = sibling
+        .refresh(FillBudget::default(), &mut |_| {
+            panic!("durable chunk was re-embedded during cold readmission")
+        })
+        .unwrap();
+    assert_eq!(report.model_calls, 0);
+    assert!(query(&sibling, "readmission").complete());
+    runtime.plane().arena("family").set_chunk_shortcut(true);
+    drop(non_semantic);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    assert!(query(&runtime, "readmission").complete());
+}
+
+#[test]
+fn semantic_batch_lease_pending_releases_refresh_claims_and_capacity() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn held_chunk() {}\n")]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let preparation = crate::cold_build_limiter::isolated_limiter(1);
+    let inflight = crate::cold_build_limiter::isolated_limiter(1);
+    let lease = super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    )
+    .unwrap()
+    .unwrap();
+    let outcome = catch_up_with_limiters(
+        &Arc::downgrade(&slot),
+        epoch,
+        &runtime,
+        &schedule,
+        FillBudget::default(),
+        &mut |_| panic!("contender dispatched"),
+        &preparation,
+        &inflight,
+    );
+    assert!(matches!(outcome, FillOutcome::Contended));
+    assert!(runtime.refresh.try_lock().is_ok());
+    assert!(runtime.plane().arena("family").pause_resources_are_free());
+    assert!(schedule.limiter.try_acquire().is_some());
+    assert!(preparation.try_acquire().is_some());
+    assert!(inflight.try_acquire().is_some());
+    assert_eq!(query(&runtime, "held").pending.len(), 1);
+    drop(lease);
+    assert!(matches!(
+        catch_up_with_limiters(
+            &Arc::downgrade(&slot),
+            epoch,
+            &runtime,
+            &schedule,
+            FillBudget::default(),
+            &mut |texts| Model::default().embed(texts),
+            &preparation,
+            &inflight
+        ),
+        FillOutcome::Settled
+    ));
+}
+
+#[test]
+fn semantic_batch_lease_supersession_retains_inflight_exclusion_and_chunks() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[("file.rs", "pub fn superseded_chunk() {}\n")],
+    );
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Model::default().embed(texts)
+                },
+            )
+        })
+    };
+    entered_rx.recv().unwrap();
+    slot.clear();
+    assert!(super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity()
+    )
+    .unwrap()
+    .is_none());
+    release_tx.send(()).unwrap();
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Stop));
+    assert_eq!(
+        SemanticRows::of(&runtime).usage().unwrap().rows,
+        1,
+        "valid chunk survives, obsolete file run does not"
+    );
+    assert!(super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity()
+    )
+    .unwrap()
+    .is_some());
+}
+
 fn build_independent_callgraph(root: &Path, storage: &Path) {
     let graph = super::super::callgraph::CallgraphView::new(
         root.to_path_buf(),
