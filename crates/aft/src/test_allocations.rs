@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static PROCESS_COUNTING: AtomicBool = AtomicBool::new(false);
 static PROCESS_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static PROCESS_BYTES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 struct CountingAllocator;
 
@@ -17,21 +19,52 @@ thread_local! {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_allocation(layout.size());
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            record_live(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record_allocation(new_size);
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let next = unsafe { System.realloc(ptr, layout, new_size) };
+        if !next.is_null() {
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            record_live(new_size);
+        }
+        next
     }
 }
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
+
+fn record_live(bytes: usize) {
+    let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+}
+
+/// Requested Rust heap bytes, excluding allocator retention and native allocations.
+/// Run an isolated test process when comparing these process-wide counters.
+pub(crate) fn heap_marker(prefix: &str, phase: &str) {
+    if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
+        eprintln!(
+            "view_heap {prefix}.{phase} live={} peak={}",
+            LIVE_BYTES.load(Ordering::Relaxed),
+            PEAK_BYTES.load(Ordering::Relaxed),
+        );
+    }
+}
+
+pub(crate) fn live_bytes() -> usize {
+    LIVE_BYTES.load(Ordering::Relaxed)
+}
 
 fn record_allocation(bytes: usize) {
     if PROCESS_COUNTING.load(Ordering::Relaxed) {

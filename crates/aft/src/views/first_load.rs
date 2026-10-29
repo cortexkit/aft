@@ -4,6 +4,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "first_load_memory.rs"]
+mod memory;
+
 use crate::blob_store::v2::FamilyPlane;
 pub use crate::watcher_backend::cookie::{CookieObservation, CookieTicket};
 
@@ -2803,6 +2807,8 @@ impl FirstLoadDriver for CheckoutDriver {
             guard: guard.clone(),
             subscription,
         };
+        #[cfg(test)]
+        crate::test_allocations::heap_marker("first_load", "reconcile");
         let mut cut = installed.install_cut().cloned();
         if let Some(cut) = &mut cut {
             cut.verification = guard;

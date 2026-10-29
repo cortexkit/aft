@@ -2264,6 +2264,8 @@ fn join_manifest_with_surfaces(
     let mut rebuilt_facts = 0;
     let mut rebuilt_membership = 0;
     let mut rebuilt_missing = 0;
+    #[cfg(test)]
+    let mut heap_parts = [0isize; 5];
     for (path, entry) in manifest.entries() {
         let ManifestEntry::Regular { planes, .. } = entry else {
             continue;
@@ -2298,16 +2300,34 @@ fn join_manifest_with_surfaces(
             }
             continue;
         }
+        #[cfg(test)]
+        let before = crate::test_allocations::live_bytes();
         let decoded_blob = decode(key)?;
+        #[cfg(test)]
+        {
+            heap_parts[0] += crate::test_allocations::live_bytes() as isize - before as isize;
+        }
         let CallgraphBlob::Parse(blob) = decoded_blob.as_ref() else {
             continue;
         };
         decoded_caller_blobs += 1;
         facts.take();
         facts.take_config();
+        #[cfg(test)]
+        let before = crate::test_allocations::live_bytes();
         let extract =
             blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
+        #[cfg(test)]
+        {
+            heap_parts[1] += crate::test_allocations::live_bytes() as isize - before as isize;
+        }
+        #[cfg(test)]
+        let before = crate::test_allocations::live_bytes();
         let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
+        #[cfg(test)]
+        {
+            heap_parts[2] += crate::test_allocations::live_bytes() as isize - before as isize;
+        }
         rebuilt_surface_paths.insert(rel.to_string());
         match reuse {
             Some((changed, _, _)) if changed.contains(rel) => rebuilt_changed += 1,
@@ -2321,6 +2341,8 @@ fn join_manifest_with_surfaces(
             }
             _ => rebuilt_missing += 1,
         }
+        #[cfg(test)]
+        let before = crate::test_allocations::live_bytes();
         let mut binding = cache.cloned().unwrap_or_default();
         binding.surface = Some(ViewFileSurface::capture(&blob.language, &file_index));
         files.insert(rel.to_string(), file_index);
@@ -2345,6 +2367,12 @@ fn join_manifest_with_surfaces(
                 .extend(binding.binding_probes.iter().cloned());
         }
         bindings.insert(rel.to_string(), binding);
+        #[cfg(test)]
+        {
+            heap_parts[3] += crate::test_allocations::live_bytes() as isize - before as isize;
+        }
+        #[cfg(test)]
+        let before = crate::test_allocations::live_bytes();
         if resolve {
             let caller_work = work.entry(rel.to_string()).or_default();
             for ((raw, bound), reference_key) in blob
@@ -2364,6 +2392,17 @@ fn join_manifest_with_surfaces(
             }
         }
         extracts.insert(rel.to_string(), extract);
+        #[cfg(test)]
+        {
+            heap_parts[4] += crate::test_allocations::live_bytes() as isize - before as isize;
+        }
+    }
+    #[cfg(test)]
+    if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
+        eprintln!(
+            "view_heap join.parts decoded={} extracts={} file_index={} bindings={} work={}",
+            heap_parts[0], heap_parts[1], heap_parts[2], heap_parts[3], heap_parts[4]
+        );
     }
     profile.finish("decode_bind_index_entries");
     let mut replay_stage = crate::views::materialization::profile::StageTimer::new("join");
