@@ -266,14 +266,6 @@ fn main() {
         return;
     }
 
-    // Pin before CLI handlers, PATH discovery, or application startup can
-    // launch children. The helper entry points above already execute a pinned
-    // image and must not create a new pin for every sandbox or gh invocation.
-    if let Err(error) = aft::pinned_executable::initialize() {
-        eprintln!("cannot pin the running AFT executable: {error}");
-        std::process::exit(1);
-    }
-
     if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         match aft::migrate_storage::parse_cli_args(args) {
@@ -361,6 +353,15 @@ fn main() {
     // acquired before any cache can be prepared and remains held until process
     // exit; process::exit releases its kernel handle even when Rust skips Drop.
     let _process_storage_lease = hold_process_storage_lease();
+
+    // Pin the startup image before PATH discovery or application startup can
+    // launch children. Only long-running processes need a pin: the one-shot
+    // CLI commands above must not create storage (a fresh-install doctor run
+    // creates nothing), and the helper entry points already run a pinned image.
+    if let Err(error) = aft::pinned_executable::initialize() {
+        eprintln!("cannot pin the running AFT executable: {error}");
+        std::process::exit(1);
+    }
 
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
