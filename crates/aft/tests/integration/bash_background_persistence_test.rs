@@ -1129,6 +1129,58 @@ fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
 }
 
 #[test]
+fn foreign_harness_replay_retires_missing_layout_once() {
+    init_test_logger();
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let task_id = "bash-00000000000002a1";
+    let paths = task_paths(storage.path(), "retired-session", task_id).unwrap();
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        "retired-session".to_string(),
+        "true".to_string(),
+        project.path().to_path_buf(),
+        Some(project.path().to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    let conn = Arc::new(Mutex::new(
+        aft::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    aft::db::bash_tasks::upsert_bash_task(
+        &conn.lock().unwrap(),
+        &metadata.to_bash_task_row("pi", &paths).unwrap(),
+    )
+    .unwrap();
+    let registry = registry();
+    registry.set_harness(aft::harness::Harness::Opencode);
+    registry.set_db_pool(Arc::clone(&conn));
+    for _ in 0..5 {
+        registry
+            .replay_session_for_project(storage.path(), "current-session", project.path())
+            .unwrap();
+    }
+    assert!(
+        aft::db::bash_tasks::get_bash_task(
+            &conn.lock().unwrap(),
+            "pi",
+            "retired-session",
+            task_id,
+        )
+        .unwrap()
+        .is_none(),
+        "retirement must delete the stored harness's row, not the current route's row"
+    );
+    let warnings = take_logs()
+        .into_iter()
+        .filter(|line| line.contains(task_id) && line.contains("reaped"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "retirement must warn once: {warnings:?}");
+}
+
+#[test]
 fn foreign_session_replay_retires_completion_but_preserves_status_control() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
