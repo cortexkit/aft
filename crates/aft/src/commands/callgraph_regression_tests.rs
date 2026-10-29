@@ -82,12 +82,18 @@ fn callgraph_python_import_reporter_fixture() {
         ("caller_toplevel.py", "from mod import toplevel_target\n\ndef run_toplevel():\n    toplevel_target()\n"),
         ("caller_local.py", "def run_local():\n    from mod import local_target\n    local_target()\n"),
         ("tests/test_probe.py", "class TestProbe:\n    def test_local(self):\n        from mod import test_target\n        test_target()\n"),
+        ("ts_mod.ts", "export function tsTarget(): number {\n  return 7;\n}\n"),
+        ("ts_caller.ts", "import { tsTarget } from \"./ts_mod\";\n\nexport function runTsCaller(): number {\n  return tsTarget();\n}\n"),
     ]);
     let results = [
         callers(&store, "mod.py", "toplevel_target", false),
         callers(&store, "mod.py", "local_target", false),
         callers(&store, "mod.py", "test_target", true),
     ];
+    assert_eq!(
+        callers(&store, "ts_mod.ts", "tsTarget", false),
+        "1 caller · 1 file group\nts_caller.ts\n  ↳ runTsCaller:4"
+    );
     for (target, result) in ["toplevel_target", "local_target", "test_target"]
         .iter()
         .zip(&results)
@@ -142,12 +148,12 @@ fn callgraph_python_import_forms_and_unrelated_names() {
         ("invalid_relative.py", "from .mod import f\n\ndef invalid():\n    f()\n"),
     ]);
     let root = callers(&store, "mod.py", "f", true);
-    assert!(root.starts_with("3 callers"), "{root}");
+    assert!(root.contains("3 callers ·"), "{root}");
     for name in ["root_named", "root_module", "local_module"] {
         assert!(root.contains(name), "{root}");
     }
     let package = callers(&store, "pkg/mod.py", "f", true);
-    assert!(package.starts_with("5 callers"), "{package}");
+    assert!(package.contains("5 callers ·"), "{package}");
     for name in ["absolute", "relative", "dotted", "local", "parent"] {
         assert!(package.contains(&format!("↳ {name}:")), "{package}");
     }
@@ -164,6 +170,67 @@ fn callgraph_python_import_forms_and_unrelated_names() {
     let method = callers(&store, "method_only.py", "Only::f", true);
     assert!(method.starts_with("Incomplete:"), "{method}");
     assert!(method.ends_with("0 callers · 0 file groups"), "{method}");
+}
+
+#[test]
+fn callgraph_nonzero_callers_disclose_only_matching_unresolved_names() {
+    let (_temp, store) = fixture(&[
+        (
+            "mod.py",
+            "def target():\n    pass\n\ndef known():\n    target()\n",
+        ),
+        (
+            "unknown.py",
+            "from missing import target\n\ndef unknown():\n    target()\n    unrelated()\n",
+        ),
+        (
+            "tests/test_probe.py",
+            "def test_unknown():\n    from missing import target\n    target()\n",
+        ),
+        ("other.ts", "function other() { target(); }\n"),
+    ]);
+    for (tests, count, expected) in [
+        (false, 1, "Incomplete: 1 call site named `target` in the analyzed Python code could not be resolved; additional callers may be missing."),
+        (true, 2, "Incomplete: 2 call sites named `target` in the analyzed Python code could not be resolved; additional callers may be missing."),
+    ] {
+        let result = callers_result(&store, Path::new("mod.py"), "target", 1, tests).unwrap();
+        assert_eq!(result.total_callers, 1);
+        let note = result.incomplete.unwrap();
+        assert!(!note.complete);
+        assert_eq!(note.unresolved_call_sites, count);
+        assert_eq!(note.incomplete_reason, expected);
+        let result = impact_result(&store, Path::new("mod.py"), "target", 1, tests).unwrap();
+        assert_eq!(result.incomplete.unwrap().incomplete_reason, expected);
+        assert!(callers(&store, "mod.py", "target", tests).starts_with(expected));
+    }
+    let (_temp, store) = fixture(&[(
+        "mod.py",
+        "def target():\n    pass\n\ndef known():\n    target()\n    unrelated()\n",
+    )]);
+    assert!(
+        callers_result(&store, Path::new("mod.py"), "target", 1, false)
+            .unwrap()
+            .incomplete
+            .is_none()
+    );
+}
+
+#[test]
+fn callgraph_nonzero_matching_unresolved_count_is_a_lower_bound_at_cap() {
+    let calls = "    target()\n".repeat(UNRESOLVED_CALL_SITE_COUNT_LIMIT + 17);
+    let source = format!("from missing import target\n\ndef unknown():\n{calls}");
+    let (_temp, store) = fixture(&[
+        (
+            "mod.py",
+            "def target():\n    pass\n\ndef known():\n    target()\n",
+        ),
+        ("unknown.py", &source),
+    ]);
+    let result = callers_result(&store, Path::new("mod.py"), "target", 1, false).unwrap();
+    assert_eq!(result.total_callers, 1);
+    let note = result.incomplete.unwrap();
+    assert_eq!(note.unresolved_call_sites, 1_000);
+    assert_eq!(note.incomplete_reason, "Incomplete: at least 1000 call sites named `target` in the analyzed Python code could not be resolved; additional callers may be missing.");
 }
 
 #[test]

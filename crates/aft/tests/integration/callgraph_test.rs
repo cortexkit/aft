@@ -53,6 +53,8 @@ fn callgraph_python_imports_resolve_without_same_name_fallback() {
         ("caller_toplevel.py", "from mod import toplevel_target\n\ndef run_toplevel():\n    toplevel_target()\n"),
         ("caller_local.py", "def run_local():\n    from mod import local_target\n    local_target()\n"),
         ("tests/test_probe.py", "class TestProbe:\n    def test_local(self):\n        from mod import test_target\n        test_target()\n"),
+        ("ts_mod.ts", "export function tsTarget(): number {\n  return 7;\n}\n"),
+        ("ts_caller.ts", "import { tsTarget } from \"./ts_mod\";\n\nexport function runTsCaller(): number {\n  return tsTarget();\n}\n"),
         ("pkg/__init__.py", ""),
         ("pkg/mod.py", "def toplevel_target():\n    pass\n"),
         ("pkg/caller.py", "from pkg.mod import toplevel_target\nfrom .mod import toplevel_target as relative\nimport mod\n\ndef absolute():\n    toplevel_target()\n\ndef package_relative():\n    relative()\n\ndef module():\n    mod.toplevel_target()\n"),
@@ -72,6 +74,7 @@ fn callgraph_python_imports_resolve_without_same_name_fallback() {
         ("mod.py", "test_target", true, 1),
         ("pkg/mod.py", "toplevel_target", false, 2),
         ("unrelated.py", "toplevel_target", true, 0),
+        ("ts_mod.ts", "tsTarget", false, 1),
     ] {
         let response = aft.send(
             &serde_json::json!({
@@ -107,6 +110,11 @@ fn callgraph_python_imports_resolve_without_same_name_fallback() {
                 format_callgraph_response("callers", &response).contains("analyzed Python code"),
                 "{response:#}"
             );
+        }
+        if file == "mod.py" && symbol == "toplevel_target" {
+            assert_eq!(response["complete"], false, "{response:#}");
+            assert_eq!(response["unresolved_call_sites"], 1, "{response:#}");
+            assert_eq!(response["incomplete_reason"], "Incomplete: 1 call site named `toplevel_target` in the analyzed Python code could not be resolved; additional callers may be missing.");
         }
     }
     let response = aft.send(

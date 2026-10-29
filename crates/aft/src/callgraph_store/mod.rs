@@ -4576,7 +4576,7 @@ mod health_stale_census_tests {
     }
 }
 
-/// Bound the work spent counting possible callers for an empty reverse graph.
+/// Bound the work spent counting unresolved possible callers.
 pub const UNRESOLVED_CALL_SITE_COUNT_LIMIT: usize = 1_000;
 
 const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
@@ -4588,15 +4588,26 @@ const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
         WHERE r.status = 'unresolved'
           AND r.kind IN ('call', 'construction')
           AND f.lang = ?1
+          AND (?4 IS NULL OR r.short_name = ?4)
           AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
           AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
         LIMIT ?3
     )";
 
+#[cfg(test)]
 fn unresolved_call_site_count(
     conn: &Connection,
     language: LangId,
     include_tests: bool,
+) -> Result<usize> {
+    unresolved_call_site_count_filtered(conn, language, include_tests, None)
+}
+
+fn unresolved_call_site_count_filtered(
+    conn: &Connection,
+    language: LangId,
+    include_tests: bool,
+    name: Option<&str>,
 ) -> Result<usize> {
     Ok(conn
         .prepare_cached(UNRESOLVED_CALL_SITE_COUNT_SQL)?
@@ -4604,7 +4615,8 @@ fn unresolved_call_site_count(
             params![
                 lang_label(language),
                 include_tests,
-                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64
+                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64,
+                name
             ],
             |row| row.get(0),
         )?)
@@ -4618,7 +4630,7 @@ mod callgraph_unresolved_count_tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE files(path TEXT PRIMARY KEY, lang TEXT);
             CREATE TABLE nodes(id TEXT PRIMARY KEY, is_test INTEGER);
-            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT);
+            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT, short_name TEXT DEFAULT 'target');
             CREATE TABLE edges(ref_id TEXT, kind TEXT);
             INSERT INTO files VALUES ('lib.rs', 'rust');").unwrap();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4641,7 +4653,7 @@ mod callgraph_unresolved_count_tests {
         let (conn, reads) = fixture();
         for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
             conn.execute(
-                "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
+                "INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
                 params![i.to_string(), i as i64],
             )
             .unwrap();
@@ -4658,12 +4670,39 @@ mod callgraph_unresolved_count_tests {
     }
 
     #[test]
+    fn callgraph_named_unresolved_count_filters_before_the_sql_cap() {
+        let (conn, reads) = fixture();
+        for (name, offset) in [("other", 0), ("target", 10_000)] {
+            for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
+                conn.execute(
+                    "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call', ?3)",
+                    params![format!("{name}_{i}"), (offset + i) as i64, name],
+                ).unwrap();
+            }
+        }
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            1_000
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            1_000,
+            "unrelated names must not consume the cap, and matching rows must stop in SQL"
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("absent")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn callgraph_unresolved_count_preserves_site_identity_and_exclusions() {
         let (conn, _) = fixture();
         conn.execute_batch(
             "INSERT INTO files VALUES ('other.ts', 'typescript');
             INSERT INTO nodes VALUES ('test_node', 1);
-            INSERT INTO refs VALUES
+            INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES
                 ('a', 'lib.rs', NULL, 1, 2, 'unresolved', 'call'),
                 ('duplicate', 'lib.rs', NULL, 1, 2, 'unresolved', 'construction'),
                 ('b', 'lib.rs', NULL, 2, 3, 'unresolved', 'construction'),
@@ -4710,7 +4749,7 @@ mod callgraph_unresolved_count_tests {
             conn.execute("INSERT INTO files VALUES (?1, 'rust')", [path])
                 .unwrap();
             conn.execute(
-                "INSERT INTO refs VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
+                "INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
                 params![format!("test_{i}"), path],
             )
             .unwrap();
@@ -4803,6 +4842,17 @@ pub trait CallGraphRead {
     /// A count at the limit is a lower bound, not an exact total.
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         let _ = (language, include_tests);
+        Ok(0)
+    }
+    /// Count unresolved calls with this short name, including bare imported calls.
+    /// Uses the same site identity, test filter and SQL bound as the unnamed count.
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        let _ = (name, language, include_tests);
         Ok(0)
     }
     fn call_tree(
@@ -9383,6 +9433,24 @@ impl CallGraphStore {
     }
 
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.unresolved_call_site_count_matching(language, include_tests, None)
+    }
+
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        self.unresolved_call_site_count_matching(language, include_tests, Some(name))
+    }
+
+    fn unresolved_call_site_count_matching(
+        &self,
+        language: LangId,
+        include_tests: bool,
+        name: Option<&str>,
+    ) -> Result<usize> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
@@ -9395,7 +9463,7 @@ impl CallGraphStore {
                 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
             |ctx| Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?)),
         )?;
-        unresolved_call_site_count(&conn, language, include_tests)
+        unresolved_call_site_count_filtered(&conn, language, include_tests, name)
     }
 
     pub fn call_tree(
@@ -10180,6 +10248,14 @@ impl CallGraphRead for CallGraphStore {
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         CallGraphStore::unresolved_call_site_count(self, language, include_tests)
     }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        CallGraphStore::unresolved_call_site_count_named(self, name, language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -10303,6 +10379,14 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         (**self).unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        (**self).unresolved_call_site_count_named(name, language, include_tests)
     }
     fn call_tree(
         &self,
@@ -10428,6 +10512,15 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         self.inner
             .unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        self.inner
+            .unresolved_call_site_count_named(name, language, include_tests)
     }
     fn call_tree(
         &self,
