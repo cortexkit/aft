@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+    "crates/aft/src/commands/semantic_search/telemetry.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Performance-only: reuse query-independent matching-line normalization and trigram membership by the digest of bytes just read, single-flight concurrent preparation, and assemble rerank whole-file text from one source read. Candidate sets, evidence, ranking, canonical tie-breaking, coverage bounds and agent-visible wording are unchanged. Replay the pinned real-query rows byte-identically and compare parallel reader costs on one Linux allocation with views disabled.",
+  "slices": [
+    "aft-search-ranking-cost"
+  ]
+}

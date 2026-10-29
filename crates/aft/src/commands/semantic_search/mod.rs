@@ -4640,17 +4640,31 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
-    let _cost = telemetry::CostPhase::start("matching_line");
     let source = std::fs::read_to_string(file).ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
+    matching_line_in_text(&source, query, symbol_range)
+}
+
+/// Preparation is addressed by the bytes just read, not a path or watcher
+/// generation: edits are visible immediately, even before index refresh.
+fn matching_line_in_text(
+    source: &str,
+    query: &str,
+    symbol_range: Option<SymbolOffsetRange>,
+) -> Option<(u32, String)> {
+    let _cost = telemetry::CostPhase::start("matching_line");
+    static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
+    let prepared = CACHE
+        .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
+        .prepare(source);
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
-        if let Some((line_index, line)) = source
-            .lines()
-            .enumerate()
-            .find(|(_, line)| exact_lane::normalize_exact_phrase(line).contains(&normalized_phrase))
-        {
+        if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
+            prepared.lines[*index]
+                .normalized
+                .contains(&normalized_phrase)
+        }) {
             // The phrase matched after whitespace normalization, so its first
             // word locates the match in the raw line.
             let anchor = normalized_phrase
@@ -4677,7 +4691,7 @@ fn matching_line_from_source(
         })
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
-    let best = best_content_line(&source, &compact_tokens);
+    let best = prepared.best_line(source, &compact_tokens);
     if let Some((_, line_index, line)) = best {
         // Start the shown part of a long line at the earliest query token it
         // contains, so the window covers the region that made the line match.
@@ -4694,58 +4708,203 @@ fn matching_line_from_source(
         ));
     }
 
-    line_at_offset(&source, symbol_range?.start)
+    line_at_offset(source, symbol_range?.start)
 }
 
+struct MatchingContentLine {
+    normalized: String,
+    compact: String,
+    trigrams: std::sync::OnceLock<Box<[[u8; 3]]>>,
+}
+
+struct MatchingSource {
+    lines: Vec<MatchingContentLine>,
+}
+
+impl MatchingSource {
+    fn new(source: &str) -> Self {
+        Self {
+            lines: source
+                .lines()
+                .map(|line| MatchingContentLine {
+                    normalized: exact_lane::normalize_exact_phrase(line),
+                    compact: line
+                        .chars()
+                        .filter(|ch| ch.is_alphanumeric())
+                        .flat_map(char::to_lowercase)
+                        .collect(),
+                    trigrams: std::sync::OnceLock::new(),
+                })
+                .collect(),
+        }
+    }
+
+    // Reserve the worst-case trigram storage before lazy initialization, so
+    // concurrent queries cannot grow a retained entry beyond its cache charge.
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.lines.capacity() * std::mem::size_of::<MatchingContentLine>()
+            + self
+                .lines
+                .iter()
+                .map(|line| {
+                    line.normalized.capacity()
+                        + line.compact.capacity()
+                        + line.compact.len().saturating_sub(2) * 3
+                })
+                .sum::<usize>()
+    }
+
+    fn best_line<'a>(&self, source: &'a str, tokens: &[String]) -> Option<(usize, usize, &'a str)> {
+        if tokens.is_empty() {
+            return None;
+        }
+        source
+            .lines()
+            .zip(&self.lines)
+            .enumerate()
+            .filter_map(|(index, (line, prepared))| {
+                let score = tokens
+                    .iter()
+                    .map(|token| {
+                        if prepared.compact.contains(token) {
+                            token.len().saturating_mul(4)
+                        } else {
+                            let trigrams = prepared.trigrams.get_or_init(|| {
+                                let mut trigrams = prepared
+                                    .compact
+                                    .as_bytes()
+                                    .windows(3)
+                                    .map(|trigram| {
+                                        #[cfg(test)]
+                                        MATCHING_LINE_TRIGRAM_VISITS
+                                            .with(|count| count.set(count.get() + 1));
+                                        [trigram[0], trigram[1], trigram[2]]
+                                    })
+                                    .collect::<Vec<_>>();
+                                trigrams.sort_unstable();
+                                trigrams.dedup();
+                                trigrams.into_boxed_slice()
+                            });
+                            token
+                                .as_bytes()
+                                .windows(3)
+                                .filter(|trigram| {
+                                    trigrams
+                                        .binary_search(&[trigram[0], trigram[1], trigram[2]])
+                                        .is_ok()
+                                })
+                                .count()
+                        }
+                    })
+                    .sum::<usize>();
+                (score > 0).then_some((score, index, line))
+            })
+            .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+    }
+}
+
+struct MatchingSourceEntry {
+    source: Arc<std::sync::OnceLock<Arc<MatchingSource>>>,
+    used: u64,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct MatchingSourceState {
+    entries: HashMap<blake3::Hash, MatchingSourceEntry>,
+    clock: u64,
+    bytes: usize,
+}
+
+impl MatchingSourceState {
+    fn evict_oldest(&mut self) {
+        if let Some(digest) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.used)
+            .map(|(digest, _)| *digest)
+        {
+            let entry = self.entries.remove(&digest).expect("selected cache entry");
+            self.bytes -= entry.bytes;
+        }
+    }
+}
+
+struct MatchingSourceCache {
+    state: parking_lot::Mutex<MatchingSourceState>,
+    max_bytes: usize,
+    #[cfg(test)]
+    preparations: std::sync::atomic::AtomicUsize,
+}
+
+impl MatchingSourceCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(MatchingSourceState::default()),
+            max_bytes,
+            #[cfg(test)]
+            preparations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn prepare(&self, source: &str) -> Arc<MatchingSource> {
+        let digest = blake3::hash(source.as_bytes());
+        let cell = {
+            let mut state = self.state.lock();
+            state.clock = state.clock.wrapping_add(1);
+            let clock = state.clock;
+            if let Some(entry) = state.entries.get_mut(&digest) {
+                entry.used = clock;
+                if let Some(prepared) = entry.source.get() {
+                    return Arc::clone(prepared);
+                }
+                Arc::clone(&entry.source)
+            } else {
+                // Bound in-flight placeholders as well as completed entries;
+                // normalization and trigram work never hold the map lock.
+                if state.entries.len() >= 1024 {
+                    state.evict_oldest();
+                }
+                let cell = Arc::new(std::sync::OnceLock::new());
+                state.entries.insert(
+                    digest,
+                    MatchingSourceEntry {
+                        source: Arc::clone(&cell),
+                        used: clock,
+                        bytes: 0,
+                    },
+                );
+                cell
+            }
+        };
+        let prepared = cell.get_or_init(|| {
+            #[cfg(test)]
+            self.preparations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(MatchingSource::new(source))
+        });
+        let retained_bytes = prepared.retained_bytes();
+        let mut state = self.state.lock();
+        if let Some(entry) = state.entries.get_mut(&digest) {
+            if Arc::ptr_eq(&entry.source, &cell) && entry.bytes == 0 {
+                entry.bytes = retained_bytes;
+                state.bytes += retained_bytes;
+            }
+        }
+        while state.bytes > self.max_bytes {
+            state.evict_oldest();
+        }
+        Arc::clone(prepared)
+    }
+}
+
+#[cfg(test)]
 fn best_content_line<'a>(
     source: &'a str,
     compact_tokens: &[String],
 ) -> Option<(usize, usize, &'a str)> {
-    if compact_tokens.is_empty() {
-        return None;
-    }
-
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(line_index, line)| {
-            let compact_line = line
-                .chars()
-                .filter(|character| character.is_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
-            let mut line_trigrams = None;
-            let score = compact_tokens
-                .iter()
-                .map(|token| {
-                    if compact_line.contains(token) {
-                        token.len().saturating_mul(4)
-                    } else {
-                        let line_trigrams = line_trigrams.get_or_insert_with(|| {
-                            compact_line
-                                .as_bytes()
-                                .windows(3)
-                                .inspect(|_| {
-                                    #[cfg(test)]
-                                    MATCHING_LINE_TRIGRAM_VISITS
-                                        .with(|count| count.set(count.get() + 1));
-                                })
-                                .map(|trigram| [trigram[0], trigram[1], trigram[2]])
-                                .collect::<std::collections::HashSet<_>>()
-                        });
-                        token
-                            .as_bytes()
-                            .windows(3)
-                            .filter(|trigram| {
-                                line_trigrams.contains(&[trigram[0], trigram[1], trigram[2]])
-                            })
-                            .count()
-                    }
-                })
-                .sum::<usize>();
-            (score > 0).then_some((score, line_index, line))
-        })
-        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+    MatchingSource::new(source).best_line(source, compact_tokens)
 }
 
 #[cfg(test)]
@@ -13848,6 +14007,92 @@ mod tests {
             12
         );
         assert_eq!(MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn matching_line_preparation_reuses_different_queries_and_observes_edits() {
+        let cache = MatchingSourceCache::new(1024 * 1024);
+        let source = "fn alpha_beta() {}\r\n// café 中中中 abcabc\r\nfn second_alpha() {}\n";
+        let prepared = cache.prepare(source);
+        MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(0));
+        for query in [
+            "alpha beta",
+            "café abcxxx",
+            "中中中 missing",
+            "abcabcxxx abcabcxxx",
+        ] {
+            let tokens = query
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                prepared.best_line(source, &tokens),
+                reference_best_content_line(source, &tokens)
+            );
+        }
+        assert!(MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()) > 0);
+        MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(0));
+        let again = cache.prepare(source);
+        assert!(Arc::ptr_eq(&prepared, &again));
+        again.best_line(source, &["newxxx".into()]);
+        assert_eq!(
+            MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()),
+            0,
+            "a new query must reuse each line's trigram membership"
+        );
+        let changed = source.replace("alpha_beta", "fresh_value");
+        let fresh = cache.prepare(&changed);
+        assert!(!Arc::ptr_eq(&prepared, &fresh));
+        assert_eq!(cache.preparations.load(Ordering::Relaxed), 2);
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("fresh.rs");
+        fs::write(&file, "// before\nfn alpha_beta() {}\n").unwrap();
+        assert_eq!(
+            matching_line_from_source(&file, "alpha_beta", None),
+            Some((1, "fn alpha_beta() {}".into()))
+        );
+        fs::write(&file, "fn alpha_beta() {}\n// after\n").unwrap();
+        assert_eq!(
+            matching_line_from_source(&file, "alpha_beta", None),
+            Some((0, "fn alpha_beta() {}".into()))
+        );
+    }
+
+    #[test]
+    fn matching_line_preparation_single_flights_and_bounds_retained_bytes() {
+        let cache = MatchingSourceCache::new(1024 * 1024);
+        let source = "abcdefghij\nklmnopqrst";
+        thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let prepared = cache.prepare(source);
+                        assert_eq!(
+                            prepared.best_line(source, &["abcxxx".into()]),
+                            Some((1, 0, "abcdefghij"))
+                        );
+                        prepared
+                    })
+                })
+                .collect::<Vec<_>>();
+            let prepared = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(prepared.iter().all(|item| Arc::ptr_eq(item, &prepared[0])));
+        });
+        assert_eq!(cache.preparations.load(Ordering::Relaxed), 1);
+        assert!(cache.state.lock().bytes <= 1024 * 1024);
+        let tiny = MatchingSourceCache::new(1);
+        let retained = tiny.prepare(source);
+        assert_eq!(
+            retained.best_line(source, &["klmxxx".into()]),
+            Some((1, 1, "klmnopqrst"))
+        );
+        assert!(tiny.state.lock().entries.is_empty());
+        assert_eq!(tiny.state.lock().bytes, 0);
+        tiny.prepare(source);
+        assert_eq!(tiny.preparations.load(Ordering::Relaxed), 2);
     }
 
     #[test]

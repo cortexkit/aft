@@ -141,6 +141,7 @@ def run(args):
     selected = selected[:args.queries]
     assert len(selected) >= args.concurrency, len(selected)
     records = []
+    cpu_by_repeat = []
     with runtime_evidence_tree(tree) as root, \
             vector_server(pack["vectors"], str(pack["embed_template_version"]), output / "vectors.log") as vectors, \
             rerank_server() as reranker:
@@ -163,24 +164,30 @@ def run(args):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(config))
+        with (root / ".aftignore").open("a") as ignore:
+            ignore.write("\n/.cortexkit/aft.jsonc\n/.cortexkit/aft.opencode.jsonc\n")
         broker = Broker(Path(args.binary).resolve(), Path(args.broker).resolve(), output, root)
         try:
             for channel in range(1, args.concurrency + 1):
                 broker.call("bind", channel=channel, root=str(root))
             deadline = time.monotonic() + 1800
             while True:
-                status = broker.call("tool", channel=1, name="status", arguments={})
-                status = status.get("structuredContent", status)
-                if status.get("semantic_index", {}).get("status") == "failed":
-                    raise RuntimeError(status)
-                if (status.get("semantic_index", {}).get("status") == "ready"
-                        and status.get("search_index", {}).get("status") == "ready"):
+                ready = []
+                for channel in range(1, args.concurrency + 1):
+                    status = broker.call("tool", channel=channel, name="status", arguments={})
+                    status = status.get("structuredContent", status)
+                    if status.get("semantic_index", {}).get("status") == "failed":
+                        raise RuntimeError(status)
+                    ready.append(status.get("semantic_index", {}).get("status") == "ready"
+                                 and status.get("search_index", {}).get("status") == "ready")
+                if all(ready):
                     break
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"index readiness: {status}")
                 time.sleep(.2)
             cpu_start = cpu_seconds(broker.pid)
             for repeat in range(args.repeats):
+                repeat_cpu = cpu_seconds(broker.pid)
                 for offset in range(0, len(selected), args.concurrency):
                     batch = selected[offset:offset + args.concurrency]
                     broker.send("batch", requests=[{"id": f"{repeat}:{offset+i}", "channel": i + 1,
@@ -199,6 +206,7 @@ def run(args):
                         record["response"] = json.loads(json.dumps(body).replace(str(root), "<root>"))
                         record["repeat"] = repeat
                         records.append(record)
+                cpu_by_repeat.append((cpu_seconds(broker.pid) - repeat_cpu) / len(selected))
             cpu = cpu_seconds(broker.pid) - cpu_start
         finally:
             broker.close()
@@ -210,16 +218,21 @@ def run(args):
             traces.append(json.loads(line.removeprefix("AFT_SEARCH_COST ")))
     assert len(traces) == len(records), (len(traces), len(records))
     phases = defaultdict(list)
-    for trace in traces:
+    per_repeat = [defaultdict(list) for _ in range(args.repeats)]
+    for index, trace in enumerate(traces):
         totals = defaultdict(float)
         for name, elapsed in trace["phases"]:
             totals[name] += elapsed
         for name in ["embedding", "ann", "lexical", "exact_and_path", "fusion", "rerank", "snippet", "matching_line"]:
             phases[name].append(totals[name])
+            per_repeat[index // len(selected)][name].append(totals[name])
     result = {"concurrency": args.concurrency, "queries": selected, "rerank_fixture": args.rerank,
               "cpu_seconds_per_query": cpu / len(records), "requests": len(records),
+              "cpu_seconds_per_query_by_repeat": cpu_by_repeat,
               "latency_ms": distribution([row["latency_ms"] for row in records]),
               "phase_ms": {name: distribution(values) for name, values in phases.items()},
+              "phase_ms_by_repeat": [{name: distribution(values) for name, values in repeat.items()}
+                                     for repeat in per_repeat],
               "exec_ms": distribution([row["total_ms"] for row in traces]),
               "records": sorted(records, key=lambda row: row["id"]), "traces": traces}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
