@@ -381,6 +381,26 @@ describe("outside-access approvals that expire", () => {
     expect(confirm).toHaveBeenCalledTimes(1);
   });
 
+  test("route replacement asks for a fresh approval", async () => {
+    const engine = expiringEngine(1, "approval_route_replaced");
+    const confirm = mock(async () => true);
+    const result = await withOutsidePermissions({}, context(confirm), engine.send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(engine.sends).toHaveLength(3);
+    expect(engine.sends[2]?.permissions_granted).toEqual(["outside:late-1"]);
+  });
+
+  test("repeated route replacement stops after one re-ask", async () => {
+    const engine = expiringEngine(10, "approval_route_replaced");
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(engine.sends).toHaveLength(3);
+  });
+
   test("a path that keeps expiring stops at the re-ask limit", async () => {
     const engine = expiringEngine(10);
     const confirm = mock(async () => true);

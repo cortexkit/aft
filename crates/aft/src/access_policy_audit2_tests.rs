@@ -2013,3 +2013,63 @@ fn assert_outside_grep_round_trip(f: &Fixture, folder: &Path) {
         );
     }
 }
+
+#[test]
+fn outside_grep_grant_round_trip_route_replaced() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.outside.join("packages")).unwrap();
+    std::fs::write(f.outside.join("packages/probe.rs"), "outside_grep_canary\n").unwrap();
+    let run = |mut scope: plugin::Scope, tokens: Vec<String>| {
+        let once = plugin::claim(&mut scope, &tokens);
+        let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+        crate::commands::grep::handle_grep(
+            &request(
+                "grep",
+                json!({"path": f.outside, "pattern": "outside_grep_canary"}),
+            ),
+            &f.ctx,
+        )
+    };
+    let owner = std::sync::Arc::new(());
+    let scope = plugin::Scope::new(&owner, "audit-session").for_tool("grep", &Value::Null);
+    let asked = run(scope, Vec::new());
+    assert_eq!(
+        asked.data["code"], "permission_required",
+        "{:?}",
+        asked.data
+    );
+    let token = asked.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Closing a daemon route while the host asks the person drops its owner.
+    drop(owner);
+    let replacement = std::sync::Arc::new(());
+    let scope = plugin::Scope::new(&replacement, "audit-session").for_tool("grep", &Value::Null);
+    let reasked = run(scope.clone(), vec![token]);
+    assert_eq!(
+        reasked.data["code"], "permission_required",
+        "{:?}",
+        reasked.data
+    );
+    assert_eq!(
+        reasked.data["asks"][0]["reason"], "approval_route_replaced",
+        "{:?}",
+        reasked.data
+    );
+    assert!(
+        reasked.data.get("matches").is_none(),
+        "the old route's token must not authorize the replacement"
+    );
+    let fresh = reasked.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let answered = run(scope, vec![fresh]);
+    assert!(answered.success, "{:?}", answered.data);
+    assert!(
+        answered.data.to_string().contains("outside_grep_canary"),
+        "{:?}",
+        answered.data
+    );
+}

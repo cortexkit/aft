@@ -414,6 +414,26 @@ describe("outside-access approvals that expire", () => {
       expect(prompt).toHaveBeenCalledTimes(1);
     });
 
+    test(`OpenCode ${hostVersion}: route replacement asks for a fresh approval`, async () => {
+      const engine = expiringEngine(1, "approval_route_replaced");
+      const prompt = mock(async (_ask: unknown) => {});
+      const result = await withOutsidePermissions(runtime(prompt), {}, engine.send, false, "grep");
+      expect(result.success).toBe(true);
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(engine.sends).toHaveLength(3);
+      expect(engine.sends[2]?.permissions_granted).toEqual(["outside:late-1"]);
+    });
+
+    test(`OpenCode ${hostVersion}: repeated route replacement stops after one re-ask`, async () => {
+      const engine = expiringEngine(10, "approval_route_replaced");
+      const prompt = mock(async (_ask: unknown) => {});
+      await expect(
+        withOutsidePermissions(runtime(prompt), {}, engine.send, false, "grep"),
+      ).rejects.toMatchObject({ code: "outside_permission_stalled" });
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(engine.sends).toHaveLength(3);
+    });
+
     test(`OpenCode ${hostVersion}: a path that keeps expiring stops at the re-ask limit`, async () => {
       const engine = expiringEngine(10);
       const prompt = mock(async (_ask: unknown) => {});
