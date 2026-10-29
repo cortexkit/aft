@@ -238,6 +238,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pinned_executable_unpinned_path_is_current_exe() {
+        assert!(PINNED.get().is_none());
+        assert_eq!(path().unwrap(), std::env::current_exe().unwrap());
+    }
+
+    #[test]
+    fn pinned_executable_unpinned_shims_use_storage() {
+        assert!(PINNED.get().is_none());
+        let storage = tempfile::tempdir().unwrap();
+        assert_eq!(
+            shims_dir(storage.path()),
+            storage.path().join(crate::agent_child_env::SHIMS_DIR_NAME)
+        );
+    }
+
+    #[test]
     fn pinned_executable_explicit_gh_binary_path_wins() {
         let mut config = crate::config::Config::default();
         let explicit = std::env::current_exe()

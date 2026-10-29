@@ -81,6 +81,32 @@ fn copy_and_warm_aft(destination: &Path) {
 }
 
 #[test]
+fn pinned_executable_standalone_creates_no_pin() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let storage = home.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let deploy = root.join("aft-deploy");
+    copy_and_warm_aft(&deploy);
+    let envs = [
+        ("HOME", home.as_os_str()),
+        ("AFT_STORAGE_DIR", storage.as_os_str()),
+    ];
+    let mut aft = AftProcess::spawn_binary_with_env(&deploy, &envs);
+    let response = aft.send(r#"{"id":"standalone-echo","command":"echo","message":"hello"}"#);
+    assert_eq!(response["success"], true, "{response:?}");
+    assert_eq!(response["message"], "hello");
+    let pins = if storage.join("run").exists() {
+        pin_directories(&storage)
+    } else {
+        Vec::new()
+    };
+    assert!(pins.is_empty(), "standalone created executable pins: {pins:?}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pins() {
     use std::os::unix::fs::MetadataExt;
 
