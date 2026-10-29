@@ -3160,14 +3160,7 @@ impl LspManager {
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
-        // Source membership uses exactly the watcher's root/glob/kind routing.
-        // Keep legacy configuration-content notifications on their existing path.
-        let (lifecycle, content): (Vec<_>, Vec<_>) = paths
-            .iter()
-            .cloned()
-            .partition(|(_, kind)| *kind != FileChangeType::CHANGED);
-        self.forward_watcher_file_events(&lifecycle, &[]);
-        self.notify_files_watched_changed_for_server(&content, None)
+        self.notify_files_watched_changed_for_server(paths, None)
     }
 
     fn notify_files_watched_changed_for_server(
@@ -3292,6 +3285,13 @@ impl LspManager {
                 if let Err(error) = send_result {
                     log::warn!("watched-file notification failed for {key:?}: {error}");
                     first_error.get_or_insert(error);
+                } else {
+                    let delivered = self.watched_lifecycle.entry(key.clone()).or_default();
+                    for (path, kind) in &canonical_events {
+                        if path.starts_with(&key.root) && *kind != FileChangeType::CHANGED {
+                            delivered.insert(path.clone(), WatchedLifecycle::new(path, *kind));
+                        }
+                    }
                 }
             }
         }

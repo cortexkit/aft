@@ -15510,7 +15510,20 @@ impl AppContext {
     /// Publish final file membership, independently of delayed OS watcher echoes.
     /// Content-only edits continue through the existing document notifications.
     pub(crate) fn lsp_notify_mutation_file_events(&self, events: &[(PathBuf, FileChangeType)]) {
-        self.notify_watched_config_events(events);
+        if events.is_empty() {
+            return;
+        }
+        let config = self.config();
+        let markers = self.custom_lsp_root_markers();
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            config,
+            |lsp| {
+                lsp.forward_watcher_file_events(events, &markers);
+            },
+            |pending| pending.queue_mutation_watched(events),
+        );
     }
 
     pub fn lsp_notify_watched_config_file(&self, file_path: &Path, change_type: FileChangeType) {

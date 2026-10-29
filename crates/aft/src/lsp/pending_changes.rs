@@ -45,6 +45,9 @@ pub struct PendingLspChanges {
     start_servers: HashSet<PathBuf>,
     /// Watched-file events, one per path, the latest kind winning.
     watched: Vec<(PathBuf, FileChangeType)>,
+    /// Mutation events must match each server's registered file globs and kinds;
+    /// configuration notifications otherwise retain their existing send behavior.
+    mutation_watched: HashSet<PathBuf>,
     /// Documents were dropped past [`PENDING_LSP_DOCUMENTS_CAP`].
     overflowed: bool,
     /// The latest configuration seen by a queuing caller.
@@ -88,6 +91,17 @@ impl PendingLspChanges {
         }
     }
 
+    pub(crate) fn queue_mutation_watched(&mut self, events: &[(PathBuf, FileChangeType)]) {
+        self.queue_watched(events);
+        self.mutation_watched
+            .extend(self.watched.iter().filter_map(|(path, _)| {
+                events
+                    .iter()
+                    .any(|(event_path, _)| event_path == path)
+                    .then(|| path.clone())
+            }));
+    }
+
     fn set_config(&mut self, config: Arc<Config>) {
         self.config = Some(config);
     }
@@ -108,8 +122,18 @@ impl PendingLspChanges {
     /// then each document's current contents.
     pub(crate) fn apply(self, lsp: &mut LspManager) {
         let config = self.config.unwrap_or_default();
-        if !self.watched.is_empty() {
-            if let Err(error) = lsp.notify_files_watched_changed(&self.watched, &config) {
+        let (mutations, watched): (Vec<_>, Vec<_>) = self
+            .watched
+            .into_iter()
+            .partition(|(path, _)| self.mutation_watched.contains(path));
+        let markers = config
+            .lsp_servers
+            .iter()
+            .flat_map(|server| server.root_markers.iter().cloned())
+            .collect::<Vec<_>>();
+        lsp.forward_watcher_file_events(&mutations, &markers);
+        if !watched.is_empty() {
+            if let Err(error) = lsp.notify_files_watched_changed(&watched, &config) {
                 crate::slog_warn!("queued watched-file sync error: {error}");
             }
         }
