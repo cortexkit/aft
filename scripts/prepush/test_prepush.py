@@ -109,7 +109,8 @@ class PrepushTests(unittest.TestCase):
             ck = temp / "ck"
             ck.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 91\n")
             ck.chmod(0o755)
-            env = {**os.environ, "PATH": f"{temp}{os.pathsep}{os.environ['PATH']}"}
+            env = {**os.environ, "PATH": f"{temp}{os.pathsep}{os.environ['PATH']}",
+                   "PREPUSH_BASE": "HEAD", "PREPUSH_BRANCH": "prepush-plan-fixture"}
             result = subprocess.run(["bash", str(HERE.parent / "prepush.sh"), "--print-lanes"], env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = [json.loads(line) for line in result.stdout.splitlines()]
