@@ -92,6 +92,10 @@ pub(crate) fn view_scope(scope: &str) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CoordinationState {
     Contended,
+    BaseBusy {
+        owner_pid: u32,
+        attempt: i64,
+    },
     Error {
         failure: LeaseError,
         retry_scheduled: bool,
@@ -450,6 +454,14 @@ impl CheckoutSemantic {
             None,
         ) {
             Ok(super::base_builder::ClaimOutcome::Claimed(claim)) => claim,
+            Ok(super::base_builder::ClaimOutcome::Busy { owner_pid, attempt }) => {
+                let mut report = FillReport::default();
+                report.queued = pending.len();
+                report.deferred = pending.len();
+                report.pending =
+                    Some(super::semantic::FillPending::BaseBusy { owner_pid, attempt });
+                return Ok(report);
+            }
             Ok(outcome) => {
                 crate::slog_debug!(
                     "semantic base fill left to its owner root={} base={} outcome={:?}",
@@ -656,12 +668,25 @@ impl CheckoutSemantic {
             } else {
                 self.bind().map_err(RefreshError::classify)?
             };
+        } else if matches!(
+            self.coordination_state(),
+            Some(CoordinationState::BaseBusy { .. })
+        ) {
+            // Another process publishes base successors without waking this
+            // checkout's channel. Poll the binding before trying its claim again.
+            snapshot = self
+                .bind_with_subscription_check(false)
+                .map_err(RefreshError::classify)?;
         }
         let reconcile = reconcile_started.elapsed();
         // Inherited base entries first: once their successor is published,
         // every checkout of the base serves them, not only this one.
         let base_report = self.fill_base(budget, embed, admit)?;
-        if base_report.pending.is_some() {
+        let base_busy = matches!(
+            base_report.pending,
+            Some(super::semantic::FillPending::BaseBusy { .. })
+        );
+        if base_report.pending.is_some() && !base_busy {
             return Ok(base_report);
         }
         if base_report != FillReport::default() {
@@ -727,6 +752,9 @@ impl CheckoutSemantic {
         report.failed += base_report.failed;
         report.errors.extend(base_report.errors);
         report.store_errors.extend(base_report.store_errors);
+        if report.pending.is_none() && report.errors.is_empty() && report.store_errors.is_empty() {
+            report.pending = base_report.pending;
+        }
         if own_progress {
             self.unfolded.store(true, Ordering::SeqCst);
         }
@@ -765,7 +793,7 @@ impl CheckoutSemantic {
     pub(crate) fn coordination_pending(&self) -> bool {
         matches!(
             self.coordination_state(),
-            Some(CoordinationState::Contended)
+            Some(CoordinationState::Contended | CoordinationState::BaseBusy { .. })
         )
     }
 
@@ -1803,6 +1831,8 @@ enum FillOutcome {
     },
     /// Coordination is pending, not a failed/unavailable semantic backend.
     Contended,
+    /// Retry outside refresh and poll the base owner's published successor.
+    BasePending,
     /// A lease failed, distinct from an owner that can finish pending work.
     LeaseError(LeaseError),
     /// The lane is no longer this worker's.
@@ -1985,7 +2015,8 @@ fn serve_fills_with_status<F>(
         };
         match outcome {
             FillOutcome::Stop => return,
-            FillOutcome::Contended => {
+            pending @ (FillOutcome::Contended | FillOutcome::BasePending) => {
+                let base_pending = matches!(pending, FillOutcome::BasePending);
                 lease_error_attempts = 0;
                 let started = *contention_started.get_or_insert_with(Instant::now);
                 contention_attempts += 1;
@@ -2008,7 +2039,10 @@ fn serve_fills_with_status<F>(
                     schedule.retry_initial,
                 );
                 retry_after = Some((wait, true));
-                if let Some(runtime) = slot.upgrade().and_then(|slot| slot.runtime()) {
+                if let Some(runtime) = slot.upgrade().and_then(|slot| {
+                    let runtime = slot.runtime()?;
+                    slot.is_current(epoch).then_some(runtime)
+                }) {
                     runtime.clear_unavailable();
                 }
                 if let Some(status) = status {
@@ -2020,13 +2054,21 @@ fn serve_fills_with_status<F>(
                     );
                 }
                 crate::slog_info!(
-                    "semantic batch pending retry_count={} wait_age_ms={} retry_ms={}",
+                    "semantic batch pending base_pending={} retry_count={} wait_age_ms={} retry_ms={}",
+                    base_pending,
                     contention_attempts,
                     started.elapsed().as_millis(),
                     wait.as_millis()
                 );
                 #[cfg(test)]
-                observe_fill(&schedule.root, "contended");
+                observe_fill(
+                    &schedule.root,
+                    if base_pending {
+                        "base_pending"
+                    } else {
+                        "contended"
+                    },
+                );
                 backoff = (backoff * 2).min(schedule.retry_max);
             }
             FillOutcome::LeaseError(failure) => {
@@ -2338,10 +2380,22 @@ where
                         failure: failure.clone(),
                         retry_scheduled: false,
                     },
+                    super::semantic::FillPending::BaseBusy { owner_pid, attempt } => {
+                        CoordinationState::BaseBusy {
+                            owner_pid: *owner_pid,
+                            attempt: *attempt,
+                        }
+                    }
                     _ => CoordinationState::Contended,
                 }));
                 if let Some(super::semantic::FillPending::LeaseError(failure)) = &report.pending {
                     return FillOutcome::LeaseError(failure.clone());
+                }
+                if matches!(
+                    report.pending,
+                    Some(super::semantic::FillPending::BaseBusy { .. })
+                ) {
+                    return FillOutcome::BasePending;
                 }
                 if report.pending == Some(super::semantic::FillPending::LocalContention) {
                     // refresh, its file claims and all scoped permits have

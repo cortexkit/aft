@@ -141,6 +141,127 @@ fn semantic_batch_lease_permanent_error_is_visible_without_a_retry_timer() {
 }
 
 #[test]
+fn semantic_batch_lease_busy_base_retries_and_adopts_owner_successor() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let runtime = Arc::new(open(storage.path(), "base-waiter", root.path()));
+    let original = runtime.installed();
+    let base_scope = original.generation().base_header().unwrap().scope.clone();
+    assert!(pending_semantic(&runtime) > 0);
+    let super::super::base_builder::ClaimOutcome::Claimed(held) =
+        super::super::base_builder::claim_base(storage.path(), "family", &base_scope, None)
+            .unwrap()
+    else {
+        panic!("base claim unavailable");
+    };
+    let owner = open(storage.path(), "base-owner", root.path());
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    assert!(slot.install(epoch, Arc::clone(&runtime)));
+    let bind_checks = Arc::new(AtomicUsize::new(0));
+    let checks = Arc::clone(&bind_checks);
+    *lock(&runtime.before_bind_verify) = Some(Box::new(move |_| {
+        checks.fetch_add(1, Ordering::SeqCst);
+    }));
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let schedule = fast_schedule(root.path());
+        std::thread::spawn(move || {
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |_| {
+                panic!("waiter embedded the owner's inherited files")
+            })
+        })
+    };
+    let first = observer.next();
+    let retry_armed = lock(&slot.retry).is_some();
+    bind_checks.store(0, Ordering::SeqCst);
+    let snapshot = owner.installed();
+    let pending = owner.plane.inherited_pending(&snapshot);
+    let mut delta = LiveDelta::from_snapshot(&snapshot);
+    for (path, content) in &pending {
+        delta.set_readiness(
+            path.clone(),
+            super::super::snapshot::PlanePatch {
+                content: *content,
+                planes: super::super::manifest_v2::EntryPlanes {
+                    semantic: Some(super::super::readiness::PlaneState::pending(
+                        "awaiting the base owner",
+                    )),
+                    ..Default::default()
+                },
+            },
+        );
+    }
+    let draft = delta.snapshot();
+    let model = Model::default();
+    owner
+        .plane
+        .fill_admitted(
+            &owner.owner,
+            &draft,
+            FillBudget::default(),
+            &mut |texts| model.embed(texts),
+            &|| snapshot.clone(),
+            &mut |_| Ok(()),
+            true,
+        )
+        .unwrap();
+    let keys = owner
+        .plane
+        .completed_keys(&owner.owner, &draft, &pending)
+        .unwrap();
+    // Publish while retaining the base claim. The waiter must rebind to the
+    // successor, not wait for claim release or a checkout-local notification.
+    super::super::base_builder::publish_successor(
+        &held,
+        |manifest| {
+            for (path, content, key) in &keys {
+                if let Some(super::super::manifest_v2::EntryV2::Regular {
+                    content: stored,
+                    planes,
+                    ..
+                }) = manifest.get_mut(path)
+                {
+                    if stored == content {
+                        planes.semantic = Some(super::super::readiness::PlaneState::ready(key));
+                    }
+                }
+            }
+        },
+        None,
+    )
+    .unwrap();
+    if retry_armed {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while observer.next() != "settled" {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    let remaining = pending_semantic(&runtime);
+    let rebound = bind_checks.load(Ordering::SeqCst);
+    held.release().unwrap();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(
+        first, "base_pending",
+        "busy inherited work settled without a retry"
+    );
+    assert!(retry_armed);
+    assert!(!keys.is_empty());
+    assert!(
+        rebound > 0,
+        "timer retry never rebound to the owner's publication"
+    );
+    assert_eq!(remaining, 0);
+    assert!(query(&runtime, "alpha").complete());
+}
+
+#[test]
 fn semantic_batch_lease_transient_errors_back_off_then_park_visibly() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();

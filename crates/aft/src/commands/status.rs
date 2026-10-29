@@ -340,6 +340,17 @@ impl AppContext {
                                 crate::views::semantic_batch_lease::PENDING_REASON
                             );
                         }
+                        crate::views::semantic_runtime::CoordinationState::BaseBusy {
+                            owner_pid,
+                            attempt,
+                        } => {
+                            semantic_index_info["pending_reason"] = serde_json::json!(
+                                crate::views::semantic_batch_lease::PENDING_REASON
+                            );
+                            semantic_index_info["pending_owner"] = serde_json::json!({
+                                "kind": "base_claim", "pid": owner_pid, "attempt": attempt,
+                            });
+                        }
                         crate::views::semantic_runtime::CoordinationState::Error {
                             failure,
                             retry_scheduled,

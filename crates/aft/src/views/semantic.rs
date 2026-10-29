@@ -635,6 +635,7 @@ pub enum FillPending {
     Contended,
     LocalContention,
     AdmissionChanged,
+    BaseBusy { owner_pid: u32, attempt: i64 },
     LeaseError(LeaseError),
 }
 
