@@ -5861,7 +5861,8 @@ impl ProjectIndex<'_> {
         )
     }
     /// The eager crate-wide memo. Lazy indexes build their parent map
-    /// separately; their inline-scoped target lookup still scans stored paths.
+    /// separately; resolving symbols inside inline Rust modules still scans
+    /// stored paths.
     fn crate_scans(&self) -> Option<&CrateScanMemo> {
         #[cfg(test)]
         if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
@@ -32039,6 +32040,7 @@ mod crate_scan_memo_tests {
     //! order, and show that a changed file set (a new index) never reuses an
     //! earlier index's answers.
     use super::*;
+    use std::fs;
 
     fn rust_file(declared: &[(&str, &str)], scoped: &[&str]) -> DbFileIndex {
         let mut index = DbFileIndex::empty(Some(LangId::Rust));
@@ -32161,9 +32163,8 @@ mod crate_scan_memo_tests {
             )
             .unwrap();
             let session = rust_module_work::Session::start(disabled);
-            let mut profile = RefreshFilesProfile::default();
-            let refresh = store
-                .refresh_files_profiled(std::slice::from_ref(&changed), &mut profile)
+            let (refresh, profile) = store
+                .refresh_files_profiled(std::slice::from_ref(&changed))
                 .unwrap();
             let refresh_work = session.finish();
             assert!(
