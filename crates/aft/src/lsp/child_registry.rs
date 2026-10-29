@@ -103,6 +103,7 @@ pub struct LspChildRegistry {
 #[derive(Clone, Copy)]
 enum ForceKillPhase {
     BeforeSignals,
+    BeforeCleanup,
     AfterCleanup,
 }
 
@@ -295,6 +296,10 @@ impl LspChildRegistry {
         // Spawning a child holds the registry mutex across process creation.
         // Send every kill before cleanup can block on that mutex, otherwise a
         // slow fork can leave the remaining servers running without a signal.
+        #[cfg(test)]
+        if let Some(hook) = &self.force_kill_hook {
+            hook(ForceKillPhase::BeforeCleanup);
+        }
         for pid in &killed {
             self.untrack(*pid);
         }
@@ -839,7 +844,13 @@ mod tests {
         use crate::lsp::manager::{LspManager, LSP_SHUTDOWN_ALL_BUDGET};
         use crate::lsp::roots::ServerKey;
 
-        let registry = LspChildRegistry::new();
+        let (cleanup_tx, cleanup_rx) = crossbeam_channel::bounded(1);
+        let mut registry = LspChildRegistry::new();
+        registry.force_kill_hook = Some(Arc::new(move |phase| {
+            if matches!(phase, ForceKillPhase::BeforeCleanup) {
+                cleanup_tx.send(()).unwrap();
+            }
+        }));
         let temp = tempfile::tempdir().unwrap();
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let mut clients = Vec::new();
@@ -885,19 +896,39 @@ mod tests {
             locked_tx.send(()).unwrap();
             // Process creation can hold this same lock. Keep it held until
             // shutdown returns; the timeout only prevents a broken test hanging.
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            release_rx.recv_timeout(Duration::from_secs(10)).is_ok()
         });
         locked_rx.recv().unwrap();
 
         let started = Instant::now();
-        let outcome = LspManager::shutdown_taken_clients(clients, registry.clone());
-        let elapsed = started.elapsed();
+        let mut deadlines = Vec::new();
+        let outcome = LspManager::shutdown_all_clients_with_wait(
+            clients,
+            registry.clone(),
+            LSP_SHUTDOWN_ALL_BUDGET,
+            false,
+            started,
+            |rx, until| {
+                deadlines.push(until.duration_since(started));
+                if deadlines.len() == 2 {
+                    // All signals have been sent, but cleanup and client drops
+                    // cannot finish while the registry mutex is still held.
+                    cleanup_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(rx.try_recv().is_err());
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            },
+        );
         release_tx.send(()).ok();
-        holder.join().unwrap();
+        let released = holder.join().unwrap();
 
         assert!(
-            elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
-            "registry cleanup held shutdown open: {outcome:?} wall={elapsed:?}"
+            released,
+            "registry cleanup must remain blocked until shutdown returns"
+        );
+        assert_eq!(
+            deadlines,
+            [Duration::from_millis(1200), LSP_SHUTDOWN_ALL_BUDGET]
         );
         assert_eq!(outcome.graceful, 0, "{outcome:?}");
         assert_eq!(outcome.forced, 6, "{outcome:?}");
