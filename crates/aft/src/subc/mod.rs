@@ -221,6 +221,7 @@ mod consent;
 pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
+mod diagnostics_findings;
 // The secret vault seam and its consent adapter. They read ragged route
 // fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
@@ -1538,6 +1539,12 @@ struct RouteBindCompletion {
 
 #[derive(Debug, Clone)]
 struct RouteIdentity(Arc<RouteIdentityData>);
+
+#[derive(Default)]
+struct ManagementIdentity {
+    principal: Option<Principal>,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+}
 
 impl RouteIdentity {
     fn reply_policy(&self) -> wire::ToolResponsePolicy {
@@ -3931,7 +3938,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -4920,7 +4927,7 @@ async fn process_route_bind_completion(
     writer_tx: &WriterSender,
     completion: ControlCompletion,
     a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -4952,11 +4959,11 @@ async fn process_route_bind_completion(
             _ => return Err(SubcError::WriterClosed),
         },
         ControlCompletion::ManagementAckWritten {
-            route, principal, ..
+            route, identity, ..
         } => {
             a0.retire(route);
             if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
-                management_routes.insert(route, principal);
+                management_routes.insert(route, identity);
             }
             return Ok(());
         }
@@ -4992,7 +4999,7 @@ async fn drain_pending_route_bind_completions(
     control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     configure_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -5294,7 +5301,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
-    let mut management_routes: HashMap<RouteChannel, Option<Principal>> = HashMap::new();
+    let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
@@ -5829,7 +5836,9 @@ where
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
-                        if let Err(error) = handle_control_request(
+                        // Keep the control future on the heap so it does not enlarge
+                        // the loop's poll stack frame, including for tool requests.
+                        if let Err(error) = heap_module_future(|| handle_control_request(
                             &a0.writer,
                             &writer_tx,
                             &a0,
@@ -5863,7 +5872,7 @@ where
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
-                        )
+                        ))
                         .await
                         {
                             break Err(error);
@@ -5872,6 +5881,26 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // A flow has a non-empty flow_id in its bound scope. On a
+                        // management route it may call only diagnostics.findings;
+                        // refuse every other management op before it can read
+                        // stores. Flow-scoped tool routes are governed by the
+                        // call-mode contract instead (reads served, writes
+                        // refused), so they are not checked here.
+                        let scope = management_routes.get(&route).and_then(|identity| identity.scope.as_ref());
+                        if let Some(error) = flow_scope_refusal(scope) {
+                            let result = match decoded.body() {
+                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    scope, body, &health_rollup_cache, &executor,
+                                ).await,
+                                _ => send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await,
+                            };
+                            if let Err(error) = result {
+                                break Err(error);
+                            }
+                            continue;
+                        }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
                             // Rich-UI chunk queries are provider reads that name no
                             // session or tool, so they are answered here, before the
@@ -5879,6 +5908,15 @@ where
                             if let Some((operation, query)) = chunk_query(body) {
                                 let db = shared_app.db();
                                 if let Err(error) = answer_chunk_query(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, operation, &query, db.as_deref()).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -5891,6 +5929,17 @@ where
                             }
                             if let Err(error) = carrier_read_only::admit(identity, body) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
+                        if let (Some(identity), Ok(body)) = (management_routes.get(&route), decoded.body()) {
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -6047,15 +6096,14 @@ where
                                 &routes,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
-                                management_routes.get(&route).and_then(Option::as_ref),
+                                management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
                                 storage_dir,
                             )
                             .await
                         } else {
-                            // The tool-call future is polled on this loop's
-                            // thread, so it is boxed to keep its own frame on
-                            // the heap instead of widening this loop's frame.
-                            Box::pin(handle_tool_call_with_capabilities(
+                            // Keep construction of the large tool-call future out
+                            // of the loop's poll stack as well as its stored state.
+                            heap_module_future(|| handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
                                 parsed_body,
@@ -8092,7 +8140,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -8286,7 +8334,7 @@ async fn handle_control_request(
                         ack,
                         ControlCompletion::ManagementAckWritten {
                             route: route_id,
-                            principal,
+                            identity: ManagementIdentity { principal, scope },
                             corr: frame.header.corr,
                         },
                         metrics,
@@ -9629,6 +9677,23 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         && identity.scope.as_ref().is_some_and(|scope| {
             principal_id(&Some(scope.owner.clone())).as_deref()
                 != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+        })
+}
+
+fn flow_scope_refusal(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Option<ErrorBody> {
+    scope
+        .filter(|stamp| {
+            stamp
+                .attributes
+                .flow_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+        })
+        .map(|_| {
+            ErrorBody::new(
+                "flow_scope_not_supported",
+                "a flow may call only diagnostics.findings on an AFT management route",
+            )
         })
 }
 

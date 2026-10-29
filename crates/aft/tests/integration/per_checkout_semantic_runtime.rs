@@ -830,6 +830,16 @@ fn evict_until_lane_released(ctx: &AppContext) {
         thread::sleep(Duration::from_millis(20));
     }
 }
+/// Evicts the root's artifacts once it is idle. Readiness can be reported
+/// while background work that settled it is still finishing, and eviction
+/// refuses a root that is not idle yet, so retry until it accepts.
+fn evict_once_idle(ctx: &AppContext) {
+    let deadline = Instant::now() + DEADLINE;
+    while !ctx.evict_idle_artifacts() {
+        assert!(Instant::now() < deadline, "the root never became idle");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
 /// Idle eviction drops the lexical lane too, and both lanes reload by design.
 /// Reloads the lexical lane through a grep, which reloads only that lane, and
 /// waits until grep answers from a ready index, so the next search has a
@@ -927,7 +937,7 @@ fn views_off_search_after_idle_eviction_reports_the_index_reloading() {
     let storage = tempfile::tempdir().unwrap();
     let ctx = configure(&repo.main, storage.path(), &server, false);
     wait_legacy_ready(&ctx);
-    assert!(ctx.evict_idle_artifacts(), "the root must be idle");
+    evict_once_idle(&ctx);
     // As in the views-on test: a search would refuse while the text index is
     // still reloading too, so reload it first and keep the check on semantic.
     reload_trigram_after_eviction(&ctx);

@@ -28,6 +28,21 @@ type Describe = Arc<
 >;
 type EndNotice = Arc<dyn Fn(ScopeStamp) + Send + Sync>;
 
+pub(crate) fn binding_refusal(code: Code, reason: &str, detail: impl Into<String>) -> Refusal {
+    let detail = detail.into();
+    log::warn!(
+        "gh speech binding verification refused: {}",
+        serde_json::json!({"reason": reason, "detail": detail})
+    );
+    let mut refusal = Refusal::new(code, reason);
+    refusal.detail = Some(detail);
+    refusal
+}
+
+fn binding_unverifiable(detail: impl Into<String>) -> Refusal {
+    binding_refusal(Code::AuthorityUnavailable, "binding_unverifiable", detail)
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestPartners {
@@ -549,19 +564,13 @@ impl LaunchContext {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let Some(runtime) = guard.as_ref() else {
-                prepared.denial = Some(Refusal::new(
-                    Code::AuthorityUnavailable,
-                    "binding_unverifiable",
-                ));
+                prepared.denial = Some(binding_unverifiable("no_runtime"));
                 return prepared;
             };
             runtime.handle.clone()
         };
         if tokio::runtime::Handle::try_current().is_ok() {
-            prepared.denial = Some(Refusal::new(
-                Code::AuthorityUnavailable,
-                "binding_unverifiable",
-            ));
+            prepared.denial = Some(binding_unverifiable("inside_tokio_runtime"));
             return prepared;
         }
         let agent = match launch.agent() {
@@ -577,13 +586,13 @@ impl LaunchContext {
                 async {
                     let reply = self
                         .service
-                        .read_bindings(&self.seed.project_root, &self.seed.session)
+                        .read_bindings(&self.seed.project_root, &self.seed.session, agent)
                         .await?;
                     parse_bindings(&desired, &facade_reply(&reply), agent)
                 },
             )
             .await
-            .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable"))?
+            .map_err(|_| binding_unverifiable("start_binding_read_timeout"))?
         });
         match result {
             Ok(bindings) => {
@@ -617,7 +626,7 @@ pub(crate) fn parse_bindings(
     reply: &Value,
     agent: &str,
 ) -> Result<BTreeMap<String, Binding>, Refusal> {
-    let invalid = || Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable");
+    let invalid = || binding_unverifiable("invalid_binding");
     let reply = reply
         .get("result")
         .filter(|result| result.get("repo_binding_generation").is_some())
@@ -625,7 +634,7 @@ pub(crate) fn parse_bindings(
     let generation = reply
         .get("repo_binding_generation")
         .and_then(Value::as_u64)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| binding_unverifiable("missing_repo_binding_generation"))?;
     let rows = reply
         .get("bindings")
         .and_then(Value::as_array)
@@ -646,8 +655,10 @@ pub(crate) fn parse_bindings(
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(&repo))
             .map(|(_, value)| value.as_str());
-        if !seen.insert(repo.clone()) || signed != Some(current) {
-            return Err(Refusal::new(Code::IdentityConflict, "binding_changed"));
+        if !seen.insert(repo.clone()) || signed != Some(current) || current != agent {
+            return Err(binding_refusal(Code::IdentityConflict, "binding_changed", format!(
+                "binding_identity_mismatch: repository={repo:?} signed_agent={signed:?} returned_agent={current:?} launch_agent={agent:?}"
+            )));
         }
         if current == agent {
             let handle = row
@@ -665,7 +676,14 @@ pub(crate) fn parse_bindings(
         }
     }
     if found.is_empty() {
-        return Err(invalid());
+        let expected: Vec<_> = desired
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == agent)
+            .map(|(repo, _)| repo.as_str())
+            .collect();
+        return Err(binding_unverifiable(format!(
+            "no_binding_row: launch_agent={agent:?} repositories={expected:?}"
+        )));
     }
     Ok(found)
 }
@@ -847,6 +865,7 @@ impl Service {
         &self,
         project: &str,
         session: &str,
+        agent: &str,
     ) -> Result<Value, Refusal> {
         #[cfg(test)]
         if let Some(partners) = self.test_partners() {
@@ -859,14 +878,14 @@ impl Service {
                 .unwrap_or_else(|error| error.into_inner());
             runtime.as_ref().and_then(|runtime| runtime.relay.upgrade())
         }
-        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable"))?;
+        .ok_or_else(|| binding_unverifiable("relay_unavailable"))?;
         tokio::time::timeout(
             Duration::from_secs(1),
-            relay.read_bindings(project, session),
+            relay.read_bindings(project, session, agent),
         )
         .await
-        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable"))?
-        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable"))
+        .map_err(|_| binding_unverifiable("binding_read_timeout"))?
+        .map_err(|error| binding_unverifiable(format!("binding_read_transport: {error:?}")))
     }
     pub(crate) async fn reserve(
         &self,

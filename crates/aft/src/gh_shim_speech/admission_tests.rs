@@ -1,5 +1,131 @@
 use super::*;
 
+fn subconscious_options(sdk_daemon: bool) -> LaunchOptions {
+    LaunchOptions {
+        sdk_daemon,
+        repository: Some("cortexkit/subconscious".into()),
+        agent: Some("agent_2bfd6927602f7977".into()),
+        handle: Some("subc-alfonso".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn agent_selected_bindings_allow_a_subconscious_head_to_post() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new_with_options(false, subconscious_options(true)).await;
+    let answer = fixture.post(false, "subconscious-head").await;
+    assert!(answer.ok, "{:?}", answer.data);
+    let reads: Vec<_> = fixture
+        .sdk
+        .as_ref()
+        .unwrap()
+        .requests()
+        .into_iter()
+        .filter(|request| request["arguments"]["op"] != "bot_request")
+        .collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "capture and send-time revalidation both read bindings"
+    );
+    assert!(reads.iter().all(|request| request["arguments"]
+        == json!({"op":"bindings.read_for_agent", "agent_id":"agent_2bfd6927602f7977"})));
+    let state = fixture.plex.state.lock().unwrap();
+    assert_eq!(state.posts.len(), 1);
+    assert_eq!(state.posts[0]["repository"], "cortexkit/subconscious");
+    drop(state);
+    let ticket = call_ticket(&fixture).await;
+    let mut params = fixture.params.clone();
+    params["ticket"] = json!(ticket.value().unwrap());
+    params["request_nonce"] = json!("subconscious-scoped-issue-write");
+    let answer = post_params(&fixture, &params, &fixture.routes(true)).await;
+    assert!(answer.ok, "{:?}", answer.data);
+    assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 2);
+}
+
+#[tokio::test]
+async fn agent_selected_bindings_without_a_row_refuse_with_a_specific_detail() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new_with_options(
+        false,
+        LaunchOptions {
+            sdk_daemon: true,
+            handle: Some("aft-alfonso".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture.plex.state.lock().unwrap().agent = "agent-not-bound-to-the-head".into();
+    let ticket = call_ticket(&fixture).await;
+    let speech = crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap()).unwrap();
+    let denial = speech.prepared.denial.as_ref().unwrap();
+    assert_eq!(denial.code, Code::AuthorityUnavailable);
+    assert_eq!(denial.reason, "binding_unverifiable");
+    assert!(denial
+        .detail
+        .as_deref()
+        .unwrap()
+        .starts_with("no_binding_row:"));
+    let mut params = fixture.params.clone();
+    params["ticket"] = json!(ticket.value().unwrap());
+    let answer = post_params(&fixture, &params, &fixture.routes(true)).await;
+    assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(answer.data["detail"], denial.detail.as_deref().unwrap());
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
+async fn agent_selected_bindings_reject_even_a_signed_row_for_another_agent() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new_with_options(false, subconscious_options(false)).await;
+    let mut reply = fixture.plex.bindings();
+    let manifest = super::super::tests::fixture_manifest();
+    let (other_repo, other_agent) = manifest.bindings.iter().next().unwrap();
+    reply["bindings"].as_array_mut().unwrap().push(json!({
+        "repository":other_repo, "agent_id":other_agent, "app_handle_id":"another-handle"
+    }));
+    fixture.partners(|partners| partners.bindings = Arc::new(move |_, _| Ok(reply.clone())));
+    let ticket = call_ticket(&fixture).await;
+    let speech = crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap()).unwrap();
+    let denial = speech.prepared.denial.as_ref().unwrap();
+    assert_eq!(denial.code, Code::IdentityConflict);
+    assert_eq!(denial.reason, "binding_changed");
+    let detail = denial.detail.as_deref().unwrap();
+    assert!(
+        detail.contains(other_agent) && detail.contains("agent_2bfd6927602f7977"),
+        "{detail}"
+    );
+    let mut params = fixture.params.clone();
+    params["ticket"] = json!(ticket.value().unwrap());
+    let answer = post_params(&fixture, &params, &fixture.routes(true)).await;
+    assert!(!answer.ok, "{:?}", answer.data);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
+async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let warm = crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
+        .unwrap();
+    let context = warm.prepared.context.clone();
+    assert_eq!(
+        context.prepare().denial.unwrap().detail.as_deref(),
+        Some("inside_tokio_runtime")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    crate::db::open(&dir.path().join("aft.db")).unwrap();
+    let context = crate::gh_shim_speech::service::LaunchContext {
+        seed: context.seed,
+        service: crate::gh_shim_speech::service::record_service(dir.path()),
+    };
+    assert_eq!(
+        context.prepare().denial.unwrap().detail.as_deref(),
+        Some("no_runtime")
+    );
+}
+
 async fn call_ticket(fixture: &Fixture) -> crate::gh_shim_ticket::ScopedTicket {
     let speech =
         crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())

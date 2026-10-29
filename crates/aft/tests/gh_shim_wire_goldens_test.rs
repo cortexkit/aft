@@ -35,6 +35,8 @@ use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTO
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 use subc_transport::{DAEMON_ID_LEN, KEY_LEN};
 
+#[path = "../src/gh_shim/plexus_bindings_contract.rs"]
+mod plexus_bindings_contract;
 /// The stand-in holder's copy of Plexus's published `gh.route` request
 /// contract (`crates/aft/src/gh_shim/plexus_contract_judge.rs`, vendored
 /// fixtures under `crates/aft/tests/fixtures/gh_shim/plexus-contract/`).
@@ -411,19 +413,20 @@ fn relay_reply(gh_route_response: &[u8]) -> Vec<u8> {
     .expect("relay reply")
 }
 
-/// Plexus's bindings, matching the test manifest so the shim's version check
-/// passes.
-fn relay_bindings_reply() -> Vec<u8> {
+/// The fake AFT relay returns only the selected agent's view. The handler's
+/// reply shape comes from Plexus's vectors; repository identities are local fixtures.
+fn relay_bindings_reply(agent: &str) -> Vec<u8> {
+    let reply = match agent {
+        "alfonso-aft" => plexus_bindings_contract::agent_reply(REPOSITORY, agent, "h1", 3),
+        OTHER_BOUND_AGENT => {
+            plexus_bindings_contract::agent_reply(OTHER_BOUND_REPOSITORY, agent, "h2", 3)
+        }
+        _ => plexus_bindings_contract::vector("none").1,
+    };
     serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
         "status": "ok",
-        "data": {
-            "repo_binding_generation": 1,
-            "bindings": [
-                {"repository": REPOSITORY, "app_handle_id": "h1", "agent_id": "alfonso-aft"},
-                {"repository": OTHER_BOUND_REPOSITORY, "app_handle_id": "h2", "agent_id": OTHER_BOUND_AGENT},
-            ],
-        },
+        "data": reply["result"],
     }))
     .expect("bindings reply")
 }
@@ -483,13 +486,20 @@ fn response_frame(request: &Frame, body: Vec<u8>) -> Frame {
 
 impl CapturingHolder {
     fn spawn(reply: Option<Vec<u8>>) -> Self {
-        Self::spawn_with_bindings(reply, relay_bindings_reply())
+        Self::spawn_with_binding_override(reply, None)
     }
 
     /// Like `spawn`, answering the relay's bindings read with
     /// `bindings_reply`, so a manifest with other bindings passes the shim's
     /// manifest-versus-holder check.
     fn spawn_with_bindings(reply: Option<Vec<u8>>, bindings_reply: Vec<u8>) -> Self {
+        Self::spawn_with_binding_override(reply, Some(bindings_reply))
+    }
+
+    fn spawn_with_binding_override(
+        reply: Option<Vec<u8>>,
+        bindings_reply: Option<Vec<u8>>,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake holder");
         listener
             .set_nonblocking(true)
@@ -578,7 +588,7 @@ async fn serve_connection(
     daemon_id: [u8; DAEMON_ID_LEN],
     captured: Arc<Mutex<Vec<CapturedFrame>>>,
     reply: Option<Vec<u8>>,
-    bindings_reply: Vec<u8>,
+    bindings_reply: Option<Vec<u8>>,
 ) {
     if subc_transport::authenticate_server(
         &mut stream,
@@ -672,7 +682,16 @@ async fn serve_connection(
                             .expect("route close body"),
                     )),
                     Some("gh_shim.bindings_read") if frame.header.channel == ROUTE_CHANNEL => {
-                        Some(response_frame(&frame, bindings_reply.clone()))
+                        let agent = decoded
+                            .as_ref()
+                            .and_then(|request| request["params"]["agent_id"].as_str())
+                            .expect("shim binding read names its signed target agent");
+                        Some(response_frame(
+                            &frame,
+                            bindings_reply
+                                .clone()
+                                .unwrap_or_else(|| relay_bindings_reply(agent)),
+                        ))
                     }
                     _ if bot_write => {
                         // The captured frame body above holds these same bytes;
@@ -1912,10 +1931,7 @@ fn run_v22_row_with_reply(
     let bindings = serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
         "status": "ok",
-        "data": {
-            "repo_binding_generation": 1,
-            "bindings": [{"repository": REPOSITORY, "app_handle_id": "h1", "agent_id": agent_id}],
-        },
+        "data": plexus_bindings_contract::agent_reply(REPOSITORY, agent_id, "h1", 3)["result"],
     }))
     .expect("bindings reply");
     let holder = CapturingHolder::spawn_with_bindings(Some(reply), bindings);

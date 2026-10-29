@@ -78,9 +78,25 @@ fn wire_owner(owner: &subc_protocol::Principal) -> String {
 impl FakePlex {
     fn bindings(&self) -> Value {
         let state = self.state.lock().unwrap();
-        json!({"repo_binding_generation":state.generation,"bindings":[{
-            "repository":state.repo,"agent_id":state.agent,"app_handle_id":state.handle
-        }]})
+        crate::gh_shim_relay::bindings_contract::agent_reply(
+            &state.repo,
+            &state.agent,
+            &state.handle,
+            state.generation,
+        )["result"]
+            .clone()
+    }
+
+    fn bindings_reply(&self, arguments: &Value) -> Option<Value> {
+        let state = self.state.lock().unwrap();
+        crate::gh_shim_relay::bindings_contract::stand_in_reply(
+            arguments,
+            &state.repo,
+            &state.agent,
+            &state.handle,
+            state.generation,
+            true,
+        )
     }
 
     fn describe(
@@ -298,6 +314,9 @@ struct LaunchOptions {
     command: Option<String>,
     seal_failure: Option<Refusal>,
     fail_revocation: bool,
+    repository: Option<String>,
+    agent: Option<String>,
+    handle: Option<String>,
     pause: Option<(
         std::sync::mpsc::Sender<String>,
         std::sync::mpsc::Receiver<()>,
@@ -319,7 +338,13 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let state_dir = dir.path().join("shim");
-        let project = dir.path().join("project");
+        let project = dir.path().join(
+            options
+                .repository
+                .as_deref()
+                .and_then(|repo| repo.split('/').next_back())
+                .unwrap_or("project"),
+        );
         // Production opens its storage lease before registering speech. The
         // directory must already exist so symlinked temp ancestors have the
         // same canonical identity during registration and later lookup.
@@ -333,10 +358,19 @@ impl Fixture {
             Env::set("AFT_GH_SHIM_STATE_DIR", state_dir.as_os_str()),
         ];
         let paths = StatePaths::from_root(state_dir);
-        let manifest = super::tests::fixture_manifest();
+        let mut manifest = super::tests::fixture_manifest();
+        if let Some(repo) = &options.repository {
+            manifest
+                .bindings
+                .insert(repo.clone(), options.agent.clone().unwrap());
+        }
         super::tests::write_signed_manifest(&paths, manifest.clone(), unix_seconds());
         load_manifest(&paths, unix_seconds()).unwrap();
-        let (repo, agent) = manifest.bindings.iter().next().unwrap();
+        let (repo, agent) = options
+            .repository
+            .as_ref()
+            .map(|repo| manifest.bindings.get_key_value(repo).unwrap())
+            .unwrap_or_else(|| manifest.bindings.iter().next().unwrap());
         let head = ScopeStamp::new(
             subc_protocol::Principal::Reserved {
                 module_id: "prefrontal-core".into(),
@@ -378,7 +412,10 @@ impl Fixture {
             state: Arc::new(Mutex::new(PlexState {
                 repo: repo.clone(),
                 agent: agent.clone(),
-                handle: "app-original".into(),
+                handle: options
+                    .handle
+                    .clone()
+                    .unwrap_or_else(|| "app-original".into()),
                 generation: 4,
                 scopes,
                 unknown: HashSet::new(),
@@ -398,8 +435,13 @@ impl Fixture {
                 crate::gh_shim_relay::tests::fake_daemon_with_reply(Arc::new(
                     move |body, scope| {
                         let args = &body["arguments"];
-                        if args["op"] == "bindings.read" {
-                            return server.bindings();
+                        if args["op"]
+                            .as_str()
+                            .is_some_and(|op| op.starts_with("bindings."))
+                        {
+                            return server
+                                .bindings_reply(args)
+                                .expect("bindings request must match the real Plexus contract");
                         }
                         let expected = serde_json::to_value(subc_client_rs::ScopeSelector::new(
                             server.head.owner.clone(),

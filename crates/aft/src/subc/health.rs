@@ -2216,6 +2216,40 @@ pub(super) struct HealthRollupCache {
 }
 
 impl HealthRollupCache {
+    pub(super) fn findings(
+        &self,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> Vec<super::diagnostics_findings::Finding> {
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => Arc::clone(&snapshot),
+            Err(_) => {
+                return super::diagnostics_findings::from_health(
+                    &Value::Null,
+                    None,
+                    Some("cache_contended_or_poisoned"),
+                    now_ms,
+                    window_ms,
+                )
+            }
+        };
+        let age_ms = snapshot
+            .generated_at_ms
+            .map(|generated| self.now_ms().saturating_sub(generated));
+        let reason = if self.census_contended(&snapshot) {
+            Some("executor_contended")
+        } else {
+            snapshot.stale_reason
+        };
+        super::diagnostics_findings::from_health(
+            &snapshot.metrics,
+            age_ms,
+            reason,
+            now_ms,
+            window_ms,
+        )
+    }
+
     pub(super) fn new() -> Self {
         Self {
             origin: Instant::now(),
@@ -2383,7 +2417,7 @@ impl HealthRollupCache {
         project_root: &std::path::Path,
         project_key: Option<&str>,
         cache_dir: &std::path::Path,
-    ) {
+    ) -> Option<&'static str> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2394,7 +2428,7 @@ impl HealthRollupCache {
         let Some(path) = crate::context::build_breaker_path_for_health(cache_dir, project_key)
         else {
             ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-            return;
+            return Some("breaker_location_unknown");
         };
         let breaker = {
             let mut breakers = self
@@ -2413,13 +2447,16 @@ impl HealthRollupCache {
                     Err(error) => {
                         log::debug!("health breaker open failed; retrying next rollup: {error}");
                         ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-                        return;
+                        return Some("breaker_open_failed");
                     }
                 }
             }
         };
         match breaker.active_suspensions_for_root_at(&project_root.display().to_string(), now_ms) {
-            Ok(suspensions) => ctx.publish_build_suspensions_for_health(suspensions, now_ms),
+            Ok(suspensions) => {
+                ctx.publish_build_suspensions_for_health(suspensions, now_ms);
+                None
+            }
             Err(error) => {
                 log::debug!("health breaker read failed; reopening next rollup: {error}");
                 self.breakers
@@ -2427,6 +2464,7 @@ impl HealthRollupCache {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .retain(|_, cached| !Arc::ptr_eq(cached, &breaker));
                 ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+                Some("breaker_read_failed")
             }
         }
     }
@@ -2651,6 +2689,24 @@ impl HealthRollupCache {
     #[cfg(test)]
     fn census_builds_for_test(&self) -> u64 {
         self.census_builds.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod findings_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_findings_contended_cache_returns_unknown_without_fallback_probes() {
+        let cache = HealthRollupCache::new();
+        let _held = cache.snapshot.write().unwrap();
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert_eq!(findings.as_array().unwrap().len(), 1);
+        assert_eq!(findings[0]["severity"], "error");
+        assert_eq!(
+            findings[0]["samples"][0]["reason"],
+            "cache_contended_or_poisoned"
+        );
     }
 }
 
@@ -3040,7 +3096,7 @@ fn insert_lifecycle_metrics(
     }
 }
 
-fn dispatch_liveness_metrics(executor: &Executor) -> Value {
+pub(super) fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     match executor.try_dispatch_liveness_snapshot() {
         Some(snapshot) => json!({
             "interactive": {
@@ -3273,6 +3329,7 @@ fn build_health_diagnostic_rollup_from_actors(
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
+        diagnostics_evidence: Value,
     }
 
     let lifecycle_contexts = actor_entries
@@ -3376,7 +3433,12 @@ fn build_health_diagnostic_rollup_from_actors(
         // cached health reply reads only the context snapshot. Standing keys can
         // be scoped or path-based, so they must not depend on the session-key memo.
         let cache_dir = tick_paths.cache_dir(&config);
-        cache.refresh_build_suspensions(ctx.as_ref(), root_id.as_path(), artifact_key, &cache_dir);
+        let breaker_error = cache.refresh_build_suspensions(
+            ctx.as_ref(),
+            root_id.as_path(),
+            artifact_key,
+            &cache_dir,
+        );
         let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
@@ -3438,6 +3500,11 @@ fn build_health_diagnostic_rollup_from_actors(
             watcher: Some(ctx.watcher_counters().snapshot()),
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
+            diagnostics_evidence: json!({
+                "build_breaker_error": breaker_error,
+                "database_open_failed": ctx.database_runtime_failed(),
+                "lsp_start_failures": ctx.try_lsp().map(|lsp| lsp.cached_start_failure_counts()),
+            }),
         });
         rollup_mark!(timer, "root summary assembly");
     }
@@ -3460,6 +3527,7 @@ fn build_health_diagnostic_rollup_from_actors(
             resident_callgraph_stale_backend_rows: None,
             watcher: None,
             standing: Some(standing),
+            diagnostics_evidence: Value::Null,
         });
     }
 
@@ -3533,6 +3601,10 @@ fn build_health_diagnostic_rollup_from_actors(
                 );
             }
             if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "diagnostics_evidence".to_owned(),
+                    candidate.diagnostics_evidence,
+                );
                 if let Some(configured) = candidate.disclaim_privacy {
                     // The root snapshot may already carry a `bash` block with
                     // background task counts; add the privacy fields to it

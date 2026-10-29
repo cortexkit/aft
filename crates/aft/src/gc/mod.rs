@@ -139,7 +139,7 @@ fn sweep_planes_with_sidecars(
     let cancelled_for_bind =
         || cancelled() || crate::storage_retention::bind_pending(request.durable_storage);
     let control = SweepControl {
-        deadline: Instant::now() + Duration::from_secs(5),
+        deadline: Instant::now() + sweep_budget(),
         cancelled: &cancelled_for_bind,
     };
     control.check()?;
@@ -701,6 +701,18 @@ type BeforeBlobDelete = Box<dyn FnMut(&rusqlite::Connection)>;
 #[cfg(test)]
 thread_local! {
     static BEFORE_BLOB_DELETE: std::cell::RefCell<Option<BeforeBlobDelete>> = const { std::cell::RefCell::new(None) };
+    static SWEEP_BUDGET_FOR_TEST: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// One sweep's wall-clock budget. Tests that check what a sweep deletes, not
+/// how long it may take, can raise it so a loaded CI runner cannot cut them
+/// short.
+fn sweep_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = SWEEP_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return budget;
+    }
+    Duration::from_secs(5)
 }
 
 #[cfg(test)]
@@ -782,6 +794,9 @@ mod storage_retention_tests {
                 hook_calls.set(hook_calls.get() + 1);
             }))
         });
+        // This test checks the delete transaction, not the 5 s budget, which
+        // a loaded Windows runner overran on this three-row fixture.
+        SWEEP_BUDGET_FOR_TEST.with(|budget| budget.set(Some(Duration::from_secs(60))));
         let report = sweep(SweepRequest {
             durable_storage: temp.path(),
             storage: temp.path(),
@@ -793,8 +808,9 @@ mod storage_retention_tests {
                 retained_keys: BTreeSet::from([[1_u8; 32]]),
                 ..Default::default()
             },
-        })
-        .unwrap();
+        });
+        SWEEP_BUDGET_FOR_TEST.with(|budget| budget.set(None));
+        let report = report.unwrap();
         BEFORE_BLOB_DELETE.with(|slot| slot.borrow_mut().take());
         assert_eq!(calls.get(), 2);
         assert_eq!(report.deleted_blobs, 2);

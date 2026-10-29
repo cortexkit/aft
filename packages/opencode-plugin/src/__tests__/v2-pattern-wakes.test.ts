@@ -701,6 +701,7 @@ test("V2 each_line superseded push delivers every durable line once", async () =
     await r.register(false, "each_line");
     const first = eachLineFrame(0, "READY first");
     const second = eachLineFrame(12, "READY second");
+    const third = eachLineFrame(25, "READY third");
     r.setPending(eachLineSnapshot("pending-a", first));
     r.holdNextDrain(async () => {
       entered.release();
@@ -710,11 +711,26 @@ test("V2 each_line superseded push delivers every durable line once", async () =
     await entered.promise;
     r.setPending(eachLineSnapshot("pending-a", first, second));
     await r.push(second);
+    r.setPending(eachLineSnapshot("pending-a", first, second, third));
+    await r.push(third);
     resume.release();
     await firstPush;
     expect(r.synthetic).toHaveLength(1);
-    expect(r.synthetic[0]?.text).toContain("stdout byte 0: READY first");
-    expect(r.synthetic[0]?.text).toContain("stdout byte 12: READY second");
+    expect(r.synthetic[0]?.text.split("\n").filter((line) => line.includes("stdout byte"))).toEqual(
+      [
+        "      > stdout byte 0: READY first",
+        "      > stdout byte 12: READY second",
+        "      > stdout byte 25: READY third",
+      ],
+    );
+    expect(
+      r.sends.filter((send) => send.command === "bash_ack_completions").map((send) => send.params),
+    ).toEqual([
+      {
+        session_id: "session-v2",
+        matches: [{ task_id: "bash-running", watch_id: "watch-ready", match_offset: 25 }],
+      },
+    ]);
     expect(r.pending()).toBeUndefined();
   } finally {
     resume.release();

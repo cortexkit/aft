@@ -79,6 +79,7 @@ pub(crate) struct Refusal {
     pub(crate) code: Code,
     pub(crate) reason: String,
     pub(crate) role: Option<ScopeRole>,
+    pub(crate) detail: Option<String>,
 }
 
 impl Refusal {
@@ -87,6 +88,7 @@ impl Refusal {
             code,
             reason: reason.into(),
             role: None,
+            detail: None,
         }
     }
 
@@ -95,6 +97,7 @@ impl Refusal {
             code,
             reason: reason.into(),
             role: Some(role),
+            detail: None,
         }
     }
 
@@ -134,6 +137,9 @@ impl Refusal {
         });
         if let Some(role) = self.role {
             value["scope_role"] = json!(role);
+        }
+        if let Some(detail) = &self.detail {
+            value["detail"] = json!(detail);
         }
         value
     }

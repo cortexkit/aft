@@ -619,6 +619,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "flow-only telemetry stops at byte or line caps and reports truncated plus scanned counts; top tool and WARN previews disclose tools_total and warn_shapes_total, not a paginated agent list",
     },
     ExclusionEntry {
+        file: "subc/diagnostics_findings.rs",
+        enclosing_item: "bounded_body",
+        location_or_primitive: "truncate(5) samples and size >= BODY_LIMIT response trimming",
+        reason: "diagnostics.findings v1 is a bounded diagnosis snapshot, not a paginated ledger; samples are removed first, then tail findings, and retained counts are unchanged as required by the vendored contract",
+    },
+    ExclusionEntry {
         file: "subc/perf_sweep.rs",
         enclosing_item: "summarize_profile, child_output, ChildCapture::drain",
         location_or_primitive: "top eight threads, first stack, leaf frame and child-output ceilings",

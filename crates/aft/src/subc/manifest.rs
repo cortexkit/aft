@@ -483,6 +483,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             provides: vec![
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
@@ -551,6 +552,14 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         name: crate::commands::health_digest::HEALTH_DIGEST_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
                         description: None,
+                    },
+                    ManagementOperation {
+                        name: super::diagnostics_findings::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: Some(
+                            "Read AFT's recorded health findings without scheduling work."
+                                .to_owned(),
+                        ),
                     },
                     ManagementOperation {
                         name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
@@ -626,6 +635,9 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 concurrency: Concurrency::ModuleManaged,
             },
         ])
+        .flow_operations(Some(
+            vec![super::diagnostics_findings::OPERATION.to_owned()],
+        ))
         .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
@@ -851,6 +863,7 @@ mod tests {
             vec![
                 "tool-provider/v1".to_string(),
                 "call-modes/v1".to_string(),
+                "flow-scopes/v1".to_string(),
                 "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
                 "page-collect/v1".to_string(),
@@ -863,6 +876,7 @@ mod tests {
             Some(&serde_json::json!([
                 "tool-provider/v1",
                 "call-modes/v1",
+                "flow-scopes/v1",
                 "worker-runs/v1",
                 "scope-workdir/v1",
                 "page-collect/v1"
@@ -902,6 +916,10 @@ mod tests {
                 ),
                 (
                     crate::commands::health_digest::HEALTH_DIGEST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    super::super::diagnostics_findings::OPERATION,
                     &ManagementOperationKind::Query,
                 ),
                 (
@@ -1157,7 +1175,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1183,6 +1201,13 @@ mod tests {
             0,
             json!({"name": crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION, "kind": "mutate"}),
         );
+        operations.insert(
+            2,
+            json!({
+                "name": "diagnostics.findings", "kind": "query",
+                "description": "Read AFT's recorded health findings without scheduling work.",
+            }),
+        );
         operations.extend([
             json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
             json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
@@ -1197,6 +1222,13 @@ mod tests {
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");
         assert_eq!(top.insert("ready".to_string(), json!(false)), None);
+        assert_eq!(
+            top.insert(
+                "flow_operations".to_owned(),
+                json!(["diagnostics.findings"])
+            ),
+            None
+        );
         // The snapshot predates the bash companion tools, which the catalog
         // appends after `safety`.
         expected["provides"][0]["tools"]

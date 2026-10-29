@@ -1,0 +1,4 @@
+{
+  "op": "bindings.read_for_agent",
+  "agent_id": "agent-without-bindings"
+}
