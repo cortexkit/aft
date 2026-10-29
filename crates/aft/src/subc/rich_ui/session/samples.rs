@@ -14,7 +14,7 @@ fn sample_fixture() -> Fixture {
         let project = f.dir.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let project = project.canonicalize().unwrap();
-        let mut config = f.ctx.config().clone();
+        let mut config = (*f.ctx.config()).clone();
         config.project_root = Some(project.clone());
         let db = f.ctx.db().unwrap();
         f.ctx = Arc::new(AppContext::new(
