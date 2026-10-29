@@ -37,7 +37,7 @@ fn v21_manifest() -> Manifest {
 
 /// The synthetic v21 baseline with the v22 additions applied the way
 /// `scripts/prepare-gh-shim-v22.py` applies them (bindings stay synthetic).
-fn manifest() -> Manifest {
+pub(super) fn manifest() -> Manifest {
     let mut value = v21_value();
     let additions = additions();
     for removed in additions["removed_from_admin"].as_array().unwrap() {

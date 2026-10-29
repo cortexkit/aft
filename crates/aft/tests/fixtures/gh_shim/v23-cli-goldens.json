@@ -1,0 +1,119 @@
+[
+  {
+    "name": "enqueue-pinned",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
+    "reply": "pr-enqueue-own",
+    "exit": 0,
+    "stdout": "https://github.com/org/repo/pull/7\n",
+    "stderr": "",
+    "request": {"action": "pr enqueue", "repository": "cortexkit/aft", "target": {"number": 7}, "body": {"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"}}
+  },
+  {
+    "name": "enqueue-auto-url",
+    "argv": ["-Rcortexkit/aft", "pr", "merge", "https://github.com/cortexkit/aft/pull/7", "--auto", "--match-head-commit=0123456789abcdef0123456789abcdef01234567"],
+    "reply": "pr-enqueue-own",
+    "exit": 0,
+    "stdout": "https://github.com/org/repo/pull/7\n",
+    "stderr": "",
+    "request": {"action": "pr enqueue", "repository": "cortexkit/aft", "target": {"number": 7}, "body": {"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"}}
+  },
+  {
+    "name": "dequeue",
+    "argv": ["pr", "dequeue", "7"],
+    "reply": "pr-dequeue-own",
+    "exit": 0,
+    "stdout": "https://github.com/org/repo/pull/7\n",
+    "stderr": "",
+    "request": {"action": "pr dequeue", "repository": "cortexkit/aft", "target": {"number": 7}}
+  },
+  {
+    "name": "dequeue-url",
+    "argv": ["pr", "dequeue", "https://github.com/cortexkit/aft/pull/7"],
+    "reply": "pr-dequeue-own",
+    "exit": 0,
+    "stdout": "https://github.com/org/repo/pull/7\n",
+    "stderr": "",
+    "request": {"action": "pr dequeue", "repository": "cortexkit/aft", "target": {"number": 7}}
+  },
+  {
+    "name": "enqueue-missing-pin",
+    "argv": ["pr", "merge", "7", "--auto"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unclassified: To queue a pull request, pass --match-head-commit with its full 40-character head SHA.\n"
+  },
+  {
+    "name": "enqueue-short-pin",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unclassified: To queue a pull request, pass --match-head-commit with its full 40-character head SHA.\n"
+  },
+  {
+    "name": "enqueue-nonhex-pin",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unclassified: To queue a pull request, pass --match-head-commit with its full 40-character head SHA.\n"
+  },
+  {
+    "name": "enqueue-jump",
+    "argv": ["pr", "merge", "7", "--jump", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unsupported_flag: Jumping the merge queue is operator-only.\n"
+  },
+  {
+    "name": "dequeue-jump",
+    "argv": ["pr", "dequeue", "7", "--jump=true"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unsupported_flag: Jumping the merge queue is operator-only.\n"
+  },
+  {
+    "name": "enqueue-extra-field",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567", "-f", "jump=true"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unsupported_flag: Queue commands accept only a pull request number or URL, --repo, and (for enqueue) --auto and --match-head-commit.\n"
+  },
+  {
+    "name": "dequeue-body",
+    "argv": ["pr", "dequeue", "7", "--body", "{}"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unsupported_flag: Queue commands accept only a pull request number or URL, --repo, and (for enqueue) --auto and --match-head-commit.\n"
+  },
+  {
+    "name": "enqueue-missing-target",
+    "argv": ["pr", "merge", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unclassified: Queue commands need exactly one pull request number or URL.\n"
+  },
+  {
+    "name": "dequeue-extra-target",
+    "argv": ["pr", "dequeue", "7", "8"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_unclassified: Queue commands need exactly one pull request number or URL.\n"
+  },
+  {
+    "name": "enqueue-not-own",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
+    "reply": "pr-enqueue-not-own",
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write with a code this shim does not know: pr_edit_not_own; it was not retried\n",
+    "request": {"action": "pr enqueue", "repository": "cortexkit/aft", "target": {"number": 7}, "body": {"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"}}
+  },
+  {
+    "name": "enqueue-repository-without-a-queue",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
+    "reply": "pr-enqueue-graphql-errors",
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write: vendor_rejected{status: 422}\n",
+    "request": {"action": "pr enqueue", "repository": "cortexkit/aft", "target": {"number": 7}, "body": {"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"}}
+  }
+]

@@ -36,6 +36,7 @@ mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
 mod v22_rows;
+mod v23_queue;
 mod worker_reads;
 
 use v22_rows::{
@@ -139,6 +140,7 @@ const V22_GOVERNED_TUPLES: &[&str] = &[
     REVIEW_THREAD_RESOLVE_TUPLE,
     REVIEW_THREAD_UNRESOLVE_TUPLE,
 ];
+const V23_GOVERNED_TUPLES: &[&str] = &["pr enqueue", "pr dequeue"];
 // Installing, upgrading or removing a gh extension puts a program on the
 // operator's machine that later runs with the operator's gh login, so it is
 // operator administration. Listing installed extensions is a read and is
@@ -4712,6 +4714,7 @@ fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 16 && V16_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 19 && V19_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 22 && V22_GOVERNED_TUPLES.contains(&tuple))
+        || (manifest_version >= 23 && V23_GOVERNED_TUPLES.contains(&tuple))
 }
 
 /// True for a governed tuple whose label-only form the operator bypass may run
@@ -4834,7 +4837,20 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     if verb == "api" {
         return classify_api(args, manifest, platform);
     }
-    let tuple = verb_tuple(verb, subcommand);
+    let mut tuple = verb_tuple(verb, subcommand);
+    // Only a signed queue declaration may reinterpret the queue-shaped merge
+    // invocation. Direct merges and disabling auto-merge retain their admin row.
+    if tuple == "pr merge"
+        && manifest.manifest_version >= 23
+        && manifest.tier_for_tuple("pr enqueue", platform) == Some(Tier::Governed)
+        && v23_queue::is_queue_merge(args)
+    {
+        tuple = "pr enqueue".into();
+    } else if tuple == "pr enqueue" {
+        // Enqueue uses upstream's pinned `pr merge` spelling; only dequeue is
+        // a shim-only subcommand.
+        return Classification::Unclassified;
+    }
     if DESTRUCTIVE_TUPLES.contains(&tuple.as_str())
         || (tuple.starts_with("release ")
             && args.iter().any(|arg| {
@@ -5417,7 +5433,12 @@ fn wire_mutation_semantics(request: &Value) -> Option<Value> {
         }
         (json!({"number":object.get("number")?}), Value::Object(body))
     } else {
-        (object.get("target")?.clone(), object.get("body")?.clone())
+        let body = match object.get("body") {
+            Some(body) => body.clone(),
+            None if action == "pr dequeue" => json!({}),
+            None => return None,
+        };
+        (object.get("target")?.clone(), body)
     };
     Some(
         json!({"action":action,"repository":object.get("repository")?,"target":target,"body":body,"edit_last":edit_last,"author_scope":object.get("author_scope").cloned().unwrap_or(Value::Null)}),
@@ -5512,14 +5533,14 @@ impl GithubReadMutation {
             "issue comment" | "issue edit" | "issue reaction" | "issue close" | "issue reopen" => {
                 GithubReadResourceKind::Issue
             }
-            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" | "pr edit" => {
-                GithubReadResourceKind::PullRequest
-            }
+            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" | "pr edit"
+            | "pr enqueue" | "pr dequeue" => GithubReadResourceKind::PullRequest,
             action if action == review_reply_tuple() => GithubReadResourceKind::PullRequest,
             _ => return None,
         };
         let normalized_repository = canonical_repository_key(request.repository.as_deref()?)?;
-        let resource_number = request.target.get("number")?.as_str()?.parse().ok()?;
+        let number = request.target.get("number")?;
+        let resource_number = number.as_i64().or_else(|| number.as_str()?.parse().ok())?;
         (resource_number > 0).then_some(Self {
             resource_kind,
             normalized_repository,
@@ -5595,6 +5616,9 @@ fn canonicalize_governed_from<R: Read>(
     } else {
         head_index + 1
     };
+    if V23_GOVERNED_TUPLES.contains(&tuple) {
+        return v23_queue::canonicalize(args, tuple, canonical, manifest_version, subcommand_index);
+    }
     if tuple == "pr create" {
         return canonicalize_pr_create_from(
             args,
@@ -7428,6 +7452,10 @@ fn governed_wire_request(
         "rung_as_of_unix_secs": determination.as_of_unix_secs,
         "metadata": metadata,
     });
+    if wire["action"] == "pr dequeue" {
+        // Plexus deliberately rejects even an empty body on dequeue.
+        wire.as_object_mut().expect("wire object").remove("body");
+    }
     if let Some(author_scope) = author_scope {
         wire["author_scope"] = Value::String(author_scope);
     }
@@ -8296,6 +8324,10 @@ mod v19_tests;
 #[cfg(test)]
 #[path = "gh_shim/v22_tests.rs"]
 mod v22_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/v23_tests.rs"]
+mod v23_tests;
 
 #[cfg(test)]
 // Release-profile test builds carry no dev key in the trust set, so the tests

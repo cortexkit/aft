@@ -1886,6 +1886,28 @@ fn synthetic_v22_manifest(now: u64) -> Vec<u8> {
     serde_json::to_vec(&manifest).expect("serialize synthetic v22 manifest")
 }
 
+fn synthetic_v23_manifest(now: u64) -> Vec<u8> {
+    let mut manifest: Value = serde_json::from_slice(&synthetic_v22_manifest(now)).unwrap();
+    let additions: Value =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v23-additions.json")).unwrap();
+    manifest["tiers"]["governed"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            additions["tiers"]["governed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    manifest["canonicalization"]
+        .as_object_mut()
+        .unwrap()
+        .extend(additions["canonicalization"].as_object().unwrap().clone());
+    manifest["manifest_version"] = json!(23);
+    serde_json::to_vec(&manifest).unwrap()
+}
+
 fn write_signed_manifest_bytes(state_dir: &Path, manifest_bytes: &[u8], now: u64) {
     let key = Ed25519KeyPair::from_seed_unchecked(&DEV_MANIFEST_SEED).expect("dev signing key");
     let envelope = json!({
@@ -1928,6 +1950,17 @@ fn run_v22_row_with_reply(
     agent_id: &str,
     reply: Vec<u8>,
 ) -> V22Run {
+    run_queue_row(row, manifest_bytes, agent_id, reply, false, true)
+}
+
+fn run_queue_row(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+    worker: bool,
+    provisioned: bool,
+) -> V22Run {
     let bindings = serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
         "status": "ok",
@@ -1949,7 +1982,9 @@ fn run_v22_row_with_reply(
     let recorder = temp.path().join("upstream-invocations.txt");
     write_upstream_gh(&upstream_bin);
     let now = unix_seconds();
-    write_signed_manifest_bytes(&state_dir, manifest_bytes, now);
+    if provisioned {
+        write_signed_manifest_bytes(&state_dir, manifest_bytes, now);
+    }
 
     let inherited_path = std::env::var_os("PATH").expect("test PATH");
     let path = std::env::join_paths(
@@ -1980,6 +2015,9 @@ fn run_v22_row_with_reply(
         .stderr(Stdio::piped());
     for name in WORKER_BROKER_ENV {
         command.env_remove(name);
+    }
+    if worker {
+        command.env("AFT_GH_SHIM_WORKER", "1");
     }
     let output = command.output().expect("run gh shim");
     let routed = holder
@@ -2115,6 +2153,18 @@ fn reply_contract_row(vector: &Value) -> V22Row {
         .or(request["verb"].as_str())
         .unwrap();
     let argv: Vec<String> = match action {
+        "pr enqueue" => vec![
+            "pr".into(),
+            "merge".into(),
+            request["target"]["number"].to_string(),
+            "--match-head-commit".into(),
+            text(&request["body"]["expected_head_sha"]),
+        ],
+        "pr dequeue" => vec![
+            "pr".into(),
+            "dequeue".into(),
+            request["target"]["number"].to_string(),
+        ],
         "pr ready" => {
             let mut argv = vec!["pr".into(), "ready".into(), text(&request["number"])];
             if request["undo"] == true {
@@ -2171,9 +2221,17 @@ fn reply_contract_row(vector: &Value) -> V22Row {
 #[test]
 fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
     let vectors = plexus_contract_judge::load_reply_vectors();
-    assert_eq!(vectors.len(), 17);
-    let manifest = synthetic_v22_manifest(unix_seconds());
+    assert_eq!(vectors.len(), 26);
     for vector in vectors {
+        let queue = matches!(
+            vector["request"]["action"].as_str(),
+            Some("pr enqueue" | "pr dequeue")
+        );
+        let manifest = if queue {
+            synthetic_v23_manifest(unix_seconds())
+        } else {
+            synthetic_v22_manifest(unix_seconds())
+        };
         let row = reply_contract_row(&vector);
         let native = serde_json::to_vec(&vector["reply"]).unwrap();
         let wrapped: Value = serde_json::from_slice(
@@ -2190,6 +2248,10 @@ fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
         let mut routed = run.routed_request.expect("one request, with no retries");
         let mut expected = vector["request"].clone();
         expected["repository"] = json!(REPOSITORY);
+        if queue {
+            // Plexus vectors pin the facade contract, not manifest activation.
+            expected["manifest_version"] = json!(23);
+        }
         for request in [&mut routed, &mut expected] {
             request
                 .as_object_mut()
@@ -2201,8 +2263,12 @@ fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
         let result = &vector["reply"]["result"];
         if result["status"] == "completed" {
             assert_eq!(run.exit_code, Some(0), "{}: {}", row.name, run.stderr);
-            assert_eq!(row.name, "resolve-thread-own", "unhandled completed vector");
-            assert_eq!(run.stdout, "id: \"PRRT_kwDOAbc123\"\nresolved: true\n");
+            if queue {
+                assert_eq!(run.stdout, "https://github.com/org/repo/pull/7\n");
+            } else {
+                assert_eq!(row.name, "resolve-thread-own", "unhandled completed vector");
+                assert_eq!(run.stdout, "id: \"PRRT_kwDOAbc123\"\nresolved: true\n");
+            }
         } else {
             assert_eq!(run.exit_code, Some(86), "{}: {}", row.name, run.stderr);
             assert!(run.stdout.is_empty(), "{}", row.name);
@@ -2226,6 +2292,173 @@ fn v22_speech_rows_route_exactly_the_declared_requests_and_lookalikes_never_rout
     for row in v22_rows() {
         let run = run_v22_row(&row, &manifest, "alfonso-aft");
         check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
+    let goldens: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v23-cli-goldens.json")).unwrap();
+    let replies = plexus_contract_judge::load_reply_vectors();
+    let manifest = synthetic_v23_manifest(unix_seconds());
+    assert_eq!(goldens.len(), 15);
+    for golden in goldens {
+        let row = V22Row {
+            name: leak(golden["name"].as_str().unwrap().to_string()),
+            argv: golden["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| leak(arg.as_str().unwrap().to_string()))
+                .collect(),
+            expect: V22Expect::Refused("unused"),
+        };
+        let native = golden["reply"]
+            .as_str()
+            .map(|name| {
+                let vector = replies
+                    .iter()
+                    .find(|vector| vector["name"] == name)
+                    .unwrap();
+                serde_json::to_vec(&vector["reply"]).unwrap()
+            })
+            .unwrap_or_else(|| b"{}".to_vec());
+        let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", native);
+        assert_eq!(
+            run.exit_code,
+            Some(golden["exit"].as_i64().unwrap() as i32),
+            "{}: {}",
+            row.name,
+            run.stderr
+        );
+        assert_eq!(
+            run.stdout,
+            golden["stdout"].as_str().unwrap(),
+            "{}",
+            row.name
+        );
+        assert_eq!(
+            run.stderr,
+            golden["stderr"].as_str().unwrap(),
+            "{}",
+            row.name
+        );
+        assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
+        if let Some(expected) = golden.get("request") {
+            let mut routed = run.routed_request.expect("one queue request");
+            assert_eq!(routed["operation"], "gh.route");
+            assert_eq!(routed["gh_route_schema"], 1);
+            assert_eq!(routed["manifest_version"], 23);
+            assert!(routed["metadata"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0));
+            assert_eq!(routed["metadata"]["agent_id"], "alfonso-aft");
+            assert!(routed["rung_as_of_unix_secs"].is_u64());
+            for field in [
+                "operation",
+                "gh_route_schema",
+                "manifest_version",
+                "metadata",
+                "rung_as_of_unix_secs",
+            ] {
+                routed.as_object_mut().unwrap().remove(field);
+            }
+            assert_eq!(&routed, expected, "{}", row.name);
+        } else {
+            assert!(run.routed_request.is_none(), "{} routed", row.name);
+        }
+    }
+}
+
+#[test]
+fn queue_writes_from_worker_shells_keep_the_approved_refusal() {
+    let manifest = synthetic_v23_manifest(unix_seconds());
+    for argv in [
+        vec![
+            "pr",
+            "merge",
+            "7",
+            "--match-head-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+        ],
+        vec!["pr", "dequeue", "7"],
+    ] {
+        let row = V22Row {
+            name: "worker queue write",
+            argv,
+            expect: V22Expect::Refused("gh_shim_worker_write_refused"),
+        };
+        let run = run_queue_row(&row, &manifest, "alfonso-aft", b"{}".to_vec(), true, true);
+        assert_eq!(run.exit_code, Some(86));
+        assert_eq!(run.stderr, "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead\n");
+        assert!(run.stdout.is_empty());
+        assert!(run.routed_request.is_none());
+        assert!(run.upstream_invocations.is_none());
+    }
+}
+
+#[test]
+fn queue_actions_never_route_under_v22_even_with_v23_rows_signed() {
+    let mut premature: Value =
+        serde_json::from_slice(&synthetic_v23_manifest(unix_seconds())).unwrap();
+    premature["manifest_version"] = json!(22);
+    let mut absent: Value =
+        serde_json::from_slice(&synthetic_v22_manifest(unix_seconds())).unwrap();
+    absent["manifest_version"] = json!(23);
+    for manifest in [
+        synthetic_v22_manifest(unix_seconds()),
+        serde_json::to_vec(&premature).unwrap(),
+        serde_json::to_vec(&absent).unwrap(),
+    ] {
+        for argv in [
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--match-head-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            vec!["pr", "dequeue", "7"],
+        ] {
+            let row = V22Row {
+                name: "queue not activated",
+                argv,
+                expect: V22Expect::Refused("unused"),
+            };
+            let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", b"{}".to_vec());
+            assert_eq!(run.exit_code, Some(86), "{}", run.stderr);
+            assert!(run.routed_request.is_none());
+            assert!(run.upstream_invocations.is_none());
+            let code = if row.argv[1] == "merge" {
+                "gh_shim_admin_tier"
+            } else {
+                "gh_shim_unclassified"
+            };
+            assert!(
+                run.stderr.starts_with(&format!("gh-shim: {code}: ")),
+                "{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+#[test]
+fn unprovisioned_head_shell_keeps_unknown_dequeue_and_merge_passthrough() {
+    for argv in [
+        vec!["pr", "dequeue", "7"],
+        vec!["pr", "merge", "7", "--auto"],
+    ] {
+        let row = V22Row {
+            name: "unprovisioned queue",
+            argv,
+            expect: V22Expect::Refused("unused"),
+        };
+        let run = run_queue_row(&row, &[], "alfonso-aft", b"{}".to_vec(), false, false);
+        assert_eq!(run.exit_code, Some(73), "{}", run.stderr);
+        assert!(run.routed_request.is_none());
+        let recorded = run.upstream_invocations.expect("delegated unchanged to gh");
+        assert_eq!(recorded, format!("{}\n", row.argv.join(" ")));
     }
 }
 
