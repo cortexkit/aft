@@ -1,5 +1,14 @@
 use super::*;
 
+#[test]
+fn supported_hosts_use_their_declared_manifest_platform() {
+    for host in ["macos", "linux", "windows"] {
+        assert_eq!(manifest_platform(host), host);
+    }
+    assert_eq!(manifest_platform("freebsd"), "unsupported");
+    assert_eq!(current_platform(), manifest_platform(std::env::consts::OS));
+}
+
 pub(super) fn manifest() -> Manifest {
     let mut manifest = v22_tests::manifest();
     let additions: Value = serde_json::from_str(include_str!(
