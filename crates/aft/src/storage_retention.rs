@@ -5362,12 +5362,15 @@ struct V3Bounds {
     budget: Duration,
     /// Members examined in one visit, as `collect_one_v2_family` caps them.
     members: usize,
+    /// Allocated bytes retained in the unified v3 family namespace.
+    soft_bytes: u64,
 }
 
 impl V3Bounds {
     const PASS: Self = Self {
         budget: PASS_BUDGET,
         members: HISTORY_ENTRIES,
+        soft_bytes: crate::views::eviction::FAMILY_PAYLOAD_BUDGET_BYTES,
     };
 }
 
@@ -13384,6 +13387,53 @@ mod v3_collector_tests {
     fn fill_view_dir(view_dir: &Path) {
         fs::create_dir_all(view_dir).unwrap();
         fs::write(view_dir.join("data.bin"), vec![7u8; 64 * 1024]).unwrap();
+    }
+
+    #[test]
+    fn v3_budget_evicts_idle_live_roots_lru_and_stops_at_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let names = ["a-newest", "b-middle", "z-oldest"];
+        let roots = names
+            .iter()
+            .map(|name| bound_root(&temp, &storage, name))
+            .collect::<Vec<_>>();
+        let members = names
+            .iter()
+            .zip(&roots)
+            .map(|(name, root)| (*name, "view", Some(root.as_path())))
+            .collect::<Vec<_>>();
+        seed(&storage, &members);
+        with_registry(&storage, |tx| {
+            for (scope, bound) in [("z-oldest", 10), ("b-middle", 20), ("a-newest", 30)] {
+                tx.execute(
+                    "UPDATE members SET last_bind_ms=?2 WHERE scope=?1",
+                    rusqlite::params![scope, bound],
+                )?;
+            }
+            Ok(())
+        });
+        for name in names {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        let family = v3::family_dir(&storage, FAMILY).unwrap();
+        let before = v3::allocated_bytes(&family).unwrap();
+        // Leave room for registry bookkeeping, but require one whole view to go.
+        let bounds = V3Bounds {
+            soft_bytes: before - 64 * 1024 + 16 * 1024,
+            ..V3Bounds::PASS
+        };
+        let mut report = SweepReport::default();
+        collect_one_v3_family(&StoragePaths::same(&storage), &|| false, &mut report, bounds)
+            .unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert_eq!(member_scopes(&storage), ["a-newest", "b-middle"]);
+        assert!(!view_dir(&storage, "z-oldest").exists());
+        assert!(roots.iter().all(|root| root.exists()));
+        assert!(v3::allocated_bytes(&family).unwrap() <= bounds.soft_bytes);
     }
 
     #[test]
