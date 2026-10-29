@@ -1989,6 +1989,10 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
             metrics.insert("v2_family_sweeps_omitted".into(), json!(omitted));
             continue;
         }
+        #[cfg(test)]
+        if metrics.get("roots").and_then(Value::as_array).is_some_and(|roots| !roots.is_empty()) {
+            eprintln!("health budget before dropping root: bytes={} roots={} metrics={}", encoded_health_metrics_len(metrics), metrics["roots"], Value::Object(metrics.clone()));
+        }
         if metrics
             .get_mut("roots")
             .and_then(Value::as_array_mut)
@@ -9196,6 +9200,7 @@ mod tests {
         assert_eq!(report.status, HealthStatus::Degraded);
         let report_summary = format!("status={:?} detail={:?}", report.status, report.detail);
         let metrics = report.metrics.expect("health metrics");
+        eprintln!("standing drift health: {report_summary} row_count={:?} roots={} metrics={metrics}", metrics["roots"].as_array().map(Vec::len), metrics["roots"]);
         let root_row = metrics["roots"]
             .as_array()
             .and_then(|rows| {
