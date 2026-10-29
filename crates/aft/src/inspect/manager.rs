@@ -8022,6 +8022,7 @@ mod guard_tests {
 
     include!("view_projection_tests.rs");
     include!("completion_perf_tests.rs");
+    include!("tier2_refresh_perf_tests.rs");
 
     fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
         let dir = tempfile::tempdir().expect("tempdir");
