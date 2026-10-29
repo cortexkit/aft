@@ -16,6 +16,184 @@ use std::sync::atomic::AtomicUsize;
 /// are a v2 optimization the v3 store does not write.)
 const ROWS_PER_ONE_CHUNK_FILE: u64 = 2;
 
+#[test]
+fn semantic_batch_lease_permanent_error_is_visible_without_a_retry_timer() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // A multiline function gets its own chunk; a one-line function may only
+    // contribute the file summary, whose result is named after the file.
+    write_tree(
+        root.path(),
+        &[("saved.rs", "pub fn saved_vector() -> u64 {\n    7\n}\n")],
+    );
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    // Use a known mock reply and query direction. Hash-derived similarity can
+    // omit a valid saved result, so prove retrieval before injecting the error.
+    let mut saved_query = vec![0.0; 16];
+    saved_query[0] = 1.0;
+    runtime
+        .refresh(FillBudget::default(), &mut |texts| {
+            Ok(model
+                .embed(texts)?
+                .into_iter()
+                .map(|_| saved_query.clone())
+                .collect())
+        })
+        .unwrap();
+    let saved = runtime.search(&saved_query, 20, &|_| true).unwrap();
+    assert!(saved.complete());
+    assert!(saved.results.iter().any(|row| row.name == "saved_vector"));
+    let baseline = model.texts();
+    let directory = storage.path().join("semantic-batch-leases-v1");
+    std::fs::remove_dir_all(&directory).unwrap();
+    std::fs::write(&directory, b"not a directory").unwrap();
+    write_tree(
+        root.path(),
+        &[("pending.rs", "pub fn pending_vector() -> u64 { 9 }\n")],
+    );
+    runtime.driver().register_write_intent();
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().to_path_buf());
+    config.storage_dir = Some(storage.path().to_path_buf());
+    config.views.enabled = true;
+    config.indexes.semantic = true;
+    let ctx = Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    let (status_epoch, _status_wake) = ctx.checkout_semantic().begin();
+    assert!(ctx
+        .checkout_semantic()
+        .install(status_epoch, Arc::clone(&runtime)));
+    *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::ready();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let ctx = Arc::clone(&ctx);
+        let model = Arc::clone(&model);
+        let schedule = fast_schedule(root.path());
+        std::thread::spawn(move || {
+            serve_fills_with_status(
+                &weak,
+                epoch,
+                &wake,
+                &schedule,
+                Some(ctx.semantic_index_status()),
+                &mut |texts| model.embed(texts),
+            )
+        })
+    };
+    let first = observer.next();
+    let retry_armed = lock(&slot.retry).is_some();
+    let pending_was_contention = runtime.coordination_pending();
+    let answer = runtime.search(&saved_query, 20, &|_| true).unwrap();
+    let request: crate::protocol::RawRequest =
+        serde_json::from_value(serde_json::json!({"id":"lease-error", "command":"status"}))
+            .unwrap();
+    let status =
+        serde_json::to_value(crate::commands::status::handle_status(&request, &ctx)).unwrap();
+    let attempts = runtime.refresh_attempts();
+    let before_repair = model.texts();
+    // Repair alone sends no checkout notification. Explicitly wake the parked
+    // worker, which must then recover without losing the saved vectors.
+    std::fs::remove_file(&directory).unwrap();
+    slot.wake();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while observer.next() != "settled" {
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(
+        first, "lease_error",
+        "a permanent storage failure was presented as a live sibling"
+    );
+    assert!(
+        !retry_armed,
+        "a permanent coordination failure armed a retry timer"
+    );
+    assert!(!pending_was_contention);
+    assert!(attempts > 0);
+    assert_eq!(
+        before_repair, baseline,
+        "failed coordination dispatched paid work"
+    );
+    assert!(!answer.complete());
+    assert!(answer.unavailable.is_none());
+    assert!(answer.results.iter().any(|row| row.name == "saved_vector"));
+    assert_eq!(status["semantic_index"]["status"], "ready");
+    assert_eq!(
+        status["semantic_index"]["coordination_error"]["retryable"],
+        false
+    );
+    assert!(
+        status["semantic_index"]["coordination_error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("lease")),
+        "{status}"
+    );
+    assert!(query(&runtime, "pending").complete());
+    assert_eq!(model.texts(), baseline + 1);
+}
+
+#[test]
+fn semantic_batch_lease_transient_errors_back_off_then_park_visibly() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[("file.rs", "pub fn uncertain_vector() {}\n")],
+    );
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let lease_path = super::super::semantic_batch_lease::path(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    );
+    let model = Arc::new(Model::default());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let model = Arc::clone(&model);
+        let schedule = fast_schedule(root.path());
+        std::thread::spawn(move || {
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts| {
+                let vectors = model.embed(texts);
+                std::fs::remove_file(&lease_path).unwrap();
+                vectors
+            })
+        })
+    };
+    // Repeated ownership loss is uncertain paid work, not ordinary contention.
+    // Four bounded retries are allowed; the fifth error must park visibly.
+    for _ in 0..5 {
+        assert_eq!(observer.next(), "lease_error");
+    }
+    let retry_armed = lock(&slot.retry).is_some();
+    let state = runtime.coordination_state();
+    slot.clear();
+    worker.join().unwrap();
+    assert!(!retry_armed);
+    assert!(matches!(
+        state,
+        Some(CoordinationState::Error {
+            failure: LeaseError {
+                kind: super::super::semantic::LeaseErrorKind::OwnershipLost,
+                retryable: true,
+                ..
+            },
+            retry_scheduled: false
+        })
+    ));
+    assert_eq!(model.texts(), 5);
+    assert!(!query(&runtime, "uncertain").complete());
+}
+
 /// Row usage of the family's v3 semantic plane store, read through its own
 /// read-only connection.
 struct SemanticRows {

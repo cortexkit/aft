@@ -6,11 +6,67 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::{fmt, io};
 
 use crate::fs_lock::{self, AcquireError, LockGuard};
 
 // Placeholder reason for pending semantic work, not a backend failure.
 pub(crate) const PENDING_REASON: &str = "SEMANTIC_BATCH_PENDING_APPROVAL";
+pub(crate) const ERROR_REASON: &str = "SEMANTIC_BATCH_COORDINATION_ERROR_APPROVAL";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseErrorKind {
+    MalformedOwner,
+    Storage(io::ErrorKind),
+    OwnershipLost,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseError {
+    pub kind: LeaseErrorKind,
+    pub detail: String,
+    pub retryable: bool,
+}
+
+impl LeaseError {
+    fn from_io(operation: &str, error: io::Error) -> Self {
+        let kind = error.kind();
+        // Windows can report access denied while a lease is pending deletion.
+        // Retry that ambiguity only within the worker's finite error budget.
+        let retryable = matches!(
+            kind,
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::NotFound
+        ) || cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33));
+        Self {
+            kind: if kind == io::ErrorKind::InvalidData {
+                LeaseErrorKind::MalformedOwner
+            } else {
+                LeaseErrorKind::Storage(kind)
+            },
+            detail: format!("{operation}: {error}"),
+            retryable,
+        }
+    }
+
+    pub(crate) fn kind_label(&self) -> &'static str {
+        match self.kind {
+            LeaseErrorKind::MalformedOwner => "malformed_owner",
+            LeaseErrorKind::Storage(_) => "storage",
+            LeaseErrorKind::OwnershipLost => "ownership_lost",
+        }
+    }
+}
+
+impl fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for LeaseError {}
 
 pub(crate) fn path(storage: &Path, family: &str, producer: &str) -> PathBuf {
     let mut hash = blake3::Hasher::new();
@@ -35,10 +91,10 @@ pub(crate) fn try_acquire(
     storage: &Path,
     family: &str,
     producer: &str,
-) -> Result<Option<BatchLease>, String> {
+) -> Result<Option<BatchLease>, LeaseError> {
     let path = path(storage, family, producer);
     std::fs::create_dir_all(path.parent().expect("lease directory"))
-        .map_err(|error| format!("semantic batch lease directory: {error}"))?;
+        .map_err(|error| LeaseError::from_io("semantic batch lease directory", error))?;
     // Recover only this requested, unowned/stale lease via the existing
     // incarnation-aware protocol. Never sweep or expire a live owner's lease.
     match fs_lock::try_acquire_once_with_policy(&path, fs_lock::MalformedOwnerPolicy::FailClosed) {
@@ -47,9 +103,16 @@ pub(crate) fn try_acquire(
             started: Instant::now(),
         })),
         Err(AcquireError::Timeout) => {
-            let metadata = fs_lock::read_lease_settled(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let metadata = match fs_lock::read_lease_settled(&path) {
+                Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(LeaseError::from_io(
+                        "semantic batch lease owner metadata",
+                        error,
+                    ))
+                }
+            };
             let pid = metadata.as_ref().and_then(|m| m["pid"].as_u64());
             let created = metadata.as_ref().and_then(|m| m["created_at_ms"].as_u64());
             let now = std::time::SystemTime::now()
@@ -62,18 +125,24 @@ pub(crate) fn try_acquire(
             );
             Ok(None)
         }
-        Err(error) => Err(format!("semantic batch lease: {error}")),
+        Err(AcquireError::Io(error)) => Err(LeaseError::from_io("semantic batch lease", error)),
     }
 }
 
 impl BatchLease {
-    pub(crate) fn verify(&self) -> Result<(), String> {
+    pub(crate) fn verify(&self) -> Result<(), LeaseError> {
         match self.guard.verify_writer_epoch() {
             Ok(true) => Ok(()),
-            Ok(false) => {
-                Err("semantic batch lease ownership lost; provider outcome may be uncertain".into())
-            }
-            Err(error) => Err(format!("semantic batch lease verification: {error}")),
+            Ok(false) => Err(LeaseError {
+                kind: LeaseErrorKind::OwnershipLost,
+                detail: "semantic batch lease ownership lost; provider outcome may be uncertain"
+                    .into(),
+                retryable: true,
+            }),
+            Err(error) => Err(LeaseError::from_io(
+                "semantic batch lease verification",
+                error,
+            )),
         }
     }
 }
@@ -90,6 +159,33 @@ impl Drop for BatchLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_batch_lease_error_policy_distinguishes_storage_and_transient_io() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotADirectory,
+            io::ErrorKind::StorageFull,
+        ] {
+            let error =
+                LeaseError::from_io("semantic batch lease directory", io::Error::from(kind));
+            assert_eq!(error.kind, LeaseErrorKind::Storage(kind));
+            assert!(!error.retryable);
+        }
+        let malformed = LeaseError::from_io(
+            "semantic batch lease",
+            io::Error::from(io::ErrorKind::InvalidData),
+        );
+        assert_eq!(malformed.kind, LeaseErrorKind::MalformedOwner);
+        assert!(!malformed.retryable);
+        assert!(
+            LeaseError::from_io(
+                "semantic batch lease",
+                io::Error::from(io::ErrorKind::Interrupted)
+            )
+            .retryable
+        );
+    }
 
     #[test]
     fn semantic_batch_lease_malformed_live_owner_fails_closed() {

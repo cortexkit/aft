@@ -689,9 +689,11 @@ fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
             1,
             "contender duplicated provider work"
         );
-        if status
-            .to_string()
-            .contains("SEMANTIC_BATCH_PENDING_APPROVAL")
+        // An unusable coordinator is not acknowledgement of a live owner.
+        if status["semantic_index"]["pending_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+            && status["semantic_index"]["coordination_error"].is_null()
         {
             break;
         }

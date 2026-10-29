@@ -34,7 +34,8 @@ use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::ViewRegistration;
 use super::semantic::{
-    FillAdmission, FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery,
+    FillAdmission, FillBudget, FillReport, LeaseError, SemanticPlane, SemanticProducer,
+    SemanticQuery,
 };
 use super::snapshot::{DiskState, LiveDelta, Snapshot};
 
@@ -88,6 +89,15 @@ pub(crate) fn view_scope(scope: &str) -> String {
     format!("{scope}.semantic")
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoordinationState {
+    Contended,
+    Error {
+        failure: LeaseError,
+        retry_scheduled: bool,
+    },
+}
+
 /// One checkout's semantic view: registration, driver and plane.
 pub struct CheckoutSemantic {
     root: PathBuf,
@@ -109,7 +119,7 @@ pub struct CheckoutSemantic {
     /// the scheduled deadline when a transient refresh is being retried. Searches
     /// report it as `semantic: unavailable: <reason>`.
     unavailable: Mutex<Option<String>>,
-    coordination_pending: AtomicBool,
+    coordination: Mutex<Option<CoordinationState>>,
     /// Semantic searches answered from this view.
     searches: AtomicU64,
     /// Readiness successors this view published as its base's owner.
@@ -211,7 +221,7 @@ impl CheckoutSemantic {
             unfolded: AtomicBool::new(false),
             refresh_attempts: AtomicUsize::new(0),
             unavailable: Mutex::new(None),
-            coordination_pending: AtomicBool::new(false),
+            coordination: Mutex::new(None),
             searches: AtomicU64::new(0),
             base_successors: AtomicU64::new(0),
             #[cfg(test)]
@@ -743,8 +753,20 @@ impl CheckoutSemantic {
         self.refresh_attempts.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn coordination_state(&self) -> Option<CoordinationState> {
+        lock(&self.coordination).clone()
+    }
+
+    fn set_coordination(&self, state: Option<CoordinationState>) {
+        *lock(&self.coordination) = state;
+    }
+
+    #[cfg(test)]
     pub(crate) fn coordination_pending(&self) -> bool {
-        self.coordination_pending.load(Ordering::Relaxed)
+        matches!(
+            self.coordination_state(),
+            Some(CoordinationState::Contended)
+        )
     }
 
     /// Why the checkout's vectors cannot be brought up to date, including a
@@ -1781,6 +1803,8 @@ enum FillOutcome {
     },
     /// Coordination is pending, not a failed/unavailable semantic backend.
     Contended,
+    /// A lease failed, distinct from an owner that can finish pending work.
+    LeaseError(LeaseError),
     /// The lane is no longer this worker's.
     Stop,
     /// The lane is still this worker's, but its root lost its route while the
@@ -1900,6 +1924,8 @@ fn serve_fills_with_status<F>(
     let mut first = true;
     let mut contention_started = None;
     let mut contention_attempts = 0u64;
+    let mut lease_error_attempts = 0u32;
+    const LEASE_ERROR_RETRIES: u32 = 4;
     loop {
         if !first {
             let woke = match retry_after {
@@ -1921,6 +1947,9 @@ fn serve_fills_with_status<F>(
                     Err(_) => return,
                 },
             };
+            if woke {
+                lease_error_attempts = 0;
+            }
             #[cfg(test)]
             if woke {
                 observe_fill(&schedule.root, "wake");
@@ -1957,6 +1986,7 @@ fn serve_fills_with_status<F>(
         match outcome {
             FillOutcome::Stop => return,
             FillOutcome::Contended => {
+                lease_error_attempts = 0;
                 let started = *contention_started.get_or_insert_with(Instant::now);
                 contention_attempts += 1;
                 // Capped, non-FIFO jitter avoids synchronized process convoys.
@@ -1999,12 +2029,60 @@ fn serve_fills_with_status<F>(
                 observe_fill(&schedule.root, "contended");
                 backoff = (backoff * 2).min(schedule.retry_max);
             }
+            FillOutcome::LeaseError(failure) => {
+                lease_error_attempts += 1;
+                let retry_scheduled =
+                    failure.retryable && lease_error_attempts <= LEASE_ERROR_RETRIES;
+                if retry_scheduled {
+                    schedule_retry(
+                        slot,
+                        epoch,
+                        super::semantic_batch_lease::ERROR_REASON,
+                        backoff,
+                        schedule.retry_initial,
+                    );
+                    retry_after = Some((backoff, true));
+                    backoff = (backoff * 2).min(schedule.retry_max);
+                } else {
+                    clear_retry(slot, epoch);
+                    retry_after = None;
+                }
+                if let Some(runtime) = slot.upgrade().and_then(|slot| {
+                    let runtime = slot.runtime()?;
+                    slot.is_current(epoch).then_some(runtime)
+                }) {
+                    runtime.clear_unavailable();
+                    runtime.set_coordination(Some(CoordinationState::Error {
+                        failure: failure.clone(),
+                        retry_scheduled,
+                    }));
+                }
+                // The loaded vectors remain usable. Only coordination failed;
+                // do not turn this into an unavailable embedding backend.
+                if let Some(status) = status {
+                    set_status(
+                        slot,
+                        epoch,
+                        status,
+                        crate::context::SemanticIndexStatus::ready(),
+                    );
+                }
+                crate::slog_warn!(
+                    "semantic batch lease error retry_count={} retry_scheduled={} error={}",
+                    lease_error_attempts,
+                    retry_scheduled,
+                    failure
+                );
+                #[cfg(test)]
+                observe_fill(&schedule.root, "lease_error");
+            }
             FillOutcome::Parked => {
                 #[cfg(test)]
                 observe_fill(&schedule.root, "parked");
                 retry_after = None;
             }
             FillOutcome::Settled => {
+                lease_error_attempts = 0;
                 contention_started = None;
                 contention_attempts = 0;
                 clear_retry(slot, epoch);
@@ -2027,6 +2105,7 @@ fn serve_fills_with_status<F>(
                 retry_after = None;
             }
             FillOutcome::Retry { progress, reason } => {
+                lease_error_attempts = 0;
                 if progress {
                     backoff = schedule.retry_initial;
                 }
@@ -2250,13 +2329,20 @@ where
             return FillOutcome::Stop;
         }
         if refresh.is_err() {
-            runtime.coordination_pending.store(false, Ordering::Relaxed);
+            runtime.set_coordination(None);
         }
         match refresh {
             Ok(report) => {
-                runtime
-                    .coordination_pending
-                    .store(report.pending.is_some(), Ordering::Relaxed);
+                runtime.set_coordination(report.pending.as_ref().map(|pending| match pending {
+                    super::semantic::FillPending::LeaseError(failure) => CoordinationState::Error {
+                        failure: failure.clone(),
+                        retry_scheduled: false,
+                    },
+                    _ => CoordinationState::Contended,
+                }));
+                if let Some(super::semantic::FillPending::LeaseError(failure)) = &report.pending {
+                    return FillOutcome::LeaseError(failure.clone());
+                }
                 if report.pending == Some(super::semantic::FillPending::LocalContention) {
                     // refresh, its file claims and all scoped permits have
                     // returned. Park only this background worker, checking lane

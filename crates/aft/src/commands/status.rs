@@ -331,12 +331,32 @@ impl AppContext {
                 runtime,
             ))) = self.checkout_semantic().try_state()
             {
-                if runtime.coordination_pending() {
-                    // Keep the ready index queryable: only the missing paths are
-                    // pending. Treating the ready index as loading or failed would
-                    // hide saved results.
-                    semantic_index_info["pending_reason"] =
-                        serde_json::json!(crate::views::semantic_batch_lease::PENDING_REASON);
+                if let Some(coordination) = runtime.coordination_state() {
+                    // Keep the ready index queryable. Coordination can be an
+                    // error even though previously saved vectors still serve.
+                    match coordination {
+                        crate::views::semantic_runtime::CoordinationState::Contended => {
+                            semantic_index_info["pending_reason"] = serde_json::json!(
+                                crate::views::semantic_batch_lease::PENDING_REASON
+                            );
+                        }
+                        crate::views::semantic_runtime::CoordinationState::Error {
+                            failure,
+                            retry_scheduled,
+                        } => {
+                            semantic_index_info["pending_reason"] = serde_json::json!(format!(
+                                "{}: {}",
+                                crate::views::semantic_batch_lease::ERROR_REASON,
+                                failure.detail
+                            ));
+                            semantic_index_info["coordination_error"] = serde_json::json!({
+                                "state": "error", "kind": failure.kind_label(),
+                                "reason": crate::views::semantic_batch_lease::ERROR_REASON,
+                                "detail": failure.detail, "retryable": failure.retryable,
+                                "retry_scheduled": retry_scheduled,
+                            });
+                        }
+                    }
                 }
             }
         }

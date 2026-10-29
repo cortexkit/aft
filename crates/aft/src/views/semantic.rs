@@ -47,6 +47,7 @@ use super::readiness::{
 };
 use super::registry::ViewRegistration;
 use super::segment_store::rel_path_to_os;
+pub use super::semantic_batch_lease::{LeaseError, LeaseErrorKind};
 use super::snapshot::{ComposedGeneration, DiskState, LiveEntry, Snapshot, Source, WatcherState};
 use super::RelPath;
 
@@ -634,7 +635,7 @@ pub enum FillPending {
     Contended,
     LocalContention,
     AdmissionChanged,
-    LeaseError(String),
+    LeaseError(LeaseError),
 }
 
 struct FillClaim {
@@ -2372,7 +2373,7 @@ impl SemanticPlane {
                     }
                     Err(error) => {
                         report.pending = Some(FillPending::LeaseError(error.clone()));
-                        return Err(error);
+                        return Err(error.to_string());
                     }
                 }
                 // Persistent lookup must be repeated after lease acquisition,
@@ -2390,7 +2391,7 @@ impl SemanticPlane {
                 .expect("missing chunks require semantic ownership");
             if let Err(error) = owner.verify() {
                 report.pending = Some(FillPending::LeaseError(error.clone()));
-                return Err(error);
+                return Err(error.to_string());
             }
             report.model_calls += 1;
             report.embedded_texts += misses.len();
@@ -2403,7 +2404,7 @@ impl SemanticPlane {
             batch_checkpoint("validated_response");
             if let Err(error) = owner.verify() {
                 report.pending = Some(FillPending::LeaseError(error.clone()));
-                return Err(error);
+                return Err(error.to_string());
             }
             let store_started = Instant::now();
             let mut payloads = Vec::new();
