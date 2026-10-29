@@ -1968,6 +1968,39 @@ fn retention_report_totals(
     Value::Object(totals)
 }
 
+fn ordinary_ready_health_root(root: &Value) -> bool {
+    root["standing"] != true
+        && !root["standing_refusal"].is_string()
+        && root["cache_unavailable_reason"].is_null()
+        && root["state"] == "ready"
+        && ["search_index", "semantic_index", "callgraph_store", "tier2"]
+            .iter()
+            .all(|component| {
+                matches!(
+                    root[component]["status"].as_str(),
+                    Some("ready" | "disabled")
+                )
+            })
+        && root["suspended_domains"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && root["tier2"]["retry_paused"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && root["bash"]["project_replay_failures"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && root["views"].as_object().is_none_or(|views| {
+            views.get("pinned").and_then(Value::as_bool) == Some(true)
+                && views.get("pending_paths").and_then(Value::as_u64) == Some(0)
+                && views.get("failed_paths").and_then(Value::as_u64) == Some(0)
+                && views.get("publication_failure").is_none_or(Value::is_null)
+                && views
+                    .get("callgraph_readiness_deferred")
+                    .is_none_or(Value::is_null)
+        })
+}
+
 fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
     let mut ledger_compacted = false;
     loop {
@@ -1987,23 +2020,6 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
                 .unwrap_or(0)
                 .saturating_add(1);
             metrics.insert("v2_family_sweeps_omitted".into(), json!(omitted));
-            continue;
-        }
-        #[cfg(test)]
-        if metrics.get("roots").and_then(Value::as_array).is_some_and(|roots| !roots.is_empty()) {
-            eprintln!("health budget before dropping root: bytes={} roots={} metrics={}", encoded_health_metrics_len(metrics), metrics["roots"], Value::Object(metrics.clone()));
-        }
-        if metrics
-            .get_mut("roots")
-            .and_then(Value::as_array_mut)
-            .is_some_and(|roots| roots.pop().is_some())
-        {
-            let omitted = metrics
-                .get("root_details_omitted")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .saturating_add(1);
-            metrics.insert("root_details_omitted".to_string(), json!(omitted));
             continue;
         }
         if !ledger_compacted {
@@ -2028,9 +2044,9 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
             metrics.insert("storage_retention_reports_omitted".into(), json!(omitted));
             continue;
         }
-        // Cache-root paths are user-chosen and may be long; drop them last,
-        // unavailable entries first because their paths repeat ones listed in
-        // cache_roots, counting each one dropped.
+        // Cache-root paths are user-chosen and may be long. Their detail yields
+        // before root health, unavailable entries first because their paths
+        // repeat ones listed in cache_roots, counting each one dropped.
         let mut trimmed_cache_path = false;
         for (field, omitted_field) in [
             ("cache_unavailable", "cache_unavailable_omitted"),
@@ -2057,6 +2073,25 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         }
         if trimmed_cache_path {
             continue;
+        }
+        // Current refusals and unhealthy roots are more useful than ancillary
+        // telemetry. After compacting that telemetry, discard ordinary ready
+        // roots first; keep the original order among the surviving rows.
+        if let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) {
+            if !roots.is_empty() {
+                let index = roots
+                    .iter()
+                    .rposition(ordinary_ready_health_root)
+                    .unwrap_or(roots.len() - 1);
+                roots.remove(index);
+                let omitted = metrics
+                    .get("root_details_omitted")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                metrics.insert("root_details_omitted".into(), json!(omitted));
+                continue;
+            }
         }
         return;
     }
@@ -3913,6 +3948,16 @@ fn build_health_report_with_snapshots(
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
+    // Findings read their evidence from the cached rollup, not the public
+    // health reply. Do not let that internal evidence displace root diagnostics
+    // under the public reply's byte budget.
+    if let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) {
+        for root in roots {
+            if let Some(root) = root.as_object_mut() {
+                root.remove("diagnostics_evidence");
+            }
+        }
+    }
     // The count's age is recorded at assembly; include time spent serving this
     // rollup too, including when scheduler contention delays the next census.
     if let Some(age) = metrics
@@ -4383,20 +4428,18 @@ mod tests {
             "write_ledger_top_10m": [{"root_id":format!("/very/long/{}/root", "directory/".repeat(1000)), "bytes": 123}],
             "storage_retention": (0..20).map(|i| (format!("report-{i:02}"), json!({"detail":"r".repeat(1500)}))).collect::<serde_json::Map<_,_>>()
         }).as_object().unwrap().clone();
-        let mut expected = oversized.clone();
-        legacy_health_budget(&mut expected);
         super::budget_health_metrics(&mut oversized);
-        assert_eq!(
-            serde_json::to_vec(&oversized).unwrap(),
-            serde_json::to_vec(&expected).unwrap()
-        );
+        // Byte counting still matches the legacy serializer, but trimming now
+        // preserves root detail ahead of ledger paths and retention reports.
+        assert_eq!(oversized["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(oversized["root_details_omitted"], 9);
         assert_eq!(oversized["write_ledger_top_10m"][0]["root_id"], "root");
-        assert!(
-            oversized["storage_retention_reports_omitted"]
-                .as_u64()
-                .unwrap()
-                > 0
+        assert_eq!(oversized["storage_retention_reports_omitted"], 20);
+        assert_eq!(
+            oversized["metrics_bytes"],
+            serde_json::to_vec(&oversized).unwrap().len()
         );
+        assert!(oversized["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
         let mut cached = json!({"roots":[{"detail":"r".repeat(12000)}]})
             .as_object()
             .unwrap()
@@ -4505,7 +4548,10 @@ mod tests {
             "cache_roots": ["c".repeat(13000)], "cache_roots_omitted": 0,
             "cache_unavailable": {"unavailable": "c".repeat(13000)},
             "cache_unavailable_omitted": 0
-        }).as_object().unwrap().clone();
+        })
+        .as_object()
+        .unwrap()
+        .clone();
         budget_health_metrics(&mut metrics);
         assert_eq!(metrics["roots"], json!([root]));
         assert_eq!(metrics["root_details_omitted"], 0);
@@ -4519,13 +4565,24 @@ mod tests {
     #[test]
     fn health_budget_drops_healthy_roots_before_degraded_refused_and_standing_rows() {
         for (detail_bytes, expected) in [
-            (2000, vec!["healthy-a", "degraded", "standing", "refused", "healthy-b"]),
+            (
+                2000,
+                vec!["healthy-a", "degraded", "standing", "refused", "healthy-b"],
+            ),
             (2600, vec!["healthy-a", "degraded", "standing", "refused"]),
             (3400, vec!["degraded", "standing", "refused"]),
             (7000, vec!["degraded"]),
         ] {
-            let mut roots = ["healthy-a", "degraded", "standing", "refused", "healthy-b", "healthy-c"]
-                .map(|name| json!({
+            let mut roots = [
+                "healthy-a",
+                "degraded",
+                "standing",
+                "refused",
+                "healthy-b",
+                "healthy-c",
+            ]
+            .map(|name| {
+                json!({
                     "project_root": name, "state": "ready",
                     "search_index": {"status": "ready"},
                     "semantic_index": {"status": "disabled"},
@@ -4534,19 +4591,66 @@ mod tests {
                     "diagnostics_evidence": {"build_breaker_error": null,
                         "database_open_failed": false, "lsp_start_failures": {}},
                     "detail": "x".repeat(detail_bytes)
-                }));
+                })
+            });
             roots[1]["semantic_index"]["status"] = json!("degraded");
             roots[2]["standing"] = json!(true);
             roots[3]["standing_refusal"] = json!("resolved-path-drift refusal");
             let mut metrics = json!({"roots": roots, "root_details_omitted": 2})
-                .as_object().unwrap().clone();
+                .as_object()
+                .unwrap()
+                .clone();
             budget_health_metrics(&mut metrics);
             let retained = metrics["roots"].as_array().unwrap();
-            let names = retained.iter().map(|row| row["project_root"].as_str().unwrap()).collect::<Vec<_>>();
+            let names = retained
+                .iter()
+                .map(|row| row["project_root"].as_str().unwrap())
+                .collect::<Vec<_>>();
             assert_eq!(names, expected, "detail_bytes={detail_bytes}");
             assert_eq!(metrics["root_details_omitted"], 2 + 6 - retained.len());
-            assert_eq!(metrics["metrics_bytes"], serde_json::to_vec(&metrics).unwrap().len());
-            assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+            assert_eq!(
+                metrics["metrics_bytes"],
+                serde_json::to_vec(&metrics).unwrap().len()
+            );
+            assert!(
+                metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64
+            );
+        }
+    }
+
+    #[test]
+    fn health_budget_does_not_treat_unknown_or_nonready_roots_as_healthy() {
+        let ready = json!({
+            "state": "ready", "search_index": {"status": "ready"},
+            "semantic_index": {"status": "disabled"}, "callgraph_store": {"status": "ready"},
+            "tier2": {"status": "ready"},
+            "views": {"pinned": true, "pending_paths": 0, "failed_paths": 0}
+        });
+        assert!(ordinary_ready_health_root(&ready));
+        for (pointer, value) in [
+            ("/state", json!("busy")),
+            ("/search_index/status", json!("building")),
+            ("/semantic_index/status", json!("degraded")),
+            ("/callgraph_store/status", json!("absent")),
+            ("/tier2/status", json!("stale")),
+            ("/views/pinned", json!(false)),
+            ("/views/pending_paths", json!(1)),
+            ("/views/failed_paths", json!(1)),
+        ] {
+            let mut root = ready.clone();
+            *root.pointer_mut(pointer).unwrap() = value;
+            assert!(!ordinary_ready_health_root(&root), "{pointer}");
+        }
+        for (field, value) in [
+            ("standing", json!(true)),
+            ("standing_refusal", json!("resolved-path-drift refusal")),
+            ("cache_unavailable_reason", json!("storage unavailable")),
+            ("suspended_domains", json!([{"domain": "search"}])),
+            ("search_index", Value::Null),
+        ] {
+            let mut root = ready.clone();
+            root[field] = value;
+            assert!(!ordinary_ready_health_root(&root), "{field}");
         }
     }
 
@@ -4557,7 +4661,7 @@ mod tests {
         let app = App::default_shared();
         let evidence = json!({
             "build_breaker_error": null, "database_open_failed": false,
-            "lsp_start_failures": {("server".repeat(HEALTH_METRICS_BUDGET_BYTES)): 3}
+            "lsp_start_failures": {("server".repeat(HEALTH_METRICS_BUDGET_BYTES / 6)): 3}
         });
         let mut rollup = allocator_rollup(&cache);
         rollup.status = HealthStatus::Degraded;
@@ -4569,17 +4673,33 @@ mod tests {
         }]);
         cache.publish(Some(rollup));
 
-        let report = build_health_report(&cache, &executor, &HashMap::new(), &DispatchPathMetrics::new(), &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
         assert_eq!(report.status, HealthStatus::Degraded);
         let metrics = report.metrics.unwrap();
         assert_eq!(metrics["roots"].as_array().unwrap().len(), 1);
-        assert_eq!(metrics["roots"][0]["standing_refusal"], "resolved-path-drift refusal");
+        assert_eq!(
+            metrics["roots"][0]["standing_refusal"],
+            "resolved-path-drift refusal"
+        );
         assert!(metrics["roots"][0].get("diagnostics_evidence").is_none());
         assert_eq!(metrics["root_details_omitted"], 0);
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
-        assert_eq!(cache.snapshot().0.metrics["roots"][0]["diagnostics_evidence"], evidence);
+        assert_eq!(
+            cache.snapshot().0.metrics["roots"][0]["diagnostics_evidence"],
+            evidence
+        );
         let findings = serde_json::to_value(cache.findings(1_000, 60_000)).unwrap();
-        assert!(findings.as_array().unwrap().iter().any(|finding| finding["check"] == "lsp_start_failures"));
+        assert!(findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["check"] == "lsp_start_failures"));
     }
 
     #[test]
@@ -9275,7 +9395,12 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_standing_health_names_resolved_path_drift(prefix: &str) {
-        let directory = || tempfile::Builder::new().prefix(prefix).tempdir().expect("standing directory");
+        let directory = || {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir()
+                .expect("standing directory")
+        };
         let storage = directory();
         let original = directory();
         let retargeted = directory();
@@ -9305,7 +9430,6 @@ mod tests {
         assert_eq!(report.status, HealthStatus::Degraded);
         let report_summary = format!("status={:?} detail={:?}", report.status, report.detail);
         let metrics = report.metrics.expect("health metrics");
-        eprintln!("standing drift health: {report_summary} row_count={:?} roots={} metrics={metrics}", metrics["roots"].as_array().map(Vec::len), metrics["roots"]);
         let root_row = metrics["roots"]
             .as_array()
             .and_then(|rows| {
