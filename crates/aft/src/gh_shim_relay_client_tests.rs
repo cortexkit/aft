@@ -374,6 +374,7 @@ fn refusal_explanation_read_only_gates_do_not_warn_unless_steps_were_sent() {
         assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), format!("Plexus refused the bot write: {code}. {explanation} GitHub received only reads; nothing was written. The agent must change the request."));
         refusal["legs_sent"] = json!(["comment"]);
         refusal["transmission"] = json!("not_sent");
+        refusal["retry_same_nonce"] = json!(true);
         assert_eq!(refusal_explanation(json!({"result": refusal})), format!("Plexus refused the bot write: {code}. {explanation} GitHub received a request. Already-sent write steps: comment. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
     }
 }
@@ -393,6 +394,54 @@ fn refusal_explanation_ambiguous_read_failures_keep_conservative_warning() {
         assert_eq!(refusal_explanation(json!({"result": {
             "status": "refused", "refusal_code": code, "retry_same_nonce": false,
         }})), format!("Plexus refused the bot write: {code}. {explanation} Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+}
+
+#[test]
+fn non_retryable_posted_steps_are_reported_as_partially_applied() {
+    for retry in [None, Some(false)] {
+        let mut refusal = json!({"status": "refused", "refusal_code": "transport_not_sent", "legs_sent": ["comment"]});
+        if let Some(retry) = retry {
+            refusal["retry_same_nonce"] = json!(retry);
+        }
+        let Reply::Completed { result, .. } = parse_reply(&ok_envelope(json!({"result": refusal})))
+        else {
+            panic!("expected posted-work report");
+        };
+        assert_eq!(
+            result,
+            json!({"status": "partial_posted", "posted_legs": ["comment"], "refusal_code": "transport_not_sent", "scope_role": null})
+        );
+        let Err(outcome @ RouteOutcome::PartiallyApplied(_)) = render_completed(&result) else {
+            panic!("expected partial-application outcome");
+        };
+        let RouteOutcome::PartiallyApplied(ref text) = outcome else {
+            unreachable!()
+        };
+        assert_eq!(text, "Posted as the bot: [\"comment\"].\nThe rest of this GitHub write did not finish (transport_not_sent). Check GitHub before trying again.\n");
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "alfonso-aft".into(),
+        };
+        assert_eq!(
+            super::super::governed_outcome_status(&paths, &binding, TEST_NOW, outcome),
+            1
+        );
+    }
+}
+
+#[test]
+fn posted_step_names_are_validated_even_when_same_nonce_retry_is_allowed() {
+    for retry in [None, Some(false), Some(true)] {
+        for invalid in [Value::Null, json!(""), json!(7)] {
+            let mut refusal = json!({"status": "refused", "refusal_code": "transport_not_sent", "legs_sent": [invalid]});
+            if let Some(retry) = retry {
+                refusal["retry_same_nonce"] = json!(retry);
+            }
+            assert_eq!(parse_reply(&ok_envelope(json!({"result": refusal}))), Reply::Malformed("plexus reported posted legs without valid action names; check GitHub before retrying".into()));
+        }
     }
 }
 

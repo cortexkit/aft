@@ -464,6 +464,17 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
             }
             let generation = reply.get("repo_binding_generation").and_then(Value::as_u64);
             let result = reply.get("result").cloned().unwrap_or(Value::Null);
+            if result["status"] == "refused"
+                && result
+                    .get("legs_sent")
+                    .and_then(Value::as_array)
+                    .is_some_and(|legs| {
+                        legs.iter()
+                            .any(|leg| leg.as_str().is_none_or(str::is_empty))
+                    })
+            {
+                return Reply::Malformed("plexus reported posted legs without valid action names; check GitHub before retrying".into());
+            }
             match result.get("status").and_then(Value::as_str) {
                 Some("completed") => Reply::Completed {
                     generation,
@@ -473,15 +484,13 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     if result
                         .get("legs_sent")
                         .and_then(Value::as_array)
-                        .is_some_and(|legs| !legs.is_empty()) =>
+                        .is_some_and(|legs| !legs.is_empty())
+                        && result.get("retry_same_nonce").and_then(Value::as_bool)
+                            != Some(true) =>
                 {
                     let legs = result["legs_sent"].as_array().expect("checked above");
-                    if legs
-                        .iter()
-                        .any(|leg| leg.as_str().is_none_or(str::is_empty))
-                    {
-                        return Reply::Malformed("plexus reported posted legs without valid action names; check GitHub before retrying".into());
-                    }
+                    // Only an explicit same-nonce retry guarantee can safely
+                    // resume a write without repeating its completed steps.
                     Reply::Completed {
                         generation,
                         result: json!({
