@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rebind-keeps-queued-calls"
+  ],
+  "note": "A higher-epoch rebind of the same project route no longer releases calls still queued in the executor; they run once and return their terminal frame. Explicit route close still releases them. No search, indexing, query routing or ranking code changes."
+}
