@@ -6175,54 +6175,6 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runon_worker_foreground_pins_five_minute_queue_limit_on_wire() {
-        use crate::exec_remote::wire_tests::Script;
-        for timeout in [None, Some(7_200_000)] {
-            let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::Plain).await;
-            ctx.update_config(|config| config.bash.worker_wait_max_ms = 600_000);
-            let mut args = json!({"command":"uname -s", "runon":"linux", "wait":true});
-            if let Some(timeout) = timeout {
-                args["timeout"] = json!(timeout);
-            }
-            let mut rx =
-                with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
-                    deadline_test_call_controlled(
-                        &executor,
-                        &root,
-                        remote_runon_stub,
-                        args,
-                        Instant::now(),
-                        false,
-                        true,
-                        Arc::new(DispatchPathMetrics::new()),
-                        capture_cancel(),
-                    )
-                });
-            let done = tokio::time::timeout(Duration::from_secs(30), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                done.response_for_test().success,
-                "{:?}",
-                done.response_for_test()
-            );
-            let requests = daemon.log.lock().unwrap();
-            let (_, run) = requests
-                .iter()
-                .find(|(_, body)| body["method"] == "exec.run")
-                .unwrap();
-            assert_eq!(run["params"]["queue_wait_limit_s"], 300, "{run}");
-            assert_eq!(
-                run["params"]["timeout"],
-                timeout.unwrap_or(1_800_000) / 1000,
-                "{run}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn runon_pre_acceptance_refusal_ends_subc_worker_wait_promptly() {
         use crate::exec_remote::wire_tests::Script;
         for (reason, detail) in [

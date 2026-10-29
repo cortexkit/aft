@@ -1111,6 +1111,15 @@ fn outage_job_records() -> Vec<StreamRecord> {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn outage_daemon() -> OutageDaemon {
+    outage_daemon_with_started_job(true).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn queued_outage_daemon() -> OutageDaemon {
+    outage_daemon_with_started_job(false).await
+}
+
+async fn outage_daemon_with_started_job(started: bool) -> OutageDaemon {
     use std::sync::atomic::{AtomicBool, Ordering};
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1232,11 +1241,13 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                                         id(),
                                         1,
                                     ))));
-                                    for job_record in &outage_job_records()[..2] {
-                                        replies.push(record(job_record));
+                                    if started {
+                                        for job_record in &outage_job_records()[..2] {
+                                            replies.push(record(job_record));
+                                        }
                                     }
                                     // The provider restarts: its route closes with the job
-                                    // still running, and it stays away until restored.
+                                    // still queued or running, and stays away until restored.
                                     up.store(false, Ordering::SeqCst);
                                     drop_route = true;
                                 }
@@ -1338,43 +1349,6 @@ async fn drain(stream: &mut RemoteStream, sink: &mut MemorySink) -> Result<Verdi
     })
     .await
     .expect("the fixture stream must terminate")
-}
-
-#[tokio::test]
-async fn queue_wait_limit_defaults_and_preset_overrides_reach_exec_run() {
-    for (configured, expected) in [(None, 300), (Some(0), 0), (Some(47), 47)] {
-        let daemon = daemon(Script::Plain, client::CAPABILITY).await;
-        let client = client(&daemon).await;
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
-        let request = build_request(
-            &root,
-            &root,
-            &root,
-            "cargo test",
-            Default::default(),
-            Some(7_200),
-            &PresetParams {
-                queue_wait_limit_s: configured,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let mut stream = client.run(&request).await.unwrap();
-        assert_eq!(
-            drain(&mut stream, &mut MemorySink::default())
-                .await
-                .unwrap(),
-            Verdict::Exited { code: 0 }
-        );
-        let log = daemon.log.lock().unwrap();
-        let (_, run) = log
-            .iter()
-            .find(|(_, body)| body["method"] == "exec.run")
-            .unwrap();
-        assert_eq!(run["params"]["queue_wait_limit_s"], expected, "{run}");
-        assert_eq!(run["params"]["timeout"], 7_200);
-    }
 }
 
 #[tokio::test]

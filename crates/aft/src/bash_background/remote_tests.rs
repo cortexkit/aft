@@ -1034,30 +1034,6 @@ fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
 }
 
 #[tokio::test]
-async fn runon_head_queue_wait_limit_is_five_minutes_for_foreground_and_background() {
-    for background in [false, true] {
-        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = remote_test_context(dir.path());
-        let response = handle_with_policy(
-            &ctx,
-            Some(launch(daemon.connection.clone())),
-            serde_json::json!({
-                "command": "uname -s", "runon": "linux", "background": background,
-                "timeout": 7_200_000, "compressed": false,
-            }),
-        );
-        assert!(response.success, "{response:?}");
-        let task_id = response.data["task_id"].as_str().unwrap();
-        terminal(ctx.bash_background(), task_id).await;
-        let runs = exec_runs(&daemon);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["queue_wait_limit_s"], 300, "{}", runs[0]);
-        assert_eq!(runs[0]["timeout"], 7_200);
-    }
-}
-
-#[tokio::test]
 async fn runon_pre_acceptance_refusal_ends_standalone_foreground_wait_promptly() {
     for (reason, detail) in [
         ("runner_full", Some("hosted_host_full")),
@@ -2357,6 +2333,151 @@ fn reattach_backoff_doubles_from_a_tenth_of_a_second_up_to_thirty_seconds() {
             .map(Duration::from_millis)
     );
     assert_eq!(reattach_backoff(u32::MAX), Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
+    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let mut remote = launch(daemon.connection.clone());
+    remote.explicit_runon = true;
+    remote.requested_vcpus = Some(16);
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        remote,
+        crate::bash_background::HardKill::After(DEFAULT_BG_TIMEOUT),
+    );
+    daemon.after_refused_connects(3).await;
+    assert_eq!(
+        registry.remote_progress(&task_id, "session").unwrap().phase,
+        RemotePhase::Queued { position: 1 }
+    );
+    let run = &daemon.methods("exec.run")[0];
+    assert_eq!(run["params"]["weight_hint"], 16);
+    assert_eq!(run["params"]["timeout"], 1800);
+    assert!(
+        run["params"].get("queue_wait_limit_s").is_none(),
+        "the runner owns admission policy"
+    );
+
+    // Pass the old 5m queue + 30m run + 5m grace deadline without real waiting.
+    clock.advance(Duration::from_secs(41 * 60));
+    let refused = *daemon.refused_connects.borrow();
+    let still_trying = wait_for("the queued job must still be recoverable", || {
+        let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+        if snapshot.info.status.is_terminal() {
+            return Some(Err(snapshot));
+        }
+        (*daemon.refused_connects.borrow() >= refused + 3).then_some(Ok(()))
+    })
+    .await;
+    assert!(
+        still_trying.is_ok(),
+        "queued job abandoned: {still_trying:?}"
+    );
+
+    let metadata = registry
+        .task(&task_id)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .clone();
+    let submission = KeyedSubmission {
+        key: "queued-submission".into(),
+        created_at_ms: metadata.started_at,
+        request_digest: "digest".into(),
+        attempts: 1,
+        fresh_key_used: false,
+        resuming: false,
+        reattached: false,
+        refusal: None,
+    };
+    assert_eq!(
+        submission.expires_at(&metadata),
+        metadata.started_at + 60 * 60 * 1000,
+        "a lost Accepted must remain recoverable for the same queue and runtime allowance"
+    );
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(
+        fs::read(&registry.task(&task_id).unwrap().paths.stdout).unwrap(),
+        b"AB"
+    );
+    assert_eq!(
+        daemon.methods("exec.run").len(),
+        1,
+        "recovery must not submit another job"
+    );
+    assert!(!daemon.methods("exec.attach").is_empty());
+}
+
+#[tokio::test]
+async fn large_queued_runon_recovery_ends_after_queue_runtime_and_grace() {
+    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let mut remote = launch(daemon.connection.clone());
+    remote.explicit_runon = true;
+    remote.requested_vcpus = Some(16);
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        remote,
+        crate::bash_background::HardKill::After(DEFAULT_BG_TIMEOUT),
+    );
+    daemon.after_refused_connects(3).await;
+    clock.advance(Duration::from_secs(66 * 60));
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(done.output_preview.contains(&format!(
+        "job {} could not be re-attached before its own time limit passed (a queue wait allowance of 30m and its run timeout of 30m have passed since AFT submitted it, plus 5m of grace); command not rerun", id()
+    )), "{}", done.output_preview);
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+}
+
+#[tokio::test]
+async fn short_queued_runon_keeps_the_five_minute_queue_allowance() {
+    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let mut remote = launch(daemon.connection.clone());
+    remote.explicit_runon = true;
+    remote.requested_vcpus = Some(8);
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        remote,
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    daemon.after_refused_connects(3).await;
+    let metadata = registry
+        .task(&task_id)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .clone();
+    let (remaining, _, _) = ReattachBudget::until_job_end(&metadata);
+    assert!(
+        (Duration::from_secs(325)..=Duration::from_secs(330)).contains(&remaining),
+        "{remaining:?}"
+    );
+    clock.advance(Duration::from_secs(11 * 60));
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(done.output_preview.contains(&format!(
+        "job {} could not be re-attached before its own time limit passed (a queue wait allowance of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun", id()
+    )), "{}", done.output_preview);
+    assert_eq!(daemon.methods("exec.run").len(), 1);
 }
 
 #[test]
