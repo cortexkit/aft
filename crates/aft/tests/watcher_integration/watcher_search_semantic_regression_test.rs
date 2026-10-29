@@ -80,7 +80,9 @@ fn exact_memo_watcher_content_changes(views: bool) {
     let seed = project.path().join("seed.rs");
     let edited = project.path().join("edited.rs");
     let created = project.path().join("created.rs");
-    let phrase = "quartz meadow beacon";
+    // Quoted stopwords still match the exact phrase, but have no lexical
+    // content tokens that could rescue a file missing from the exact memo.
+    let phrase = "the and";
     fs::write(&seed, format!("// {phrase}\n")).unwrap();
     fs::write(&edited, "// unrelated initial content\n").unwrap();
 
@@ -104,20 +106,44 @@ fn exact_memo_watcher_content_changes(views: bool) {
     });
 
     let search = |aft: &mut AftProcess, label: &str| {
-        let response = send(
-            aft,
-            json!({
-                "id": "search-exact-memo-watcher",
-                "command": "semantic_search",
-                "query": phrase,
-                "hint": "literal",
-                "top_k": 10,
-                "include_tests": false,
-            }),
-        );
-        assert_eq!(response["success"], true, "{label}: {response}");
-        eprintln!("exact memo watcher views={views} {label}: {response}");
-        response
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let response = send(
+                aft,
+                json!({
+                    "id": "search-exact-memo-watcher",
+                    "command": "semantic_search",
+                    "query": format!("\"{phrase}\""),
+                    "hint": "literal",
+                    "top_k": 10,
+                    "include_tests": false,
+                }),
+            );
+            assert_eq!(response["success"], true, "{label}: {response}");
+            let pending = response["gaps"]
+                .as_array()
+                .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"));
+            if !pending {
+                eprintln!(
+                    "exact memo watcher views={views} {label}: {}",
+                    json!({
+                        "results": response["results"],
+                        "complete": response["complete"],
+                        "total": response["results_list_envelope"]["total"],
+                        "generation": response["structuredContent"]["plan"]["snapshot_generation"],
+                        "stability_void": response["structuredContent"]["plan"]["stability_void"],
+                    })
+                );
+                assert_eq!(response["engine_capped"], false, "{response}");
+                assert_eq!(response["more_available"], false, "{response}");
+                return response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watcher did not settle: {response}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     };
     let files = |response: &Value| -> Vec<String> {
         let mut files = response["results"]
@@ -125,6 +151,7 @@ fn exact_memo_watcher_content_changes(views: bool) {
             .expect("search results")
             .iter()
             .map(|row| {
+                assert_eq!(row["exact"], true, "{row}");
                 Path::new(row["file"].as_str().expect("result file"))
                     .file_name()
                     .unwrap()
