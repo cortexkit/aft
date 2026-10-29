@@ -1,0 +1,44 @@
+{
+  "result": {
+    "findings": [
+      {
+        "check": "health_degraded",
+        "count": 1,
+        "first_seen_ms": 10000000,
+        "hint": "Call manager.status for the same detail with its counters. Run store.vacuum only inside a maintenance window, and only when the detail names store growth.",
+        "key": "health_degraded",
+        "last_seen_ms": 10000000,
+        "samples": [
+          {
+            "detail": "1 critical unsettled intent",
+            "status": "degraded"
+          }
+        ],
+        "severity": "error",
+        "summary": "core reports its own health as degraded: 1 critical unsettled intent"
+      },
+      {
+        "check": "stuck_effect_intents",
+        "count": 1,
+        "first_seen_ms": 9000000,
+        "hint": "Call manager.status and read its critical-unsettled intents, which carry the same ids. An intent whose host is gone is settled by the recovery cadence; one that keeps being rescheduled names a host that needs restarting.",
+        "key": "stuck_effect_intents",
+        "last_seen_ms": 9000000,
+        "samples": [
+          {
+            "age_ms": 1000000,
+            "effect_id": "ef_stuck",
+            "effect_type": "prompt_session",
+            "overdue_since_ms": 9000000,
+            "status": "sent_pending",
+            "target_session": "ses_worker"
+          }
+        ],
+        "severity": "warn",
+        "summary": "1 effect intents is still unsettled past its reconcile deadline, so the delivery it carries has not happened"
+      }
+    ],
+    "generated_at_ms": 10000000,
+    "window_ms": 21600000
+  }
+}
