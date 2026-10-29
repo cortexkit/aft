@@ -1,0 +1,6 @@
+{
+  "method": "diagnostics.findings",
+  "params": {
+    "window_ms": 60000
+  }
+}
