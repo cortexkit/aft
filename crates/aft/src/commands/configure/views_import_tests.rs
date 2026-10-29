@@ -29,7 +29,7 @@ fn views_import_benchmark_prepare() {
         let generation = cache.read().unwrap().generation();
         cache.write().unwrap().set_project_root_for_generation(generation, root.clone());
         let mut parser = crate::parser::FileParser::with_symbol_cache(cache.clone());
-        for file in search_index_symbol_files(&index) {
+        for file in search_index_symbol_files(&index).iter() {
             let _ = prewarm_symbol_cache_file(&mut parser, &file.path);
         }
         crate::symbol_cache_disk::write_to_disk(&cache.read().unwrap(), &storage, key)
