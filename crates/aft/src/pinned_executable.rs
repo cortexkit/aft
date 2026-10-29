@@ -51,8 +51,11 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     #[cfg(target_os = "macos")]
     capture_at_startup();
     #[cfg(target_os = "macos")]
-    let source = SOURCE.get().expect("startup source captured").as_ref()
-        .map_err(io::Error::other)?;
+    let source = SOURCE
+        .get()
+        .expect("startup source captured")
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))?;
     #[cfg(target_os = "macos")]
     let mut source_file = source.file.try_clone()?;
 
@@ -198,6 +201,19 @@ fn linux_image_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_executable_explicit_gh_binary_path_wins() {
+        let mut config = crate::config::Config::default();
+        let explicit = std::env::current_exe()
+            .unwrap()
+            .with_file_name("operator-aft");
+        config.gh_shim.binary_path = Some(explicit.clone());
+        assert_eq!(
+            crate::agent_child_env::shim_binary(&config).unwrap(),
+            explicit
+        );
+    }
 
     #[test]
     fn pinned_executable_cleanup_preserves_live_owner_and_unrelated_entries() {
