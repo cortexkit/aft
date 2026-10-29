@@ -67,6 +67,19 @@ fn pin_directories(storage: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn copy_and_warm_aft(destination: &Path) {
+    std::fs::copy(crate::test_helpers::aft_binary::aft_binary(), destination).unwrap();
+    let probe = Command::new(destination)
+        .args(["gh-shim", "--shim-version"])
+        .output()
+        .unwrap();
+    assert!(probe.status.success(), "{probe:?}");
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains("\"shim_version\""),
+        "{probe:?}"
+    );
+}
+
 #[test]
 fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pins() {
     use std::os::unix::fs::MetadataExt;
@@ -83,7 +96,7 @@ fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pin
     let secret = ssh.join("identity");
     std::fs::write(&secret, "PRIVATE_IMAGE_PIN_SENTINEL").unwrap();
     let deploy = root.join("aft-deploy");
-    std::fs::copy(crate::test_helpers::aft_binary::aft_binary(), &deploy).unwrap();
+    copy_and_warm_aft(&deploy);
     let original = deploy.metadata().unwrap();
 
     // The replacement is a different native image, not another path to AFT.
@@ -113,7 +126,16 @@ fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pin
     assert_eq!(pins.len(), 1, "{pins:?}");
     let first_pin = pins[0].clone();
     let gh = first_pin.join("shims/gh");
-    let pinned_image = std::fs::read_link(&gh).unwrap();
+    let pinned_image = match std::fs::read_link(&gh) {
+        Ok(image) => image,
+        Err(error) => {
+            let (_, stderr) = aft.stderr_output();
+            panic!(
+                "missing pinned gh link {}: {error}; daemon stderr: {stderr}",
+                gh.display()
+            );
+        }
+    };
     let pinned_metadata = pinned_image.metadata().unwrap();
     assert_eq!(
         (pinned_metadata.dev(), pinned_metadata.ino()),
@@ -167,7 +189,7 @@ fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pin
 
     // Starting another real server must not retarget the first server's PATH.
     let other_deploy = root.join("aft-other");
-    std::fs::copy(crate::test_helpers::aft_binary::aft_binary(), &other_deploy).unwrap();
+    copy_and_warm_aft(&other_deploy);
     let mut other = AftProcess::spawn_binary_with_env(&other_deploy, &envs);
     configure(&mut other, &project, &storage, "off");
     assert_eq!(pin_directories(&storage).len(), 2);
