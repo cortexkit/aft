@@ -9761,20 +9761,23 @@ impl AppContext {
     pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
         let cause = view_load_cause(error);
         let now = Instant::now();
-        let (count, _total, suppressed) = {
+        let (count, suppressed) = {
             let mut health = self.view_load_health.lock();
-            let count = health
-                .by_cause
-                .entry((plane.to_string(), cause.to_string()))
-                .or_default();
-            *count = count.saturating_add(1);
+            let count = {
+                let slot = health
+                    .by_cause
+                    .entry((plane.to_string(), cause.to_string()))
+                    .or_default();
+                *slot = slot.saturating_add(1);
+                *slot
+            };
             health.total = health.total.saturating_add(1);
             let last_at_ms = semantic_health_unix_millis();
             health.last = Some(ViewLoadFailure {
                 plane: plane.to_string(),
                 cause: cause.to_string(),
                 error: error.to_string(),
-                count: *count,
+                count,
                 total: health.total,
                 last_at_ms,
             });
@@ -9784,11 +9787,11 @@ impl AppContext {
                 .or_insert((now, 0));
             if now.duration_since(entry.0) < VIEW_LOAD_LOG_INTERVAL {
                 entry.1 = entry.1.saturating_add(1);
-                (*count, health.total, None)
+                (count, None)
             } else {
                 let suppressed = std::mem::take(&mut entry.1);
                 entry.0 = now;
-                (*count, health.total, Some(suppressed))
+                (count, Some(suppressed))
             }
         };
         self.add_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
