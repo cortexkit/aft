@@ -4490,6 +4490,67 @@ mod tests {
     }
 
     #[test]
+    fn health_budget_compacts_other_metrics_before_standing_detail() {
+        let root = json!({
+            "project_root": "standing", "standing": true,
+            "standing_refusal": "resolved-path-drift refusal",
+            "diagnostics_evidence": {"build_breaker_error": null,
+                "database_open_failed": false, "lsp_start_failures": {}}
+        });
+        let mut metrics = json!({
+            "roots": [root.clone()], "root_details_omitted": 0,
+            "write_ledger_top_10m": [{"root_id": format!("/{}project", "directory/".repeat(2000))}],
+            "storage_retention": {"cache": {"detail": "r".repeat(13000)}},
+            "storage_retention_reports_omitted": 0,
+            "cache_roots": ["c".repeat(13000)], "cache_roots_omitted": 0,
+            "cache_unavailable": {"unavailable": "c".repeat(13000)},
+            "cache_unavailable_omitted": 0
+        }).as_object().unwrap().clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["roots"], json!([root]));
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(metrics["write_ledger_top_10m"][0]["root_id"], "project");
+        assert_eq!(metrics["storage_retention_reports_omitted"], 1);
+        assert_eq!(metrics["cache_roots_omitted"], 1);
+        assert_eq!(metrics["cache_unavailable_omitted"], 1);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+    }
+
+    #[test]
+    fn health_budget_drops_healthy_roots_before_degraded_refused_and_standing_rows() {
+        for (detail_bytes, expected) in [
+            (2000, vec!["healthy-a", "degraded", "standing", "refused", "healthy-b"]),
+            (2600, vec!["healthy-a", "degraded", "standing", "refused"]),
+            (3400, vec!["degraded", "standing", "refused"]),
+            (7000, vec!["degraded"]),
+        ] {
+            let mut roots = ["healthy-a", "degraded", "standing", "refused", "healthy-b", "healthy-c"]
+                .map(|name| json!({
+                    "project_root": name, "state": "ready",
+                    "search_index": {"status": "ready"},
+                    "semantic_index": {"status": "disabled"},
+                    "callgraph_store": {"status": "ready"},
+                    "tier2": {"status": "ready"},
+                    "diagnostics_evidence": {"build_breaker_error": null,
+                        "database_open_failed": false, "lsp_start_failures": {}},
+                    "detail": "x".repeat(detail_bytes)
+                }));
+            roots[1]["semantic_index"]["status"] = json!("degraded");
+            roots[2]["standing"] = json!(true);
+            roots[3]["standing_refusal"] = json!("resolved-path-drift refusal");
+            let mut metrics = json!({"roots": roots, "root_details_omitted": 2})
+                .as_object().unwrap().clone();
+            budget_health_metrics(&mut metrics);
+            let retained = metrics["roots"].as_array().unwrap();
+            let names = retained.iter().map(|row| row["project_root"].as_str().unwrap()).collect::<Vec<_>>();
+            assert_eq!(names, expected, "detail_bytes={detail_bytes}");
+            assert_eq!(metrics["root_details_omitted"], 2 + 6 - retained.len());
+            assert_eq!(metrics["metrics_bytes"], serde_json::to_vec(&metrics).unwrap().len());
+            assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        }
+    }
+
+    #[test]
     fn health_fixture_ignores_process_global_sweep_telemetry() {
         let dir = tempfile::tempdir().unwrap();
         crate::gc::family::record_stale_rows(&dir.path().join("semantic.db"), "foreign-family", 1);
@@ -9171,9 +9232,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn standing_health_names_resolved_path_drift_without_re_recording() {
-        let storage = tempfile::tempdir().expect("storage directory");
-        let original = tempfile::tempdir().expect("original standing root");
-        let retargeted = tempfile::tempdir().expect("retargeted standing root");
+        assert_standing_health_names_resolved_path_drift(".tmp");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standing_health_names_resolved_path_drift_with_long_temp_paths() {
+        assert_standing_health_names_resolved_path_drift("standing-health-resolved-path-drift-");
+    }
+
+    #[cfg(unix)]
+    fn assert_standing_health_names_resolved_path_drift(prefix: &str) {
+        let directory = || tempfile::Builder::new().prefix(prefix).tempdir().expect("standing directory");
+        let storage = directory();
+        let original = directory();
+        let retargeted = directory();
         let link = storage.path().join("standing-link");
         std::os::unix::fs::symlink(original.path(), &link).expect("initial standing symlink");
         let config = standing_config(&link, storage.path());
