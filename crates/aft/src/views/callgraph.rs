@@ -960,7 +960,12 @@ mod tests {
                 },
                 semantic_producer: None,
                 callgraph_producer: PRODUCER.into(),
-                ignore_fingerprint: None,
+                ignore_fingerprint: Some(
+                    super::super::verification::BindGuard::capture(&root, None)
+                        .unwrap()
+                        .policy
+                        .digest,
+                ),
                 history: None,
                 budget: DiskBudget::default(),
             },
@@ -1003,21 +1008,59 @@ mod tests {
     }
 
     #[test]
-    fn failed_lexical_bootstrap_releases_completion_claim_for_callgraph() {
+    fn failed_base_completion_releases_claim_for_callgraph() {
         use super::super::first_load::{
-            CheckoutDriver, ConfiguredMembershipWalker, MembershipWalker, TrigramBridge,
+            CallgraphBridge, CheckoutDriver, CompositePlane, ConfiguredMembershipWalker,
+            TrigramBridge,
         };
 
-        struct FailSecondWalk(std::sync::atomic::AtomicUsize);
-        impl MembershipWalker for FailSecondWalk {
-            fn files(&self, root: &Path) -> Result<Vec<PathBuf>, PlaneError> {
-                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                    return Err(PlaneError::loader(
-                        super::super::contracts::LoaderStage::Driver,
-                        "injected reconciliation failure after base publication",
-                    ));
-                }
-                ConfiguredMembershipWalker.files(root)
+        struct FailedCompletion(CallgraphBridge);
+        impl CompositePlane for FailedCompletion {
+            fn plane(&self) -> FamilyPlane {
+                FamilyPlane::Callgraph
+            }
+            fn applies_to(&self, path: &RelPath) -> bool {
+                self.0.applies_to(path)
+            }
+            fn attachment(
+                &self,
+                path: &RelPath,
+                bytes: &[u8],
+            ) -> Result<super::super::snapshot::PlaneAttachment, PlaneError> {
+                self.0.attachment(path, bytes)
+            }
+            fn completes_fresh_base(&self) -> bool {
+                true
+            }
+            fn complete_v3_base(
+                &self,
+                _: &super::super::base_builder::BuildClaim,
+                _: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,
+            ) -> Result<(), PlaneError> {
+                Err(PlaneError::loader(
+                    super::super::contracts::LoaderStage::Driver,
+                    "injected base completion failure",
+                ))
+            }
+            fn materialize(
+                &self,
+                _: &super::super::registry::ViewRegistration,
+                _: &str,
+                _: &Snapshot,
+                _: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,
+                _: &mut super::super::manifest_v2::ManifestV2,
+                _: &mut crate::pins::LivePin,
+                _: bool,
+            ) -> Result<(), PlaneError> {
+                unreachable!("completion fails before worker materialization")
+            }
+            fn finish_generation(
+                &self,
+                _: &super::super::registry::ViewRegistration,
+                _: &str,
+                _: &str,
+            ) -> Result<(), PlaneError> {
+                unreachable!("completion fails before worker publication")
             }
         }
 
@@ -1028,34 +1071,37 @@ mod tests {
         let policy = crate::blob_store::v2::TrigramPolicy {
             max_file_size: 1 << 20,
         };
-        let lexical = CheckoutDriver::new_v3(
+        let failed = CheckoutDriver::new_v3(
             &storage,
             "donor-reuse",
-            "lexical",
+            "failed-callgraph",
             &root,
             super::super::manifest_v2::Producers {
                 trigram: policy.fingerprint_hex(),
                 semantic: None,
                 callgraph: PRODUCER.into(),
             },
-            Arc::new(FailSecondWalk(std::sync::atomic::AtomicUsize::new(0))),
-            vec![Arc::new(TrigramBridge::new(storage.clone(), policy))],
+            Arc::new(ConfiguredMembershipWalker),
+            vec![
+                Arc::new(TrigramBridge::new(storage.clone(), policy)),
+                Arc::new(FailedCompletion(CallgraphBridge::default())),
+            ],
         )
         .unwrap();
-        let error = lexical
+        let error = failed
             .verified_bind(
-                &lexical.access(),
-                lexical.installed_snapshot().generation().clone(),
+                &failed.access(),
+                failed.installed_snapshot().generation().clone(),
             )
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("injected reconciliation failure"),
+                .contains("injected base completion failure"),
             "{error}"
         );
 
-        // Keep the failed lexical driver alive: its process is still live, so
+        // Keep the failed completion driver alive: its process is still live, so
         // another driver can finish the graph only if the failed bind released
         // its completion claim rather than waiting for process-death takeover.
         let graph = view(&root, &storage);
@@ -1063,7 +1109,7 @@ mod tests {
             .reader()
             .expect("a failed bind must not strand a live claim");
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
-        assert_eq!(lexical.installed_snapshot().generation().name(), "empty");
+        assert_eq!(failed.installed_snapshot().generation().name(), "empty");
     }
 
     #[test]
