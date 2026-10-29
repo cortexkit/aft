@@ -58,6 +58,9 @@ Semantic and inspect/LSP work are disabled; trigram, callgraph and watchers stay
 
 Use the shell tool's `runon: "linux,8c,net"` selector to request a remote Linux
 job with eight vCPUs and network access. Never build or load-test on the operator's Mac.
+The fake daemon's `state/connection.json` must have no group/world-writable ancestor. Put results
+under a private directory in the checkout, not a shared `target/` mount; the
+production transport intentionally refuses insecure connection-file parents.
 Build-server snapshots do not preserve ignored binaries/state between jobs.
 Commit the harness first and print `git log -1` at job start. Use a writable,
 exact-revision clone as the subject if the snapshot's Git index is read-only.

@@ -241,7 +241,7 @@ class SubcClient(NDJSONClient):
             return {"id": payload["id"], "op": "bind", "channel": channel,
                     "root": payload["project_root"]}
         return {"id": payload["id"], "op": "tool", "channel": channel,
-                "name": "aft_search" if payload["name"] == "search" else payload["name"],
+                "name": payload["name"],
                 "arguments": payload["arguments"]}
 
     def decode(self, message):
@@ -774,7 +774,7 @@ class HarnessTests(unittest.TestCase):
         client = SubcClient(None, Path("."))
         self.assertEqual(client.encode({"id": "23", "command": "tool_call", "session_id": "load-7",
                                        "name": "search", "arguments": {}}),
-                         {"id": "23", "op": "tool", "channel": 8, "name": "aft_search", "arguments": {}})
+                         {"id": "23", "op": "tool", "channel": 8, "name": "search", "arguments": {}})
         reply = client.decode({"id": "23", "transport_error": True, "body": {"code": "busy"}})
         self.assertIsNotNone(response_error(reply))
 
