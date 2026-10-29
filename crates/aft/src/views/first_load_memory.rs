@@ -18,21 +18,22 @@ fn first_load_memory_corpus() {
         max_file_size: 1 << 20,
     };
     let trigram = Arc::new(TrigramBridge::new(storage.clone(), policy.clone()));
+    let registry = crate::views::registry::FamilyRegistry::open(&storage, "memory").unwrap();
+    let owner = registry
+        .register_view_with_storage(&storage, "worker", &root)
+        .unwrap();
     let driver = Arc::new(
-        CheckoutDriver::new_v3(
-            &storage,
-            "memory",
-            "worker",
-            &root,
+        CheckoutDriver::new(
+            owner,
             Producers {
                 trigram: policy.fingerprint_hex(),
                 semantic: None,
                 callgraph: crate::views::callgraph::PRODUCER.into(),
             },
+            None,
             Arc::new(ConfiguredMembershipWalker),
             vec![trigram, bridge.clone()],
         )
-        .unwrap()
         .with_adapters(vec![bridge.adapter.clone()]),
     );
     let access = driver.access();
