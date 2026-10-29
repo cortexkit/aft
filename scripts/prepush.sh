@@ -5,11 +5,14 @@ cd "$(dirname "$0")/.."
 source scripts/prepush/common.sh
 if [[ "${1:-}" != fast || $# != 1 ]]; then
   echo 'Usage: scripts/prepush.sh fast'
+  echo 'Server fast phase: scripts/prepush/fast-compile.sh (linux,4c)'
   echo 'Full lanes: scripts/prepush/{linux-rust,linux-typescript,linux-search,windows,macos}.sh'
   exit 2
 fi
 prepush_init fast
 trap 'prepush_abort $?' EXIT
+mkdir -p target/scratch/prepush-temp
+export TMPDIR="$PWD/target/scratch/prepush-temp"
 prepush_step versions bash -c 'set -euo pipefail; cargo fmt --version; bun --version; node --version; python3 --version'
 prepush_step rust-format cargo fmt --all -- --check
 prepush_step bun-lock bun install --frozen-lockfile
@@ -26,11 +29,12 @@ prepush_step search-descriptor python3 benchmarks/aft-search/search_quality.py -
 prepush_step landing-identity python3 scripts/landing-policy.py \
   --base "$(git merge-base "${PREPUSH_BASE:-origin/main}" HEAD)" --head "$(git rev-parse HEAD)" --branch "$(git branch --show-current)"
 prepush_step fixture-attributes python3 scripts/prepush/check-fixture-attributes.py
+prepush_step feature-inventory python3 scripts/prepush/check-feature-matrix.py
 prepush_step path-dependencies python3 scripts/check-path-deps.py
 prepush_step path-dependency-tests python3 scripts/check-path-deps.py --self-test
 prepush_step secret-fake-tests bash scripts/check-secret-test-fake.test.sh
 prepush_step secret-fake bash scripts/check-secret-test-fake.sh
-prepush_step workflow-guards bash scripts/prepush/workflow-guards.sh
+prepush_step rust-ci-policy python3 scripts/test-ci-rust-quality.py
 prepush_step prepush-tests python3 -m unittest discover -s scripts/prepush -p 'test_*.py' -v
 prepush_step package-shapes node scripts/validate-packages.mjs
 prepush_step publication-inputs node scripts/release-gate-v049.mjs --check-inputs

@@ -16,11 +16,11 @@ export AFT_NEXTEST_ARCHIVE_FILE="$PWD/target/prepush-windows-nextest.tar.zst"
 prepush_step archive cargo nextest archive --workspace \
   -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' \
   --archive-file "$AFT_NEXTEST_ARCHIVE_FILE"
+prepush_step tls python scripts/ci-windows-probes.py --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --probe tls || true
+prepush_step backtrace python scripts/ci-windows-probes.py --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --probe backtrace || true
 prepush_step inventory env AFT_UNIT_PARTITION_COUNT=6 python3 scripts/rust-test-inventory-proof.py
 for shard in 1 2 3 4 5 6; do
-  phases=lib-shard
-  [[ "$shard" != 1 ]] || phases=lib,lib-shard
-  prepush_step "unit-$shard" env AFT_GATE_PHASES="$phases" AFT_NEXTEST_PARTITION="hash:$shard/6" \
+  prepush_step "unit-$shard" env AFT_GATE_PHASES=lib-shard AFT_NEXTEST_PARTITION="hash:$shard/6" \
     bash scripts/rust-test-gate.sh || true
 done
 for shard in 1 2 3; do
@@ -39,8 +39,9 @@ prepush_step debug-binary cargo build -p agent-file-tools || true
 export AFT_CACHE_DIR="$PWD/target/prepush-windows-cache"
 prepush_step bash-e2e bash -c 'set -euo pipefail; cd packages/opencode-plugin; bun test src/__tests__/e2e/bash.test.ts' || true
 prepush_step stage-binary cargo build --profile stage --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings || true
-export AFT_BINARY_PATH="$(cygpath -w "${CARGO_TARGET_DIR:-$PWD/target}/x86_64-pc-windows-msvc/stage/aft.exe")"
-export AFT_PLUGIN_DIST="$(cygpath -w "$PWD/packages/opencode-plugin/dist")"
+AFT_BINARY_PATH="$(cygpath -w "${CARGO_TARGET_DIR:-$PWD/target}/x86_64-pc-windows-msvc/stage/aft.exe")"
+AFT_PLUGIN_DIST="$(cygpath -w "$PWD/packages/opencode-plugin/dist")"
+export AFT_BINARY_PATH AFT_PLUGIN_DIST
 prepush_step native-e2e pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1 || true
 trap - EXIT
 prepush_finish

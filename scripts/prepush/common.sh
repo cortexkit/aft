@@ -4,7 +4,7 @@ set -euo pipefail
 
 prepush_init() {
   lane=$1
-  cd "$(git rev-parse --show-toplevel)"
+  cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   log_dir=${PREPUSH_LOG_DIR:-$PWD/.cortexkit/internal-docs/investigations/prepush}
   mkdir -p "$log_dir"
   log_dir=$(cd "$log_dir" && pwd)
@@ -12,9 +12,23 @@ prepush_init() {
   : > "$lane_log"
   lane_start=$SECONDS
   failures=()
-  git log -1 --format='%H %s'
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    git log -1 --format='%H %s'
+    git log -1 >> "$lane_log"
+  else
+    # Some Windows transports omit Git metadata. Record the caller-reported
+    # snapshot SHA, which cannot be verified against the copied files here.
+    # An empty Git root lets fixture helpers locate the checkout without
+    # creating a commit or inventing history.
+    [[ "${PREPUSH_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] || {
+      echo 'Source snapshot has no Git history; pass PREPUSH_COMMIT=<snapshot SHA>.'
+      echo "GATE FAILED: $lane provenance"
+      return 2
+    }
+    git init -q
+    printf 'Source snapshot %s (transport omitted Git history)\n' "$PREPUSH_COMMIT" | tee -a "$lane_log"
+  fi
   printf 'lane=%s full log=%s\n' "$lane" "$lane_log"
-  git log -1 >> "$lane_log"
 }
 
 prepush_step() {
@@ -35,6 +49,15 @@ prepush_step() {
 }
 
 prepush_finish() {
+  python3 - "$lane_log" <<'PY' || failures+=(summary-parser)
+import re
+import sys
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+summaries = [line for line in lines if re.search(r"Summary \[|^test result:|^Ran \d+ tests|^\s*\d+ (pass|fail)$|Checked \d+ files", line)]
+for line in summaries[-25:]:
+    print(line)
+PY
   printf '%s elapsed=%ss log=%s\n' "$lane" "$((SECONDS - lane_start))" "$lane_log"
   if ((${#failures[@]})); then
     printf 'GATE FAILED: %s' "$lane"

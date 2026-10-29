@@ -9,6 +9,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("check_generated", HERE / "check-generated.py")
+assert spec is not None and spec.loader is not None
 generated = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(generated)
 
@@ -45,6 +46,7 @@ class PrepushTests(unittest.TestCase):
         scratch = Path("target/scratch")
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as temp:
+            (Path(temp) / "expected").write_bytes(b"unchanged")
             self.assertEqual(generated.check(Path(temp), [sys.executable, "-c", "pass"]), 0)
 
     def test_failed_step_stays_red_when_collection_continues(self):

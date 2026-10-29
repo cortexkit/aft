@@ -18,6 +18,8 @@ def check(root, command):
         backup = Path(temp) / "original"
         shutil.copytree(root, backup, symlinks=True)
         before = contents(root)
+        if not before:
+            raise ValueError(f"No generated files found under {root}; check did not run")
         try:
             result = subprocess.run(command, check=False)
             after = contents(root)
@@ -35,6 +37,6 @@ def check(root, command):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 5 or sys.argv[2] != "--":
+    if len(sys.argv) < 4 or sys.argv[2] != "--":
         raise SystemExit("usage: check-generated.py <directory> -- <generator> [args...]")
     raise SystemExit(check(Path(sys.argv[1]), sys.argv[3:]))
