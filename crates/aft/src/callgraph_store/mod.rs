@@ -5297,6 +5297,10 @@ struct ProjectIndex<'a> {
     /// uses it. Such an index's file set is fixed when it is constructed: a
     /// changed file set means a new `ProjectIndex`, which starts empty.
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
+    /// The lazy index overlays fresh caller extracts on stored rows. Its parent
+    /// map and caller paths belong to that immutable snapshot, not the worker.
+    lazy_module_parents: std::cell::OnceCell<HashMap<String, (String, String)>>,
+    rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
     local_symbols: RefCell<CallerSymbolMemo>,
 }
@@ -5568,26 +5572,30 @@ impl CrateScanMemo {
         rust_files.sort();
         let mut module_parents = HashMap::<String, (String, String)>::new();
         for (file, index) in files {
-            for (module, target) in &index.declared_module_targets {
-                let Some(target) = target else {
-                    continue;
-                };
-                let candidate = (file.clone(), module.clone());
-                match module_parents.entry(target.clone()) {
-                    std::collections::hash_map::Entry::Occupied(mut best) => {
-                        if candidate < *best.get() {
-                            best.insert(candidate);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(candidate);
-                    }
-                }
-            }
+            Self::note_module_parents(&mut module_parents, file, index);
         }
         Self {
             rust_files,
             module_parents,
+        }
+    }
+
+    fn note_module_parents(
+        parents: &mut HashMap<String, (String, String)>,
+        file: &str,
+        index: &DbFileIndex,
+    ) {
+        for (module, target) in &index.declared_module_targets {
+            let Some(target) = target else {
+                continue;
+            };
+            let candidate = (file.to_string(), module.clone());
+            let best = parents
+                .entry(target.clone())
+                .or_insert_with(|| candidate.clone());
+            if candidate < *best {
+                *best = candidate;
+            }
         }
     }
 }
@@ -5617,6 +5625,9 @@ trait ResolverIndex {
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
     fn module_parent(&self, target_file: &str) -> Option<(String, String)>;
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        rust_caller_module_segments_uncached(self, caller_file)
+    }
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex>;
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String>;
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool;
@@ -5694,10 +5705,32 @@ impl ResolverIndex for ProjectIndex<'_> {
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
         #[cfg(test)]
         let _timing = rust_module_work::Timing::parent();
+        if self.lazy.is_some() {
+            #[cfg(test)]
+            if rust_module_work::disabled() {
+                return self.module_parent_by_scan(target_file);
+            }
+            return self.lazy_module_parents().get(target_file).cloned();
+        }
         match self.crate_scans() {
             Some(memo) => memo.module_parents.get(target_file).cloned(),
             None => self.module_parent_by_scan(target_file),
         }
+    }
+
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        #[cfg(test)]
+        if rust_module_work::disabled() {
+            return rust_caller_module_segments_uncached(self, caller_file);
+        }
+        if let Some(path) = self.rust_caller_paths.borrow().get(caller_file) {
+            return path.clone();
+        }
+        let path = rust_caller_module_segments_uncached(self, caller_file);
+        self.rust_caller_paths
+            .borrow_mut()
+            .insert(caller_file.to_string(), path.clone());
+        path
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -5787,6 +5820,24 @@ impl ResolverIndex for ProjectIndex<'_> {
 }
 
 impl ProjectIndex<'_> {
+    fn lazy_module_parents(&self) -> &HashMap<String, (String, String)> {
+        self.lazy_module_parents.get_or_init(|| {
+            #[cfg(test)]
+            rust_module_work::note(|work| work.parent_scans += 1);
+            let mut parents = HashMap::new();
+            // scan_paths excludes stored rows replaced by this refresh's
+            // extracts, including declarations that have just been removed.
+            for file in self.scan_paths(LazyDbFileIndexes::module_declaring_files) {
+                #[cfg(test)]
+                rust_module_work::note(|work| work.parent_file_visits += 1);
+                if let Some(index) = self.file_index(&file) {
+                    CrateScanMemo::note_module_parents(&mut parents, &file, &index);
+                }
+            }
+            parents
+        })
+    }
+
     fn go_package(
         &self,
         paths: &FactPaths<'_>,
@@ -17323,6 +17374,13 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
 fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
     #[cfg(test)]
     let _timing = rust_module_work::Timing::caller();
+    index.rust_caller_module_segments(caller_file)
+}
+
+fn rust_caller_module_segments_uncached<I: ResolverIndex + ?Sized>(
+    index: &I,
+    caller_file: &str,
+) -> Vec<String> {
     #[cfg(test)]
     rust_module_work::note(|work| work.caller_walks += 1);
     if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file) {
@@ -17426,7 +17484,7 @@ fn rust_resolve_segments_from(
     }
 }
 
-fn rust_registered_module_segments<I: ResolverIndex>(
+fn rust_registered_module_segments<I: ResolverIndex + ?Sized>(
     index: &I,
     caller_file: &str,
 ) -> Option<Vec<String>> {
@@ -17570,6 +17628,8 @@ impl<'a> ProjectIndex<'a> {
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            lazy_module_parents: std::cell::OnceCell::new(),
+            rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
         }
@@ -32175,6 +32235,135 @@ mod crate_scan_memo_tests {
     }
 
     #[test]
+    fn lazy_rust_module_paths_scan_once_and_walk_once_per_caller() {
+        const DEPTH: usize = 48;
+        const CALL_SITES: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let mut files = Vec::new();
+        for level in 0..=DEPTH {
+            let file = root.join(if level == 0 {
+                "src/lib.rs".to_string()
+            } else {
+                format!("src/m{level}.rs")
+            });
+            let source = if level < DEPTH {
+                format!("#[path = \"m{}.rs\"] pub mod child;\n", level + 1)
+            } else {
+                "pub fn leaf() {}\n".to_string()
+            };
+            fs::write(&file, source).unwrap();
+            files.push(file);
+        }
+        let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let callers = HashMap::new();
+        let index = ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &callers,
+            WorkspaceCratePrefixCache::default(),
+        );
+        let caller = format!("src/m{DEPTH}.rs");
+        let session = rust_module_work::Session::start(false);
+        for _ in 0..CALL_SITES {
+            assert_eq!(
+                rust_caller_module_segments(&index, &caller),
+                vec!["child".to_string(); DEPTH],
+            );
+        }
+        let work = session.finish();
+        assert_eq!(work.caller_requests, CALL_SITES);
+        assert_eq!(work.caller_walks, 1, "one path walk, not one per call site");
+        assert_eq!(work.parent_lookups, DEPTH + 1);
+        assert_eq!(
+            work.parent_scans, 1,
+            "one inventory pass, not one per parent"
+        );
+        assert_eq!(work.parent_file_visits, DEPTH);
+        assert!(index.take_lazy_load_error().is_none());
+    }
+
+    #[test]
+    fn lazy_rust_module_paths_overlay_replaced_declarations_and_reset_per_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let lib = root.join("src/lib.rs");
+        let child = root.join("src/physical.rs");
+        let zed = root.join("src/zed.rs");
+        fs::write(&lib, "#[path = \"physical.rs\"] mod old;\n").unwrap();
+        fs::write(&child, "pub fn target() {}\n").unwrap();
+        fs::write(&zed, "#[path = \"physical.rs\"] mod fallback;\n").unwrap();
+        let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&[lib.clone(), child, zed]).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let empty = HashMap::new();
+        let before = ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &empty,
+            WorkspaceCratePrefixCache::default(),
+        );
+        assert_eq!(
+            rust_caller_module_segments(&before, "src/physical.rs"),
+            segments(&["old"])
+        );
+        for (source, expected) in [
+            ("#[path = \"physical.rs\"] mod new;\n", "new"),
+            ("// declaration removed\n", "fallback"),
+        ] {
+            fs::write(&lib, source).unwrap();
+            let callers = HashMap::from([(
+                "src/lib.rs".to_string(),
+                build_file_extract(&root, &lib).unwrap(),
+            )]);
+            let next = ProjectIndex::from_db_and_callers(
+                &conn,
+                &root,
+                &callers,
+                WorkspaceCratePrefixCache::default(),
+            );
+            assert_eq!(
+                ResolverIndex::module_parent(&next, "src/physical.rs"),
+                next.module_parent_by_scan("src/physical.rs")
+            );
+            assert_eq!(
+                rust_caller_module_segments(&next, "src/physical.rs"),
+                segments(&[expected])
+            );
+            assert_eq!(
+                rust_caller_module_segments(&before, "src/physical.rs"),
+                segments(&["old"])
+            );
+            assert!(next.take_lazy_load_error().is_none());
+        }
+    }
+
+    #[test]
+    fn rust_module_path_memo_preserves_cycles_missing_parents_and_path_fallbacks() {
+        let index = index(vec![
+            ("src/a.rs", rust_file(&[("b", "src/b.rs")], &[])),
+            ("src/b.rs", rust_file(&[("a", "src/a.rs")], &[])),
+            ("src/loose.rs", rust_file(&[], &[])),
+            ("src/lib.rs", rust_file(&[], &[])),
+        ]);
+        for caller in [
+            "src/a.rs",
+            "src/b.rs",
+            "src/loose.rs",
+            "src/lib.rs",
+            "src/missing.rs",
+        ] {
+            let expected = rust_caller_module_segments_uncached(&index, caller);
+            assert_eq!(rust_caller_module_segments(&index, caller), expected);
+            assert_eq!(rust_caller_module_segments(&index, caller), expected);
+        }
+    }
+
+    #[test]
     fn memoized_crate_scans_answer_exactly_like_the_scans() {
         let index = index(fixture_files());
         assert_memo_matches_scan(&index);
@@ -32275,6 +32464,8 @@ mod reexport_resolution_tests {
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            lazy_module_parents: std::cell::OnceCell::new(),
+            rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
         }
