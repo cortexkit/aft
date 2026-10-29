@@ -50,6 +50,10 @@ impl ResumePoint {
 /// lengths and sequence together so restart can discard an uncheckpointed tail
 /// and replay it from ResumePoint. Terminal proof must be durable before success.
 pub trait OutputSink {
+    /// Display-only pre-acceptance status, with no durable cursor or timer effect.
+    fn admission_progress(&mut self, _progress: &types::Progress) -> io::Result<()> {
+        Ok(())
+    }
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()>;
     fn started(&mut self, started: &Started) -> io::Result<()> {
         self.unknown_output(started.seq, &[])
@@ -152,13 +156,24 @@ impl StreamConsumer {
         bytes: &[u8],
         sink: &mut S,
     ) -> Result<(), Error> {
+        self.consume_frame(bytes, sink).map(|_| ())
+    }
+
+    /// False means display-only data, not evidence for a recovery-budget reset.
+    pub(super) fn consume_frame<S: OutputSink>(
+        &mut self,
+        bytes: &[u8],
+        sink: &mut S,
+    ) -> Result<bool, Error> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|e| Error::Protocol(e.to_string()))?;
         let seq = value.get("seq").and_then(serde_json::Value::as_u64);
         let record: StreamRecord =
             serde_json::from_value(value).map_err(|e| Error::Protocol(e.to_string()))?;
+        let progress = matches!(record, StreamRecord::Progress(_));
         match record {
-            StreamRecord::Accepted(_)
+            StreamRecord::Progress(_)
+            | StreamRecord::Accepted(_)
             | StreamRecord::Started(_)
             | StreamRecord::Output(_)
             | StreamRecord::ReturnChunk(_)
@@ -166,6 +181,7 @@ impl StreamConsumer {
             | StreamRecord::Terminal(_) => self.consume(record, sink),
             _ => self.consume_unknown(seq, sink),
         }
+        .map(|_| !progress)
     }
 
     /// First-seen wins for duplicate seqs, including conflicting duplicates.
@@ -177,6 +193,12 @@ impl StreamConsumer {
         record: StreamRecord,
         sink: &mut S,
     ) -> Result<(), super::Error> {
+        if let StreamRecord::Progress(progress) = record {
+            if !self.accepted && self.point.is_none() && self.terminal.is_none() {
+                sink.admission_progress(&progress)?;
+            }
+            return Ok(());
+        }
         if self.terminal.is_some() {
             return Err(Error::Protocol("record after terminal".into()));
         }

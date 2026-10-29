@@ -164,9 +164,14 @@ impl ExecRemoteClient {
                 });
             }
         }
+        // Progress is optional display data. Older executors receive no opt-in,
+        // even if a saved request was created against a newer executor.
+        let request = request
+            .clone()
+            .with_progress(self.advertises(PROGRESS_CAPABILITY).await.unwrap_or(false));
         self.stream(
             "exec.run",
-            request,
+            &request,
             StreamConsumer::keyed_run(request.resume_from_seq()),
             diagnostics,
         )
@@ -334,6 +339,7 @@ fn envelope<T: Serialize>(method: &str, params: &T) -> Result<Vec<u8>, Error> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamProgress {
     Record,
+    AdmissionProgress,
     Complete(Verdict),
 }
 
@@ -377,9 +383,13 @@ impl RemoteStream {
             return self.consumer.finish().map(StreamProgress::Complete);
         }
         if let Some(bytes) = self.subscription.events().recv().await {
-            self.received_frame = true;
-            if let Err(error) = self.consumer.consume_bytes(&bytes, sink) {
-                return Err(self.consumer.recovery(error.to_string()));
+            match self.consumer.consume_frame(&bytes, sink) {
+                Ok(false) => return Ok(StreamProgress::AdmissionProgress),
+                Ok(true) => self.received_frame = true,
+                Err(error) => {
+                    self.received_frame = true;
+                    return Err(self.consumer.recovery(error.to_string()));
+                }
             }
             return Ok(StreamProgress::Record);
         }
@@ -405,13 +415,18 @@ impl RemoteStream {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
+    use super::{CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
     /// `<name>/v<N>` grammar, so AFT must check for names that can exist on the wire.
     #[test]
     fn checked_capabilities_pass_the_daemon_grammar() {
-        for capability in [CAPABILITY, WINDOWS_CAPABILITY, RETURN_CHUNKED_CAPABILITY] {
+        for capability in [
+            CAPABILITY,
+            WINDOWS_CAPABILITY,
+            RETURN_CHUNKED_CAPABILITY,
+            PROGRESS_CAPABILITY,
+        ] {
             assert!(
                 subc_protocol::manifest::is_valid_capability_identifier(capability),
                 "{capability} is not a capability name the daemon admits"

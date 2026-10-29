@@ -598,7 +598,13 @@ impl ReattachBudget {
         }
     }
 
-    /// A record arrived: the job is alive, so recovery starts over.
+    fn observe(&mut self, progress: &StreamProgress) {
+        if matches!(progress, StreamProgress::Record) {
+            self.reset();
+        }
+    }
+
+    /// An execution record arrived: the job is alive, so recovery starts over.
     fn reset(&mut self) {
         self.deadline = None;
         self.attempts = 0;
@@ -1009,6 +1015,25 @@ impl RemotePhase {
 pub(crate) struct RemoteProgress {
     pub job_id: Option<Uuid>,
     pub phase: RemotePhase,
+}
+
+#[cfg(unix)]
+fn admission_progress_line(progress: &exec::types::Progress) -> String {
+    use exec::types::ProgressPhase;
+    let step = match progress.phase() {
+        ProgressPhase::Upload => "uploading its files".to_owned(),
+        ProgressPhase::PlacementWait => "waiting for a free build host".to_owned(),
+        ProgressPhase::Connect => "connecting to its build host".to_owned(),
+        phase => format!("in step {}", String::from(phase.clone())),
+    };
+    let elapsed =
+        crate::lsp::manager::format_retry_delay(Duration::from_millis(progress.phase_elapsed_ms()));
+    let detail = progress
+        .detail()
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
+    format!("The remote job is {step} ({elapsed} so far){detail}.")
 }
 
 impl RemoteProgress {
@@ -1638,6 +1663,22 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 
 #[cfg(unix)]
 impl OutputSink for TaskSink {
+    fn admission_progress(&mut self, progress: &exec::types::Progress) -> io::Result<()> {
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("task lock poisoned"))?;
+        if !state.metadata.is_terminal()
+            && state.metadata.remote.as_ref().is_some_and(|r| !r.accepted)
+        {
+            // Replace, never append: pre-acceptance status is ephemeral and is
+            // not output, a resume checkpoint, or execution evidence.
+            state.remote_admission_note = Some(admission_progress_line(progress));
+            self.task.publish_runon_launch_state(&state);
+        }
+        Ok(())
+    }
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         // Measure receipt before local persistence adds its own latency. An
         // attach after restart has no in-process exec.run send timestamp.
@@ -1670,6 +1711,7 @@ impl OutputSink for TaskSink {
             .state
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
+        state.remote_admission_note = None;
         append_executor_environment_disclosure(&mut state.metadata);
         if let Some(remote) = &state.metadata.remote {
             let note = remote_execution_note(remote);
@@ -3288,8 +3330,11 @@ impl BgTaskRegistry {
             } else {
                 true
             };
+            if let Ok(progress) = &result {
+                recovery.observe(progress);
+            }
             match result {
-                Ok(StreamProgress::Record) => recovery.reset(),
+                Ok(StreamProgress::AdmissionProgress | StreamProgress::Record) => {}
                 Ok(StreamProgress::Complete(Verdict::RunLocally {
                     reason,
                     refusal_detail,

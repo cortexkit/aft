@@ -1,6 +1,143 @@
 use super::*;
 use crate::bash_background::persistence::{read_task, write_task};
 use crate::exec_remote::wire_tests::{daemon, id, Script};
+
+#[test]
+fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
+    use exec::types::{Progress, ProgressPhase};
+    for (phase, elapsed, without, with) in [
+        (ProgressPhase::Upload, 14_000,
+         "The remote job is uploading its files (14s so far).",
+         "The remote job is uploading its files (14s so far): <room> & **capacity**."),
+        (ProgressPhase::PlacementWait, 130_000,
+         "The remote job is waiting for a free build host (2m 10s so far).",
+         "The remote job is waiting for a free build host (2m 10s so far): <room> & **capacity**."),
+        (ProgressPhase::Connect, 3_000,
+         "The remote job is connecting to its build host (3s so far).",
+         "The remote job is connecting to its build host (3s so far): <room> & **capacity**."),
+        (ProgressPhase::Unknown("future_phase".into()), 40_000,
+         "The remote job is in step future_phase (40s so far).",
+         "The remote job is in step future_phase (40s so far): <room> & **capacity**."),
+    ] {
+        for detail in [None, Some(String::new())] {
+            assert_eq!(admission_progress_line(&Progress::new(phase.clone(), elapsed, detail).unwrap()), without);
+        }
+        assert_eq!(admission_progress_line(&Progress::new(phase, elapsed, Some("<room> & **capacity**".into())).unwrap()), with);
+    }
+}
+
+#[tokio::test]
+async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timers_or_cursor() {
+    use exec::types::{Progress, ProgressPhase};
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused-connection"), "true");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.accepted = false;
+        remote.explicit_runon = true;
+        remote.last_seq = Some(7);
+        remote.retry = Some(DrainingRetry {
+            request_digest: "unchanged".into(),
+            attempts: 2,
+            first_refusal_at_ms: Some(1),
+            next_retry_at_ms: Some(2),
+            waited_ms: Some(3),
+            resubmitted_at_ms: Some(4),
+        });
+        registry.persist_task(&paths, &state.metadata).unwrap();
+    }
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    let saved = fs::read(&paths.json).unwrap();
+    let started = task.started;
+    let last_checkpoint = sink.last_progress_persist;
+    let mut recovery = ReattachBudget::new(dir.path(), &metadata);
+    recovery.deadline();
+    recovery.attempts = 3;
+    let deadlines = (
+        recovery.job_end,
+        recovery.deadline,
+        recovery.grace,
+        recovery.attempts,
+    );
+    let mut consumer = exec::StreamConsumer::keyed_run(Some(7));
+    for elapsed in 0..10_000 {
+        let bytes = serde_json::to_vec(&StreamRecord::Progress(
+            Progress::new(ProgressPhase::Upload, elapsed, Some("latest".into())).unwrap(),
+        ))
+        .unwrap();
+        consumer.consume_bytes(&bytes, &mut sink).unwrap();
+        recovery.observe(&StreamProgress::AdmissionProgress);
+        assert!(consumer.resume_point().is_none());
+        let state = task.state.lock().unwrap();
+        assert!(state.remote_admission_note.as_ref().unwrap().len() < 100);
+    }
+    let latest = "The remote job is uploading its files (10s so far): latest.";
+    assert_eq!(task.snapshot(0).remote_phase_note.as_deref(), Some(latest));
+    assert_eq!(
+        registry
+            .runon_launch_state(&task_id, "session")
+            .unwrap()
+            .admission_note
+            .as_deref(),
+        Some(latest)
+    );
+    assert_eq!(
+        serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap(),
+        serde_json::to_value(&metadata).unwrap()
+    );
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+    assert_eq!(fs::metadata(&paths.stdout).unwrap().len(), 0);
+    assert_eq!(task.started, started);
+    assert_eq!(sink.last_progress_persist, last_checkpoint);
+    assert_eq!(sink.output_progress.last_seq, Some(7));
+    assert_eq!(
+        (
+            recovery.job_end,
+            recovery.deadline,
+            recovery.grace,
+            recovery.attempts
+        ),
+        deadlines
+    );
+    assert!(!task.remote_launch_ready.load(Ordering::Acquire));
+
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)
+        .unwrap();
+    let cursor = consumer.resume_point();
+    let accepted = serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap();
+    consumer
+        .consume(
+            StreamRecord::Progress(Progress::new(ProgressPhase::Connect, 3_000, None).unwrap()),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(consumer.resume_point(), cursor);
+    assert_eq!(
+        serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap(),
+        accepted
+    );
+    assert!(task.state.lock().unwrap().remote_admission_note.is_none());
+    assert!(registry
+        .runon_launch_state(&task_id, "session")
+        .unwrap()
+        .admission_note
+        .is_none());
+    assert!(!task
+        .snapshot(0)
+        .remote_phase_note
+        .unwrap()
+        .contains("so far"));
+    // A sink reused by an attach also refuses late display updates.
+    sink.admission_progress(&Progress::new(ProgressPhase::Connect, 3_000, None).unwrap())
+        .unwrap();
+    assert!(task.state.lock().unwrap().remote_admission_note.is_none());
+}
+
 fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
     static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Duration>>> =
         std::sync::OnceLock::new();

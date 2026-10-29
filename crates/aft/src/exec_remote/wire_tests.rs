@@ -471,6 +471,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
                             } else if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
                                 let mut request = body["params"].clone();
+                                request.as_object_mut().unwrap().remove("progress");
                                 let cursor = request.as_object_mut().unwrap().remove("resume_from_seq").and_then(|v| v.as_u64());
                                 let keyed = request["submission_key"].is_string();
                                 let same_key = keyed && submission.as_ref().is_some_and(|old| old["submission_key"] == request["submission_key"]);
@@ -502,6 +503,10 @@ pub(crate) async fn daemon_with_capabilities(
                                 }
                                 if !(disconnect && runs == 1) { replies.push(reply(FrameType::StreamEnd, Value::Null)); }
                             } else {
+                            if !attaching && body["params"]["progress"] == true && claims.iter().any(|claim| claim == PROGRESS_CAPABILITY) {
+                                let progress = Progress::new(ProgressPhase::Upload, 14_000, Some("plain <detail>".into())).unwrap();
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Progress(progress)).unwrap()));
+                            }
                             let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } | Script::SignerRefused { refusals, .. } if runs <= refusals)
                                 || matches!(script, Script::DrainingThenSigner { signer_refusals, .. } if runs <= 1 + signer_refusals)
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
@@ -1313,7 +1318,7 @@ async fn drain(stream: &mut RemoteStream, sink: &mut MemorySink) -> Result<Verdi
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match stream.next(sink).await? {
-                StreamProgress::Record => {}
+                StreamProgress::Record | StreamProgress::AdmissionProgress => {}
                 StreamProgress::Complete(verdict) => return Ok(verdict),
             }
         }
@@ -1370,6 +1375,50 @@ async fn daemon_route_uses_hyphenated_capability_and_dotted_operations() {
             .filter_map(|(_, body)| body["method"].as_str())
             .collect();
         assert_eq!(operations, ["exec.run", "exec.status", "exec.cancel"]);
+    }
+}
+
+#[tokio::test]
+async fn remote_progress_is_requested_only_with_the_advertised_capability() {
+    for supported in [false, true] {
+        let claims = if supported {
+            vec![client::CAPABILITY, PROGRESS_CAPABILITY]
+        } else {
+            vec![client::CAPABILITY]
+        };
+        let daemon = daemon_with_capabilities(Script::Utf8, &claims, 1).await;
+        let client = client(&daemon).await;
+        // Enable a default request on a new executor, but remove a saved
+        // opt-in when today's executor no longer advertises progress.
+        let request = RunRequest::new("/workspace", "/src/repo", "/workspace", "test")
+            .with_progress(!supported);
+        let mut stream = client.run(&request).await.unwrap();
+        let mut sink = MemorySink::default();
+        if supported {
+            assert_eq!(
+                stream.next(&mut sink).await.unwrap(),
+                StreamProgress::AdmissionProgress
+            );
+            assert!(!stream.received_frame());
+            assert_eq!(stream.resume_point(), None);
+            assert!(sink.seqs.is_empty());
+        }
+        assert_eq!(
+            drain(&mut stream, &mut sink).await.unwrap(),
+            Verdict::Exited { code: 0 }
+        );
+        let log = daemon.log.lock().unwrap();
+        let run = log
+            .iter()
+            .find(|(_, body)| body["method"] == "exec.run")
+            .unwrap();
+        assert_eq!(
+            run.1["params"]["progress"].as_bool().unwrap_or(false),
+            supported
+        );
+        if !supported {
+            assert!(run.1["params"].get("progress").is_none());
+        }
     }
 }
 

@@ -1257,6 +1257,13 @@ fn accepted_runon_launch_reply(
     response: &Response,
 ) -> Response {
     let mut reply = copy_response(response);
+    let admission_note = reply.data["remote_admission_note"]
+        .as_str()
+        .map(str::to_owned);
+    if let Some(data) = reply.data.as_object_mut() {
+        data.remove("remote_admission_note");
+        data.remove("remote_phase_note");
+    }
     reply.data["status"] = json!("running");
     if let Some(progress) = progress {
         let phase = progress.phase.tag();
@@ -1277,6 +1284,7 @@ fn accepted_runon_launch_reply(
         let mut output = output.to_owned();
         for warning in [
             crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING,
+            admission_note.as_deref().unwrap_or(""),
             REMOTE_ADMISSION_PENDING_NOTE,
         ] {
             if let Some(prefix) = output.strip_suffix(warning) {
@@ -1317,6 +1325,11 @@ fn cached_runon_launch_reply(
         if launch.accepted {
             return background_runon
                 .then(|| accepted_runon_launch_reply(Some(launch.progress), response));
+        }
+        if let Some(note) = launch.admission_note {
+            let mut reply = copy_response(response);
+            reply.data["remote_admission_note"] = json!(note);
+            return Some(with_capture_warning(&reply));
         }
     }
     Some(with_capture_warning(response))
@@ -1393,10 +1406,14 @@ fn foreground_runon_reply(
             bash_watch_available,
         )
     };
+    let admission_note = response.data["remote_admission_note"]
+        .as_str()
+        .unwrap_or(REMOTE_ADMISSION_PENDING_NOTE);
     let reply = Response::success(
         &response.id,
         json!({
-            "output": format!("{guidance}\n{REMOTE_ADMISSION_PENDING_NOTE}"),
+            "output": format!("{guidance}\n{admission_note}"),
+            "remote_admission_note": response.data["remote_admission_note"],
             "task_id": task_id,
             "status": "starting",
             "remote_phase": crate::bash_background::registry::remote::RemotePhase::Submitting.tag(),
@@ -5930,6 +5947,42 @@ mod grant_path_tests {
             connection: PersistentCancelSignal::new(),
             route: PersistentCancelSignal::new(),
             drain: drain::ModuleDrainWindow::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runon_progress_replaces_admission_text_in_launch_and_promotion_replies() {
+        let note =
+            "The remote job is waiting for a free build host (2m 10s so far): plain <detail>.";
+        for background in [false, true] {
+            let response = Response::success(
+                "progress",
+                json!({
+                    "task_id": "bash-progress", "status": "starting",
+                    "remote_admission_note": note,
+                }),
+            );
+            let reply = foreground_runon_reply(
+                response,
+                Some(Instant::now()),
+                background,
+                &capture_cancel(),
+                None,
+                1_000,
+                false,
+                true,
+            );
+            let output = reply.data["output"].as_str().unwrap();
+            assert!(output.contains(note), "{output}");
+            assert!(!output.contains(REMOTE_ADMISSION_PENDING_NOTE), "{output}");
+            assert!(output.contains("completion reminder"), "{output}");
+            assert_eq!(output.matches(REMOTE_INPUT_CAPTURE_WARNING).count(), 1);
+            let accepted = accepted_runon_launch_reply(None, &reply);
+            let output = accepted.data["output"].as_str().unwrap();
+            assert!(!output.contains(note), "{output}");
+            assert!(!output.contains(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
+            assert!(accepted.data.get("remote_admission_note").is_none());
         }
     }
 
