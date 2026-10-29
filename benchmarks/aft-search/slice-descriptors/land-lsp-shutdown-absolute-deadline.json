@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "lsp-shutdown-absolute-deadline"
+  ],
+  "note": "Language-server shutdown waits use absolute deadlines; its tests check deadlines and ordering deterministically. No search or indexing code changes."
+}
