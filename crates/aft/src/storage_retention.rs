@@ -1,9 +1,11 @@
 //! Durable checkout retention, independent of the roots an actor has opened.
 //!
-//! A missing path is necessary but not sufficient for deletion: binding history
+//! For age-based deletion, a missing path is necessary but not sufficient: binding history
 //! must also be old, and all writers, pins, readers and local SQLite handles must
 //! have gone. Unknown keys receive a fresh observation grace instead of treating
 //! an old payload mtime as proof that a root has not recently been bound.
+//! V3 families also shed idle view members above their allocated-byte target,
+//! even when the checkout still exists, without bypassing reader or writer holds.
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, ReadDir};
 use std::io::{self, Write};
@@ -247,6 +249,9 @@ struct State {
     /// The last key the due-first lane processed, so keys that stay protected
     /// cannot starve the ones after them.
     due_cursor: Option<String>,
+    /// Process-local LRU windows resume past held members. Restarting merely
+    /// repeats protection checks; no cache or registry format is changed.
+    v3_idle_after: HashMap<String, (u64, String)>,
     reaping: bool,
     trash: TrashReport,
     reaper_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -5347,7 +5352,8 @@ fn v3_finish_eviction(
 /// been missing, unprotected and past the recency and mount guards for
 /// `MISSING_ROOT_SWEEPS` consecutive passes. `kind = base` members and
 /// members with no root are never removed. Plane rows stay for the v3 plane
-/// sweep.
+/// sweep. Above the unified namespace target it also evicts idle views in
+/// least-recently-bound order, with the same protection checks.
 ///
 /// It only opens registries that already exist. A storage root with no
 /// `blobs/v3/` lists nothing, and a family directory without `members.sqlite`
@@ -5360,7 +5366,7 @@ fn v3_finish_eviction(
 struct V3Bounds {
     /// Time for the lock wait, the member work and the measurements together.
     budget: Duration,
-    /// Members examined in one visit, as `collect_one_v2_family` caps them.
+    /// Members examined in each missing-root or idle window of one visit.
     members: usize,
     /// Allocated bytes retained in the unified v3 family namespace.
     soft_bytes: u64,
@@ -5459,6 +5465,197 @@ fn reservation_lock_busy(error: &crate::blob_store::v3::Error) -> bool {
                 })
                 .is_some_and(crate::blob_store::v3::ReservationLockError::is_timeout)
     )
+}
+
+enum V3IdleStep {
+    Evicting,
+    Held,
+    Unknown(String),
+}
+
+fn v3_mark_idle_evicting(
+    tx: &rusqlite::Transaction<'_>,
+    observed: &V3Member,
+    view_dir: &Path,
+) -> rusqlite::Result<V3IdleStep> {
+    let Some(current) = v3_member(tx, &observed.scope)? else {
+        return Ok(V3IdleStep::Held);
+    };
+    if current.kind != "view"
+        || current.state != "active"
+        || current.last_bind_ms != observed.last_bind_ms
+        || current.root != observed.root
+        || current.view_dir != observed.view_dir
+    {
+        return Ok(V3IdleStep::Held);
+    }
+    // Worker pointer publication can outlive the reservation lock. Its intent
+    // protects the worker even when the insertion marker lives in its base.
+    if crate::views::base_refs::has_base_refs(tx)?
+        && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM base_refs WHERE worker_scope=?1 AND state='intent')",
+            [&current.scope],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Ok(V3IdleStep::Held);
+    }
+    match v3_member_protected(tx, &current.scope, view_dir) {
+        Ok(true) => return Ok(V3IdleStep::Held),
+        Err(reason) => return Ok(V3IdleStep::Unknown(reason)),
+        Ok(false) => {}
+    }
+    let _files = crate::db::file_identity::filesystem_guard();
+    if crate::db::file_identity::has_open_connections_under(view_dir) {
+        return Ok(V3IdleStep::Held);
+    }
+    tx.execute(
+        "UPDATE members SET state=?2 WHERE scope=?1",
+        rusqlite::params![current.scope, crate::views::registry::STATE_EVICTING],
+    )?;
+    Ok(V3IdleStep::Evicting)
+}
+
+/// The v3 ledger charges one namespace, including view directories and shared
+/// search, semantic and call-graph indexes. Use its allocated-byte target, not
+/// the separate v2 view-store limit.
+/// Fetch one LRU candidate only while over target: an unexamined tail is not a
+/// claim that those members are idle. Held windows resume on the next pass.
+fn collect_v3_idle(
+    paths: &StoragePaths,
+    family: &str,
+    registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+    domain: &mut DomainReport,
+    bounds: V3Bounds,
+    deadline: Instant,
+) -> io::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
+    // Reservations have no member scope and can survive a lock release during
+    // construction. Conservatively keep the whole family until they settle.
+    let publishing = registry
+        .with_barrier(|tx| {
+            Ok(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE state='reserved')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .map_err(v3)?;
+    if publishing {
+        report
+            .skipped_families
+            .push(format!("blobs/v3/{family}: publication_active"));
+        return Ok(false);
+    }
+    let resume = states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(paths.artifacts.clone())
+        .or_default()
+        .v3_idle_after
+        .get(family)
+        .cloned();
+    let mut after = resume.clone();
+    let mut wrapped = false;
+    let mut last_examined = None;
+    let mut owed = false;
+    let mut usage = registry.accounting().map_err(v3)?.usage();
+    while usage > bounds.soft_bytes && domain.examined < bounds.members {
+        if cancelled() || Instant::now() >= deadline {
+            report.stopped_early = true;
+            break;
+        }
+        let ceiling = if wrapped { resume.as_ref() } else { None };
+        let member = registry
+            .with_barrier(|tx| {
+                Ok(tx
+                    .query_row(
+                        "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members
+                 WHERE kind='view' AND state='active'
+                   AND (?1 IS NULL OR (last_bind_ms,scope) > (?1,?2))
+                   AND (?3 IS NULL OR (last_bind_ms,scope) <= (?3,?4))
+                 ORDER BY last_bind_ms,scope LIMIT 1",
+                        rusqlite::params![
+                            after.as_ref().map(|key| key.0),
+                            after.as_ref().map(|key| &key.1),
+                            ceiling.map(|key| key.0),
+                            ceiling.map(|key| &key.1)
+                        ],
+                        v3_member_row,
+                    )
+                    .optional()?)
+            })
+            .map_err(v3)?;
+        let Some(member) = member else {
+            if resume.is_some() && !wrapped {
+                after = None;
+                wrapped = true;
+                continue;
+            }
+            break;
+        };
+        after = Some((member.last_bind_ms, member.scope.clone()));
+        last_examined = after.clone();
+        domain.examined += 1;
+        let expected = crate::blob_store::v3::view_dir(&paths.artifacts, family, &member.scope);
+        let Some(view_dir) = expected.ok().filter(|path| {
+            Path::new(&member.view_dir) == path
+                && member.root.as_deref().and_then(v3_root_path).is_some()
+        }) else {
+            domain.skipped_unknown += 1;
+            continue;
+        };
+        #[cfg(test)]
+        test_hook(&paths.artifacts, "v3-idle-before-recheck");
+        let step = registry
+            .with_barrier(|tx| Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?))
+            .map_err(v3)?;
+        match step {
+            V3IdleStep::Held => domain.skipped_protected += 1,
+            V3IdleStep::Unknown(reason) => {
+                domain.skipped_unknown += 1;
+                report_candidate_error(&view_dir, &io::Error::other(reason), report);
+            }
+            V3IdleStep::Evicting => {
+                let bytes = retention_tree_bytes(&view_dir, deadline).ok();
+                match v3_finish_eviction(
+                    &paths.artifacts,
+                    registry,
+                    &member.scope,
+                    &view_dir,
+                    deadline,
+                ) {
+                    Ok(measured) => {
+                        record_v3_removal(domain, bytes);
+                        owed = measured == crate::blob_store::v3::Measurement::Owed;
+                        if owed {
+                            break;
+                        }
+                        usage = registry.accounting().map_err(v3)?.usage();
+                    }
+                    Err(error) => {
+                        domain.skipped_unknown += 1;
+                        report_candidate_error(&view_dir, &error, report);
+                    }
+                }
+            }
+        }
+    }
+    report.stopped_early |= usage > bounds.soft_bytes && domain.examined == bounds.members;
+    let mut states = states().lock().unwrap_or_else(|e| e.into_inner());
+    let cursors = &mut states
+        .entry(paths.artifacts.clone())
+        .or_default()
+        .v3_idle_after;
+    if usage <= bounds.soft_bytes {
+        cursors.remove(family);
+    } else if let Some(last) = last_examined {
+        cursors.insert(family.to_owned(), last);
+    }
+    Ok(owed)
 }
 
 fn collect_v3_family(
@@ -5691,11 +5888,31 @@ fn collect_v3_family(
     if !owed {
         owed = registry.covering_measurement_until(deadline).map_err(v3)? == Measurement::Owed;
     }
+    if !owed && !cancelled() && Instant::now() < deadline {
+        let mut idle = DomainReport::default();
+        let result = collect_v3_idle(
+            paths,
+            family,
+            &mut registry,
+            cancelled,
+            report,
+            &mut idle,
+            bounds,
+            deadline,
+        );
+        record_v3_domain(report, "views/v3-idle", &idle);
+        owed |= result?;
+    }
     if owed {
         report
             .skipped_families
             .push(format!("blobs/v3/{family}: measurement_owed"));
     }
+    record_v3_domain(report, "views/v3", &domain);
+    Ok(V3Visit::Done)
+}
+
+fn record_v3_domain(report: &mut SweepReport, name: &str, domain: &DomainReport) {
     report.examined += domain.examined;
     report.skipped_live += domain.skipped_live;
     report.skipped_recent += domain.skipped_recent;
@@ -5707,10 +5924,9 @@ fn collect_v3_family(
     report.unmeasured_removed_roots += domain.unmeasured_removed_roots;
     report
         .domains
-        .entry("views/v3".to_owned())
+        .entry(name.to_owned())
         .or_default()
-        .add(&domain);
-    Ok(V3Visit::Done)
+        .add(domain);
 }
 
 fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
@@ -13426,14 +13642,209 @@ mod v3_collector_tests {
             ..V3Bounds::PASS
         };
         let mut report = SweepReport::default();
-        collect_one_v3_family(&StoragePaths::same(&storage), &|| false, &mut report, bounds)
-            .unwrap();
+        collect_one_v3_family(
+            &StoragePaths::same(&storage),
+            &|| false,
+            &mut report,
+            bounds,
+        )
+        .unwrap();
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.removed_roots, 1, "{report:?}");
         assert_eq!(member_scopes(&storage), ["a-newest", "b-middle"]);
+        assert_eq!(report.domains["views/v3-idle"].examined, 1, "{report:?}");
         assert!(!view_dir(&storage, "z-oldest").exists());
         assert!(roots.iter().all(|root| root.exists()));
         assert!(v3::allocated_bytes(&family).unwrap() <= bounds.soft_bytes);
+        #[cfg(unix)]
+        {
+            let disk = inventory(&family);
+            let charged = v3::LedgerReader::open_existing(&storage, FAMILY)
+                .unwrap()
+                .accounting()
+                .unwrap()
+                .usage();
+            assert!(
+                charged.abs_diff(disk) <= 16 * 1024,
+                "ledger={charged} disk={disk}"
+            );
+            assert!(before.saturating_sub(disk).abs_diff(64 * 1024) <= 16 * 1024);
+        }
+    }
+
+    fn idle_pass(storage: &Path, bounds: V3Bounds) -> SweepReport {
+        let lock = ReservationLock::acquire(storage).unwrap();
+        let mut registry = RegistryWriter::open_existing(storage, FAMILY, &lock).unwrap();
+        let mut report = SweepReport::default();
+        let mut domain = DomainReport::default();
+        let owed = collect_v3_idle(
+            &StoragePaths::same(storage),
+            FAMILY,
+            &mut registry,
+            &|| false,
+            &mut report,
+            &mut domain,
+            bounds,
+            Instant::now() + bounds.budget,
+        )
+        .unwrap();
+        assert!(!owed, "{report:?}");
+        record_v3_domain(&mut report, "views/v3-idle", &domain);
+        report
+    }
+
+    #[test]
+    fn v3_budget_keeps_readers_pins_sessions_intents_and_uncertain_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "live");
+        let names = [
+            "a-late-pin",
+            "b-pin",
+            "c-reader",
+            "d-session",
+            "e-intent",
+            "f-unknown",
+            "z-idle",
+        ];
+        let members = names
+            .iter()
+            .map(|name| (*name, "view", Some(root.as_path())))
+            .collect::<Vec<_>>();
+        seed(&storage, &members);
+        for name in names {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        write_pin(&view_dir(&storage, "b-pin"), "g1", live_owner());
+        let _reader =
+            crate::root_cache::ReadMarker::create(&view_dir(&storage, "c-reader"), "g1").unwrap();
+        let unknown = view_dir(&storage, "f-unknown").join("pins");
+        fs::create_dir_all(&unknown).unwrap();
+        fs::write(unknown.join("broken.json"), b"not json").unwrap();
+        {
+            let lock = ReservationLock::acquire(&storage).unwrap();
+            let mut registry = RegistryWriter::open_existing(&storage, FAMILY, &lock).unwrap();
+            registry.upgrade_to_base_refs().unwrap();
+        }
+        let owner = live_owner();
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            tx.execute(
+                "INSERT INTO view_sessions VALUES('session','d-session',?1,?2,0)",
+                rusqlite::params![owner.pid, owner.start_time],
+            )?;
+            tx.execute("INSERT INTO base_refs VALUES('e-intent','base','nonce','digest',NULL,'intent',?1,?2,0)",
+                rusqlite::params![owner.pid, owner.start_time])?;
+            Ok(())
+        });
+        let late_dir = view_dir(&storage, "a-late-pin");
+        let _hook = observe_test_hook(
+            &storage,
+            Arc::new(move |step| {
+                if step == "v3-idle-before-recheck" {
+                    write_pin(&late_dir, "g1", live_owner());
+                }
+            }),
+        );
+        let report = idle_pass(
+            &storage,
+            V3Bounds {
+                soft_bytes: 0,
+                ..V3Bounds::PASS
+            },
+        );
+        let idle = &report.domains["views/v3-idle"];
+        assert_eq!(idle.examined, 7, "{report:?}");
+        assert_eq!(idle.skipped_protected, 5, "{report:?}");
+        assert_eq!(idle.skipped_unknown, 1, "{report:?}");
+        assert_eq!(idle.removed_roots, 1, "{report:?}");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert!(report.errors[0].contains("malformed pin"), "{report:?}");
+        assert_eq!(member_scopes(&storage), &names[..6]);
+        assert!(!view_dir(&storage, "z-idle").exists());
+        for name in &names[..6] {
+            assert!(view_dir(&storage, name).join("data.bin").exists());
+        }
+    }
+
+    #[test]
+    fn v3_budget_keeps_a_family_with_a_live_publication_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "live");
+        seed(&storage, &[("idle", "view", Some(&root))]);
+        fill_view_dir(&view_dir(&storage, "idle"));
+        let owner = live_owner();
+        with_registry(&storage, |tx| {
+            // Even a zero-byte live reservation is an in-flight publisher.
+            tx.execute("INSERT INTO reservations(owner_pid,owner_start,state,reserved_bytes,charge_bytes) VALUES(?1,?2,'reserved',0,0)",
+                rusqlite::params![owner.pid, owner.start_time])?;
+            Ok(())
+        });
+        let bounds = V3Bounds {
+            soft_bytes: 0,
+            ..V3Bounds::PASS
+        };
+        let report = idle_pass(&storage, bounds);
+        assert_eq!(report.removed_roots, 0);
+        assert_eq!(report.examined, 0);
+        assert_eq!(
+            report.skipped_families,
+            [format!("blobs/v3/{FAMILY}: publication_active")]
+        );
+        assert_eq!(member_scopes(&storage), ["idle"]);
+        assert!(view_dir(&storage, "idle").join("data.bin").exists());
+        with_registry(&storage, |tx| {
+            tx.execute(
+                "UPDATE reservations SET state='released' WHERE state='reserved'",
+                [],
+            )?;
+            Ok(())
+        });
+        assert_eq!(idle_pass(&storage, bounds).removed_roots, 1);
+    }
+
+    #[test]
+    fn v3_budget_resumes_past_a_window_of_held_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "live");
+        seed(
+            &storage,
+            &[
+                ("a-pin", "view", Some(&root)),
+                ("b-pin", "view", Some(&root)),
+                ("z-idle", "view", Some(&root)),
+            ],
+        );
+        for name in ["a-pin", "b-pin", "z-idle"] {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        for name in ["a-pin", "b-pin"] {
+            write_pin(&view_dir(&storage, name), "g1", live_owner());
+        }
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        let bounds = V3Bounds {
+            soft_bytes: 0,
+            members: 2,
+            ..V3Bounds::PASS
+        };
+        let first = idle_pass(&storage, bounds);
+        assert_eq!(first.examined, 2);
+        assert_eq!(first.removed_roots, 0);
+        assert!(first.stopped_early);
+        let next = idle_pass(&storage, bounds);
+        assert_eq!(next.removed_roots, 1, "{next:?}");
+        assert_eq!(member_scopes(&storage), ["a-pin", "b-pin"]);
     }
 
     #[test]
