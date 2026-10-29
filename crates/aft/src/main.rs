@@ -104,6 +104,7 @@ fn exit_after_log_flush(code: i32) -> i32 {
     let started = Instant::now();
     aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
     aft::logging::flush_stderr_on_exit(DURABLE_LOG_EXIT_FLUSH.saturating_sub(started.elapsed()));
+    aft::pinned_executable::cleanup_at_exit();
     code
 }
 
@@ -193,10 +194,11 @@ fn main() {
     // variables are removed before any child (the login-shell PATH probe
     // below included) could inherit them. Standalone mode has no nonce and
     // never touches the descriptor.
-    if parse_subc_arg(std::env::args_os().skip(1)).is_some() {
+    let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
+    if subc_connection_file.is_some() {
         aft::launch_nonce::capture_at_startup();
+        aft::pinned_executable::capture_at_startup();
     }
-    aft::pinned_executable::capture_at_startup();
 
     // Only the binary embeds the per-commit revision. Declare it before CLI
     // dispatch or the subc HELLO can request the library's build provenance.
@@ -354,13 +356,14 @@ fn main() {
     // exit; process::exit releases its kernel handle even when Rust skips Drop.
     let _process_storage_lease = hold_process_storage_lease();
 
-    // Pin the startup image before PATH discovery or application startup can
-    // launch children. Only long-running processes need a pin: the one-shot
-    // CLI commands above must not create storage (a fresh-install doctor run
-    // creates nothing), and the helper entry points already run a pinned image.
-    if let Err(error) = aft::pinned_executable::initialize() {
-        eprintln!("cannot pin the running AFT executable: {error}");
-        std::process::exit(1);
+    // Only the daemon's fixed deployment path can be replaced while it runs.
+    // Standalone hosts use versioned paths and need no persistent image copy.
+    // Pin before PATH discovery or application startup can launch children.
+    if subc_connection_file.is_some() {
+        if let Err(error) = aft::pinned_executable::initialize() {
+            eprintln!("cannot pin the running AFT executable: {error}");
+            std::process::exit(1);
+        }
     }
 
     // Daemon launches can miss user shell PATH entries. Initialize before any
@@ -378,7 +381,6 @@ fn main() {
     // the named global pool must precede context construction and index work.
     initialize_global_rayon_pool();
 
-    let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
     if uses_subc_stderr(
         std::env::args().nth(1).as_deref(),
         subc_connection_file.is_some(),
@@ -511,6 +513,7 @@ fn main() {
                 // The stderr mirror has its own queue: a durable-file flush does
                 // not deliver the shutdown reason to redirected module stderr.
                 aft::logging::flush_stderr_on_exit(aft::subc::exit_log_flush_wait());
+                aft::pinned_executable::cleanup_at_exit();
                 if !native_idle {
                     aft::ort_lifecycle::exit_without_native_teardown(0);
                 }

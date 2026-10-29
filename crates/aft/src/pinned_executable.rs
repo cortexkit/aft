@@ -1,7 +1,8 @@
 //! Process-lifetime re-exec identity, independent of the deployment pathname.
 //!
-//! Placement may rename a new binary over that pathname while this process is
-//! serving requests. Children must keep using the image that started the server.
+//! Placement may rename a new binary over the daemon's fixed deployment pathname
+//! while it serves requests. Its children must keep using the startup image.
+//! Standalone hosts use versioned paths and retain normal executable discovery.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ pub fn capture_at_startup() {
     });
 }
 
-/// Called once by the binary, before any serving-process child can be spawned.
+/// Called once by the daemon, before any serving-process child can be spawned.
 pub fn initialize() -> io::Result<()> {
     if PINNED.get().is_some() {
         return Ok(());
@@ -203,17 +204,20 @@ fn materialize(
     Ok(())
 }
 
-/// Return the startup pin. Library-only hosts retain their platform's image
-/// discovery when they have not opted into binary startup initialization.
+/// Remove this daemon's pin on a controlled exit, including exits that skip Drop.
+/// Startup cleanup handles crashes and any best-effort removal failures.
+pub fn cleanup_at_exit() {
+    if let Some(pin) = PINNED.get() {
+        let _ = std::fs::remove_dir_all(&pin.directory);
+    }
+}
+
+/// Return the daemon's startup pin, or normal executable discovery for standalone
+/// and library-only hosts that have not initialized a pin.
 pub fn path() -> io::Result<PathBuf> {
     if let Some(pin) = PINNED.get() {
         return Ok(pin.executable.clone());
     }
-    // Uninitialized library/test hosts keep direct image discovery. Serving
-    // hosts must initialize before constructing governed children.
-    #[cfg(target_os = "linux")]
-    return Ok(linux_image_path());
-    #[cfg(not(target_os = "linux"))]
     std::env::current_exe()
 }
 
