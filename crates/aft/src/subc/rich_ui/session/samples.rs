@@ -7,6 +7,19 @@ const FIXTURE: &str = "tests/fixtures/rich_ui/aft-rich-ui-manifest-v1.json";
 const TASK: &str = "bash-0000000000000081";
 const VIEWED_CALL: &str = "sample-viewed-call";
 
+fn sample_fixture() -> Fixture {
+    read_tests::indexed_fixture_with_setup("head", |f| {
+        // Generated task/cache files and the fixture database are not project
+        // source. Exclude them before starting the indexes and watcher so writes
+        // to these generated files cannot enter the indexed project corpus.
+        std::fs::write(
+            f.policy.project_root.join(".aftignore"),
+            "/storage/\n/aft.db*\n",
+        )
+        .unwrap();
+    })
+}
+
 fn wait_for_capture_ready(ctx: &AppContext, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -44,7 +57,7 @@ async fn capture() -> Value {
     // These calls inject a test manifest without publishing a production manifest.
     let _manifest =
         super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
-    let f = read_tests::indexed_fixture("head");
+    let f = sample_fixture();
     // Finish task-artifact writes before waiting for any indexed sample reply.
     bash_tests::seed(
         &f,
@@ -204,7 +217,7 @@ async fn rich_ui_samples_match_handlers() {
 
 #[test]
 fn rich_ui_samples_wait_for_pending_watcher_application() {
-    let f = read_tests::indexed_fixture("head");
+    let f = sample_fixture();
     wait_for_capture_ready(&f.ctx, Duration::from_secs(60));
     // Replace OS event delivery with a queued real path application so the
     // assertion does not depend on when a platform's watcher reports a write.
