@@ -12955,6 +12955,15 @@ mod tests {
     /// only what changed, reusing every stored vector.
     #[test]
     fn semantic_view_pauses_while_unbound_and_resumes_after_rebind() {
+        semantic_view_reconnect_grace(false);
+    }
+
+    #[test]
+    fn semantic_view_retries_transient_backend_failure_inside_reconnect_grace() {
+        semantic_view_reconnect_grace(true);
+    }
+
+    fn semantic_view_reconnect_grace(transient_backend_failure: bool) {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -12990,7 +12999,7 @@ mod tests {
                     .is_ok_and(|answer| answer.complete())
             })
         };
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx), "the semantic view never filled");
         let stored = server.non_probe_input_count();
         assert!(stored >= 6);
@@ -13000,6 +13009,9 @@ mod tests {
         // a wait after a `lane_paused` refusal uses the immediate-unbind check.
         ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(300));
         ctx.mark_subc_unbound();
+        server
+            .fail_summaries
+            .store(transient_backend_failure, Ordering::SeqCst);
         let during_grace = root.join("module_1.rs");
         fs::write(
             &during_grace,
@@ -13008,16 +13020,26 @@ mod tests {
         .unwrap();
         ctx.record_checkout_watcher_change(&during_grace);
         assert_eq!(fills.next(), "wake");
-        assert_eq!(
-            fills.next(),
-            "settled",
-            "healthy view work stopped inside reconnect grace"
-        );
+        if transient_backend_failure {
+            assert_eq!(fills.next(), "retry");
+            let reason = ctx
+                .checkout_semantic_runtime()
+                .unwrap()
+                .unavailable_reason()
+                .unwrap();
+            assert!(reason.contains("503"), "unexpected retry: {reason}");
+            assert!(!complete(&ctx));
+            server.fail_summaries.store(false, Ordering::SeqCst);
+        }
+        // Transient backend or checkout contention can retry without stopping
+        // the lane. Require settlement within one deadline, without rebinding
+        // or sending another wake to rescue work inside reconnect grace.
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx));
         assert!(server.non_probe_input_count() > stored);
         ctx.mark_subc_bound();
         assert_eq!(fills.next(), "wake");
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         let stored = server.non_probe_input_count();
 
         ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
@@ -13044,7 +13066,7 @@ mod tests {
         // the transient-retry timer, then wait for that fill to finish.
         ctx.mark_subc_bound();
         assert_eq!(fills.next(), "wake");
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         let names = |ctx: &AppContext| {
             ctx.checkout_semantic_runtime()
                 .unwrap()

@@ -4347,3 +4347,23 @@ fn no_subscription_refresh_installs_and_answers_complete() {
     );
     assert_eq!(pending_semantic(&runtime), 0);
 }
+
+#[test]
+fn fill_observer_waits_through_retry_until_settled() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    observe_fill(root.path(), "settled");
+    observer.wait_until_settled(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn fill_observer_retry_without_settlement_fails_with_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    let error = observer
+        .wait_until_settled(Duration::from_millis(20))
+        .unwrap_err();
+    assert!(error.contains("temporary backend failure"), "{error}");
+}

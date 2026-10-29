@@ -1807,13 +1807,20 @@ impl Drop for ServingIndexFailure {
 
 #[cfg(test)]
 static FILL_OBSERVERS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<PathBuf, crossbeam_channel::Sender<&'static str>>>,
+    Mutex<std::collections::HashMap<PathBuf, crossbeam_channel::Sender<ObservedFill>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ObservedFill {
+    state: &'static str,
+    reason: Option<String>,
+}
 
 #[cfg(test)]
 pub(crate) struct FillObserver {
     root: PathBuf,
-    rx: crossbeam_channel::Receiver<&'static str>,
+    rx: crossbeam_channel::Receiver<ObservedFill>,
 }
 #[cfg(test)]
 impl FillObserver {
@@ -1826,6 +1833,42 @@ impl FillObserver {
         self.rx
             .recv_timeout(Duration::from_secs(60))
             .expect("semantic fill event")
+            .state
+    }
+
+    pub(crate) fn wait_until_settled(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut retries = Vec::new();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "semantic fill deadline expired for {}; retries={retries:?}",
+                    self.root.display()
+                ));
+            }
+            let event = self.rx.recv_deadline(deadline).map_err(|error| {
+                format!(
+                    "semantic fill did not settle for {}: {error}; retries={retries:?}",
+                    self.root.display()
+                )
+            })?;
+            match event.state {
+                "settled" => return Ok(()),
+                "retry" => {
+                    eprintln!(
+                        "semantic fill retry for {}: {:?}",
+                        self.root.display(),
+                        event.reason
+                    );
+                    retries.push(event.reason);
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected semantic fill event: {event:?}; retries={retries:?}"
+                    ))
+                }
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -1836,8 +1879,16 @@ impl Drop for FillObserver {
 }
 #[cfg(test)]
 fn observe_fill(root: &Path, event: &'static str) {
+    observe_fill_with_reason(root, event, None);
+}
+
+#[cfg(test)]
+fn observe_fill_with_reason(root: &Path, state: &'static str, reason: Option<&str>) {
     if let Some(tx) = lock(&FILL_OBSERVERS).get(root) {
-        let _ = tx.send(event);
+        let _ = tx.send(ObservedFill {
+            state,
+            reason: reason.map(str::to_owned),
+        });
     }
 }
 
@@ -1978,7 +2029,7 @@ fn serve_fills_with_status<F>(
                         );
                     }
                     #[cfg(test)]
-                    observe_fill(&schedule.root, "retry");
+                    observe_fill_with_reason(&schedule.root, "retry", Some(&reason));
                 }
                 backoff = (backoff * 2).min(schedule.retry_max);
             }
