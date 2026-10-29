@@ -1,12 +1,15 @@
 """Regression checks for gate verdicts and non-destructive byte comparisons."""
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
 
 
 HERE = Path(__file__).resolve().parent
@@ -14,9 +17,49 @@ spec = importlib.util.spec_from_file_location("check_generated", HERE / "check-g
 assert spec is not None and spec.loader is not None
 generated = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(generated)
+lint_spec = importlib.util.spec_from_file_location("prepush_lint", HERE / "lint.py")
+assert lint_spec is not None and lint_spec.loader is not None
+pinned_lint = importlib.util.module_from_spec(lint_spec)
+lint_spec.loader.exec_module(pinned_lint)
 
 
 class PrepushTests(unittest.TestCase):
+    def test_pinned_biome_version_mismatch_refuses_to_lint(self):
+        version = subprocess.CompletedProcess([], 0, "Version: 0.3.3\n", "")
+        successful_check = subprocess.CompletedProcess([], 0, "Checked 42 files in 1ms.\n", "")
+        with mock.patch.object(pinned_lint, "locked_version", return_value="9.8.7"), \
+             mock.patch.object(pinned_lint.subprocess, "run", side_effect=[version, successful_check]) as runner, \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertNotEqual(pinned_lint.lint(), 0)
+            self.assertEqual(runner.call_count, 1)
+            self.assertEqual(runner.call_args.args[0], ["bunx", "@biomejs/biome@9.8.7", "--version"])
+
+    def test_pinned_biome_is_used_for_both_version_and_check(self):
+        version = subprocess.CompletedProcess([], 0, "Version: 9.8.7\n", "")
+        successful_check = subprocess.CompletedProcess([], 0, "Checked 42 files in 1ms.\n", "")
+        with mock.patch.object(pinned_lint, "locked_version", return_value="9.8.7"), \
+             mock.patch.object(pinned_lint.subprocess, "run", side_effect=[version, successful_check]) as runner, \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(pinned_lint.lint(), 0)
+            self.assertEqual(runner.call_args_list[0].args[0], ["bunx", "@biomejs/biome@9.8.7", "--version"])
+            self.assertEqual(runner.call_args_list[1].args[0], ["bunx", "@biomejs/biome@9.8.7", "check", "."])
+
+    def test_pinned_biome_empty_success_is_not_a_pass(self):
+        version = subprocess.CompletedProcess([], 0, "Version: 9.8.7\n", "")
+        empty_check = subprocess.CompletedProcess([], 0, "Checked 0 files.\n", "")
+        with mock.patch.object(pinned_lint, "locked_version", return_value="9.8.7"), \
+             mock.patch.object(pinned_lint.subprocess, "run", side_effect=[version, empty_check]), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertNotEqual(pinned_lint.lint(), 0)
+
+    def test_biome_version_is_read_from_the_resolved_lock_entry(self):
+        scratch = Path("target/scratch")
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temp:
+            lock = Path(temp) / "bun.lock"
+            lock.write_text('{"workspaces":{"":{"devDependencies":{"@biomejs/biome":"^9.8.0"}}},"packages":{"@biomejs/biome":["@biomejs/biome@9.8.7","",{}]}}')
+            self.assertEqual(pinned_lint.locked_version(lock), "9.8.7")
+
     def test_byte_drift_fails_and_restores_existing_and_new_files(self):
         scratch = Path("target/scratch")
         scratch.mkdir(parents=True, exist_ok=True)

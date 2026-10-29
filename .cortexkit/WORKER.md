@@ -76,7 +76,7 @@ Build the bridge first whenever you change it: `bun run --cwd packages/aft-bridg
 
 | Gate | Command | Proof it ran |
 |---|---|---|
-| Lint (Biome 2.x) | `bun run lint` at the repo root | `Checked N files`. Show `./node_modules/.bin/biome --version`. |
+| Lint (locked Biome) | `python3 scripts/prepush/lint.py` at the repo root | Reads the exact `@biomejs/biome` version from `bun.lock`, runs the scoped pinned package, rejects a reported-version mismatch, then requires `Checked N files`. CI's equivalent is `bun run lint`. |
 | Typecheck | `bun run --cwd packages/<pkg> typecheck` | Exit 0. Name the package. |
 | Unit tests | `bun run --cwd packages/<pkg> test:unit` | `N pass` / `0 fail` with N > 0. |
 | End-to-end tests | `bun run --cwd packages/opencode-plugin test:e2e` (and pi-plugin) | Same as above. They spawn `target/debug/aft`. |
@@ -98,6 +98,7 @@ Regenerate only with the named generator; do not hand-edit artifacts. Local fast
 All worker guidance belongs in `.cortexkit/WORKER.md`, not a separate root guide.
 
 ## Do not
+- **Run plain `bunx biome`.** It can resolve an unrelated npm package. The local lint command uses the scoped `@biomejs/biome` lock pin and checks its reported version before linting.
 - **Pipe a gated command** (`cmd | tail`, `cmd | grep`). The pipe's exit code hides the failure. Run it bare, or save output to a file and read the file.
 - **Run TypeScript end-to-end suites while cargo is building** the same checkout. Cargo rewrites `target/debug/aft` mid-run and every bridge test fails with "Bridge shutting down".
 - **Run the plugin end-to-end or permission suites from a worktree under `/tmp`.** The temp-directory permission exemption makes their assertions wrong.

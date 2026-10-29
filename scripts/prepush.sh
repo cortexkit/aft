@@ -20,8 +20,7 @@ export TMPDIR="$PWD/target/scratch/prepush-temp"
 prepush_step versions bash -c 'set -euo pipefail; cargo --version; cargo fmt --version; bun --version; node --version; python3 --version'
 prepush_step rust-format cargo fmt --all -- --check
 prepush_step bun-lock bun install --frozen-lockfile
-prepush_step biome-version ./node_modules/.bin/biome --version
-prepush_step lint bun run lint
+prepush_step lint python3 scripts/prepush/lint.py
 prepush_step cargo-lock bash -c 'set -euo pipefail; mkdir -p "${CARGO_TARGET_DIR:-target}"; cargo metadata --locked --format-version 1 > "${CARGO_TARGET_DIR:-target}/prepush-metadata.json"; python3 -c '\''import json, sys; data=json.load(open(sys.argv[1])); count=len(data["packages"]); assert count > 0; print("Locked Cargo metadata: %s packages, %s workspace members" % (count, len(data["workspace_members"])))'\'' "${CARGO_TARGET_DIR:-target}/prepush-metadata.json"'
 prepush_step bridge bun run --cwd packages/aft-bridge build
 prepush_step typecheck bun run typecheck
