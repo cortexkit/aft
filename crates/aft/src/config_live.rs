@@ -935,6 +935,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("indexes.semantic", indexes.semantic);
     later!("indexes.callgraph", indexes.callgraph);
     later!("index.roots", index.roots);
+    later!("project_detection", project_detection);
     later!("views.enabled", views.enabled);
     live!("callgraph_chunk_size", callgraph_chunk_size);
     // Inspect.
@@ -1076,6 +1077,7 @@ fn classification_is_exhaustive(config: &Config) {
         restrict_to_project_root: _,
         indexes,
         index: _,
+        project_detection: _,
         views: _,
         callgraph_chunk_size: _,
         experimental_bash_rewrite: _,

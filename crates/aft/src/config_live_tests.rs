@@ -331,6 +331,17 @@ fn bash_env_updates_live_while_cache_dir_waits_for_reconfigure() {
 }
 
 #[test]
+fn project_detection_changes_wait_for_reconfigure() {
+    let published = Config::default();
+    let mut candidate = published.clone();
+    candidate.project_detection.mode = crate::folder_admission::DetectionMode::Off;
+    let result = super::apply_live_config(&published, &candidate, &published);
+    assert_eq!(result.deferred, ["project_detection"]);
+    assert!(result.applied.is_empty());
+    assert_eq!(result.next.project_detection, published.project_detection);
+}
+
+#[test]
 fn user_file_edit_applies_live_too() {
     let fixture = Fixture::new(r#"{ "url_fetch_allow_private": false }"#, None);
     write(&fixture.user_path, r#"{ "url_fetch_allow_private": true }"#);
