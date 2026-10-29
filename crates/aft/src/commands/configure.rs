@@ -14336,10 +14336,10 @@ mod tests {
         // Holds the process environment lock for the whole test, like the
         // other lexical views tests above.
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        struct Refused;
+        struct Refused(String);
         impl crate::views::trigram::LexicalSnapshotSource for Refused {
             fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
-                Err("lexical source deliberately refused".into())
+                Err(self.0.clone())
             }
             fn record_change(&self, _: &Path) {}
         }
@@ -14371,13 +14371,21 @@ mod tests {
             .expect("bind loads a snapshot");
         assert!(initialized.is_ok(), "{:?}", initialized.err());
         let working = ctx.lexical_source_for_test();
-        ctx.install_lexical_source_for_test(Arc::new(Refused));
+        let failed_file = root.join("visible.ts");
+        let load_error = format!(
+            "view I/O failed reading {}: Permission denied",
+            failed_file.display()
+        );
+        ctx.install_lexical_source_for_test(Arc::new(Refused(load_error.clone())));
 
         // Every lexical lane fails with the view error, never an empty
         // success and never a fallback walk.
         let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
         assert!(
-            !grep.success && grep.data.to_string().contains("deliberately refused"),
+            !grep.success
+                && grep.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(&load_error)),
             "{:?}",
             grep.data
         );
@@ -14386,7 +14394,10 @@ mod tests {
             &ctx,
         );
         assert!(
-            !search.success && search.data.to_string().contains("deliberately refused"),
+            !search.success
+                && search.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(&load_error)),
             "{:?}",
             search.data
         );
@@ -14401,7 +14412,10 @@ mod tests {
             &ctx,
         );
         assert!(
-            !glob.success && glob.data.to_string().contains("deliberately refused"),
+            !glob.success
+                && glob.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(&load_error)),
             "{:?}",
             glob.data
         );
@@ -14426,14 +14440,14 @@ mod tests {
         // Health counts every failed load by plane and cause, keeps the last
         // error, and marks the project degraded.
         let health = ctx.try_health_snapshot(&root);
-        assert_eq!(health.view_load_failures.get("trigram:other"), Some(&3));
+        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
         let last = health.view_load_failure_last.expect("last failure kept");
         assert_eq!(
             (last.plane.as_str(), last.cause.as_str()),
-            ("trigram", "other")
+            ("trigram", "io")
         );
         assert_eq!((last.count, last.total), (3, 3));
-        assert!(last.error.contains("deliberately refused"));
+        assert_eq!(last.error, load_error);
         assert!(degraded());
 
         // Recovery: the next successful load clears the degraded flag but
@@ -14443,10 +14457,10 @@ mod tests {
         assert!(recovered.success, "{:?}", recovered.data);
         assert!(!degraded());
         let health = ctx.try_health_snapshot(&root);
-        assert_eq!(health.view_load_failures.get("trigram:other"), Some(&3));
+        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
         assert!(health
             .view_load_failure_last
-            .is_some_and(|last| last.error.contains("deliberately refused")));
+            .is_some_and(|last| last.error == load_error));
     }
 
     #[test]
@@ -14926,7 +14940,7 @@ mod tests {
         // Holds the process environment lock for the whole test, like the
         // other callgraph views tests above.
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        struct Refused;
+        struct Refused(String);
         impl crate::views::callgraph::CallgraphReaderSource for Refused {
             fn acquire(
                 &self,
@@ -14934,7 +14948,7 @@ mod tests {
                 Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
                 crate::views::callgraph::CallgraphViewError,
             > {
-                Err("callgraph source deliberately refused".into())
+                Err(self.0.clone().into())
             }
             fn record_change(&self, _: &Path) {}
         }
@@ -14953,7 +14967,12 @@ mod tests {
             handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
                 .success
         );
-        ctx.install_callgraph_source_for_test(Arc::new(Refused));
+        let failed_file = root.join("a.ts");
+        let load_error = format!(
+            "view I/O failed opening {}: Permission denied",
+            failed_file.display()
+        );
+        ctx.install_callgraph_source_for_test(Arc::new(Refused(load_error.clone())));
 
         // Every graph operation fails with the view error, never an empty
         // success and never another store's answer.
@@ -15004,7 +15023,10 @@ mod tests {
             request.params = params.clone();
             let answer = handle(&request, &ctx);
             assert!(
-                !answer.success && answer.data.to_string().contains("deliberately refused"),
+                !answer.success
+                    && answer.data["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(&load_error)),
                 "{command}: {:?}",
                 answer.data
             );
@@ -15028,13 +15050,9 @@ mod tests {
             zoom_with_graph.data["callgraph"]["code"],
             "callgraph_unavailable"
         );
-        assert!(
-            zoom_with_graph
-                .data
-                .to_string()
-                .contains("deliberately refused"),
-            "{:?}",
-            zoom_with_graph.data
+        assert_eq!(
+            zoom_with_graph.data["callgraph"]["index"]["reason"],
+            format!("callgraph store unavailable: callgraph view unavailable: {load_error}")
         );
         let zoom_local = crate::commands::zoom::handle_zoom(
             &serde_json::from_value(json!({
@@ -15053,15 +15071,15 @@ mod tests {
         // project degraded.
         let health = ctx.try_health_snapshot(&root);
         assert_eq!(
-            health.view_load_failures.get("callgraph:other"),
+            health.view_load_failures.get("callgraph:io"),
             Some(&(ops.len() as u64 + 1))
         );
         let last = health.view_load_failure_last.expect("last failure kept");
         assert_eq!(
             (last.plane.as_str(), last.cause.as_str()),
-            ("callgraph", "other")
+            ("callgraph", "io")
         );
-        assert!(last.error.contains("deliberately refused"));
+        assert_eq!(last.error, load_error);
         assert!(ctx
             .degraded_reasons()
             .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));

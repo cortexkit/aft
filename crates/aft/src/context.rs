@@ -22759,6 +22759,42 @@ mod view_load_health_tests {
             .as_str()
             .is_some_and(|error| error.contains("/root/b.ts")));
     }
+
+    #[test]
+    fn view_load_log_throttle_reports_suppressed_repeats_per_project_and_plane() {
+        let ctx = ctx();
+        let other_project = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let error = "view I/O failed reading /project/a.ts: Permission denied";
+        let ((), first_lines) = crate::logging::capture_log_lines(|| {
+            ctx.note_view_load_failure("trigram", error);
+            ctx.note_view_load_failure("trigram", error);
+            ctx.note_view_load_failure("trigram", error);
+            ctx.note_view_load_failure("callgraph", error);
+            other_project.note_view_load_failure("trigram", error);
+        });
+        assert_eq!(first_lines.len(), 3, "{first_lines:?}");
+        assert!(first_lines
+            .iter()
+            .all(|line| line.starts_with("ERROR ") && line.contains("suppressed=0")));
+        assert_eq!(ctx.view_load_suppressed_for_test("trigram"), 2);
+        assert_eq!(ctx.view_load_suppressed_for_test("callgraph"), 0);
+        assert_eq!(other_project.view_load_suppressed_for_test("trigram"), 0);
+
+        // Expire only the throttle interval, without sleeping for a minute.
+        {
+            let mut health = ctx.view_load_health.lock();
+            let (last_log, _) = health.log_state.get_mut("trigram").unwrap();
+            *last_log = Some(Instant::now() - VIEW_LOAD_LOG_INTERVAL);
+        }
+        let ((), next_lines) = crate::logging::capture_log_lines(|| {
+            ctx.note_view_load_failure("trigram", error);
+        });
+        assert_eq!(next_lines.len(), 1, "{next_lines:?}");
+        assert!(next_lines[0].contains("plane=trigram"));
+        assert!(next_lines[0].contains("failures=4"));
+        assert!(next_lines[0].contains("suppressed=2"));
+        assert_eq!(ctx.view_load_suppressed_for_test("trigram"), 0);
+    }
 }
 
 #[cfg(test)]
