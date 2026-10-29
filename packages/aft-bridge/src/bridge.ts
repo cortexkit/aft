@@ -806,11 +806,17 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
-  private debugVia(message: string, meta?: LogMeta): void {
+    private debugVia(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
+    // A host logger without a debug method, or no logger at all, gets the same
+    // destination as an INFO record, as before DEBUG forwarding existed. Never
+    // fall back to the console: engine DEBUG records can be numerous.
+    if (!logger?.debug) {
+      this.logVia(message, meta);
+      return;
+    }
     try {
-      if (logger?.debug) logger.debug(message, meta);
-      else console.error(`[aft-bridge] DEBUG: ${message}`);
+      logger.debug(message, meta);
     } catch (err) {
       console.error(
         `[aft-bridge] ERROR: logger debug threw: ${err instanceof Error ? err.message : String(err)}`,

@@ -41,6 +41,20 @@ describe("engine stderr flush severity", () => {
     });
   }
 
+  test("sends DEBUG to log when the host logger has no debug method", () => {
+    const calls: [string, string][] = [];
+    const bridge = new BinaryBridge("/unused/aft", process.cwd(), {
+      logger: {
+        log: (message) => calls.push(["INFO", message]),
+        warn: (message) => calls.push(["WARN", message]),
+        error: (message) => calls.push(["ERROR", message]),
+      },
+    }) as any;
+    const line = "2026-10-23T21:26:36.123Z [aft] DEBUG detail";
+    bridge.onStderrData(`${line}\n`);
+    expect(calls).toEqual([["INFO", `[aft] ${line}`]]);
+  });
+
   test("flushes an unterminated record and leaves unrecognized stderr on INFO", () => {
     const { calls, bridge } = capture();
     const lines = [
