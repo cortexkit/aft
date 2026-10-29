@@ -1979,15 +1979,17 @@ fn outside_grep_grant_round_trip_symlinked_parent() {
 }
 
 fn assert_outside_grep_round_trip(f: &Fixture, folder: &Path) {
-    f.ctx.set_harness(crate::harness::Harness::Opencode);
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("grep", &Value::Null);
     let run = |path: &Path, tokens: Vec<String>| {
-        crate::access_policy::with_native_route(
-            request(
+        let mut scope = scope.clone();
+        let once = plugin::claim(&mut scope, &tokens);
+        let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+        crate::commands::grep::handle_grep(
+            &request(
                 "grep",
-                json!({"path": path, "pattern": "outside_grep_canary", "permissions_granted": tokens}),
+                json!({"path": path, "pattern": "outside_grep_canary"}),
             ),
             &f.ctx,
-            |req, ctx| crate::commands::grep::handle_grep(&req, ctx),
         )
     };
     for path in [folder.to_path_buf(), folder.join("packages")] {
