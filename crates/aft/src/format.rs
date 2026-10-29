@@ -3462,36 +3462,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn process_state_for_test(pid: u32) -> String {
-        // Sandboxed macOS tests cannot spawn the setuid ps binary. A nonzero
-        // PROC_PIDTBSDINFO argument includes zombies in the native lookup.
-        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: the buffer points to a proc_bsdinfo with its exact size.
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                1,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if read == size {
-            // SAFETY: the successful full-size query initialized the structure.
-            let info = unsafe { info.assume_init() };
-            return if info.pbi_status == libc::SZOMB {
+        if let Some(info) = crate::fs_lock::macos_kinfo(pid) {
+            return if info.has_exited() {
                 "Z".to_string()
             } else {
-                info.pbi_status.to_string()
+                info.state.to_string()
             };
         }
-        let query_error = std::io::Error::last_os_error();
-        // A failed query is not proof of exit; only ESRCH confirms absence.
-        // SAFETY: signal zero checks existence without signalling the process.
+        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // A failed kernel query is not proof of exit; only ESRCH confirms absence.
         let absent = unsafe { libc::kill(pid, 0) } == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        assert!(absent, "proc_pidinfo({pid}) returned {read}: {query_error}");
+        assert!(
+            absent,
+            "kern.proc.pid({pid}) did not provide a known process snapshot"
+        );
         String::new()
     }
 

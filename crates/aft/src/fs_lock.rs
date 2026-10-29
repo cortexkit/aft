@@ -2495,40 +2495,141 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
+const MACOS_KINFO_SIZE: usize = 648;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SZOMB: u8 = 5;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const P_WEXIT: u32 = 0x0000_2000;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MacosExitState {
+    NotExiting,
+    Exiting,
+    Zombie,
+}
+
+/// One kernel snapshot supplies both incarnation and exit evidence. libproc's
+/// PROC_PIDTBSDINFO can fail for a zombie, which is not evidence of liveness.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug)]
+pub(crate) struct MacosKinfo {
+    pub(crate) comm: String,
+    pub(crate) ruid: u32,
+    pub(crate) pgid: i32,
+    pub(crate) state: u8,
+    pub(crate) flags: u32,
+    pub(crate) started_at_us: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosKinfo {
+    pub(crate) fn exit_state(&self) -> MacosExitState {
+        if self.state == SZOMB {
+            MacosExitState::Zombie
+        } else if self.flags & P_WEXIT != 0 {
+            MacosExitState::Exiting
+        } else {
+            MacosExitState::NotExiting
+        }
+    }
+
+    /// The kernel exposes exit-started (P_WEXIT) before the process reaches the
+    /// zombie state (SZOMB). Both count as exited for lease ownership and for
+    /// deciding when a killed background task has finished.
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exit_state() != MacosExitState::NotExiting
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_macos_kinfo(bytes: &[u8]) -> Option<MacosKinfo> {
+    // Darwin's kinfo_proc ABI is 648 bytes on arm64 and x86_64. libc does not
+    // declare it for Apple targets; reject any other layout rather than guess.
+    const P_FLAG_OFFSET: usize = 32;
+    const P_STAT_OFFSET: usize = 36;
+    const P_COMM_OFFSET: usize = 243;
+    const P_COMM_LEN: usize = 17;
+    const P_RUID_OFFSET: usize = 392;
+    const E_PGID_OFFSET: usize = 564;
+    if bytes.len() != MACOS_KINFO_SIZE {
+        return None;
+    }
+    let read_u32 = |offset: usize| {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    // extern_proc begins with p_un.p_starttime (timeval): 64-bit seconds and
+    // 32-bit microseconds. Keep microsecond identity distinct from ms callers.
+    let seconds = i64::from_ne_bytes(bytes[0..8].try_into().ok()?);
+    let micros = i32::from_ne_bytes(bytes[8..12].try_into().ok()?);
+    let started_at_us = if seconds > 0 && (0..1_000_000).contains(&micros) {
+        (seconds as u64)
+            .checked_mul(1_000_000)?
+            .checked_add(micros as u64)
+    } else {
+        None
+    };
+    let comm = &bytes[P_COMM_OFFSET..P_COMM_OFFSET + P_COMM_LEN];
+    let end = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    Some(MacosKinfo {
+        comm: String::from_utf8_lossy(&comm[..end]).into_owned(),
+        ruid: read_u32(P_RUID_OFFSET),
+        pgid: read_u32(E_PGID_OFFSET) as i32,
+        state: bytes[P_STAT_OFFSET],
+        flags: read_u32(P_FLAG_OFFSET),
+        started_at_us,
+    })
+}
+
+/// kern.proc.pid also answers for other users and unreaped processes. A failed
+/// or partial read is inconclusive, never a fabricated live/dead identity.
 #[cfg(target_os = "macos")]
-fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+pub(crate) fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
     if pid == 0 || pid > i32::MAX as u32 {
         return None;
     }
-
-    // PROC_PIDTBSDINFO supplies the kernel-recorded process birth time without
-    // spawning a command or trusting user-controlled process metadata.
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let written = unsafe {
-        proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDTBSDINFO,
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as i32,
+    ];
+    let mut bytes = [0_u8; MACOS_KINFO_SIZE];
+    let mut size = bytes.len();
+    // SAFETY: sysctl receives the real buffer size and may write at most it.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
             0,
-            info.as_mut_ptr().cast(),
-            size,
         )
     };
-    if written != size {
+    if status != 0 || size != bytes.len() {
         return None;
     }
-    let info = unsafe { info.assume_init() };
-    let start_time = info
-        .pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)?;
+    decode_macos_kinfo(&bytes)
+}
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_process_identity(snapshot: Option<MacosKinfo>) -> Option<ProcessIdentity> {
+    let info = snapshot?;
     Some(ProcessIdentity {
-        start_time,
+        start_time: info.started_at_us?,
         boot_id: None,
-        exited: info.pbi_status == 5,
+        exited: info.has_exited(),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    macos_process_identity(macos_kinfo(pid))
 }
 
 #[cfg(windows)]
@@ -2609,7 +2710,7 @@ fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
     None
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 unsafe extern "C" {
     fn proc_pidinfo(
         pid: libc::c_int,
@@ -2721,6 +2822,70 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn macos_snapshot_bytes(state: u8, flags: u32) -> [u8; 648] {
+        let mut bytes = [0; 648];
+        bytes[0..8].copy_from_slice(&1_700_000_000_i64.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&123_456_i32.to_ne_bytes());
+        bytes[32..36].copy_from_slice(&flags.to_ne_bytes());
+        bytes[36] = state;
+        bytes[243..248].copy_from_slice(b"owner");
+        bytes[392..396].copy_from_slice(&42_u32.to_ne_bytes());
+        bytes[564..568].copy_from_slice(&123_i32.to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn semantic_batch_lease_macos_snapshot_keeps_birth_and_exit_phase() {
+        let info = decode_macos_kinfo(&macos_snapshot_bytes(SZOMB, P_WEXIT)).unwrap();
+        assert_eq!(info.comm, "owner");
+        assert_eq!((info.ruid, info.pgid), (42, 123));
+        assert_eq!(info.exit_state(), MacosExitState::Zombie);
+        let identity = macos_process_identity(Some(info)).unwrap();
+        assert_eq!(identity.start_time, 1_700_000_000_123_456);
+        assert!(identity.exited);
+        assert!(identity.boot_id.is_none());
+
+        let exiting = decode_macos_kinfo(&macos_snapshot_bytes(2, P_WEXIT)).unwrap();
+        assert_eq!(exiting.exit_state(), MacosExitState::Exiting);
+        assert!(macos_process_identity(Some(exiting)).unwrap().exited);
+        let running = decode_macos_kinfo(&macos_snapshot_bytes(2, 0)).unwrap();
+        assert_eq!(running.exit_state(), MacosExitState::NotExiting);
+        assert!(!macos_process_identity(Some(running)).unwrap().exited);
+    }
+
+    #[test]
+    fn semantic_batch_lease_macos_missing_identity_stays_inconclusive() {
+        assert!(macos_process_identity(None).is_none());
+        let mut bytes = macos_snapshot_bytes(SZOMB, P_WEXIT);
+        assert!(decode_macos_kinfo(&bytes[..16]).is_none());
+        bytes[8..12].copy_from_slice(&1_000_000_i32.to_ne_bytes());
+        assert!(macos_process_identity(decode_macos_kinfo(&bytes)).is_none());
+        bytes[8..12].copy_from_slice(&0_i32.to_ne_bytes());
+        bytes[0..8].copy_from_slice(&0_i64.to_ne_bytes());
+        assert!(macos_process_identity(decode_macos_kinfo(&bytes)).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn semantic_batch_lease_macos_birth_matches_live_libproc() {
+        let pid = std::process::id();
+        let identity = process_identity(pid).expect("kernel identity for this process");
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let written = unsafe { proc_pidinfo(pid as i32, 3, 0, info.as_mut_ptr().cast(), size) };
+        assert_eq!(written, size, "libproc must answer for this live process");
+        let info = unsafe { info.assume_init() };
+        assert_eq!(
+            identity.start_time,
+            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+        );
+        assert!(!identity.exited);
+        assert_eq!(
+            crate::root_cache::process_start_time_ms(pid),
+            Some(identity.start_time / 1_000)
+        );
+    }
     use std::io::{BufRead, Write};
     use std::process::{Child, ChildStdin, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
