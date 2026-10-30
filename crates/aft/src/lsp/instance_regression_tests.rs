@@ -271,6 +271,7 @@ fn current_reader_events_still_apply() {
     let file = dir.path().join("main.ts");
     let mut manager = LspManager::new();
     std::fs::write(&file, "const value = 1;\n").unwrap();
+    let file = canonicalize_for_lsp(&file).unwrap();
     manager.sync_document_version_for_test(&key(dir.path()), &file, 0);
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);
@@ -308,6 +309,7 @@ fn unversioned_push_queued_before_the_latest_text_sync_is_not_current() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("main.ts");
     std::fs::write(&file, "const value = 1;\n").unwrap();
+    let file = canonicalize_for_lsp(&file).unwrap();
     let mut manager = LspManager::new();
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);
@@ -359,6 +361,7 @@ fn unversioned_push_authority_tracks_disk_content_and_dynamic_pull_registration(
     let file = dir.path().join("main.ts");
     let text = "const value = 1;\n";
     std::fs::write(&file, text).unwrap();
+    let file = canonicalize_for_lsp(&file).unwrap();
     let mut manager = LspManager::new();
     let instance = ServerInstanceId::next();
     let mut client = spawn(&manager, dir.path(), instance, "exec cat");
@@ -471,6 +474,7 @@ fn startup_replay_preserves_reader_instance() {
     let file = dir.path().join("main.ts");
     let mut manager = LspManager::new();
     std::fs::write(&file, "const value = 1;\n").unwrap();
+    let file = canonicalize_for_lsp(&file).unwrap();
     manager.sync_document_version_for_test(&key(dir.path()), &file, 0);
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);

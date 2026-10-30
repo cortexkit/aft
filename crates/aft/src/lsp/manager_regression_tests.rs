@@ -482,6 +482,7 @@ fn workspace_pull_preserves_versions_and_refreshes_unchanged_reports() {
     let uri = uri_for_path(&file).unwrap();
     let mut manager = LspManager::new();
     std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    let file = canonicalize_for_lsp(&file).unwrap();
     manager.sync_document_version_for_test(&key, &file, 7);
     manager
         .finish_workspace_pull(
@@ -587,6 +588,7 @@ fn workspace_pull_from_warming_server_remains_provisional() {
     let file = tmp.path().join("lib.rs");
     let mut manager = LspManager::new();
     std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    let file = canonicalize_for_lsp(&file).unwrap();
     manager.sync_document_version_for_test(&key, &file, 7);
     manager
         .clients

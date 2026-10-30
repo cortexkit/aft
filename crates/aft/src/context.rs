@@ -23278,8 +23278,11 @@ mod status_bar_tests {
 
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
-        let root = std::path::PathBuf::from("/proj");
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         let file = root.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::Rust,
             root,
@@ -23303,6 +23306,7 @@ mod status_bar_tests {
                 file.clone(),
                 vec![diagnostic(DiagnosticSeverity::Error, "settled error")],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!((counts.errors, counts.warnings), (1, 0));
@@ -23321,6 +23325,7 @@ mod status_bar_tests {
                     None,
                     true,
                 );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(
@@ -23350,15 +23355,13 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        let root = if cfg!(windows) {
-            std::path::PathBuf::from(r"C:\proj")
-        } else {
-            std::path::PathBuf::from("/proj")
-        };
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         ctx.set_canonical_cache_root(root.clone());
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
 
         let file = root.join("aft.jsonc");
+        std::fs::write(&file, "{}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::TypeScript,
             root: root.clone(),
@@ -23381,6 +23384,7 @@ mod status_bar_tests {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
                 .publish(key.clone(), file.clone(), vec![env]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,
@@ -23391,7 +23395,8 @@ mod status_bar_tests {
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
-                .publish(key, file, vec![]);
+                .publish(key, file.clone(), vec![]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,

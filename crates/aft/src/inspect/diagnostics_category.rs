@@ -672,7 +672,12 @@ fn collect_warm_working_set(
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     // External workspace servers can publish unrelated files too. Retain only
     // the requested files outside the project; unscoped collection stays local.
-    let scoped_files = scoped_files.map(|files| files.iter().cloned().collect::<HashSet<_>>());
+    let scoped_files = scoped_files.map(|files| {
+        files
+            .iter()
+            .map(|file| crate::inspect::job::canonicalize_normalized(file))
+            .collect::<HashSet<_>>()
+    });
     let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
     let accepts_file = |file: &Path| {
         let file = crate::inspect::job::canonicalize_normalized(file);
@@ -1894,6 +1899,37 @@ mod payload_count_tests {
         let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None, None);
         assert!(unscoped.diagnostics.is_empty());
         assert!(unscoped.producer_reports.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_reports_match_symlinked_scope_without_rewriting_paths() {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let external = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(external.path());
+        let real = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let file = real.join("selected.rs");
+        std::fs::write(&file, "pub fn f() {}\n").unwrap();
+        let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
+        diagnostic.file = file.clone();
+        ctx.lsp()
+            .diagnostics_store_mut_for_test()
+            .publish_with_kind(ServerKind::Rust, file.clone(), vec![diagnostic]);
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
+
+        let files = [alias.join("selected.rs")];
+        assert_ne!(files[0], file);
+        let scoped =
+            super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files), None);
+        assert_eq!(scoped.diagnostics.len(), 1);
+        assert_eq!(scoped.diagnostics[0].diagnostic.file, file);
+        assert_eq!(scoped.producer_reports[0].1, file);
     }
 
     fn typescript_sync_exclusion_fixture() -> (

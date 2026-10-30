@@ -4913,9 +4913,12 @@ mod watcher_filter_tests {
                 kind: ServerKind::TypeScript,
                 root: root.clone(),
             };
+            let file = root.join("known.ts");
+            std::fs::write(&file, "").unwrap();
             ctx.lsp()
                 .diagnostics_store_mut_for_test()
-                .publish(key, root.join("known.ts"), vec![]);
+                .publish(key, file.clone(), vec![]);
+            ctx.lsp().certify_diagnostic_content_for_test(&file);
         }
 
         // The bar rides in the agent-visible text, never as a `status_bar` field.
@@ -6086,9 +6089,12 @@ mod watcher_filter_tests {
                 kind: ServerKind::TypeScript,
                 root: root.clone(),
             };
+            let other = root.join("other.ts");
+            std::fs::write(&other, "").unwrap();
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
-                .publish(key, root.join("other.ts"), vec![]);
+                .publish(key, other.clone(), vec![]);
+            lsp.certify_diagnostic_content_for_test(&other);
         }
         // Every producer has now reported, so the legacy projection exists.
         assert!(ctx.status_bar_counts().is_some());
@@ -6127,6 +6133,7 @@ mod watcher_filter_tests {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
                 .publish(key, file.clone(), vec![err_diag(&file)]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(ctx.status_bar_counts().unwrap().errors, 1);
 

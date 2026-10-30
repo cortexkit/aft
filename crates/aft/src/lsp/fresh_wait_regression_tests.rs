@@ -22,6 +22,7 @@ fn fresh_wait_releases_manager_and_requires_each_producer_version() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("lib.rs");
     std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    let file = crate::inspect::job::canonicalize_normalized(&file);
     let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
     let keys = [ServerKind::Rust, ServerKind::TypeScript].map(|kind| ServerKey {
         kind,

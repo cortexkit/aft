@@ -11105,7 +11105,7 @@ mod clear_diagnostics_tests {
     #[test]
     fn drain_events_reports_publish_diagnostics_updates() {
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = canonicalize_for_lsp(dir.path()).unwrap();
         let file = root.join("main.ts");
         std::fs::write(&file, "const x: number = 'nope';").unwrap();
 
