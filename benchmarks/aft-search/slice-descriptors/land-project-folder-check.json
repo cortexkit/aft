@@ -3,6 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
     "crates/aft/src/commands/configure/folder_admission_lifecycle_tests.rs",
     "crates/aft/src/views/parent/tests.rs"
   ],
