@@ -529,10 +529,9 @@ fn task_scope_kill_reports_live_controller_permission_failure() {
             &id,
             root.path().into(),
         ));
-    assert!(r
-        .kill_task_scope(&id)
-        .unwrap_err()
-        .contains("failed to confirm or kill task scope"));
+    assert!(r.kill_task_scope(&id).unwrap_err().contains(&format!(
+        "task scope aft-task-{id}.scope could not be killed"
+    )));
     std::fs::remove_file(&control).unwrap();
     assert!(
         r.kill_task_scope(&id).is_err(),
@@ -753,7 +752,10 @@ fn task_scope_kill_distinguishes_absent_present_and_failed() {
             fake.path().into(),
         ));
     let error = other.kill_task_scope(&id).unwrap_err();
-    assert_eq!(error, "failed to confirm or kill task scope");
+    assert_eq!(
+        error,
+        format!("task scope aft-task-{id}.scope could not be killed")
+    );
 }
 
 #[test]
@@ -811,7 +813,7 @@ fn task_scope_kill_file_write_failure_is_static() {
         ));
     assert_eq!(
         registry.kill_task_scope(&id).unwrap_err(),
-        "failed to confirm or kill task scope"
+        format!("task scope aft-task-{id}.scope could not be killed")
     );
 }
 
@@ -837,68 +839,163 @@ fn task_scope_replay_keeps_live_identity_without_user_manager() {
             "manager failure changed live process status"
         );
         assert_eq!(status.exit_code, None);
+        let task = registry.task(&id).unwrap();
+        assert!(
+            registry.memory_limit_exceeded(&task).is_none(),
+            "manager outage became a capped-task memory breach"
+        );
+        registry.poll_task(&task).unwrap();
+        assert_eq!(
+            registry
+                .status(&id, "task-scope", None, None, 1024)
+                .unwrap()
+                .info
+                .status,
+            expected,
+            "manager outage changed live task after poll"
+        );
+        if let Some(policy) = task.lock_state().unwrap().metadata.memory_policy.clone() {
+            assert!(
+                super::super::memory_limit::Monitor::recover(policy, &random_slug())
+                    .unwrap()
+                    .is_none(),
+                "missing local scope did not return no monitor"
+            );
+            if expected == super::super::BgTaskStatus::Running {
+                assert!(
+                    registry
+                        .inner
+                        .memory_monitors
+                        .lock()
+                        .unwrap()
+                        .get(&id)
+                        .is_some_and(|monitor| monitor.is_task_scope()),
+                    "capped task lost its local scope monitor"
+                );
+            }
+        }
         registry.detach();
         return;
     }
     if !manager_available() {
         return;
     }
+    for cap in [None, Some(64)] {
+        let root = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let id = scope_spawn(
+            &registry,
+            root.path(),
+            "sleep 60",
+            super::super::HardKill::Default,
+            cap,
+        );
+        let _stop = StopOnDrop(id.clone());
+        std::fs::write(root.path().join("task-id"), &id).unwrap();
+        let pid = registry
+            .task(&id)
+            .unwrap()
+            .lock_state()
+            .unwrap()
+            .metadata
+            .child_pid
+            .unwrap();
+        let mut owned_child = {
+            let task = registry.task(&id).unwrap();
+            let mut state = task.lock_state().unwrap();
+            match &mut state.runtime {
+                TaskRuntime::Piped(child) => child.take().unwrap(),
+                _ => unreachable!(),
+            }
+        };
+        registry.detach();
+        for (broken, gone) in [(false, false), (true, false), (true, true)] {
+            if gone {
+                super::super::task_scope::lookup(&id)
+                    .unwrap()
+                    .unwrap()
+                    .kill()
+                    .unwrap();
+                until(|| owned_child.try_wait().unwrap().is_some());
+                until(|| crate::root_cache::process_start_time_ms(pid).is_none());
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "bash_background::registry::task_scope_tests::task_scope_replay_keeps_live_identity_without_user_manager", "--nocapture"]).env(ROOT, root.path());
+            if broken {
+                child
+                    .env(
+                        "DBUS_SESSION_BUS_ADDRESS",
+                        "unix:path=/nonexistent/aft-probe-bus",
+                    )
+                    .env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime");
+            }
+            if gone {
+                child.env("AFT_TEST_SCOPE_GONE", "1");
+            }
+            assert!(
+                child.status().unwrap().success(),
+                "replay subprocess failed"
+            );
+        }
+    }
+}
+
+#[test]
+fn task_scope_monitor_recovery_error_is_not_a_breach() {
     let root = tempfile::tempdir().unwrap();
-    let registry = BgTaskRegistry::default();
-    let id = scope_spawn(
-        &registry,
-        root.path(),
-        "sleep 60",
-        super::super::HardKill::Default,
-        None,
+    let source = BgTaskRegistry::default();
+    let (_, task) = tests::insert_terminal_piped_task(&source, &root, "true", "", "", false);
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.task_id = "invalid".into();
+    metadata.status = super::super::BgTaskStatus::Running;
+    metadata.pgid = Some(i32::MAX);
+    let policy = super::super::memory_limit::MemoryPolicy {
+        mib: 64,
+        kind: super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
+        cgroup: None,
+    };
+    assert!(
+        super::super::memory_limit::Monitor::recover(policy.clone(), &metadata.task_id).is_err()
     );
-    let _stop = StopOnDrop(id.clone());
-    std::fs::write(root.path().join("task-id"), &id).unwrap();
-    let pid = registry
-        .task(&id)
+    metadata.memory_policy = Some(policy);
+    let registry = BgTaskRegistry::default();
+    registry
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let task = registry
+        .inner
+        .tasks
+        .lock()
         .unwrap()
+        .get("invalid")
+        .unwrap()
+        .clone();
+    assert!(
+        registry.memory_limit_exceeded(&task).is_none(),
+        "monitor recovery error was treated as a cap breach"
+    );
+    assert!(task
         .lock_state()
         .unwrap()
-        .metadata
-        .child_pid
-        .unwrap();
-    let mut owned_child = {
-        let task = registry.task(&id).unwrap();
-        let mut state = task.lock_state().unwrap();
-        match &mut state.runtime {
-            TaskRuntime::Piped(child) => child.take().unwrap(),
-            _ => unreachable!(),
-        }
-    };
-    registry.detach();
-    for (broken, gone) in [(false, false), (true, false), (true, true)] {
-        if gone {
-            super::super::task_scope::lookup(&id)
-                .unwrap()
-                .unwrap()
-                .kill()
-                .unwrap();
-            until(|| owned_child.try_wait().unwrap().is_some());
-            until(|| crate::root_cache::process_start_time_ms(pid).is_none());
-        }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-        child.args(["--exact", "bash_background::registry::task_scope_tests::task_scope_replay_keeps_live_identity_without_user_manager", "--nocapture"]).env(ROOT, root.path());
-        if broken {
-            child
-                .env(
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    "unix:path=/nonexistent/aft-probe-bus",
-                )
-                .env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime");
-        }
-        if gone {
-            child.env("AFT_TEST_SCOPE_GONE", "1");
-        }
-        assert!(
-            child.status().unwrap().success(),
-            "replay subprocess failed"
-        );
-    }
+        .pending_terminal_override
+        .is_none());
+}
+
+#[test]
+fn task_scope_monitor_recovery_does_not_write_controls() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("memory.oom.group"), "0").unwrap();
+    let scope =
+        super::super::task_scope::handle_for_test("bash-0123456789abcdef", root.path().into());
+    let monitor = super::super::memory_limit::Monitor::recover_task_scope(64, &scope);
+    assert!(monitor.is_task_scope());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("memory.oom.group")).unwrap(),
+        "0",
+        "monitor recovery rewrote cgroup controls"
+    );
+    drop(monitor);
+    assert!(root.path().exists());
 }
 
 #[test]

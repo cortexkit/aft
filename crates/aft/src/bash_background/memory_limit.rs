@@ -285,16 +285,22 @@ impl Monitor {
         }
     }
 
-    pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Self, String> {
+    pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Option<Self>, String> {
         #[cfg(target_os = "linux")]
         if policy.kind == MemoryPolicy::TASK_SCOPE_MEMORY_KIND {
-            let scope = super::task_scope::lookup(task_id)?.ok_or("task memory scope is absent")?;
-            return Self::from_task_scope(policy.mib, &scope);
+            let scope = match super::task_scope::lookup_state(task_id)? {
+                super::task_scope::ScopeLookup::Present(scope) => Some(scope),
+                super::task_scope::ScopeLookup::Unreachable => {
+                    super::task_scope::lookup_local(task_id)?
+                }
+                super::task_scope::ScopeLookup::Absent => None,
+            };
+            return Ok(scope.map(|scope| Self::recover_task_scope(policy.mib, &scope)));
         }
         #[cfg(windows)]
         let job = windows::Job::new(policy.mib, task_id)?;
         let _ = task_id;
-        Ok(Self {
+        Ok(Some(Self {
             policy,
             last_sample: None,
             exceeded: false,
@@ -307,7 +313,7 @@ impl Monitor {
             borrowed_scope: None,
             #[cfg(windows)]
             job,
-        })
+        }))
     }
 
     pub fn exceeded(&mut self, pgid: i32) -> bool {
@@ -390,7 +396,12 @@ impl Monitor {
         scope: &super::task_scope::ScopeHandle,
     ) -> Result<Self, String> {
         scope.ensure_oom_group()?;
-        Ok(Self {
+        Ok(Self::recover_task_scope(mib, scope))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recover_task_scope(mib: u64, scope: &super::task_scope::ScopeHandle) -> Self {
+        Self {
             policy: MemoryPolicy {
                 mib,
                 kind: MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
@@ -402,7 +413,7 @@ impl Monitor {
             bootstrap: None,
             retired_cgroup: None,
             borrowed_scope: Some(scope.clone()),
-        })
+        }
     }
 
     #[cfg(all(test, unix))]

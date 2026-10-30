@@ -5114,10 +5114,19 @@ impl BgTaskRegistry {
         if !monitors.contains_key(&task.task_id) {
             let policy = state.metadata.memory_policy.clone()?;
             match super::memory_limit::Monitor::recover(policy, &task.task_id) {
-                Ok(monitor) => {
+                Ok(Some(monitor)) => {
                     monitors.insert(task.task_id.clone(), monitor);
                 }
-                Err(error) => return Some(error),
+                Ok(None) => return None,
+                Err(_) => {
+                    static WARNING: std::sync::Once = std::sync::Once::new();
+                    WARNING.call_once(|| {
+                        crate::slog_warn!(
+                            "bash memory monitor recovery failed; no memory breach was observed"
+                        )
+                    });
+                    return None;
+                }
             }
         }
         let monitor = monitors.get_mut(&task.task_id)?;
@@ -7791,9 +7800,9 @@ impl BgTaskRegistry {
                             };
                             if let super::task_scope::ScopeLookup::Present(scope) = answer {
                                 if let Some(policy) = metadata.memory_policy.as_mut() {
-                                    let monitor = super::memory_limit::Monitor::from_task_scope(
+                                    let monitor = super::memory_limit::Monitor::recover_task_scope(
                                         policy.mib, &scope,
-                                    )?;
+                                    );
                                     *policy = monitor.policy.clone();
                                     self.inner
                                         .memory_monitors

@@ -132,35 +132,16 @@ mod linux {
             if let Some(handle) = self.resolve_handle(task_id)? {
                 handle
                     .kill()
-                    .map_err(|_| "failed to confirm or kill task scope".to_string())?;
+                    .map_err(|_| format!("task scope {} could not be killed", handle.unit))?;
             }
             Ok(())
         }
 
         fn resolve_handle(&self, task_id: &str) -> Result<Option<ScopeHandle>, String> {
-            let unit = scope_unit(task_id).map_err(|_| "failed to confirm or kill task scope")?;
             if let Some(handle) = self.get(task_id) {
                 return Ok(Some(handle));
             }
-            let Some(current) = current_cgroup(std::process::id()) else {
-                return Ok(None);
-            };
-            // A cgroup file does not use the user bus.
-            let Some(cgroup) = local_scope_path(&unit, &current, unsafe { libc::geteuid() }) else {
-                return Ok(None);
-            };
-            if !cgroup
-                .try_exists()
-                .map_err(|_| "failed to confirm or kill task scope")?
-            {
-                return Ok(None);
-            }
-            Ok(Some(ScopeHandle {
-                task_id: task_id.into(),
-                unit,
-                cgroup,
-                description: String::new(),
-            }))
+            lookup_local(task_id)
         }
 
         pub(crate) fn adopt(
@@ -263,7 +244,6 @@ mod linux {
         mut identity: impl FnMut(u32) -> Result<u64, String>,
     ) -> Result<ScopeLookup, String> {
         let before = identity(pid);
-        let before_membership = membership(pid);
         let scope = match lookup(task_id)? {
             ScopeLookup::Absent => return Ok(ScopeLookup::Absent),
             ScopeLookup::Unreachable => {
@@ -277,7 +257,7 @@ mod linux {
             ScopeLookup::Present(scope) => scope,
         };
         let actual = before?;
-        let text = before_membership?;
+        let text = membership(pid)?;
         if actual != start
             || !matches_membership(task_id, &text)
             || membership_path(task_id, &text).as_deref() != Some(scope.cgroup())
@@ -293,6 +273,29 @@ mod linux {
             return Err("task scope replay identity changed".into());
         }
         Ok(ScopeLookup::Present(scope))
+    }
+
+    pub(crate) fn lookup_local(task_id: &str) -> Result<Option<ScopeHandle>, String> {
+        let unit = scope_unit(task_id).map_err(|_| "task scope could not be killed")?;
+        let Some(current) = current_cgroup(std::process::id()) else {
+            return Ok(None);
+        };
+        // A cgroup file does not use the user bus.
+        let Some(cgroup) = local_scope_path(&unit, &current, unsafe { libc::geteuid() }) else {
+            return Ok(None);
+        };
+        if !cgroup
+            .try_exists()
+            .map_err(|_| format!("task scope {unit} could not be killed"))?
+        {
+            return Ok(None);
+        }
+        Ok(Some(ScopeHandle {
+            task_id: task_id.into(),
+            unit,
+            cgroup,
+            description: String::new(),
+        }))
     }
 
     fn local_scope_path(unit: &str, current: &Path, uid: u32) -> Option<PathBuf> {
@@ -1118,6 +1121,25 @@ mod linux {
                 1000
             )
             .is_none());
+        }
+
+        #[test]
+        fn task_scope_adopt_unreachable_skips_membership() {
+            let reads = std::cell::Cell::new(0);
+            let answer = adopt_with(
+                "bash-0123456789abcdef",
+                7,
+                42,
+                |_| Ok(ScopeLookup::Unreachable),
+                |_| panic!("unreachable manager read unused scope membership"),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    Ok(42)
+                },
+            )
+            .unwrap();
+            assert!(matches!(answer, ScopeLookup::Unreachable));
+            assert_eq!(reads.get(), 2);
         }
         #[test]
         fn task_scope_control_group_validation() {
