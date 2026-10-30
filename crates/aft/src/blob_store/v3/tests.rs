@@ -114,6 +114,55 @@ fn publication_survives_a_sidecar_disappearing_during_accounting() {
     assert_eq!(reader.get(&chunk).unwrap().unwrap(), b"chunk");
     assert_eq!(reader.get(&run).unwrap().unwrap(), b"run");
 }
+#[cfg(windows)]
+#[test]
+fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DeleteFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let root = tempdir().unwrap();
+    let dir = family_dir(root.path(), A).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let pending = dir.join("..retention-sweep.lock.tmp");
+    let payload = b"delete-pending lock bytes";
+    fs::write(&pending, payload).unwrap();
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&pending)
+        .unwrap();
+    let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = std::rc::Rc::clone(&removed);
+    WALK_BEFORE_STAT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            if path == pending && !observed.replace(true) {
+                let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                // Use legacy deletion: Rust's remove_file can unlink immediately
+                // with POSIX semantics instead of leaving a delete-pending name.
+                assert_ne!(
+                    unsafe { DeleteFileW(wide.as_ptr()) },
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(
+                    fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                    Some(5)
+                );
+            }
+        }));
+    });
+    let result = allocated_bytes_until(&dir, None);
+    WALK_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+
+    assert!(removed.get(), "the walk did not reach the pending file");
+    // The listing's length is a conservative charge until a later measurement.
+    assert_eq!(result.unwrap(), Some(payload.len() as u64));
+    drop(handle);
+}
+
 #[cfg(unix)]
 pub(super) fn inventory(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
