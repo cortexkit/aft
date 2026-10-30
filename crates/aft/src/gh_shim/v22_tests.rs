@@ -37,7 +37,7 @@ fn v21_manifest() -> Manifest {
 
 /// The synthetic v21 baseline with the v22 additions applied the way
 /// `scripts/prepare-gh-shim-v22.py` applies them (bindings stay synthetic).
-fn manifest() -> Manifest {
+pub(super) fn manifest() -> Manifest {
     let mut value = v21_value();
     let additions = additions();
     for removed in additions["removed_from_admin"].as_array().unwrap() {
@@ -694,8 +694,8 @@ fn api_request(raw: &[&str], stdin: &str) -> Result<GovernedRequest, Canonicaliz
 
 /// Every governed request shape the shim can emit, judged the way Plexus's
 /// `gh.route` facade would judge it. One row per governed tuple the shim's
-/// classification admits at the v22 manifest — which governs every older
-/// family too — built through the same classify, canonicalize and
+/// classification admits at the v22 manifest (which governs every older
+/// family too), plus the v23 queue rows, built through classify, canonicalize and
 /// `governed_wire_request` path the shim uses, so the envelope fields the
 /// shim stamps (`gh_route_schema` and friends) are part of what is judged.
 /// A row fails here if the shim ever builds a request Plexus refuses. That
@@ -1162,6 +1162,35 @@ fn plexus_contract_accepts_every_governed_wire_request_the_shim_builds() {
                 panic!("pr create: the shim's request is refused by the contract: {code}\n{wire}")
             }
         }
+    }
+    // Queue requests need the newer manifest, without changing the older rows'
+    // v22 activation boundary above.
+    let queue_manifest = v23_tests::manifest();
+    for (raw, kind) in [
+        (
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--match-head-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            "pr_enqueue",
+        ),
+        (vec!["pr", "dequeue", "7"], "pr_dequeue"),
+    ] {
+        let argv = args(&raw);
+        let Classification::Governed { tuple, canonical } =
+            classify(&argv, &queue_manifest, "linux")
+        else {
+            panic!("{kind}: must be governed at v23");
+        };
+        let request =
+            canonicalize_governed_from(&argv, &tuple, &canonical, 23, &mut Cursor::new(""))
+                .unwrap();
+        let wire = wire_of(request);
+        assert_eq!(plexus_contract_judge::judge(&wire), Ok(kind));
+        judged.push((kind, kind.to_string()));
     }
     // Every routed kind the shim can emit is judged here: the shim's
     // `issue reaction` tuple covers Plexus's `reaction` kind (whose other

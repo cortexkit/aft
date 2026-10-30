@@ -1,0 +1,22 @@
+{
+  "expect": {
+    "refused": "request_field_forbidden{field: query}"
+  },
+  "name": "refused-top-level-field-pr-dequeue",
+  "request": {
+    "action": "pr dequeue",
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "query": "mutation {}",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "number": 7
+    }
+  }
+}
