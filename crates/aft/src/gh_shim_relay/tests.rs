@@ -2786,19 +2786,19 @@ async fn governed_write_reply_budget_starts_at_send_and_outlasts_preflight() {
 #[tokio::test]
 async fn governed_write_reply_after_lease_budget_is_still_unknown_without_resending() {
     let daemon = fake_daemon(DaemonScript {
-        request_reply_delay: Some(Duration::from_millis(250)),
+        request_reply_delay: Some(Duration::from_millis(900)),
         ..Default::default()
     })
     .await;
     let mut transport = daemon.transport().await;
-    transport.write_reply_timeout = Duration::from_millis(150);
+    transport.write_reply_timeout = Duration::from_millis(600);
     let slot = transport
         .reserve_scoped(
             "/project",
             "late-write",
             &delegating_stamp(),
             github_call(json!({"op":"bot_request", "request_nonce":"late-once"})),
-            tokio::time::Instant::now() + Duration::from_millis(100),
+            tokio::time::Instant::now() + Duration::from_millis(500),
         )
         .await
         .unwrap();
@@ -2897,7 +2897,7 @@ async fn warming_reservation_is_a_retryable_pre_send_outage_not_a_binding_refusa
         Ok(_) => panic!("warming cannot admit a write"),
         Err(error) => error,
     };
-    assert_eq!(error.reason, "module_warming");
+    assert_eq!(error.reason, "relay_unavailable");
     assert!(error.retry_before_send);
     assert!(daemon.requests().is_empty());
     for code in ["module_warming", "module_reloading", "target_unavailable"] {
@@ -2938,4 +2938,53 @@ async fn pre_send_retry_never_outlives_the_overall_preflight_deadline() {
         tokio::time::Instant::now() - started,
         Duration::from_secs(2)
     );
+}
+
+#[tokio::test]
+async fn a_long_reply_budget_does_not_allow_enqueue_after_preflight_expires() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let transport = daemon.transport().await;
+    let slot = transport
+        .reserve_scoped(
+            "/project",
+            "expired-before-send",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"never-enqueued"})),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = slot
+        .send()
+        .err()
+        .expect("expired preparation must not enqueue a write");
+    assert_eq!(error.reason, "reservation_timeout");
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn real_route_open_policy_refusal_never_acquires_the_outage_retry_marker() {
+    let daemon = fake_daemon(DaemonScript {
+        refuse_scoped_opens: Some("policy_denied".into()),
+        ..Default::default()
+    })
+    .await;
+    let transport = daemon.transport().await;
+    let error = transport
+        .reserve_scoped(
+            "/project",
+            "policy-refused",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"denied"})),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(!error.retry_before_send);
+    assert_eq!(error.reason, "relay_unavailable");
+    assert!(daemon.requests().is_empty());
+    assert_eq!(daemon.opens().len(), 1);
 }

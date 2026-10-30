@@ -117,6 +117,9 @@ pub enum TransportError {
     RefusedRetryable { code: String, message: String },
     /// Nothing was sent: no connection, no route, or the module is absent.
     Unavailable(String),
+    /// Nothing was sent, but a local failure or a real route refusal is not
+    /// expected to clear when Plexus becomes reachable.
+    UnavailableNoRetry(String),
     /// The request was sent but no reply arrived; it may have executed.
     OutcomeUnknown(String),
 }
@@ -1410,7 +1413,7 @@ fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {
             reply.data["retryable"] = Value::Bool(true);
             reply
         }
-        TransportError::Unavailable(message) => {
+        TransportError::Unavailable(message) | TransportError::UnavailableNoRetry(message) => {
             RelayReply::refused("relay_unavailable", stage, message)
         }
         TransportError::OutcomeUnknown(message) => {
@@ -1632,19 +1635,19 @@ async fn route_request(
     body: &Value,
 ) -> Result<Value, CallFailure> {
     let bytes = serde_json::to_vec(body).map_err(|error| CallFailure {
-        error: TransportError::Unavailable(error.to_string()),
+        error: TransportError::UnavailableNoRetry(error.to_string()),
         reconnect: false,
     })?;
     let key =
         route_lease_key(consumer, &target, &identity, scope).map_err(|error| CallFailure {
-            error: TransportError::Unavailable(error.to_string()),
+            error: TransportError::UnavailableNoRetry(error.to_string()),
             reconnect: false,
         })?;
     let permit = RELAY_OPERATIONS
         .clone()
         .try_acquire_owned()
         .map_err(|_| CallFailure {
-            error: TransportError::Unavailable("the relay operation budget is busy".into()),
+            error: TransportError::UnavailableNoRetry("the relay operation budget is busy".into()),
             reconnect: false,
         })?;
     let consumer = Arc::clone(consumer);
@@ -1740,6 +1743,16 @@ async fn open_and_send(
             if let Some(refusal) = scope.and_then(|selector| scope_open_refusal(&error, selector)) {
                 return Err(CallFailure {
                     error: refusal,
+                    reconnect: false,
+                });
+            }
+            if let Some(body) = error.route_open_refusal() {
+                return Err(CallFailure {
+                    error: if plexus_unreachable_code(&body.code) {
+                        TransportError::Unavailable(error.to_string())
+                    } else {
+                        TransportError::UnavailableNoRetry(error.to_string())
+                    },
                     reconnect: false,
                 });
             }
@@ -1847,7 +1860,7 @@ impl SubcRelayTransport {
         // The identity is fixed for the life of the process, so checking it
         // before each new connection is the same as checking it on every call.
         if !Self::identity_available() {
-            return Err(TransportError::Unavailable(
+            return Err(TransportError::UnavailableNoRetry(
                 "the daemon has no subc module identity to relay with".to_string(),
             ));
         }

@@ -488,7 +488,7 @@ impl Fixture {
         let runtime = service.runtime_guard();
         let read = plex.clone();
         let reserve = plex.clone();
-        let binding_outages = std::sync::atomic::AtomicUsize::new(options.initial_binding_outages);
+        let binding_outages = Mutex::new(options.initial_binding_outages);
         if !options.sdk_daemon {
             service.install_test_partners(Arc::new(TestPartners {
                 seal_failure: options.seal_failure.clone(),
@@ -496,14 +496,9 @@ impl Fixture {
                 run_placed: Some("fake-atomic-run"),
                 reserved_send_placed: true,
                 bindings: Arc::new(move |_, _| {
-                    if binding_outages
-                        .fetch_update(
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                            |left| left.checked_sub(1),
-                        )
-                        .is_ok()
-                    {
+                    let mut left = binding_outages.lock().unwrap();
+                    if *left > 0 {
+                        *left -= 1;
                         let mut error = crate::gh_shim_speech::service::binding_refusal(
                             Code::AuthorityUnavailable,
                             "binding_unverifiable",

@@ -67,9 +67,9 @@ fn opening_refusal(error: TransportError, expected: &ScopeSelector) -> Refusal {
                 unavailable(&code)
             }
         }
-        TransportError::Unavailable(_) | TransportError::OutcomeUnknown(_) => {
-            unavailable("relay_unavailable")
-        }
+        TransportError::Unavailable(_)
+        | TransportError::UnavailableNoRetry(_)
+        | TransportError::OutcomeUnknown(_) => unavailable("relay_unavailable"),
     }
 }
 
@@ -89,7 +89,13 @@ impl SubcRelayTransport {
         let consumer = tokio::time::timeout_at(deadline, self.consumer())
             .await
             .map_err(|_| unavailable("reservation_timeout"))?
-            .map_err(|_| unreachable("relay_unavailable"))?;
+            .map_err(|error| {
+                if error.unreachable_before_send() {
+                    unreachable("relay_unavailable")
+                } else {
+                    unavailable("relay_unavailable")
+                }
+            })?;
         let target = subc_protocol::RouteTarget::ToolProvider {
             module_id: PLEXUS_MODULE_ID.into(),
         };
@@ -146,6 +152,12 @@ impl SubcRelayTransport {
                 Err(error) => {
                     let refusal = if let Some(error) = scope_open_refusal(&error, &selector) {
                         opening_refusal(error, &selector)
+                    } else if let Some(body) = error.route_open_refusal() {
+                        if plexus_unreachable_code(&body.code) {
+                            unreachable("relay_unavailable")
+                        } else {
+                            unavailable("relay_unavailable")
+                        }
                     } else if let subc_client_rs::CallError::Module(body) = error {
                         if plexus_unreachable_code(&body.code) {
                             unreachable(&body.code)
@@ -170,9 +182,17 @@ impl SubcRelayTransport {
                 drop(lease);
                 return;
             }
-            let reservation = match consumer.reserve(&route, deadline).await {
-                Ok(reservation) => reservation,
-                Err(_) => {
+            // SDK reservations use one absolute deadline for both admission and
+            // reply, ignoring send's timeout option. Reserve through the latest
+            // possible reply, but bound admission by the preflight deadline.
+            let reservation = match tokio::time::timeout_at(
+                deadline,
+                consumer.reserve(&route, deadline + reply_timeout),
+            )
+            .await
+            {
+                Ok(Ok(reservation)) => reservation,
+                _ => {
                     clear_failed_slot(&slot, &consumer).await;
                     let _ = result.send(Err(if tokio::time::Instant::now() >= deadline {
                         unavailable("reservation_timeout")
@@ -184,18 +204,23 @@ impl SubcRelayTransport {
                 }
             };
             let reserved = ReservedBotRequest::new(move || {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(unavailable("reservation_timeout"));
+                }
                 // SDK 0.32.7 synchronously consumes a pre-reserved writer slot.
                 // No socket await or spawned send can escape the final DB gate.
-                let (_correlation, pending) = reservation.send(
-                    body,
-                    subc_client_rs::CallOptions {
-                        timeout: reply_timeout,
-                        ..options
-                    },
-                );
+                let reply_deadline = tokio::time::Instant::now() + reply_timeout;
+                let (_correlation, pending) = reservation.send(body, options);
                 Ok(QueuedBotResponse::new(async move {
                     let _lease = lease;
-                    match pending.await {
+                    let response = match tokio::time::timeout_at(reply_deadline, pending).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            clear_failed_slot(&slot, &consumer).await;
+                            return Err(QueuedResponseError::Unknown("reply_timeout".into()));
+                        }
+                    };
+                    match response {
                         Ok(bytes) => serde_json::from_slice(&bytes)
                             .map_err(|_| QueuedResponseError::Unknown("malformed_reply".into())),
                         Err(subc_client_rs::CallError::NotSent(_)) => {
