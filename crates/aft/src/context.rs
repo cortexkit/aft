@@ -9103,9 +9103,16 @@ impl AppContext {
                     ) {
                         Ok(walk) => walk,
                         Err(error) => {
-                            crate::slog_warn!(
-                                "language-server applicability walk stopped early: {error:?}"
-                            );
+                            // Entry-limit failures are logged by the cache once
+                            // per retry, not on every lookup during backoff.
+                            if !matches!(
+                                error,
+                                crate::lsp::manager::ApplicabilityResolutionError::EntryLimitReached { .. }
+                            ) {
+                                crate::slog_warn!(
+                                    "language-server applicability walk stopped early: {error:?}"
+                                );
+                            }
                             if current() {
                                 let mut lsp = manager.lock();
                                 if current() {
