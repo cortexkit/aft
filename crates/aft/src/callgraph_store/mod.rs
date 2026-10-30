@@ -4880,8 +4880,9 @@ pub trait CallGraphRead {
         let _ = (language, include_tests);
         Ok(0)
     }
-    /// Count unresolved calls with this short name, including bare imported calls.
-    /// Uses the same site identity, test filter and SQL bound as the unnamed count.
+    /// Count distinct (caller file, byte start, byte end) spans with this short
+    /// name, including bare imported calls. The test filter and SQL count limit
+    /// match the unnamed count.
     fn unresolved_call_site_count_named(
         &self,
         name: &str,
