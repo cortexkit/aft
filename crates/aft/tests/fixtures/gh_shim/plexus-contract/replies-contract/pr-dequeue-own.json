@@ -1,0 +1,94 @@
+{
+  "github_reads": [
+    {
+      "request_body": {
+        "query": "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id url number author { login __typename } headRefOid state isInMergeQueue } } }",
+        "variables": {
+          "number": 7,
+          "owner": "org",
+          "repo": "repo"
+        }
+      },
+      "request_line": "POST /graphql HTTP/1.1",
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "author": {
+                "__typename": "Bot",
+                "login": "app-fixture[bot]"
+              },
+              "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+              "id": "PR_node_7",
+              "isInMergeQueue": true,
+              "number": 7,
+              "state": "OPEN",
+              "url": "https://github.com/org/repo/pull/7"
+            }
+          }
+        }
+      },
+      "status": 200
+    }
+  ],
+  "github_writes": [
+    {
+      "request_body": {
+        "query": "mutation($pullRequestId: ID!) { dequeuePullRequest(input: {pullRequestId: $pullRequestId}) { mergeQueueEntry { pullRequest { id url number headRefOid isInMergeQueue } } } }",
+        "variables": {
+          "pullRequestId": "PR_node_7"
+        }
+      },
+      "request_line": "POST /graphql HTTP/1.1",
+      "response": {
+        "data": {
+          "dequeuePullRequest": {
+            "mergeQueueEntry": {
+              "pullRequest": {
+                "author": {
+                  "__typename": "Bot",
+                  "login": "app-fixture[bot]"
+                },
+                "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+                "id": "PR_node_7",
+                "isInMergeQueue": false,
+                "number": 7,
+                "state": "OPEN",
+                "url": "https://github.com/org/repo/pull/7"
+              }
+            }
+          }
+        }
+      },
+      "status": 200
+    }
+  ],
+  "name": "pr-dequeue-own",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "result": {
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "number": 7,
+        "queued": false,
+        "url": "https://github.com/org/repo/pull/7"
+      },
+      "status": "completed"
+    }
+  },
+  "request": {
+    "action": "pr dequeue",
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "number": 7
+    }
+  }
+}

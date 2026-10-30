@@ -575,6 +575,20 @@ pub fn load_reply_vectors() -> Vec<Value> {
         .collect()
 }
 
+/// Imported merge-queue replies whose routing is not yet part of this shim.
+/// Keep the names together so enabling queue routing also enables their real-shim coverage.
+pub const UNSUPPORTED_REAL_SHIM_REPLY_VECTORS: &[&str] = &[
+    "pr-dequeue-closed",
+    "pr-dequeue-graphql-errors",
+    "pr-dequeue-not-own",
+    "pr-dequeue-own",
+    "pr-enqueue-closed",
+    "pr-enqueue-graphql-errors",
+    "pr-enqueue-head-moved",
+    "pr-enqueue-not-own",
+    "pr-enqueue-own",
+];
+
 /// Check the upstream exchange recorded by a reply vector before feeding its
 /// native reply to the loopback holder. AFT does not execute these GitHub legs;
 /// Plexus's fixture tests do. Pinning their shapes here makes a stale thread
@@ -582,7 +596,33 @@ pub fn load_reply_vectors() -> Vec<Value> {
 pub fn assert_reply_contract(vector: &Value) {
     let name = vector["name"].as_str().expect("reply vector name");
     let request = &vector["request"];
-    let kind = judge(request).unwrap_or_else(|code| panic!("{name}: request refused: {code}"));
+    let kind = if UNSUPPORTED_REAL_SHIM_REPLY_VECTORS.contains(&name) {
+        // Validate the recorded queue request without teaching the stand-in
+        // holder to accept writes the shim cannot route yet.
+        let enqueue = name.starts_with("pr-enqueue-");
+        assert_eq!(
+            request["action"],
+            if enqueue { "pr enqueue" } else { "pr dequeue" },
+            "{name}"
+        );
+        assert_eq!(
+            request["target"],
+            serde_json::json!({"number": 7}),
+            "{name}"
+        );
+        assert_eq!(
+            request["body"],
+            if enqueue {
+                serde_json::json!({"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"})
+            } else {
+                Value::Null
+            },
+            "{name}"
+        );
+        "merge_queue"
+    } else {
+        judge(request).unwrap_or_else(|code| panic!("{name}: request refused: {code}"))
+    };
     let reads = vector["github_reads"].as_array().expect("GitHub pre-reads");
     assert!(!reads.is_empty(), "{name}: reply requires a pre-read");
     let writes = vector.get("github_writes").and_then(Value::as_array);
@@ -593,6 +633,31 @@ pub fn assert_reply_contract(vector: &Value) {
         assert!(leg.get("response").is_some(), "{name}");
     }
     let result = &vector["reply"]["result"];
+    if matches!(
+        name,
+        "comment-edit-pre-read-unknown"
+            | "pr-edit-pull-request-not-found"
+            | "pr-ready-pull-request-read-incomplete"
+            | "resolve-thread-graphql-errors"
+            | "stack-unstack-stack-read-incomplete"
+    ) {
+        let expected = match name {
+            "comment-edit-pre-read-unknown" => {
+                "pre_dispatch_read_incomplete{reason: transport_unknown}"
+            }
+            "pr-edit-pull-request-not-found" => "vendor_rejected{status: 404}",
+            "resolve-thread-graphql-errors" => "vendor_rejected{status: 422}",
+            _ => "pre_dispatch_read_incomplete{reason: invalid_response}",
+        };
+        assert_eq!(
+            result,
+            &serde_json::json!({
+                "status": "refused", "refusal_code": expected,
+                "retry_same_nonce": true, "transmission": "not_sent",
+            }),
+            "{name}"
+        );
+    }
     match result["status"].as_str() {
         Some("refused") => {
             assert!(result["refusal_code"].is_string(), "{name}");

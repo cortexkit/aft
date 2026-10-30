@@ -16,7 +16,8 @@
     "result": {
       "refusal_code": "pre_dispatch_read_incomplete{reason: invalid_response}",
       "retry_same_nonce": true,
-      "status": "refused"
+      "status": "refused",
+      "transmission": "not_sent"
     }
   },
   "request": {
