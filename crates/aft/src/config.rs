@@ -33,6 +33,7 @@ pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
 /// decides whether to wait again or kill the command, so a stuck command can
 /// never hold a worker for longer than this.
 pub const DEFAULT_BASH_WORKER_WAIT_MAX_MS: u64 = 1_800_000;
+pub(crate) const DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS: u64 = 86_400;
 /// Smallest accepted `bash.worker_wait_max_ms`. A shorter limit would make a
 /// worker re-wait (and re-read its whole context) every few seconds; a value
 /// below it is a config error rather than a silent clamp.
@@ -824,6 +825,7 @@ pub struct BashConfig {
     pub worker_wait_max_ms: u64,
     /// Put Linux tool shells in transient user scopes when systemd is available.
     pub linux_scope: bool,
+    /// User-only ceiling for daemon scopes, in seconds. Default: 86_400.
     pub linux_scope_max_runtime_secs: u64,
     /// Aggregate local-command memory ceiling in MiB; absent means unlimited.
     pub memory_limit_mib: Option<u64>,
@@ -864,7 +866,7 @@ impl Default for BashConfig {
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             worker_wait_max_ms: default_bash_worker_wait_max_ms(),
             linux_scope: true,
-            linux_scope_max_runtime_secs: 86_400,
+            linux_scope_max_runtime_secs: DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
             memory_limit_mib: None,
             disclaim_privacy: false,
             powershell_tool: false,

@@ -1,152 +1,150 @@
-use std::{
-    collections::HashMap,
-    ffi::OsString,
-    io,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
-    time::Duration,
-};
-
-#[derive(Clone, Copy)]
-pub(crate) struct ScopePolicy {
-    pub daemon_mode: bool,
-    pub enabled: bool,
-    pub max_runtime: Duration,
-}
-
-pub(crate) struct TaskScopes {
-    daemon_mode: AtomicBool,
-    max_runtime: Mutex<Duration>,
-    handles: Mutex<HashMap<String, ScopeHandle>>,
-}
-
-impl Default for TaskScopes {
-    fn default() -> Self {
-        Self {
-            daemon_mode: AtomicBool::new(false),
-            max_runtime: Mutex::new(Duration::from_secs(86_400)),
-            handles: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl TaskScopes {
-    pub(crate) fn configure_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
-        *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner()) = max_runtime;
-        self.daemon_mode.store(daemon_mode, Ordering::Release);
-    }
-
-    pub(crate) fn max_runtime(&self) -> Duration {
-        *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub(crate) fn policy(
-        &self,
-        enabled: bool,
-        saved_max_runtime: Option<Duration>,
-        native_launcher: bool,
-    ) -> Option<ScopePolicy> {
-        #[cfg(target_os = "linux")]
-        {
-            let daemon_mode = self.daemon_mode.load(Ordering::Acquire);
-            if !daemon_mode || !enabled || native_launcher {
-                return None;
-            }
-            Some(ScopePolicy {
-                daemon_mode,
-                enabled,
-                max_runtime: saved_max_runtime
-                    .unwrap_or_else(|| *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner())),
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (enabled, saved_max_runtime, native_launcher);
-            None
-        }
-    }
-
-    pub(crate) fn register(&self, handle: ScopeHandle) {
-        self.handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(handle.task_id.clone(), handle);
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 7: scope termination")
-    )]
-    pub(crate) fn get(&self, task_id: &str) -> Option<ScopeHandle> {
-        self.handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(task_id)
-            .cloned()
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 7: scope termination")
-    )]
-    pub(crate) fn kill(&self, task_id: &str) -> io::Result<()> {
-        if let Some(handle) = self.get(task_id) {
-            handle.kill()?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ScopeHandle {
-    task_id: String,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 8: owned scope cleanup")
-    )]
-    unit: String,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 6: scoped memory monitor")
-    )]
-    cgroup: PathBuf,
-}
-
-impl ScopeHandle {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 6: scoped memory monitor")
-    )]
-    pub(crate) fn cgroup(&self) -> &Path {
-        &self.cgroup
-    }
-}
-
-pub(crate) fn scope_unit(task_id: &str) -> io::Result<String> {
-    super::persistence::validate_task_id(task_id)?;
-    Ok(format!("aft-task-{task_id}.scope"))
-}
-
-pub(crate) fn backstop(hard_kill: super::HardKill, ceiling: Duration) -> Duration {
-    match hard_kill {
-        super::HardKill::After(limit) => limit.saturating_add(Duration::from_secs(60)),
-        super::HardKill::Default => ceiling,
-    }
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;
+#[cfg(not(target_os = "linux"))]
+pub(crate) use unsupported::*;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::*;
+    use super::super::HardKill;
+    const TASK_SLICE: &str = "aft.slice";
+    const TASK_UNIT_PREFIX: &str = "aft-task-";
+    const TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
+    const SCOPE_OOM_POLICY_VERSION: u32 = 253;
+    const EXPAND_ENVIRONMENT_VERSION: u32 = 254;
+    const _: () = assert!(SCOPE_OOM_POLICY_VERSION < EXPAND_ENVIRONMENT_VERSION);
+    use std::{
+        collections::HashMap,
+        ffi::OsString,
+        io,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex,
+        },
+        time::Duration,
+    };
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct ScopePolicy {
+        pub max_runtime: Duration,
+    }
+
+    pub(crate) struct TaskScopes {
+        daemon_mode: AtomicBool,
+        max_runtime: Mutex<Duration>,
+        handles: Mutex<HashMap<String, ScopeHandle>>,
+    }
+
+    impl Default for TaskScopes {
+        fn default() -> Self {
+            Self {
+                daemon_mode: AtomicBool::new(false),
+                max_runtime: Mutex::new(Duration::from_secs(
+                    crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
+                )),
+                handles: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl TaskScopes {
+        pub(crate) fn configure_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
+            *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner()) = max_runtime;
+            self.daemon_mode.store(daemon_mode, Ordering::Release);
+        }
+
+        pub(crate) fn max_runtime(&self) -> Duration {
+            *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        pub(crate) fn policy(
+            &self,
+            enabled: bool,
+            saved_max_runtime: Option<Duration>,
+            native_launcher: bool,
+        ) -> Option<ScopePolicy> {
+            #[cfg(target_os = "linux")]
+            {
+                let daemon_mode = self.daemon_mode.load(Ordering::Acquire);
+                if daemon_mode && enabled && native_launcher {
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| crate::slog_info!("bash.linux_scope: native sandbox launcher cannot reach the user manager; spawning without a scope"));
+                }
+                if !daemon_mode || !enabled || native_launcher {
+                    return None;
+                }
+                Some(ScopePolicy {
+                    max_runtime: saved_max_runtime.unwrap_or_else(|| {
+                        *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner())
+                    }),
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (enabled, saved_max_runtime, native_launcher);
+                None
+            }
+        }
+
+        pub(crate) fn register(&self, handle: ScopeHandle) {
+            self.handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(handle.task_id.clone(), handle);
+        }
+
+        #[expect(dead_code, reason = "used by Task 7: scope termination")]
+        pub(crate) fn get(&self, task_id: &str) -> Option<ScopeHandle> {
+            self.handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(task_id)
+                .cloned()
+        }
+
+        #[expect(dead_code, reason = "used by Task 7: scope termination")]
+        pub(crate) fn kill(&self, task_id: &str) -> io::Result<()> {
+            if let Some(handle) = self.get(task_id) {
+                handle.kill()?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct ScopeHandle {
+        task_id: String,
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "used by Task 8: owned scope cleanup")
+        )]
+        unit: String,
+        #[expect(dead_code, reason = "used by Task 6: scoped memory monitor")]
+        cgroup: PathBuf,
+    }
+
+    impl ScopeHandle {
+        #[expect(dead_code, reason = "used by Task 6: scoped memory monitor")]
+        pub(crate) fn cgroup(&self) -> &Path {
+            &self.cgroup
+        }
+    }
+
+    pub(crate) fn scope_unit(task_id: &str) -> io::Result<String> {
+        super::super::persistence::validate_task_id(task_id)?;
+        Ok(format!("{TASK_UNIT_PREFIX}{task_id}.scope"))
+    }
+
+    pub(crate) fn backstop(hard_kill: HardKill, ceiling: Duration) -> Duration {
+        match hard_kill {
+            HardKill::After(limit) => limit.saturating_add(TIMEOUT_MARGIN),
+            HardKill::Default => ceiling,
+        }
+    }
+
     use std::{
         io::{Read, Write},
         os::fd::AsRawFd,
-        path::Component,
         process::{Command, Output, Stdio},
         thread,
         time::Instant,
@@ -183,9 +181,17 @@ mod linux {
             return Err("task scope command timed out".into());
         }
         command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Use only the session endpoint for the user manager, not daemon credentials.
+        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         super::super::process::start_new_session(command);
         let mut child = command
             .spawn()
@@ -257,6 +263,7 @@ mod linux {
     }
 
     fn stop_client(child: &mut std::process::Child) {
+        // A probe must stop its descendants at its deadline.
         unsafe {
             libc::killpg(child.id() as i32, libc::SIGKILL);
         }
@@ -279,6 +286,7 @@ mod linux {
     fn probe_systemd_scope(launcher: &Path, limit: Duration) -> Option<bool> {
         let deadline = Instant::now() + limit;
         for expand in [true, false] {
+            // Before systemd 254, argv is literal. More dollar characters change the shell input.
             let mut command = Command::new(launcher);
             command.args(prefix(expand)).arg("/bin/true");
             if run(
@@ -302,7 +310,8 @@ mod linux {
         let supports_scope_oom_policy = version
             .and_then(|out| String::from_utf8(out.stdout).ok())
             .and_then(|text| parse_version(&text))
-            .is_some_and(|version| version >= 253);
+            .is_some_and(|version| version >= SCOPE_OOM_POLICY_VERSION);
+        // Scope OOMPolicy starts at 253. Probe expansion independently.
         Some(SystemdScopeLauncher {
             path,
             supports_expand_environment,
@@ -336,9 +345,33 @@ mod linux {
             memory_mib: Option<u64>,
             native_launcher: bool,
         ) -> Result<Option<ScopeLaunch>, String> {
-            if !policy.daemon_mode || !policy.enabled || native_launcher {
+            let _ = native_launcher;
+            static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*UNIFIED.get_or_init(|| current_cgroup(std::process::id()).is_some()) {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| crate::slog_info!("bash.linux_scope: unified cgroup hierarchy is not visible; spawning without a scope"));
                 return Ok(None);
             }
+            let Some(launcher) = select_systemd_scope_launcher() else {
+                // If the manager probe cannot run a command, run the task without a scope.
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    crate::slog_info!("bash.linux_scope: systemd user manager unavailable; spawning without a scope");
+                });
+                return Ok(None);
+            };
+            ScopeLaunch::new(launcher, policy, task_id, hard_kill, memory_mib).map(Some)
+        }
+    }
+
+    impl ScopeLaunch {
+        fn new(
+            launcher: SystemdScopeLauncher,
+            policy: ScopePolicy,
+            task_id: &str,
+            hard_kill: HardKill,
+            memory_mib: Option<u64>,
+        ) -> Result<Self, String> {
             let unit = scope_unit(task_id).map_err(|e| e.to_string())?;
             let memory_bytes = memory_mib
                 .map(|mib| {
@@ -351,24 +384,14 @@ mod linux {
             if runtime.is_zero() {
                 return Err("task scope runtime must be positive".into());
             }
-            let Some(launcher) = select_systemd_scope_launcher() else {
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    crate::slog_info!("bash.linux_scope: systemd user manager unavailable; spawning without a scope");
-                }
-                return Ok(None);
-            };
-            Ok(Some(ScopeLaunch {
+            Ok(Self {
                 launcher,
                 task_id: task_id.into(),
                 unit,
                 runtime,
                 memory_bytes,
-            }))
+            })
         }
-    }
-
-    impl ScopeLaunch {
         pub(crate) fn argv(
             &self,
             executable: &Path,
@@ -376,8 +399,14 @@ mod linux {
         ) -> (PathBuf, Vec<OsString>) {
             let mut wrapped = prefix(self.launcher.supports_expand_environment);
             wrapped.extend([
-                format!("--unit={}", self.unit.trim_end_matches(".scope")).into(),
-                "--slice=aft.slice".into(),
+                format!(
+                    "--unit={}",
+                    self.unit
+                        .strip_suffix(".scope")
+                        .expect("validated scope unit")
+                )
+                .into(),
+                format!("--slice={TASK_SLICE}").into(),
                 format!("--property=RuntimeMaxSec={}ms", self.runtime.as_millis()).into(),
                 "--property=TimeoutStopSec=2s".into(),
             ]);
@@ -427,21 +456,11 @@ mod linux {
 
     fn cgroup_path(task_id: &str, text: &str) -> Option<PathBuf> {
         let unit = scope_unit(task_id).ok()?;
-        let path = Path::new(text);
-        if !path.is_absolute()
-            || path.components().any(|part| {
-                matches!(
-                    part,
-                    Component::ParentDir | Component::CurDir | Component::Prefix(_)
-                )
-            })
-        {
+        let path = normalize_cgroup_path(text)?;
+        if path.file_name()? != unit.as_str() || path.parent()?.file_name()? != TASK_SLICE {
             return None;
         }
-        if path.file_name()? != unit.as_str() || path.parent()?.file_name()? != "aft.slice" {
-            return None;
-        }
-        Some(Path::new("/sys/fs/cgroup").join(path.strip_prefix("/").ok()?))
+        Some(path)
     }
 
     fn membership_path(task_id: &str, text: &str) -> Option<PathBuf> {
@@ -449,6 +468,31 @@ mod linux {
             task_id,
             text.lines().find_map(|line| line.strip_prefix("0::"))?,
         )
+    }
+
+    pub(crate) fn unified_cgroup_path(text: &str) -> Option<PathBuf> {
+        let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+        normalize_cgroup_path(relative)
+    }
+
+    fn normalize_cgroup_path(relative: &str) -> Option<PathBuf> {
+        let path = Path::new(relative);
+        if !path.is_absolute() || relative.split('/').any(|part| matches!(part, "." | "..")) {
+            return None;
+        }
+        Some(Path::new("/sys/fs/cgroup").join(path.strip_prefix("/").ok()?))
+    }
+
+    pub(crate) fn current_cgroup(pid: u32) -> Option<PathBuf> {
+        unified_cgroup_path(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)
+    }
+
+    fn task_unit_id(unit: &str) -> Option<&str> {
+        let id = unit
+            .strip_prefix(TASK_UNIT_PREFIX)?
+            .strip_suffix(".scope")?;
+        scope_unit(id).ok()?;
+        Some(id)
     }
 
     fn read_membership(pid: u32, task_id: &str) -> Result<String, String> {
@@ -557,7 +601,7 @@ mod linux {
                 "--no-legend",
                 "--plain",
                 "--no-pager",
-                "aft-task-*.scope",
+                &format!("{TASK_UNIT_PREFIX}*.scope"),
             ]),
             Duration::from_secs(1),
         )?)?;
@@ -567,10 +611,7 @@ mod linux {
             let Some(unit) = line.split_whitespace().next() else {
                 continue;
             };
-            let Some(id) = unit
-                .strip_prefix("aft-task-")
-                .and_then(|s| s.strip_suffix(".scope"))
-            else {
+            let Some(id) = task_unit_id(unit) else {
                 continue;
             };
             if scope_unit(id).is_ok() && lookup_with(systemctl, id)?.is_some() {
@@ -582,19 +623,13 @@ mod linux {
         Ok(units)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 8: owned scope cleanup")
-    )]
+    #[expect(dead_code, reason = "used by Task 8: owned scope cleanup")]
     pub(crate) fn list_units() -> Result<Vec<String>, String> {
         list_with(Path::new("systemctl"))
     }
 
     fn stop_with(systemctl: &Path, unit: &str) -> Result<(), String> {
-        let id = unit
-            .strip_prefix("aft-task-")
-            .and_then(|s| s.strip_suffix(".scope"))
-            .ok_or("invalid task scope unit")?;
+        let id = task_unit_id(unit).ok_or("invalid task scope unit")?;
         scope_unit(id).map_err(|e| e.to_string())?;
         successful(run(
             Command::new(systemctl).args(["--user", "stop", unit]),
@@ -604,17 +639,43 @@ mod linux {
     }
 
     fn stop_unit(unit: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if STOP_OBSERVER.with(|slot| {
+            if let Some(observe) = slot.borrow().as_ref() {
+                observe(unit);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Ok(());
+        }
         stop_with(Path::new("systemctl"), unit)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by Tasks 6 through 8: scoped memory and termination"
-        )
-    )]
+    #[cfg(test)]
+    type StopObserver = Box<dyn Fn(&str)>;
+    #[cfg(test)]
+    thread_local! { static STOP_OBSERVER: std::cell::RefCell<Option<StopObserver>> = const { std::cell::RefCell::new(None) }; }
+    #[cfg(test)]
+    pub(crate) fn with_stop_observer_for_test<T>(
+        observer: impl Fn(&str) + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<StopObserver>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                STOP_OBSERVER.with(|slot| {
+                    *slot.borrow_mut() = self.0.take();
+                });
+            }
+        }
+        let _restore = Restore(STOP_OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+        run()
+    }
+
     impl ScopeHandle {
+        #[expect(dead_code, reason = "used by Task 7: scoped termination")]
         pub(crate) fn kill(&self) -> io::Result<()> {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -627,9 +688,14 @@ mod linux {
                 Err(e) => Err(e),
             }
         }
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "used by Task 8: owned scope cleanup")
+        )]
         pub(crate) fn stop(&self) -> Result<(), String> {
             stop_unit(&self.unit)
         }
+        #[expect(dead_code, reason = "used by Task 6: scoped memory monitor")]
         pub(crate) fn ensure_oom_group(&self) -> Result<(), String> {
             let path = self.cgroup.join("memory.oom.group");
             if std::fs::read_to_string(&path)
@@ -653,6 +719,24 @@ mod linux {
             }
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_for_test(id: &str) -> ScopeLaunch {
+        ScopeLaunch::new(
+            SystemdScopeLauncher {
+                path: "/usr/bin/systemd-run".into(),
+                supports_expand_environment: true,
+                supports_scope_oom_policy: true,
+            },
+            ScopePolicy {
+                max_runtime: Duration::from_secs(86400),
+            },
+            id,
+            HardKill::Default,
+            None,
+        )
+        .unwrap()
     }
 
     #[cfg(test)]
@@ -738,6 +822,48 @@ mod linux {
             assert_eq!(parse_version("systemd unknown"), None);
         }
         #[test]
+        fn task_scope_runtime_properties_use_the_launch_policy() {
+            let launcher = || SystemdScopeLauncher {
+                path: "/usr/bin/systemd-run".into(),
+                supports_expand_environment: true,
+                supports_scope_oom_policy: true,
+            };
+            for (limit, expected) in [
+                (
+                    HardKill::After(Duration::from_millis(1500)),
+                    "--property=RuntimeMaxSec=61500ms",
+                ),
+                (HardKill::Default, "--property=RuntimeMaxSec=7200000ms"),
+            ] {
+                let launch = ScopeLaunch::new(
+                    launcher(),
+                    ScopePolicy {
+                        max_runtime: Duration::from_secs(7200),
+                    },
+                    "bash-0123456789abcdef",
+                    limit,
+                    None,
+                )
+                .unwrap();
+                assert!(launch
+                    .argv(Path::new("/bin/true"), &[])
+                    .1
+                    .contains(&OsString::from(expected)));
+            }
+        }
+        #[test]
+        fn task_scope_unified_visibility_decision() {
+            assert!(unified_cgroup_path("0::/user.slice/test\n").is_some());
+            for text in [
+                "1:memory:/user.slice/test\n",
+                "",
+                "0::/../other\n",
+                "0::relative\n",
+            ] {
+                assert!(unified_cgroup_path(text).is_none(), "{text}");
+            }
+        }
+        #[test]
         fn lifecycle_scope_probe_deadline_falls_back() {
             let (_dir, path) = fake("sleep .1; exit 0");
             assert!(probe_systemd_scope(&path, Duration::ZERO).is_none());
@@ -746,49 +872,63 @@ mod linux {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) struct ScopeLaunch;
+mod unsupported {
+    #[derive(Default)]
+    pub(crate) struct TaskScopes;
+    pub(crate) enum ScopeLaunch {}
+    #[cfg(target_os = "macos")]
+    pub(crate) enum ScopePolicy {}
+    #[cfg(target_os = "macos")]
+    pub(crate) enum ScopeHandle {}
+    impl TaskScopes {
+        pub(crate) fn configure_runtime(&self, _daemon_mode: bool, _max: std::time::Duration) {}
+        #[cfg(target_os = "macos")]
+        pub(crate) fn max_runtime(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS)
+        }
+        #[cfg(target_os = "macos")]
+        pub(crate) fn policy(
+            &self,
+            _enabled: bool,
+            _saved: Option<std::time::Duration>,
+            _native: bool,
+        ) -> Option<ScopePolicy> {
+            None
+        }
+        #[cfg(target_os = "macos")]
+        pub(crate) fn register(&self, _handle: ScopeHandle) {}
+        #[cfg(target_os = "macos")]
+        pub(crate) fn prepare(
+            &self,
+            _policy: ScopePolicy,
+            _task_id: &str,
+            _hard_kill: super::super::HardKill,
+            _memory_mib: Option<u64>,
+            _native_launcher: bool,
+        ) -> Result<Option<ScopeLaunch>, String> {
+            Ok(None)
+        }
+    }
 
-#[cfg(not(target_os = "linux"))]
-impl TaskScopes {
-    pub(crate) fn prepare(
-        &self,
-        _policy: ScopePolicy,
-        _task_id: &str,
-        _hard_kill: super::HardKill,
-        _memory_mib: Option<u64>,
-        _native_launcher: bool,
-    ) -> Result<Option<ScopeLaunch>, String> {
-        Ok(None)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl ScopeLaunch {
-    pub(crate) fn argv(&self, executable: &Path, args: &[OsString]) -> (PathBuf, Vec<OsString>) {
-        (executable.into(), args.into())
-    }
-    pub(crate) fn await_placement(
-        &self,
-        _pid: u32,
-        _limit: Duration,
-    ) -> Result<ScopeHandle, String> {
-        Err("task scopes are unavailable on this platform".into())
-    }
-    pub(crate) fn stop(&self) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl ScopeHandle {
-    pub(crate) fn kill(&self) -> io::Result<()> {
-        Ok(())
-    }
-    pub(crate) fn stop(&self) -> Result<(), String> {
-        Ok(())
-    }
-    pub(crate) fn ensure_oom_group(&self) -> Result<(), String> {
-        Err("task scopes are unavailable on this platform".into())
+    #[cfg(target_os = "macos")]
+    impl ScopeLaunch {
+        pub(crate) fn argv(
+            &self,
+            executable: &std::path::Path,
+            args: &[std::ffi::OsString],
+        ) -> (std::path::PathBuf, Vec<std::ffi::OsString>) {
+            (executable.into(), args.into())
+        }
+        pub(crate) fn await_placement(
+            &self,
+            _pid: u32,
+            _limit: std::time::Duration,
+        ) -> Result<ScopeHandle, String> {
+            Err("task scopes are unavailable on this platform".into())
+        }
+        pub(crate) fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
     }
 }
 
@@ -928,10 +1068,7 @@ mod tests {
     #[test]
     fn task_scope_daemon_gate() {
         let scopes = TaskScopes::default();
-        assert_eq!(
-            *scopes.max_runtime.lock().unwrap(),
-            Duration::from_secs(86400)
-        );
+        assert_eq!(scopes.max_runtime(), Duration::from_secs(86400));
         scopes.configure_runtime(false, Duration::from_secs(86400));
         assert!(
             scopes.policy(true, None, false).is_none(),

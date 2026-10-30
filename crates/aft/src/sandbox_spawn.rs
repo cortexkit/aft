@@ -380,7 +380,7 @@ pub(crate) const REMOTE_LOCAL_LAUNCH: &str = "remote-local-launch";
 
 #[cfg(unix)]
 fn default_scope_max_runtime_secs() -> u64 {
-    86_400
+    crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS
 }
 
 #[cfg(unix)]

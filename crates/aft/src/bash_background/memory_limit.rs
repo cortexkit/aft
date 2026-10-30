@@ -420,16 +420,7 @@ mod linux {
     }
 
     fn current(pid: u32) -> Option<PathBuf> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
-        // Paths containing '..' are outside this process's cgroup namespace.
-        if Path::new(relative)
-            .components()
-            .any(|part| part == std::path::Component::ParentDir)
-        {
-            return None;
-        }
-        Some(Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
+        super::super::task_scope::current_cgroup(pid)
     }
 
     fn delegated(parent: &Path, mib: u64, task_id: &str) -> Option<PathBuf> {

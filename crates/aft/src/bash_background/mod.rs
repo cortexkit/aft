@@ -1196,10 +1196,7 @@ pub(crate) fn spawn_with_secrets(
         ctx.is_daemon_mode(),
         Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
     );
-    #[cfg(target_os = "linux")]
-    if !pty && config.bash.linux_scope {
-        env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
-    }
+    env.remove(registry::LINUX_SCOPE_ENV);
     enter_runon_phase("sandbox_preflight");
     let task_kind = if pty {
         SandboxTaskKind::BashPty
@@ -1384,6 +1381,7 @@ pub(crate) fn spawn_with_secrets(
             notify_on_completion,
             compressed,
             project_root.clone(),
+            config.bash.linux_scope,
         )
     });
     #[cfg(not(unix))]
@@ -1429,6 +1427,7 @@ pub(crate) fn spawn_with_secrets(
             notify_on_completion,
             compressed,
             project_root,
+            config.bash.linux_scope,
         )
     };
     #[cfg(unix)]

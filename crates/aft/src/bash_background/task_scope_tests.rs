@@ -1,5 +1,58 @@
 use super::*;
 
+#[test]
+fn task_scope_placement_never_retries_a_released_gate() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let launch = super::super::task_scope::launch_for_test(&random_slug());
+    let marker = root.path().join("payload-count");
+    let mut child = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("read ready; printf x >> '{}'; exit 0", marker.display()),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"run\n").unwrap();
+    child.wait().unwrap();
+    let mut child = Child::from(child);
+    let r = BgTaskRegistry::default();
+    let result = r.place_task_scope(&mut child, &launch);
+    assert!(result.is_err(), "released gate allowed a payload retry");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+}
+
+#[test]
+fn task_scope_placement_refuses_a_live_unplaced_child() {
+    let id = random_slug();
+    let launch = super::super::task_scope::launch_for_test(&id);
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "read ready; exit 0"])
+        .stdin(std::process::Stdio::piped());
+    super::super::process::start_new_session(&mut command);
+    let mut child = Child::from(command.spawn().unwrap());
+    let stopped = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = stopped.clone();
+    let result = super::super::task_scope::with_stop_observer_for_test(
+        move |unit| observed.borrow_mut().push(unit.to_owned()),
+        || BgTaskRegistry::default().place_task_scope(&mut child, &launch),
+    );
+    assert!(result
+        .as_ref()
+        .unwrap_err()
+        .contains("task scope placement timed out"));
+    assert_eq!(
+        *stopped.borrow(),
+        vec![super::super::task_scope::scope_unit(&id).unwrap()]
+    );
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "unplaced child was not reaped"
+    );
+}
+
 struct StopOnDrop(String);
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
@@ -17,7 +70,7 @@ fn scope_spawn(
     cap: Option<u64>,
 ) -> String {
     r.configure_task_scope_runtime(true, Duration::from_secs(86400));
-    r.spawn_with_shell(
+    r.spawn_with_shell_in_slot_typed(
         SpawnPlan::Unsandboxed,
         command,
         super::super::BashShell::Bash,
@@ -28,10 +81,11 @@ fn scope_spawn(
         limit,
         cap,
         root.to_owned(),
-        8,
+        super::super::TaskSlot::Background { max: 8 },
         true,
         false,
         Some(root.to_owned()),
+        true,
     )
     .unwrap()
 }
@@ -97,7 +151,7 @@ fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
     assert!(second.is_daemon_mode());
     let registry = second.bash_background();
     let id = registry
-        .spawn_with_shell(
+        .spawn_with_shell_in_slot_typed(
             SpawnPlan::Unsandboxed,
             "echo ready; sleep 60",
             super::super::BashShell::Bash,
@@ -108,10 +162,11 @@ fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
             super::super::HardKill::After(Duration::from_secs(90)),
             None,
             root.path().to_owned(),
-            8,
+            super::super::TaskSlot::Background { max: 8 },
             false,
             false,
             Some(root.path().to_owned()),
+            true,
         )
         .unwrap();
     let _stop = StopOnDrop(id.clone());

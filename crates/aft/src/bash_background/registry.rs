@@ -1989,6 +1989,7 @@ impl BgTaskRegistry {
         child: &mut Child,
         scope: &super::task_scope::ScopeLaunch,
     ) -> Result<bool, String> {
+        // Keep the identity gate closed until placement. An open gate can cause a retry to run the payload two times.
         match scope.await_placement(child.id(), Duration::from_secs(1)) {
             Ok(handle) => {
                 self.inner.task_scopes.register(handle);
@@ -1996,17 +1997,17 @@ impl BgTaskRegistry {
             }
             Err(error) => {
                 let exited = child.try_wait().map_err(|e| e.to_string())?.is_some();
-                let gate_closed = child.stdin.take().is_some();
+                let gate_held = child.stdin.take().is_some();
                 if !exited {
                     super::process::terminate_pgid(child.id() as i32, None);
                 }
                 let _ = scope.stop();
                 let _ = child.wait();
-                if exited && gate_closed {
-                    static LOGGED: AtomicBool = AtomicBool::new(false);
-                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                if exited && gate_held {
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| {
                         crate::slog_info!("task scope creation failed before payload release; spawning without a scope: {error}");
-                    }
+                    });
                     Ok(true)
                 } else {
                     Err(error)
@@ -5143,6 +5144,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
             project_root,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -5200,7 +5202,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5208,12 +5210,13 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
-        let linux_scope = env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
+        env.remove(LINUX_SCOPE_ENV);
 
         let _admission = self.background_admission_guard(slot);
         if let Err(refusal) = self.check_background_slot_typed(slot, &session_id) {
@@ -6150,6 +6153,7 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
+        _linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
@@ -25191,6 +25195,7 @@ mod tests {
                         true,
                         false,
                         Some(dir.path().into()),
+                        false,
                     )
                     .unwrap();
                 let task = registry.task_for_test(&id).unwrap();
@@ -25820,6 +25825,7 @@ mod tests {
                     true,
                     false,
                     Some(dir.path().into()),
+                    false,
                 )
                 .unwrap();
             let paths = original.task(&task_id).unwrap().paths.clone();

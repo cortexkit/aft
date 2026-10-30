@@ -259,6 +259,7 @@ fn allocate_past_cap(
                 true,
                 false,
                 None,
+                false,
             )
             .unwrap()
     };
@@ -599,6 +600,7 @@ fn memory_limit_cmd_waiter_contains_and_kills_powershell_tree() {
                     true,
                     false,
                     None,
+                    false,
                 )
                 .unwrap()
         };

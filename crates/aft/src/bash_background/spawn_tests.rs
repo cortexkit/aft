@@ -76,7 +76,7 @@ fn linux_scope_preserves_shell_dollar_expressions() {
             |_, id| Ok(format!("0::/aft.slice/aft-task-{id}.scope\n")),
             || {
                 registry
-                    .spawn_with_shell(
+                    .spawn_with_shell_in_slot_typed(
                         SpawnPlan::Unsandboxed,
                         command,
                         super::super::BashShell::Bash,
@@ -90,10 +90,11 @@ fn linux_scope_preserves_shell_dollar_expressions() {
                         super::super::HardKill::After(Duration::from_secs(15)),
                         None,
                         root.clone(),
-                        4,
+                        super::super::TaskSlot::Background { max: 4 },
                         false,
                         false,
                         Some(root.clone()),
+                        true,
                     )
                     .unwrap()
             },
@@ -226,7 +227,7 @@ fn task_scope_standalone_never_starts_systemd_run() {
         let r = BgTaskRegistry::default();
         r.configure_task_scope_runtime(false, Duration::from_secs(86400));
         let id = r
-            .spawn_with_shell(
+            .spawn_with_shell_in_slot_typed(
                 SpawnPlan::Unsandboxed,
                 "echo standalone; printf ran > inner-ran",
                 super::super::BashShell::Bash,
@@ -237,10 +238,11 @@ fn task_scope_standalone_never_starts_systemd_run() {
                 super::super::HardKill::Default,
                 None,
                 root.clone(),
-                8,
+                super::super::TaskSlot::Background { max: 8 },
                 false,
                 false,
                 Some(root.clone()),
+                true,
             )
             .unwrap();
         wait_done(&r, &id);
@@ -253,6 +255,36 @@ fn task_scope_standalone_never_starts_systemd_run() {
         assert!(
             !root.join("systemd-calls").exists(),
             "standalone started systemd-run"
+        );
+        r.configure_task_scope_runtime(true, Duration::from_secs(86400));
+        let id = r
+            .spawn_with_shell(
+                SpawnPlan::Unsandboxed,
+                "printf config-opt-out",
+                super::super::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "config-opt-out".into(),
+                root.clone(),
+                HashMap::from([(LINUX_SCOPE_ENV.into(), "1".into())]),
+                super::super::HardKill::Default,
+                None,
+                root.clone(),
+                8,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        wait_done(&r, &id);
+        assert_eq!(
+            r.status(&id, "config-opt-out", None, None, 1024)
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
+        assert!(
+            !root.join("systemd-calls").exists(),
+            "request environment overrode the disabled scope config"
         );
         return;
     }
@@ -296,7 +328,7 @@ fn task_scope_creation_refusal_falls_back_without_payload_retry() {
         registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
         let command = format!("test -z \"${{AFT_INTERNAL_LINUX_SCOPE+x}}\" || exit 99; printf x >> payload-count; exit {}", if released { 23 } else { 0 });
         let spawn = || {
-            registry.spawn_with_shell(
+            registry.spawn_with_shell_in_slot_typed(
                 SpawnPlan::Unsandboxed,
                 &command,
                 super::super::BashShell::Bash,
@@ -307,10 +339,11 @@ fn task_scope_creation_refusal_falls_back_without_payload_retry() {
                 super::super::HardKill::After(Duration::from_secs(15)),
                 None,
                 root.clone(),
-                8,
+                super::super::TaskSlot::Background { max: 8 },
                 false,
                 false,
                 Some(root.clone()),
+                true,
             )
         };
         let id = if released {

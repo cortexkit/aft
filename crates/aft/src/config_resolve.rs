@@ -3338,7 +3338,7 @@ fn resolve_bash_config(
         linux_scope: top_linux_scope,
         linux_scope_max_runtime_secs: top_features
             .and_then(|features| features.linux_scope_max_runtime_secs)
-            .unwrap_or(86_400),
+            .unwrap_or(crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS),
         memory_limit_mib: top_features.and_then(|features| features.memory_limit_mib),
         disclaim_privacy: top_features
             .and_then(|features| features.disclaim_privacy)
@@ -5774,6 +5774,9 @@ mod tests {
 
     #[test]
     fn task_scope_config_contract() {
+        let direct = crate::config::BashConfig::default();
+        assert!(direct.linux_scope);
+        assert_eq!(direct.linux_scope_max_runtime_secs, 86_400);
         let defaults = resolve_config(&[]).config.bash;
         assert!(defaults.linux_scope);
         assert_eq!(defaults.linux_scope_max_runtime_secs, 86_400);

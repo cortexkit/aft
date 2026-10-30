@@ -2345,6 +2345,7 @@ impl BgTaskRegistry {
             notify,
             compressed,
             root,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -2366,6 +2367,7 @@ impl BgTaskRegistry {
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let mut timings = super::super::take_runon_timings();
         timings.enter("task_setup");
@@ -2464,8 +2466,7 @@ impl BgTaskRegistry {
             &workdir,
             &crate::sandbox_spawn::current_authenticated_principal(),
             &shell_path,
-            env.get("AFT_INTERNAL_LINUX_SCOPE")
-                .is_some_and(|v| v == "1"),
+            linux_scope,
             memory_limit_mib,
             linux_scope_max_runtime_secs,
         )?;
@@ -2500,9 +2501,7 @@ impl BgTaskRegistry {
             .io_handles = Some(handles);
         let request_root = root.as_deref().unwrap_or(&workdir);
         timings.enter("remote_environment");
-        let linux_scope = env
-            .remove("AFT_INTERNAL_LINUX_SCOPE")
-            .is_some_and(|v| v == "1");
+        env.remove(super::LINUX_SCOPE_ENV);
         // Configured `bash.env` values apply to local commands only: the
         // ambient environment must not carry one to a build server just
         // because it happens to be exported here. The request's own map is a
