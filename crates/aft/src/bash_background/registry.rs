@@ -2144,6 +2144,21 @@ impl BgTaskRegistry {
     }
 
     #[cfg(unix)]
+    fn cleanup_failed_scope_spawn(
+        &self,
+        task_id: &str,
+        child: &mut Child,
+        scope: Option<&super::task_scope::ScopeLaunch>,
+    ) -> Result<(), String> {
+        let result = self.kill_task_scope(task_id);
+        if let Some(scope) = scope {
+            let _ = scope.stop();
+        }
+        let _ = child.wait();
+        result
+    }
+
+    #[cfg(unix)]
     fn place_task_scope(
         &self,
         child: &mut Child,
@@ -5639,21 +5654,21 @@ impl BgTaskRegistry {
         }
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
-            self.kill_task_scope(&task_id)?;
-            if let Some(scope) = scope.as_ref() {
-                let _ = scope.stop();
+            if let Err(kill_error) =
+                self.cleanup_failed_scope_spawn(&task_id, &mut child, scope.as_ref())
+            {
+                crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
             }
-            let _ = child.wait();
             return Err(error.into());
         }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
-                self.kill_task_scope(&task_id)?;
-                if let Some(scope) = scope.as_ref() {
-                    let _ = scope.stop();
+                if let Err(kill_error) =
+                    self.cleanup_failed_scope_spawn(&task_id, &mut child, scope.as_ref())
+                {
+                    crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
                 }
-                let _ = child.wait();
                 self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }

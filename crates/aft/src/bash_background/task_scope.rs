@@ -381,6 +381,7 @@ mod linux {
         time::Instant,
     };
 
+    #[derive(Clone)]
     pub(crate) struct SystemdScopeLauncher {
         path: PathBuf,
         supports_expand_environment: bool,
@@ -556,11 +557,24 @@ mod linux {
     }
 
     pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
-        let path = systemd_run_path_with(Path::is_file)?.to_owned();
-        probe_launcher(path)
+        static LAUNCHER: std::sync::OnceLock<Option<SystemdScopeLauncher>> =
+            std::sync::OnceLock::new();
+        LAUNCHER
+            .get_or_init(|| {
+                let path = systemd_run_path_with(Path::is_file)?.to_owned();
+                probe_launcher(path)
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LAUNCHER_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn probe_launcher(path: PathBuf) -> Option<SystemdScopeLauncher> {
+        #[cfg(test)]
+        LAUNCHER_PROBES.with(|count| count.set(count.get() + 1));
         let supports_expand_environment = probe_systemd_scope(&path, Duration::from_secs(1))?;
         let version = run(
             user_manager_command(&path).arg("--version"),
@@ -864,6 +878,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup(task_id: &str) -> Result<Option<ScopeHandle>, String> {
         lookup_with(Path::new("systemctl"), task_id)
     }
@@ -1227,6 +1242,14 @@ mod linux {
             const INNER: &str = "AFT_TEST_SCOPE_TRUSTED_LAUNCHER";
             if std::env::var_os(INNER).is_some() {
                 let selected = select_systemd_scope_launcher().unwrap();
+                let first = LAUNCHER_PROBES.with(|count| count.get());
+                assert!(first > 0);
+                select_systemd_scope_launcher().unwrap();
+                assert_eq!(
+                    LAUNCHER_PROBES.with(|count| count.get()),
+                    first,
+                    "launcher was re-probed on the second selection"
+                );
                 assert!(
                     [
                         Path::new("/usr/bin/systemd-run"),

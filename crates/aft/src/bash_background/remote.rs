@@ -4076,11 +4076,11 @@ impl BgTaskRegistry {
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child.id()) {
                 super::super::process::terminate_pgid(child.id() as i32, None);
-                self.kill_task_scope(&task.task_id)?;
-                if let Some(scope) = scope.as_ref() {
-                    let _ = scope.stop();
+                if let Err(kill_error) =
+                    self.cleanup_failed_scope_spawn(&task.task_id, &mut child, scope.as_ref())
+                {
+                    crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
                 }
-                let _ = child.wait();
                 return Err(error);
             }
             state.metadata.memory_policy = Some(monitor.policy.clone());

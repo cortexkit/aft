@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn task_scope_failed_spawn_stops_and_reaps_after_kill_error() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("cgroup.kill")).unwrap();
+    let id = random_slug();
+    let registry = BgTaskRegistry::default();
+    registry
+        .inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(
+            &id,
+            root.path().into(),
+        ));
+    let launch = super::super::task_scope::launch_for_test(&id);
+    let mut child = Child::from(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.id() as i32;
+    let stopped = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = stopped.clone();
+    let result = super::super::task_scope::with_stop_observer_for_test(
+        move |unit| observed.borrow_mut().push(unit.to_owned()),
+        || registry.cleanup_failed_scope_spawn(&id, &mut child, Some(&launch)),
+    );
+    assert!(result.is_err());
+    assert_eq!(stopped.borrow().len(), 1, "kill error skipped scope stop");
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
 fn task_scope_placement_never_retries_a_released_gate() {
     use std::io::Write;
     let root = tempfile::tempdir().unwrap();
