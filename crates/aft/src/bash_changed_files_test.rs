@@ -279,7 +279,15 @@ fn bash_changed_files_diff_deadline_is_not_reported_as_missing_before_image() {
                 other => panic!("unexpected git {other}"),
             }));
         });
-        let _budget = capture.budget(Some(Instant::now() + Duration::from_millis(500)));
+        // Only the timeout case needs the deadline to pass; the cases where
+        // `ls-tree` answers get a budget a loaded runner cannot spend before
+        // `ls-tree` runs, so a slow `finish` can't turn them into a timeout.
+        let budget = if expected == Some(DIFF_BUDGET_SPENT) {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(30)
+        };
+        let _budget = capture.budget(Some(Instant::now() + budget));
         let report = capture.finish();
         GIT_FOR_TEST.with(|hook| *hook.borrow_mut() = None);
         let file = &report.files[0];

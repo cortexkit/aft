@@ -1394,11 +1394,7 @@ fn gh_shim_provisioned_head_operator_admin_bypass_is_audited() {
                 assert_eq!(output.status.code(), Some(86), "{tuple}");
                 assert!(output.stdout.is_empty(), "{tuple}");
                 let refusal = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    refusal.contains("task_gh_policy_denied:")
-                        && refusal.contains("(not_governed)"),
-                    "{tuple}: {refusal}"
-                );
+                assert_eq!(refusal, "gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one (not_governed); use a permitted operation, or ask the operator to update the policy and start the command again. This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.\n", "{tuple}");
                 assert!(!recorder.exists());
                 assert!(!audit_path.exists());
             }

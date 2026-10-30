@@ -1043,10 +1043,19 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
         } else {
             "output"
         };
-    let output = response.data[field].as_str().unwrap_or("");
-    if !output.ends_with(REMOTE_INPUT_CAPTURE_WARNING) {
-        response.data[field] = json!(format!("{output}\n{REMOTE_INPUT_CAPTURE_WARNING}"));
+    let mut output = response.data[field].as_str().unwrap_or("").to_owned();
+    if let Some(prefix) = output.strip_suffix(REMOTE_INPUT_CAPTURE_WARNING) {
+        output = prefix.trim_end_matches('\n').to_owned();
     }
+    if let Some(note) = response.data["remote_admission_note"].as_str() {
+        if !output.contains(note) {
+            output.push('\n');
+            output.push_str(note);
+        }
+    }
+    output.push('\n');
+    output.push_str(REMOTE_INPUT_CAPTURE_WARNING);
+    response.data[field] = json!(output);
     response
 }
 
@@ -1076,7 +1085,18 @@ pub(crate) fn runon_uncaptured_reply(
             return foreground_result_response(&response.id, snapshot);
         }
     }
-    with_capture_warning(response)
+    let mut response = Response {
+        id: response.id.clone(),
+        success: response.success,
+        data: response.data.clone(),
+    };
+    if let Some(note) = registry
+        .runon_launch_state(task_id, session)
+        .and_then(|launch| launch.admission_note)
+    {
+        response.data["remote_admission_note"] = json!(note);
+    }
+    with_capture_warning(&response)
 }
 
 /// Whether this reply describes a task still in flight (`running`, `starting`,

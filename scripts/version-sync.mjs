@@ -242,6 +242,13 @@ const tokenizerPath = join(root, "crates", "aft-tokenizer", "Cargo.toml");
 results.push(updateCargoToml(tokenizerPath, version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-tokenizer", version, dryRun));
 
+// 12: Cargo.toml — aft-secret-rules (leaf crate, published before the main
+// crate for the same reason as aft-tokenizer). Its dependency key in
+// `crates/aft/Cargo.toml` is `secret-rules` (renamed via `package =`).
+const secretRulesPath = join(root, "crates", "secret-rules", "Cargo.toml");
+results.push(updateCargoToml(secretRulesPath, version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "secret-rules", version, dryRun));
+
 // Report
 let updateCount = 0;
 for (const { path, changes } of results) {

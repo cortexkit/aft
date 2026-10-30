@@ -16,6 +16,414 @@ use std::sync::atomic::AtomicUsize;
 /// are a v2 optimization the v3 store does not write.)
 const ROWS_PER_ONE_CHUNK_FILE: u64 = 2;
 
+#[test]
+fn semantic_batch_lease_error_state_keeps_the_scheduled_wait_before_backoff_doubles() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn retry_vector() {}\n")]);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let lease_path = super::super::semantic_batch_lease::path(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    );
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let mut schedule = fast_schedule(root.path());
+        schedule.retry_initial = Duration::from_secs(4);
+        schedule.retry_max = Duration::from_secs(80);
+        std::thread::spawn(move || {
+            let mut first = true;
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts| {
+                if first {
+                    first = false;
+                    std::fs::remove_file(&lease_path).unwrap();
+                } else {
+                    // Block the next provider attempt until the test has read
+                    // the first retry's coordination state, even if its reader is delayed.
+                    let _ = release_rx.recv();
+                }
+                Model::default().embed(texts)
+            });
+        })
+    };
+    let event = observer.next();
+    let state = runtime.coordination_state();
+    slot.clear();
+    let _ = release_tx.try_send(());
+    worker.join().unwrap();
+    assert_eq!(event, "lease_error");
+    assert!(
+        matches!(state, Some(CoordinationState::Error {
+        retry_in: Some(wait), ..
+    }) if wait == Duration::from_secs(4)),
+        "{state:?}"
+    );
+}
+
+#[test]
+fn semantic_batch_lease_operator_copy_never_enters_finalized_agent_replies() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("read.rs", "pub fn read_result() {\n}\n")]);
+    let (_lane_slot, _lane_epoch, _lane_wake, runtime) = served_lane(storage.path(), root.path());
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().to_path_buf());
+    config.storage_dir = Some(storage.path().to_path_buf());
+    config.views.enabled = true;
+    config.indexes.semantic = true;
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let (epoch, _wake) = ctx.checkout_semantic().begin();
+    assert!(ctx.checkout_semantic().install(epoch, Arc::clone(&runtime)));
+    *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::ready();
+    for state in [
+        CoordinationState::Contended,
+        CoordinationState::BaseBusy {
+            owner_pid: 42,
+            attempt: 3,
+        },
+        CoordinationState::Error {
+            failure: LeaseError {
+                kind: super::super::semantic::LeaseErrorKind::Storage(std::io::ErrorKind::Other),
+                detail: "coordination denied".into(),
+                retryable: true,
+            },
+            retry_in: Some(Duration::from_secs(4)),
+        },
+        CoordinationState::Error {
+            failure: LeaseError {
+                kind: super::super::semantic::LeaseErrorKind::Storage(std::io::ErrorKind::Other),
+                detail: "coordination denied".into(),
+                retryable: false,
+            },
+            retry_in: None,
+        },
+    ] {
+        runtime.set_coordination(Some(state));
+        for tool in ["read", "search", "inspect", "bash"] {
+            let mut response =
+                crate::protocol::Response::success("agent-reply", serde_json::json!({}));
+            let mut text = "ordinary tool result".to_owned();
+            crate::response_finalize::finalize_tool_response(
+                &mut response,
+                &mut text,
+                &ctx,
+                "session",
+                tool,
+                false,
+            );
+            let visible = format!("{text}\n{}", serde_json::to_string(&response).unwrap());
+            assert!(!visible.contains("Waiting for another AFT process that is embedding the same new code; results will follow."), "{visible}");
+            assert!(
+                !visible.contains("Can't coordinate embedding with other AFT processes"),
+                "{visible}"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_batch_lease_permanent_error_is_visible_without_a_retry_timer() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // A multiline function gets its own chunk; a one-line function may only
+    // contribute the file summary, whose result is named after the file.
+    write_tree(
+        root.path(),
+        &[("saved.rs", "pub fn saved_vector() -> u64 {\n    7\n}\n")],
+    );
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    // Use a known mock reply and query direction. Hash-derived similarity can
+    // omit a valid saved result, so prove retrieval before injecting the error.
+    let mut saved_query = vec![0.0; 16];
+    saved_query[0] = 1.0;
+    runtime
+        .refresh(FillBudget::default(), &mut |texts| {
+            Ok(model
+                .embed(texts)?
+                .into_iter()
+                .map(|_| saved_query.clone())
+                .collect())
+        })
+        .unwrap();
+    let saved = runtime.search(&saved_query, 20, &|_| true).unwrap();
+    assert!(saved.complete());
+    assert!(saved.results.iter().any(|row| row.name == "saved_vector"));
+    let baseline = model.texts();
+    let directory = storage.path().join("semantic-batch-leases-v1");
+    std::fs::remove_dir_all(&directory).unwrap();
+    std::fs::write(&directory, b"not a directory").unwrap();
+    write_tree(
+        root.path(),
+        &[("pending.rs", "pub fn pending_vector() -> u64 { 9 }\n")],
+    );
+    runtime.driver().register_write_intent();
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().to_path_buf());
+    config.storage_dir = Some(storage.path().to_path_buf());
+    config.views.enabled = true;
+    config.indexes.semantic = true;
+    let ctx = Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    let (status_epoch, _status_wake) = ctx.checkout_semantic().begin();
+    assert!(ctx
+        .checkout_semantic()
+        .install(status_epoch, Arc::clone(&runtime)));
+    *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::ready();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let ctx = Arc::clone(&ctx);
+        let model = Arc::clone(&model);
+        let schedule = fast_schedule(root.path());
+        std::thread::spawn(move || {
+            serve_fills_with_status(
+                &weak,
+                epoch,
+                &wake,
+                &schedule,
+                Some(ctx.semantic_index_status()),
+                &mut |texts| model.embed(texts),
+            )
+        })
+    };
+    let first = observer.next();
+    let retry_armed = lock(&slot.retry).is_some();
+    let pending_was_contention = runtime.coordination_pending();
+    let answer = runtime.search(&saved_query, 20, &|_| true).unwrap();
+    let request: crate::protocol::RawRequest =
+        serde_json::from_value(serde_json::json!({"id":"lease-error", "command":"status"}))
+            .unwrap();
+    let status =
+        serde_json::to_value(crate::commands::status::handle_status(&request, &ctx)).unwrap();
+    let attempts = runtime.refresh_attempts();
+    let before_repair = model.texts();
+    // Repair alone sends no checkout notification. Explicitly wake the parked
+    // worker, which must then recover without losing the saved vectors.
+    std::fs::remove_file(&directory).unwrap();
+    slot.wake();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while observer.next() != "settled" {
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(
+        first, "lease_error",
+        "a permanent storage failure was presented as a live sibling"
+    );
+    assert!(
+        !retry_armed,
+        "a permanent coordination failure armed a retry timer"
+    );
+    assert!(!pending_was_contention);
+    assert!(attempts > 0);
+    assert_eq!(
+        before_repair, baseline,
+        "failed coordination dispatched paid work"
+    );
+    assert!(!answer.complete());
+    assert!(answer.unavailable.is_none());
+    assert!(answer.results.iter().any(|row| row.name == "saved_vector"));
+    assert_eq!(status["semantic_index"]["status"], "ready");
+    assert_eq!(
+        status["semantic_index"]["coordination_error"]["retryable"],
+        false
+    );
+    assert!(
+        status["semantic_index"]["coordination_error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("lease")),
+        "{status}"
+    );
+    assert!(query(&runtime, "pending").complete());
+    assert_eq!(model.texts(), baseline + 1);
+}
+
+#[test]
+fn semantic_batch_lease_busy_base_retries_and_adopts_owner_successor() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let runtime = Arc::new(open(storage.path(), "base-waiter", root.path()));
+    let original = runtime.installed();
+    let base_scope = original.generation().base_header().unwrap().scope.clone();
+    assert!(pending_semantic(&runtime) > 0);
+    let super::super::base_builder::ClaimOutcome::Claimed(held) =
+        super::super::base_builder::claim_base(storage.path(), "family", &base_scope, None)
+            .unwrap()
+    else {
+        panic!("base claim unavailable");
+    };
+    let owner = open(storage.path(), "base-owner", root.path());
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    assert!(slot.install(epoch, Arc::clone(&runtime)));
+    let bind_checks = Arc::new(AtomicUsize::new(0));
+    let checks = Arc::clone(&bind_checks);
+    *lock(&runtime.before_bind_verify) = Some(Box::new(move |_| {
+        checks.fetch_add(1, Ordering::SeqCst);
+    }));
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let schedule = fast_schedule(root.path());
+        std::thread::spawn(move || {
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |_| {
+                panic!("waiter embedded the owner's inherited files")
+            })
+        })
+    };
+    let first = observer.next();
+    let retry_armed = lock(&slot.retry).is_some();
+    bind_checks.store(0, Ordering::SeqCst);
+    let snapshot = owner.installed();
+    let pending = owner.plane.inherited_pending(&snapshot);
+    let mut delta = LiveDelta::from_snapshot(&snapshot);
+    for (path, content) in &pending {
+        delta.set_readiness(
+            path.clone(),
+            super::super::snapshot::PlanePatch {
+                content: *content,
+                planes: super::super::manifest_v2::EntryPlanes {
+                    semantic: Some(super::super::readiness::PlaneState::pending(
+                        "awaiting the base owner",
+                    )),
+                    ..Default::default()
+                },
+            },
+        );
+    }
+    let draft = delta.snapshot();
+    let model = Model::default();
+    owner
+        .plane
+        .fill_admitted(
+            &owner.owner,
+            &draft,
+            FillBudget::default(),
+            &mut |texts| model.embed(texts),
+            &|| snapshot.clone(),
+            &mut |_| Ok(()),
+            true,
+        )
+        .unwrap();
+    let keys = owner
+        .plane
+        .completed_keys(&owner.owner, &draft, &pending)
+        .unwrap();
+    // Publish while retaining the base claim. The waiter must rebind to the
+    // successor, not wait for claim release or a checkout-local notification.
+    super::super::base_builder::publish_successor(
+        &held,
+        |manifest| {
+            for (path, content, key) in &keys {
+                if let Some(super::super::manifest_v2::EntryV2::Regular {
+                    content: stored,
+                    planes,
+                    ..
+                }) = manifest.get_mut(path)
+                {
+                    if stored == content {
+                        planes.semantic = Some(super::super::readiness::PlaneState::ready(key));
+                    }
+                }
+            }
+        },
+        None,
+    )
+    .unwrap();
+    if retry_armed {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while observer.next() != "settled" {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    let remaining = pending_semantic(&runtime);
+    let rebound = bind_checks.load(Ordering::SeqCst);
+    held.release().unwrap();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(
+        first, "base_pending",
+        "busy inherited work settled without a retry"
+    );
+    assert!(retry_armed);
+    assert!(!keys.is_empty());
+    assert!(
+        rebound > 0,
+        "timer retry never rebound to the owner's publication"
+    );
+    assert_eq!(remaining, 0);
+    assert!(query(&runtime, "alpha").complete());
+}
+
+#[test]
+fn semantic_batch_lease_transient_errors_back_off_then_park_visibly() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[("file.rs", "pub fn uncertain_vector() {}\n")],
+    );
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let lease_path = super::super::semantic_batch_lease::path(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    );
+    let model = Arc::new(Model::default());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let model = Arc::clone(&model);
+        let schedule = fast_schedule(root.path());
+        std::thread::spawn(move || {
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts| {
+                let vectors = model.embed(texts);
+                std::fs::remove_file(&lease_path).unwrap();
+                vectors
+            })
+        })
+    };
+    // Repeated ownership loss is uncertain paid work, not ordinary contention.
+    // Four bounded retries are allowed; the fifth error must park visibly.
+    for _ in 0..5 {
+        assert_eq!(observer.next(), "lease_error");
+    }
+    let retry_armed = lock(&slot.retry).is_some();
+    let state = runtime.coordination_state();
+    slot.clear();
+    worker.join().unwrap();
+    assert!(!retry_armed);
+    assert!(matches!(
+        state,
+        Some(CoordinationState::Error {
+            failure: LeaseError {
+                kind: super::super::semantic::LeaseErrorKind::OwnershipLost,
+                retryable: true,
+                ..
+            },
+            retry_in: None
+        })
+    ));
+    assert_eq!(model.texts(), 5);
+    assert!(!query(&runtime, "uncertain").complete());
+}
+
 /// Row usage of the family's v3 semantic plane store, read through its own
 /// read-only connection.
 struct SemanticRows {
@@ -723,7 +1131,11 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
         })
     };
     let hang_guard = Duration::from_secs(20);
-    let parked = observer.rx.recv_timeout(hang_guard).ok();
+    let parked = observer
+        .rx
+        .recv_timeout(hang_guard)
+        .map(|event| event.state)
+        .ok();
     if parked != Some("parked") {
         slot.clear();
         worker.join().unwrap();
@@ -735,7 +1147,7 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
     slot.wake();
     let deadline = Instant::now() + hang_guard;
     let finished = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("wake") => continue,
             event => break event.ok(),
         }
@@ -804,7 +1216,11 @@ fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
             (result, attempts)
         })
     };
-    let parked = observer.rx.recv_timeout(Duration::from_secs(20)).ok();
+    let parked = observer
+        .rx
+        .recv_timeout(Duration::from_secs(20))
+        .map(|event| event.state)
+        .ok();
     if parked != Some("parked") {
         slot.clear();
         let (result, _) = worker.join().unwrap();
@@ -2454,6 +2870,221 @@ fn semantic_fill_releases_cold_slot_during_model_call_and_readmits_before_store(
     assert!(query(&runtime, "delayed vector").complete());
 }
 
+#[test]
+fn semantic_batch_lease_durable_chunks_reused_during_cold_readmission() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let sibling_root = tempfile::tempdir().unwrap();
+    for root in [root.path(), sibling_root.path()] {
+        write_tree(root, &[("file.rs", "pub fn readmission_chunk() {}\n")]);
+    }
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Model::default().embed(texts)
+                },
+            )
+        })
+    };
+    entered_rx.recv().unwrap();
+    // While embedding is blocked, publication must still acquire the root
+    // lease and SQLite registry transaction and complete independently.
+    crate::blob_store::v3::publish(storage.path(), "family", 0, None, |_| Ok(())).unwrap();
+    let non_semantic = limiter.try_acquire().expect("HTTP released cold admission");
+    release_tx.send(()).unwrap();
+    assert!(
+        wait_for_fill_queue(&limiter),
+        "owner must readmit after saving chunks"
+    );
+    assert_eq!(
+        SemanticRows::of(&runtime).usage().unwrap().rows,
+        1,
+        "only the protected chunk, not its file run, is durable yet"
+    );
+    // Disable resident shortcuts so reuse must read the saved chunk row.
+    runtime.plane().arena("family").set_chunk_shortcut(false);
+    let sibling = CheckoutSemantic::new(
+        &crate::root_cache::StoragePaths::same(storage.path()),
+        "family",
+        "readmission-sibling",
+        sibling_root.path(),
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
+    sibling.load().unwrap();
+    let report = sibling
+        .refresh(FillBudget::default(), &mut |_| {
+            panic!("durable chunk was re-embedded during cold readmission")
+        })
+        .unwrap();
+    assert_eq!(report.model_calls, 0);
+    assert!(query(&sibling, "readmission").complete());
+    runtime.plane().arena("family").set_chunk_shortcut(true);
+    drop(non_semantic);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    assert!(query(&runtime, "readmission").complete());
+}
+
+#[test]
+fn semantic_batch_lease_pending_releases_refresh_claims_and_capacity() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn held_chunk() {}\n")]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let preparation = crate::cold_build_limiter::isolated_limiter(1);
+    let inflight = crate::cold_build_limiter::isolated_limiter(1);
+    let lease = super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    )
+    .unwrap()
+    .unwrap();
+    let outcome = catch_up_with_limiters(
+        &Arc::downgrade(&slot),
+        epoch,
+        &runtime,
+        &schedule,
+        FillBudget::default(),
+        &mut |_| panic!("contender dispatched"),
+        &preparation,
+        &inflight,
+    );
+    assert!(matches!(outcome, FillOutcome::Contended));
+    assert!(runtime.refresh.try_lock().is_ok());
+    assert!(runtime.plane().arena("family").pause_resources_are_free());
+    assert!(schedule.limiter.try_acquire().is_some());
+    assert!(preparation.try_acquire().is_some());
+    assert!(inflight.try_acquire().is_some());
+    assert_eq!(query(&runtime, "held").pending.len(), 1);
+    drop(lease);
+    assert!(matches!(
+        catch_up_with_limiters(
+            &Arc::downgrade(&slot),
+            epoch,
+            &runtime,
+            &schedule,
+            FillBudget::default(),
+            &mut |texts| Model::default().embed(texts),
+            &preparation,
+            &inflight
+        ),
+        FillOutcome::Settled
+    ));
+}
+
+#[test]
+fn semantic_batch_lease_preparation_upgrade_releases_claims_before_cold_wait() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn admission_chunk() {}\n")]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let held = limiter.try_acquire().unwrap();
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| Model::default().embed(texts),
+            )
+        })
+    };
+    assert!(wait_for_fill_queue(&limiter));
+    assert!(
+        runtime.plane().arena("family").pause_resources_are_free(),
+        "file claims and batch gate must be released before cold admission waits"
+    );
+    let lease = super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity(),
+    )
+    .unwrap()
+    .unwrap();
+    drop(lease);
+    drop(held);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+}
+
+#[test]
+fn semantic_batch_lease_supersession_retains_inflight_exclusion_and_chunks() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[("file.rs", "pub fn superseded_chunk() {}\n")],
+    );
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Model::default().embed(texts)
+                },
+            )
+        })
+    };
+    entered_rx.recv().unwrap();
+    slot.clear();
+    assert!(super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity()
+    )
+    .unwrap()
+    .is_none());
+    release_tx.send(()).unwrap();
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Stop));
+    assert_eq!(
+        SemanticRows::of(&runtime).usage().unwrap().rows,
+        1,
+        "valid chunk survives, obsolete file run does not"
+    );
+    assert!(super::super::semantic_batch_lease::try_acquire(
+        storage.path(),
+        "family",
+        &producer().chunk_identity()
+    )
+    .unwrap()
+    .is_some());
+}
+
 fn build_independent_callgraph(root: &Path, storage: &Path) {
     let graph = super::super::callgraph::CallgraphView::new(
         root.to_path_buf(),
@@ -2596,6 +3227,8 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
     let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let models: Vec<_> = (0..2).map(|_| Arc::new(Model::default())).collect();
+    let requests: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
     let mut lanes = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         for file in 0..33 {
@@ -2628,6 +3261,8 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         let entered = entered_tx.clone();
         let release = release_rx.clone();
         let done = done_tx.clone();
+        let model = Arc::clone(&models[i]);
+        let requests = Arc::clone(&requests[i]);
         workers.push(std::thread::spawn(move || {
             let outcome = catch_up_with_limiters(
                 &weak,
@@ -2636,11 +3271,12 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
                 &schedule,
                 FillBudget::default(),
                 &mut |texts| {
+                    requests.fetch_add(1, Ordering::SeqCst);
                     entered.send(i).unwrap();
                     if i == 0 {
                         release.recv().unwrap();
                     }
-                    Model::default().embed(texts)
+                    model.embed(texts)
                 },
                 &preparation,
                 &inflight,
@@ -2662,9 +3298,35 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         std::thread::sleep(Duration::from_millis(5));
     };
     let both_waiting = done_rx.is_empty();
+    let diagnostics = || {
+        eprintln!("cold slots: {:#?}", cold.census());
+        eprintln!("cold admissions: {:#?}", cold.admission_events());
+        for (i, (slot, _, _, runtime)) in lanes.iter().enumerate() {
+            eprintln!(
+                "lane {i}: state={} refresh_attempts={} backend_requests={} backend_completed={} backend_texts={} progress={:#?}",
+                slot.describe(),
+                runtime.refresh_attempts(),
+                requests[i].load(Ordering::SeqCst),
+                models[i].calls(),
+                models[i].texts(),
+                crate::cold_build_limiter::progress::snapshot_for_root(roots[i].path(), 0),
+            );
+        }
+    };
+    if !yielded || !both_waiting {
+        diagnostics();
+    }
     release_tx.send(()).unwrap();
     let first_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if first_done.is_err() {
+        eprintln!("first fill completion: {first_done:?}");
+        diagnostics();
+    }
     let second_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if second_done.is_err() {
+        eprintln!("second fill completion: {second_done:?}");
+        diagnostics();
+    }
     if first_done.is_err() || second_done.is_err() {
         for (slot, _, _, _) in &lanes {
             slot.clear();
@@ -3289,7 +3951,11 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     // event waits have only a hang guard; no edit, wake or rebind drives recovery.
     let hang_guard = Duration::from_secs(60);
     // A second refused connection proves a timer fires without any wake.
-    let retried = observer.rx.recv_timeout(hang_guard).ok();
+    let retried = observer
+        .rx
+        .recv_timeout(hang_guard)
+        .map(|event| event.state)
+        .ok();
     if retried != Some("unavailable") {
         slot.clear();
         worker.join().unwrap();
@@ -3302,7 +3968,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     backend.start(200);
     let deadline = Instant::now() + hang_guard;
     let recovered = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("unavailable") => continue,
             event => break event.ok(),
         }
@@ -3531,7 +4197,7 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
     // and finish the fill; a fill that never settles still fails here.
     let deadline = Instant::now() + Duration::from_secs(30);
     let settled = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("retry") => continue,
             event => break event.ok(),
         }
@@ -4315,4 +4981,24 @@ fn no_subscription_refresh_installs_and_answers_complete() {
         cold(root.path(), "gamma rewritten").0
     );
     assert_eq!(pending_semantic(&runtime), 0);
+}
+
+#[test]
+fn fill_observer_waits_through_retry_until_settled() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    observe_fill(root.path(), "settled");
+    observer.wait_until_settled(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn fill_observer_retry_without_settlement_fails_with_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    let error = observer
+        .wait_until_settled(Duration::from_millis(20))
+        .unwrap_err();
+    assert!(error.contains("temporary backend failure"), "{error}");
 }

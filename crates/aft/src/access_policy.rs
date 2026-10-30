@@ -758,7 +758,7 @@ impl AccessPolicy {
         let mut read_allow = roots.clone();
         let mut managed_paths = Vec::new();
         if config.github.shim {
-            managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
+            managed_paths.push(crate::pinned_executable::shims_dir(&storage));
             if let Ok(binary) = crate::agent_child_env::shim_binary(config) {
                 managed_paths.push(binary);
             }

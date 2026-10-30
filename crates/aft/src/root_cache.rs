@@ -1617,45 +1617,9 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
         return override_value;
     }
 
-    // `proc_pidinfo(PROC_PIDTBSDINFO)` answers only for the caller's own uid;
-    // for another user's process it returns zero bytes with no errno, which
-    // read as "no start-time source" and left a recycled low PID (a system
-    // daemon after reboot) counted as the live owner of an old log. The
-    // kern.proc.pid sysctl is what `ps` uses and answers for every pid. The
-    // reply is a kinfo_proc whose first member is extern_proc's p_un union,
-    // where p_starttime (a timeval) sits at offset 0; the libc crate does not
-    // declare the struct, so the two fields are read from the raw buffer.
-    let mut mib = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        pid as libc::c_int,
-    ];
-    let mut buffer = [0_u8; 1024];
-    let mut size = buffer.len();
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            buffer.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size < 16 {
-        return None;
-    }
-    let tv_sec = i64::from_ne_bytes(buffer[0..8].try_into().ok()?);
-    let tv_usec = i32::from_ne_bytes(buffer[8..12].try_into().ok()?);
-    if tv_sec <= 0 {
-        return None;
-    }
-    Some(
-        (tv_sec as u64)
-            .saturating_mul(1_000)
-            .saturating_add(tv_usec.max(0) as u64 / 1_000),
-    )
+    crate::fs_lock::macos_kinfo(pid)?
+        .started_at_us
+        .map(|start| start / 1_000)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

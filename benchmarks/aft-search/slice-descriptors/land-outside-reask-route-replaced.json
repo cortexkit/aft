@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "outside-reask-route-replaced"
+  ],
+  "note": "Outside-access permission retry: typed route-replaced reason, one fresh re-ask in the plugins, and a refusal log line. No search or ranking code changes."
+}

@@ -93,8 +93,14 @@ impl SubcRelayTransport {
             session.to_string(),
         );
         let selector = scope_selector(scope);
-        let key = route_lease_key(&consumer, &target, &identity, Some(&selector))
-            .map_err(|_| unavailable("snapshot_invalid"))?;
+        let key =
+            route_lease_key(&consumer, &target, &identity, Some(&selector)).map_err(|_| {
+                crate::gh_shim_speech::snapshot_invalid(
+                    "gh_shim_relay::reserve_scoped",
+                    "route_lease_key_encoding",
+                    json!({"session_id": session, "scope_epoch": scope.scope_epoch}),
+                )
+            })?;
         let operation = RELAY_OPERATIONS
             .clone()
             .try_acquire_owned()

@@ -139,6 +139,16 @@ describe("taskKillDeadlineText", () => {
     );
   });
 
+  test("remote progress keeps its approved punctuation in wait reminders", () => {
+    for (const note of [
+      "The remote job is uploading its files (14s so far).",
+      "The remote job is waiting for a free build host (2m 10s so far): room available.",
+      "The remote job is connecting to its build host (3s so far).",
+    ]) {
+      expect(taskKillDeadlineText({ ...running(), remote_phase_note: note }, "worker")).toBe(note);
+    }
+  });
+
   test("matches the Rust renderer's shared deadline wording fixture", () => {
     const fixture = JSON.parse(
       fs.readFileSync(

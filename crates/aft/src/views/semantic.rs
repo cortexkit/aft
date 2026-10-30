@@ -47,8 +47,23 @@ use super::readiness::{
 };
 use super::registry::ViewRegistration;
 use super::segment_store::rel_path_to_os;
+pub use super::semantic_batch_lease::{LeaseError, LeaseErrorKind};
 use super::snapshot::{ComposedGeneration, DiskState, LiveEntry, Snapshot, Source, WatcherState};
 use super::RelPath;
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_CHECKPOINT: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn batch_checkpoint(phase: &str) {
+    BATCH_CHECKPOINT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(phase);
+        }
+    });
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -184,7 +199,7 @@ impl SemanticProducer {
 
     /// Chunk vectors have their own hash domain, never a per-file blob key.
     /// Include the caps explicitly even for manually constructed producers.
-    fn chunk_identity(&self) -> String {
+    pub(crate) fn chunk_identity(&self) -> String {
         format!(
             "{};caps={}/{}/{}/{}",
             self.id(),
@@ -609,6 +624,43 @@ pub(crate) enum FillAdmission {
     Cold,
     SuspendCold,
     ResumeCold,
+    /// Check cancellation without acquiring capacity, including under the
+    /// semantic batch lease.
+    CheckCurrent,
+}
+
+/// Scheduling outcomes, never deterministic failures of a file or backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FillPending {
+    Contended,
+    LocalContention,
+    AdmissionChanged,
+    BaseBusy { owner_pid: u32, attempt: i64 },
+    LeaseError(LeaseError),
+}
+
+struct FillClaim {
+    key: FamilyKey,
+    holder: Arc<Mutex<Option<super::semantic_arena::ArenaClaim>>>,
+}
+
+impl FillClaim {
+    fn new(claim: super::semantic_arena::ArenaClaim) -> Self {
+        Self {
+            key: *claim.key(),
+            holder: Arc::new(Mutex::new(Some(claim))),
+        }
+    }
+
+    fn key(&self) -> &FamilyKey {
+        &self.key
+    }
+}
+
+impl Drop for FillClaim {
+    fn drop(&mut self) {
+        lock(&self.holder).take();
+    }
 }
 
 impl Default for FillBudget {
@@ -660,7 +712,53 @@ pub struct FillReport {
     /// Store errors other than busy: the store refused what was embedded.
     /// Their items stay pending, but retrying on a timer would not help.
     pub store_errors: Vec<String>,
+    /// Return out of refresh before parking: no claims, gate or permit may wait.
+    pub pending: Option<FillPending>,
+    chunked_files: BTreeMap<FamilyKey, usize>,
     pub timing: FillTiming,
+}
+
+impl FillReport {
+    fn merge_attempt(&mut self, report: Self) {
+        self.queued = self.queued.max(report.queued);
+        self.deferred = report.deferred;
+        self.pending = report.pending;
+        self.chunked_files.extend(report.chunked_files);
+        self.chunks = self.chunked_files.values().sum();
+        macro_rules! add { ($($field:ident),* $(,)?) => { $(self.$field += report.$field;)* }; }
+        add!(
+            moved,
+            resident_hits,
+            stored_hits,
+            shared_waits,
+            embedded_keys,
+            embedded_texts,
+            model_calls,
+            chunk_reused,
+            chunk_resident_hits,
+            source_reads,
+            source_bytes,
+            installed,
+            dropped,
+            failed
+        );
+        self.errors.extend(report.errors);
+        self.store_errors.extend(report.store_errors);
+        macro_rules! time { ($($field:ident),* $(,)?) => { $(self.timing.$field += report.timing.$field;)* }; }
+        time!(
+            mutex_wait,
+            reconcile,
+            queue_setup,
+            read_hash,
+            file_lookup,
+            chunk,
+            chunk_wait,
+            vector_lookup,
+            store_write,
+            shared_wait,
+            fold
+        );
+    }
 }
 
 /// Wall-clock phases of a fill. `file_lookup`, `store_write` and `fold` include
@@ -1383,15 +1481,50 @@ impl SemanticPlane {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
-        self.fill_admitted(
-            owner,
-            snapshot,
-            budget,
-            embed,
-            current,
-            &mut |_| Ok(()),
-            false,
-        )
+        let deadline = Instant::now() + budget.shared_wait;
+        let mut total = FillReport::default();
+        let mut backoff = Duration::from_millis(10);
+        loop {
+            let report = self.fill_admitted(
+                owner,
+                snapshot,
+                budget,
+                embed,
+                current,
+                &mut |_| Ok(()),
+                false,
+            )?;
+            // Another caller can own the filesystem lease before taking the local
+            // gate. Synchronous callers must retry either contention outcome.
+            let contended = matches!(
+                report.pending.as_ref(),
+                Some(FillPending::LocalContention | FillPending::Contended)
+            );
+            total.merge_attempt(report);
+            if !contended || Instant::now() >= deadline {
+                if total.pending.is_none()
+                    && total.errors.is_empty()
+                    && total.store_errors.is_empty()
+                {
+                    // Retried preparation can revisit the same positions. Count
+                    // each file's chunks once, and distinguish new provider
+                    // inputs from positions satisfied without a new input.
+                    total.chunk_reused = total.chunks.saturating_sub(total.embedded_texts);
+                }
+                return Ok(total);
+            }
+            // Synchronous callers have no outer worker. Each attempt already
+            // dropped its claims and guards; preserve the legacy bounded wait
+            // here, never inside the admitted fill used by background workers.
+            let half = backoff / 2;
+            let salt = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            let wait = half + Duration::from_nanos(salt % (half.as_nanos() as u64 + 1));
+            std::thread::park_timeout(wait.min(deadline.saturating_duration_since(Instant::now())));
+            backoff = (backoff * 2).min(Duration::from_millis(250));
+        }
     }
 
     pub(crate) fn fill_admitted<F>(
@@ -1631,8 +1764,11 @@ impl SemanticPlane {
                         );
                     }
                     report.chunks += file_chunks.len();
+                    report
+                        .chunked_files
+                        .insert(FamilyKey::from(&group.full_key), file_chunks.len());
                     chunks.push(file_chunks);
-                    to_embed.push((item, relative, group.full_key, claim));
+                    to_embed.push((item, relative, group.full_key, FillClaim::new(claim)));
                 }
                 Err(reason) => failures.push((item, group.full_key, reason)),
             }
@@ -1657,6 +1793,93 @@ impl SemanticPlane {
         let store_started = Instant::now();
         protect(&view, &keys, store.is_v3())?;
         report.timing.store_write += store_started.elapsed();
+        // Preparation may discover misses while owning file claims. Drop every
+        // claim before blocking for final cold admission, then reacquire and
+        // recheck file results. Cache-only fills never acquire a cold slot.
+        let identity = self.producer.chunk_identity();
+        let checked_at = store.deletion_epoch().ok().flatten();
+        let mut prepared_vectors = Vec::new();
+        let mut needs_cold = false;
+        for (position, chunk) in chunks.iter().flatten().enumerate() {
+            if legacy_reuse
+                .as_ref()
+                .and_then(|plan| plan.get(position))
+                .is_some_and(|(_, vector)| vector.is_some())
+            {
+                continue;
+            }
+            let key = self.producer.chunk_key(&chunk.embed_text);
+            if arena.chunk_vector(&key).is_none() {
+                match load_chunk(&store, &arena, &key, &identity, &chunk.embed_text)
+                    .map_err(|error| plane_error(error.to_string()))?
+                {
+                    Some(vector) => {
+                        prepared_vectors.push(arena.remember_chunk(key, vector, checked_at))
+                    }
+                    None => {
+                        needs_cold = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if needs_cold {
+            let unclaimed = to_embed
+                .into_iter()
+                .map(|(item, relative, full_key, claim)| {
+                    drop(claim);
+                    (item, relative, full_key)
+                })
+                .collect::<Vec<_>>();
+            before_embed(FillAdmission::Cold).map_err(plane_error)?;
+            to_embed = Vec::new();
+            let mut retained_chunks = Vec::new();
+            let mut retained_reuse = legacy_reuse.as_ref().map(|_| VecDeque::new());
+            for ((item, relative, full_key), file_chunks) in unclaimed.into_iter().zip(chunks) {
+                let reuse = legacy_reuse.as_mut().map(|plan| {
+                    (0..file_chunks.len())
+                        .map(|_| plan.pop_front().expect("prepared repair row"))
+                        .collect::<Vec<_>>()
+                });
+                let key = FamilyKey::from(&full_key);
+                let claim = arena.claim(key);
+                let run = match arena.get(&key) {
+                    Some(run) => Some(run),
+                    None => arena
+                        .load(
+                            &*store.reader(),
+                            &key,
+                            &relative,
+                            &payload_producer,
+                            &self.producer,
+                        )
+                        .map_err(plane_error)?,
+                };
+                if let Some(run) = run {
+                    report.stored_hits += 1;
+                    ready.push((item, key, run));
+                } else if let Some(claim) = claim {
+                    if let Some(plan) = retained_reuse.as_mut() {
+                        plan.extend(reuse.expect("repair plan"));
+                    }
+                    to_embed.push((item, relative, full_key, FillClaim::new(claim)));
+                    retained_chunks.push(file_chunks);
+                } else {
+                    waiting.push((item, relative, key));
+                }
+            }
+            chunks = retained_chunks;
+            legacy_reuse = retained_reuse;
+        }
+        let claim_slots = to_embed
+            .iter()
+            .map(|(_, _, _, claim)| Arc::clone(&claim.holder))
+            .collect::<Vec<_>>();
+        let release_claims = || {
+            for holder in &claim_slots {
+                lock(holder).take();
+            }
+        };
         let mut pending = to_embed.into_iter().zip(chunks).peekable();
         while pending.peek().is_some() {
             // Keep whole files together so every successful request can be
@@ -1689,14 +1912,50 @@ impl SemanticPlane {
             } else {
                 None
             };
+            let mut dispatched = false;
             let embedded = {
                 let mut rows = |batch_start: usize, batch: Vec<String>| {
+                    // The previous provider batch may have yielded cold admission.
+                    // Reenter with no claims or semantic exclusion, then recheck
+                    // file results before attempting the next semantic batch lease.
+                    if to_embed
+                        .iter()
+                        .any(|(_, _, _, claim)| lock(&claim.holder).is_none())
+                    {
+                        release_claims();
+                        before_embed(FillAdmission::ResumeCold)?;
+                        for (_, relative, _, claim) in &to_embed {
+                            let owned = arena.claim(*claim.key());
+                            let _completed = arena.load(
+                                &*store.reader(),
+                                claim.key(),
+                                relative,
+                                &payload_producer,
+                                &self.producer,
+                            )?;
+                            if owned.is_none() {
+                                report.pending = Some(FillPending::LocalContention);
+                                return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
+                            }
+                            *lock(&claim.holder) = owned;
+                        }
+                    }
+                    let mut dispatch = |texts| {
+                        // The semantic lease and chunk-batch gate cover provider
+                        // dispatch. Drop file claims before the later cold
+                        // readmission, which follows release of both guards.
+                        dispatched = true;
+                        release_claims();
+                        embed(texts)
+                    };
                     let Some(plan) = row_plan.as_ref() else {
                         return self.embed_chunks(
                             &arena,
                             &store,
+                            owner.family(),
+                            needs_cold,
                             batch,
-                            embed,
+                            &mut dispatch,
                             &mut report,
                             before_embed,
                             &mut canonical_chunks,
@@ -1734,8 +1993,10 @@ impl SemanticPlane {
                         self.embed_chunks(
                             &arena,
                             &store,
+                            owner.family(),
+                            needs_cold,
                             missing,
-                            embed,
+                            &mut dispatch,
                             &mut report,
                             before_embed,
                             &mut canonical_chunks,
@@ -1759,6 +2020,37 @@ impl SemanticPlane {
             };
             match embedded {
                 Ok(runs) => {
+                    // Chunks are durable; semantic lease and batch gate ended.
+                    // Reacquire cold CPU capacity
+                    // only after releasing every selected file claim. Another
+                    // process can reuse those chunks while this worker queues.
+                    if dispatched {
+                        release_claims();
+                        before_embed(FillAdmission::ResumeCold).map_err(plane_error)?;
+                        for (_, _relative, _, claim) in &to_embed {
+                            let owned = arena.claim(*claim.key());
+                            // Inspect existence now; the immutable write below
+                            // validates/adopts a stored winner via its conflict
+                            // path, including recovery if that winner disappears.
+                            let completed = arena.get(claim.key()).is_some()
+                                || store
+                                    .get(claim.key())
+                                    .map_err(|error| plane_error(error.to_string()))?
+                                    .is_some();
+                            if owned.is_none() && !completed {
+                                report.pending = Some(FillPending::LocalContention);
+                                return Ok(report);
+                            }
+                            *lock(&claim.holder) = owned;
+                        }
+                    }
+                    // Chunk persistence precedes this currency check: an obsolete
+                    // checkout must not abandon exclusion during synchronous I/O,
+                    // but its valid chunks can still serve the next checkout.
+                    if before_embed(FillAdmission::CheckCurrent).is_err() {
+                        report.deferred += to_embed.len() + pending.count();
+                        break;
+                    }
                     let store_started = Instant::now();
                     let payloads: Vec<_> = to_embed
                         .iter()
@@ -1872,6 +2164,12 @@ impl SemanticPlane {
                     }
                 }
                 Err(error) => {
+                    if report.pending.is_some() {
+                        report.deferred += to_embed.len() + pending.count() + waiting.len();
+                        // Returning drops every file claim before the runtime
+                        // releases refresh/admission and schedules the retry.
+                        return Ok(report);
+                    }
                     crate::semantic_index::retain_view_pause_chunks(
                         &root,
                         self.producer.caps,
@@ -1901,13 +2199,8 @@ impl SemanticPlane {
         }
 
         for (item, relative, key) in waiting {
-            // The claim owner may need cold admission after its backend returns.
-            // Do not keep that admission occupied while waiting for its run.
-            before_embed(FillAdmission::SuspendCold).map_err(plane_error)?;
-            let wait_started = Instant::now();
-            arena.wait_released(&key, budget.shared_wait);
-            report.timing.shared_wait += wait_started.elapsed();
-            before_embed(FillAdmission::ResumeCold).map_err(plane_error)?;
+            // Never park behind a live file owner under refresh or admission.
+            // Reuse an already completed run, otherwise retry outside refresh.
             let lookup_started = Instant::now();
             let run = match arena.get(&key) {
                 Some(run) => Some(run),
@@ -1924,6 +2217,9 @@ impl SemanticPlane {
             if let Some(run) = run {
                 report.shared_waits += 1;
                 ready.push((item, key, run));
+            } else {
+                report.pending = Some(FillPending::LocalContention);
+                report.deferred += 1;
             }
             report.timing.file_lookup += lookup_started.elapsed();
         }
@@ -1966,6 +2262,8 @@ impl SemanticPlane {
         &self,
         arena: &super::semantic_arena::SemanticArena,
         store: &SemanticStore,
+        family: &str,
+        cold_admitted: bool,
         texts: Vec<String>,
         embed: &mut F,
         report: &mut FillReport,
@@ -1976,10 +2274,44 @@ impl SemanticPlane {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         use crate::semantic_index::BuildEmbeddingRow;
-        // File claims alone do not serialize different versions of one file.
-        // Hold a family batch gate through lookup, model and persistence. No
-        // file-claim wait occurs under it, and it bounds retained work to one
-        // model batch without acquiring chunk claims in conflicting orders.
+        // Coalesce equal exact inputs within a batch, retaining output positions.
+        // This is independent of file/run identity and also handles overlapping
+        // chunks of different file versions.
+        let mut unique = Vec::new();
+        let mut indices = BTreeMap::new();
+        let positions = texts
+            .iter()
+            .map(|text| {
+                *indices.entry(text.clone()).or_insert_with(|| {
+                    unique.push(text.clone());
+                    unique.len() - 1
+                })
+            })
+            .collect::<Vec<_>>();
+        if unique.len() < texts.len() {
+            report.chunk_reused += texts.len() - unique.len();
+            let rows = self.embed_chunks(
+                arena,
+                store,
+                family,
+                cold_admitted,
+                unique,
+                embed,
+                report,
+                before_embed,
+                canonical_chunks,
+            )?;
+            return Ok(positions
+                .into_iter()
+                .map(|position| rows[position].clone())
+                .collect());
+        }
+        before_embed(FillAdmission::CheckCurrent)?;
+        // Order: semantic batch lease -> local batch gate -> root publication
+        // lease -> registry barrier. The local gate is only attempted, never
+        // waited on. Root and SQLite write resources are acquired only later,
+        // inside chunk persistence, never around provider I/O.
+        // Both semantic lease and gate end at this batch boundary.
         let key_started = Instant::now();
         let identity = self.producer.chunk_identity();
         let keys = texts
@@ -1987,21 +2319,12 @@ impl SemanticPlane {
             .map(|text| self.producer.chunk_key(text))
             .collect::<Vec<_>>();
         report.timing.vector_lookup += key_started.elapsed();
-        let mut admitted = false;
+        let mut lease = None;
         let (_gate, mut rows, misses, checked_at) = loop {
             let wait_started = Instant::now();
-            let gate = match arena.try_chunk_batch() {
-                Some(gate) => gate,
-                None => {
-                    // The gate owner may be returning from a model call and
-                    // need cold admission before it can persist and unlock.
-                    // Never hold a cold slot while waiting for that owner.
-                    before_embed(FillAdmission::SuspendCold)?;
-                    drop(arena.chunk_batch());
-                    report.timing.chunk_wait += wait_started.elapsed();
-                    before_embed(FillAdmission::ResumeCold)?;
-                    continue;
-                }
+            let Some(gate) = arena.try_chunk_batch() else {
+                report.pending = Some(FillPending::LocalContention);
+                return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
             };
             report.timing.chunk_wait += wait_started.elapsed();
             let lookup_started = Instant::now();
@@ -2035,24 +2358,55 @@ impl SemanticPlane {
                 }
             }
             report.timing.vector_lookup += lookup_started.elapsed();
-            if !misses.is_empty() && !admitted {
-                // Never wait for cold admission while holding the family gate:
-                // a slotted build may need that gate to finish and free a slot.
-                // Recheck after admission because a sibling may fill the misses.
+            if !misses.is_empty() && lease.is_none() {
                 drop(gate);
-                before_embed(FillAdmission::Cold)?;
-                admitted = true;
+                if !cold_admitted {
+                    // Collection may have removed a cached row since preflight.
+                    // Re-prepare outside the claims rather than acquire capacity.
+                    report.pending = Some(FillPending::AdmissionChanged);
+                    return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
+                }
+                match super::semantic_batch_lease::try_acquire(&self.storage, family, &identity) {
+                    Ok(Some(owner)) => lease = Some(owner),
+                    Ok(None) => {
+                        report.pending = Some(FillPending::Contended);
+                        return Err(super::semantic_batch_lease::PENDING_CONTROL.into());
+                    }
+                    Err(error) => {
+                        report.pending = Some(FillPending::LeaseError(error.clone()));
+                        return Err(error.to_string());
+                    }
+                }
+                // Persistent lookup must be repeated after lease acquisition,
+                // not merely before
+                // it: the preceding owner may just have saved the entire batch.
                 continue;
             }
             report.chunk_reused += texts.len() - misses.len();
             break (gate, rows, misses, checked_at);
         };
         if !misses.is_empty() {
+            before_embed(FillAdmission::CheckCurrent)?;
+            let owner = lease
+                .as_ref()
+                .expect("missing chunks require semantic ownership");
+            if let Err(error) = owner.verify() {
+                report.pending = Some(FillPending::LeaseError(error.clone()));
+                return Err(error.to_string());
+            }
             report.model_calls += 1;
             report.embedded_texts += misses.len();
+            #[cfg(test)]
+            batch_checkpoint("before_dispatch");
             // Validate backend rows and consume adaptive HTTP metadata before
             // caching: shortened or skipped input must not poison the original.
             let embedded = crate::semantic_index::execute_build_embedding_batch(misses, embed)?;
+            #[cfg(test)]
+            batch_checkpoint("validated_response");
+            if let Err(error) = owner.verify() {
+                report.pending = Some(FillPending::LeaseError(error.clone()));
+                return Err(error.to_string());
+            }
             let store_started = Instant::now();
             let mut payloads = Vec::new();
             let missing_texts = rows
@@ -2075,6 +2429,8 @@ impl SemanticPlane {
                 .put_batch(&payloads)
                 .map_err(|error| chunk_store_error(error, report))?
                 .into_iter();
+            #[cfg(test)]
+            batch_checkpoint("durable_chunks");
             report.timing.store_write += store_started.elapsed();
             let mut embedded = embedded.into_iter();
             for ((row, text), key) in rows.iter_mut().zip(&texts).zip(&keys) {
@@ -4270,6 +4626,174 @@ mod tests {
     }
 
     #[test]
+    fn semantic_batch_lease_coalesces_duplicate_inputs_and_rechecks_durable_rows() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
+        let store = SemanticStore::V2(checkout.owner.open_store(FamilyPlane::Semantic).unwrap());
+        let mut report = FillReport::default();
+        let rows = plane
+            .embed_chunks(
+                &plane.arena("family"),
+                &store,
+                "family",
+                true,
+                vec!["equal".into(), "different".into(), "equal".into()],
+                &mut |texts| {
+                    assert_eq!(texts, ["equal", "different"]);
+                    Ok(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+                },
+                &mut report,
+                &mut |_| Ok(()),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(report.embedded_texts, 2);
+        assert_eq!(report.chunk_reused, 1);
+        assert_eq!(report.model_calls, 1);
+        for (row, expected) in rows
+            .iter()
+            .zip([vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]])
+        {
+            let crate::semantic_index::BuildEmbeddingRow::Embedded { vector, .. } = row else {
+                panic!("missing vector")
+            };
+            assert_eq!(*vector, expected);
+        }
+        plane.arena("family").set_chunk_shortcut(false);
+        let retry = plane
+            .embed_chunks(
+                &plane.arena("family"),
+                &store,
+                "family",
+                true,
+                vec!["equal".into()],
+                &mut |_| panic!("durable row was dispatched twice"),
+                &mut FillReport::default(),
+                &mut |_| Ok(()),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+    }
+
+    fn checkpoint_batch(
+        storage: &Path,
+        embed: &mut impl FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    ) {
+        let root = storage.join("checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        let plane = new_plane(storage, "model-a");
+        let checkout = Checkout::open(storage, "checkpoint", &root, &plane);
+        let store = SemanticStore::V2(checkout.owner.open_store(FamilyPlane::Semantic).unwrap());
+        let rows = plane
+            .embed_chunks(
+                &plane.arena("family"),
+                &store,
+                "family",
+                true,
+                vec!["crash checkpoint input".into()],
+                embed,
+                &mut FillReport::default(),
+                &mut |_| Ok(()),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let crate::semantic_index::BuildEmbeddingRow::Embedded { vector, .. } = &rows[0] else {
+            panic!("missing vector")
+        };
+        assert_eq!(*vector, [0.25, 0.75]);
+    }
+
+    #[test]
+    fn semantic_batch_lease_provider_checkpoint_child() {
+        let Some(storage) = std::env::var_os("AFT_BATCH_CHECKPOINT_STORAGE") else {
+            return;
+        };
+        let storage = PathBuf::from(storage);
+        let phase = std::env::var("AFT_BATCH_CHECKPOINT_PHASE").unwrap();
+        let checkpoint_storage = storage.clone();
+        let checkpoint_phase = phase.clone();
+        BATCH_CHECKPOINT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |observed| {
+                if observed == checkpoint_phase {
+                    std::fs::write(checkpoint_storage.join("checkpoint-ready"), observed).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            }))
+        });
+        checkpoint_batch(&storage, &mut |texts| {
+            use std::io::Write;
+            let mut count = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(storage.join("provider-inputs"))
+                .unwrap();
+            for text in texts {
+                writeln!(count, "{text}").unwrap();
+            }
+            count.flush().unwrap();
+            if phase == "accepted" {
+                std::fs::write(storage.join("checkpoint-ready"), b"accepted").unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            Ok(vec![vec![0.25, 0.75]])
+        });
+    }
+
+    #[test]
+    fn semantic_batch_lease_provider_crash_checkpoints() {
+        for (phase, total_inputs) in [
+            ("before_dispatch", 1),
+            ("accepted", 2),
+            ("validated_response", 2),
+            ("durable_chunks", 1),
+        ] {
+            let storage = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "views::semantic::tests::semantic_batch_lease_provider_checkpoint_child",
+                    "--nocapture",
+                ])
+                .env("AFT_BATCH_CHECKPOINT_STORAGE", storage.path())
+                .env("AFT_BATCH_CHECKPOINT_PHASE", phase)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !storage.path().join("checkpoint-ready").exists() {
+                if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not reach {phase}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            checkpoint_batch(storage.path(), &mut |texts| {
+                use std::io::Write;
+                let mut count = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(storage.path().join("provider-inputs"))
+                    .unwrap();
+                for text in texts {
+                    writeln!(count, "{text}").unwrap();
+                }
+                Ok(vec![vec![0.25, 0.75]])
+            });
+            let inputs = std::fs::read_to_string(storage.path().join("provider-inputs")).unwrap();
+            assert_eq!(inputs.lines().count(), total_inputs, "phase={phase}: accepted but unsaved work is uncertain, durable work must be reused");
+        }
+    }
+
+    #[test]
     fn chunk_vector_stored_payload_is_compact_and_preserves_bits() {
         let storage = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -4286,6 +4810,8 @@ mod tests {
             .embed_chunks(
                 &plane.arena("family"),
                 &store,
+                "family",
+                true,
                 vec![text.into()],
                 &mut |_| Ok(vec![vector.clone()]),
                 &mut FillReport::default(),
@@ -4383,6 +4909,8 @@ mod tests {
             .embed_chunks(
                 &plane.arena("family"),
                 &store,
+                "family",
+                true,
                 vec![text.into()],
                 &mut |texts| Model::default().embed("model-a", texts),
                 &mut report,

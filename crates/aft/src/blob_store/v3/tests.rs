@@ -1923,3 +1923,33 @@ fn a_recheck_stopped_by_the_deadline_never_saves_a_total_below_usage() {
     );
     assert_eq!(measured, Measurement::Owed);
 }
+#[cfg(unix)]
+#[test]
+fn semantic_batch_lease_metadata_placement() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let family = family_dir(root.path(), A).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let before = inventory(&family);
+    assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
+    let lease = crate::views::semantic_batch_lease::try_acquire(root.path(), A, "producer")
+        .unwrap()
+        .unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert_eq!(inventory(&family), before);
+    assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
+    // Publication accepts the semantic batch lease directory without treating
+    // it as another blob-data directory or counting heartbeat bytes as payloads.
+    publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert_eq!(writer.accounting().unwrap().usage(), inventory(&family));
+    drop(lease);
+}

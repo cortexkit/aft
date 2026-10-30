@@ -16,6 +16,36 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 
 use crate::db::lifecycle::{SqliteStore, TrackedConnection};
 
+// Keep startup diagnostics in libtest output without changing production errors
+// or adding timing work to production opens. SQLite may bypass a busy handler,
+// so the failing statement and its elapsed time are needed to distinguish an
+// immediate BUSY from an exhausted busy timeout.
+#[cfg(test)]
+macro_rules! trace_first_open_step {
+    ($step:literal, $operation:expr) => {{
+        let started = std::time::Instant::now();
+        let result = $operation;
+        if let Err(error) = &result {
+            eprintln!(
+                "blob-store first-open thread={:?} step={} elapsed={:?} busy_timeout_ms={}: {:?}",
+                std::thread::current().id(),
+                $step,
+                started.elapsed(),
+                BUSY_TIMEOUT_MS,
+                error
+            );
+        }
+        result
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! trace_first_open_step {
+    ($step:literal, $operation:expr) => {
+        $operation
+    };
+}
+
 pub mod reclaim;
 pub mod v2;
 pub mod v3;
@@ -609,7 +639,10 @@ impl BlobStore {
         plane: BlobPlane,
         path: PathBuf,
     ) -> Result<Self, BlobStoreError> {
-        let mut connection = TrackedConnection::open(&path, SqliteStore::BlobStore)?;
+        let mut connection = trace_first_open_step!(
+            "TrackedConnection::open (before blob busy_timeout)",
+            TrackedConnection::open(&path, SqliteStore::BlobStore)
+        )?;
         configure_connection(&connection)?;
         ensure_schema(&mut connection)?;
         let pragmas = read_and_assert_pragmas(&connection)?;
@@ -901,24 +934,45 @@ fn validate_artifact_key(artifact_key: &str) -> Result<(), BlobStoreError> {
 fn configure_connection(connection: &TrackedConnection) -> Result<(), BlobStoreError> {
     // Set the wait policy before WAL attempts to acquire the journal lock so
     // concurrent first-open callers wait instead of failing immediately.
-    connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
-    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    trace_first_open_step!(
+        "busy_timeout",
+        connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
+    )?;
+    trace_first_open_step!(
+        "PRAGMA foreign_keys=OFF",
+        connection.pragma_update(None, "foreign_keys", "OFF")
+    )?;
     // Pointer maps must precede the first table. Existing NONE stores stay
     // readable without an upgrade-time full rewrite; rebuilt files opt in.
-    let pages: u64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let pages: u64 = trace_first_open_step!(
+        "PRAGMA page_count",
+        connection.pragma_query_value(None, "page_count", |row| row.get(0))
+    )?;
     if pages == 0 {
-        connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        trace_first_open_step!(
+            "PRAGMA auto_vacuum=INCREMENTAL",
+            connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        )?;
     }
     // Switching a rollback-journal file to WAL needs an exclusive lock, and
     // SQLite skips the busy handler on that upgrade when another connection
     // is mid-switch (it would risk a deadlock), so two first-openers racing on
     // a fresh file see SQLITE_BUSY straight away. Wait it out ourselves within
     // the same budget the busy handler would have used.
-    retry_while_busy(Duration::from_millis(BUSY_TIMEOUT_MS), || {
-        connection.pragma_update(None, "journal_mode", "WAL")
-    })?;
-    connection.pragma_update(None, "synchronous", "NORMAL")?;
-    connection.set_wal_autocheckpoint(DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
+    trace_first_open_step!(
+        "PRAGMA journal_mode=WAL (including BUSY retries)",
+        retry_while_busy(Duration::from_millis(BUSY_TIMEOUT_MS), || {
+            connection.pragma_update(None, "journal_mode", "WAL")
+        })
+    )?;
+    trace_first_open_step!(
+        "PRAGMA synchronous=NORMAL",
+        connection.pragma_update(None, "synchronous", "NORMAL")
+    )?;
+    trace_first_open_step!(
+        "set_wal_autocheckpoint",
+        connection.set_wal_autocheckpoint(DEFAULT_WAL_AUTOCHECKPOINT_PAGES)
+    )?;
     Ok(())
 }
 
@@ -949,23 +1003,33 @@ pub(crate) fn retry_while_busy<T>(
 }
 
 fn ensure_schema(connection: &mut Connection) -> Result<(), BlobStoreError> {
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute_batch(BLOB_SCHEMA)?;
-    let has_created_at = tx
-        .prepare("PRAGMA table_info(blob_payloads)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|column| column == "created_at_ms");
+    let tx = trace_first_open_step!(
+        "schema BEGIN IMMEDIATE",
+        connection.transaction_with_behavior(TransactionBehavior::Immediate)
+    )?;
+    trace_first_open_step!("schema CREATE/INSERT batch", tx.execute_batch(BLOB_SCHEMA))?;
+    let has_created_at = trace_first_open_step!(
+        "schema PRAGMA table_info(blob_payloads)",
+        (|| -> rusqlite::Result<Vec<String>> {
+            tx.prepare("PRAGMA table_info(blob_payloads)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect()
+        })()
+    )?
+    .iter()
+    .any(|column| column == "created_at_ms");
     if !has_created_at {
         // Existing immutable rows predate per-row timestamps and are eligible for
         // the normal age-floor policy immediately after this migration.
-        tx.execute(
-            "ALTER TABLE blob_payloads ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0",
-            [],
+        trace_first_open_step!(
+            "schema ALTER TABLE created_at_ms",
+            tx.execute(
+                "ALTER TABLE blob_payloads ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
         )?;
     }
-    tx.commit()?;
+    trace_first_open_step!("schema COMMIT", tx.commit())?;
     Ok(())
 }
 
@@ -980,10 +1044,22 @@ fn read_and_assert_pragmas(
     connection: &TrackedConnection,
 ) -> Result<BlobStorePragmas, BlobStoreError> {
     let pragmas = BlobStorePragmas {
-        journal_mode: connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?,
-        synchronous: connection.pragma_query_value(None, "synchronous", |row| row.get(0))?,
-        busy_timeout_ms: connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?,
-        foreign_keys: connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?,
+        journal_mode: trace_first_open_step!(
+            "read PRAGMA journal_mode",
+            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))
+        )?,
+        synchronous: trace_first_open_step!(
+            "read PRAGMA synchronous",
+            connection.pragma_query_value(None, "synchronous", |row| row.get(0))
+        )?,
+        busy_timeout_ms: trace_first_open_step!(
+            "read PRAGMA busy_timeout",
+            connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        )?,
+        foreign_keys: trace_first_open_step!(
+            "read PRAGMA foreign_keys",
+            connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        )?,
         // TrackedConnection owns SQLite's default threshold while replacing
         // the built-in hook with an accounting-equivalent PASSIVE checkpoint.
         wal_autocheckpoint_pages: connection.wal_autocheckpoint_pages(),
@@ -1189,20 +1265,28 @@ mod tests {
         assert_eq!(removed, 0);
     }
 
-    /// Eight racing first-openers on a fresh file trip the WAL-switch BUSY that
-    /// the busy handler does not cover. Without the retry this sees 1-3
-    /// failures per 60 rounds on an idle laptop; 150 rounds make the red
-    /// reliable while keeping the test under two seconds.
+    /// Race eight first-openers on fresh files. Failed startup statements print
+    /// their own timing so a failure can distinguish a skipped busy handler from
+    /// a timeout, rather than assuming every BUSY comes from the WAL switch.
     #[test]
     fn concurrent_first_opens_never_see_busy() {
         let mut failures = Vec::new();
         for round in 0..150 {
             let dir = tempfile::tempdir().expect("tempdir");
             let handles: Vec<_> = (0..8)
-                .map(|_| {
+                .map(|opener| {
                     let storage = dir.path().to_path_buf();
                     std::thread::spawn(move || {
-                        BlobStore::open(&storage, "fam", BlobPlane::Semantic).map(|_| ())
+                        let started = std::time::Instant::now();
+                        BlobStore::open(&storage, "fam", BlobPlane::Semantic)
+                            .map(|_| ())
+                            .map_err(|error| {
+                                format!(
+                                    "opener {opener}, thread={:?}, total elapsed={:?}: {error}",
+                                    std::thread::current().id(),
+                                    started.elapsed()
+                                )
+                            })
                     })
                 })
                 .collect();
@@ -1214,7 +1298,7 @@ mod tests {
         }
         assert!(
             failures.is_empty(),
-            "concurrent first-open must wait out the WAL switch: {failures:?}"
+            "concurrent first-open must wait out SQLite contention: {failures:?}"
         );
     }
 
