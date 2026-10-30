@@ -2788,8 +2788,12 @@ fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
     );
 }
 
+/// Waits for a fill to queue on the cold-build limiter. Every caller expects
+/// it to queue, so the bound only matters on failure; it returns as soon as
+/// the fill is queued. Saving chunks before readmission took over 3 s on a
+/// loaded Windows runner, so the bound is generous.
 fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if !limiter.census().queued.is_empty() {
             return true;
