@@ -14,5 +14,5 @@
   "holder_behavior": "replied with the response file bytes",
   "exit_code": 86,
   "stdout": "",
-  "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write: issue_edit_not_own\n"
+  "stderr": "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: issue_edit_not_own. The issue was not opened by this bot. GitHub received only reads; nothing was written. The agent must change the request.\n"
 }

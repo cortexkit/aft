@@ -6545,40 +6545,44 @@ impl AppContext {
         let previous = self.gitignore_inputs.lock().clone();
         let old_matcher = self.gitignore();
         let (tx, rx) = crossbeam_channel::bounded(1);
-        std::thread::spawn(move || {
-            let root = std::fs::canonicalize(&root).unwrap_or(root);
-            #[cfg(test)]
-            {
-                let mut slot = IGNORE_RESCAN_GATE.get_or_init(Default::default).lock();
-                let gate = if slot.as_ref().is_some_and(|gate| gate.root == root) {
-                    slot.take()
-                } else {
-                    None
-                };
-                drop(slot);
-                if let Some(gate) = gate {
-                    let _ = gate.reached.send(());
-                    let _ = gate.release.recv_timeout(Duration::from_secs(5));
+        std::thread::Builder::new()
+            .name("aft-ignore-snapshot".into())
+            .spawn(move || {
+                let root = std::fs::canonicalize(&root).unwrap_or(root);
+                #[cfg(test)]
+                {
+                    let mut slot = IGNORE_RESCAN_GATE.get_or_init(Default::default).lock();
+                    let gate = if slot.as_ref().is_some_and(|gate| gate.root == root) {
+                        slot.take()
+                    } else {
+                        None
+                    };
+                    drop(slot);
+                    if let Some(gate) = gate {
+                        let _ = gate.reached.send(());
+                        let _ = gate.release.recv_timeout(Duration::from_secs(5));
+                    }
                 }
-            }
-            let inputs = gitignore_state::IgnoreInputSnapshot::collect(root, common_dir.as_deref());
-            let (matcher, change) = if inputs.has_same_effective_inputs(previous.as_ref()) {
-                (old_matcher, IgnoreRuleChange::Unchanged)
-            } else {
-                let matcher = inputs.build_matcher();
-                let change = inputs.classify_against(
-                    previous.as_ref(),
-                    old_matcher.as_deref(),
-                    matcher.as_deref(),
-                );
-                (matcher, change)
-            };
-            let _ = tx.send(PreparedGitignoreRebuild {
-                inputs,
-                matcher,
-                change,
-            });
-        });
+                let inputs =
+                    gitignore_state::IgnoreInputSnapshot::collect(root, common_dir.as_deref());
+                let (matcher, change) = if inputs.has_same_effective_inputs(previous.as_ref()) {
+                    (old_matcher, IgnoreRuleChange::Unchanged)
+                } else {
+                    let matcher = inputs.build_matcher();
+                    let change = inputs.classify_against(
+                        previous.as_ref(),
+                        old_matcher.as_deref(),
+                        matcher.as_deref(),
+                    );
+                    (matcher, change)
+                };
+                let _ = tx.send(PreparedGitignoreRebuild {
+                    inputs,
+                    matcher,
+                    change,
+                });
+            })
+            .expect("spawn ignore snapshot worker");
         rx
     }
 
