@@ -10373,6 +10373,35 @@ mod tests {
         super::handle_configure(req, ctx)
     }
 
+    fn settle_configure_for_test(ctx: &AppContext) {
+        // Configure returns before checking whether the folder can be indexed.
+        // Drain that check and the replayed configuration before reading an index view.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            super::drain_deferred_configure_maintenance(ctx);
+            if ctx.configure_tail_idle()
+                && !crate::folder_admission_runtime::pending(ctx)
+                && !crate::provisional_identity_retry::due(ctx)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "configure maintenance did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn handle_configure_and_settle_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let response = handle_configure_for_test(req, ctx);
+        if response.success {
+            settle_configure_for_test(ctx);
+        }
+        response
+    }
+
     fn bash_background_replay_fixture(
         count: usize,
         budget: Option<usize>,
@@ -14032,7 +14061,7 @@ mod tests {
             .unwrap()
             .iter()
             .all(|warning| warning["code"] != "cache_dir_unavailable"));
-        super::drain_deferred_configure_maintenance(&ctx);
+        settle_configure_for_test(&ctx);
         assert!(ctx.cache_unavailable_reason().is_none());
         assert!(ctx.cache_dir().ends_with("offline-volume/aft"));
         let _ = ctx.flush_search_index_on_graceful_shutdown();
@@ -14247,7 +14276,8 @@ mod tests {
             deltas.physical_total_for_test(),
         );
         let ctx = test_context();
-        let bound = handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx);
+        let bound =
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx);
         assert!(bound.success, "{:?}", bound.data);
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.search_index_rx().read().unwrap().is_none());
@@ -14301,8 +14331,11 @@ mod tests {
         drop(ctx);
         let restarted = test_context();
         assert!(
-            handle_configure_for_test(&configure_lexical_views(&root, &storage), &restarted)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_lexical_views(&root, &storage),
+                &restarted
+            )
+            .success
         );
         lexical_views_assert_public_parity(&restarted, &root);
         assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
@@ -14319,6 +14352,28 @@ mod tests {
     }
 
     #[test]
+    fn lexical_views_wait_for_folder_admission_after_acknowledgement() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let response = handle_configure_for_test(
+            &configure_lexical_views(&root, &temp.path().join("storage")),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response.data);
+        assert!(crate::folder_admission_runtime::pending(&ctx));
+        assert!(!ctx.heavy_root_work_allowed());
+        assert!(ctx.lexical_view_snapshot("bind").is_none());
+
+        settle_configure_for_test(&ctx);
+        assert!(!crate::folder_admission_runtime::pending(&ctx));
+        assert!(ctx.heavy_root_work_allowed());
+        assert!(matches!(ctx.lexical_view_snapshot("bind"), Some(Ok(_))));
+    }
+
+    #[test]
     fn lexical_views_public_empty_generation_and_live_only_addition_match_legacy() {
         // Holds the process environment lock for the whole test. These views
         // resolve their storage root and verify the Git conversion policy on
@@ -14331,8 +14386,16 @@ mod tests {
         let root = temp.path().join("project");
         let storage = temp.path().join("storage");
         std::fs::create_dir_all(&root).unwrap();
+        assert!(git_command(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         lexical_views_assert_public_parity(&ctx, &root);
         std::fs::write(
             root.join("new.ts"),
@@ -14357,7 +14420,10 @@ mod tests {
         init_git_fixture(&root);
         let storage = temp.path().join("storage");
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_with_storage(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_with_storage(&root, &storage), &ctx)
+                .success
+        );
         wait_for_search_index_ready(&ctx, Duration::from_secs(10));
         assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
         let floor = std::fs::read(storage.join("reader-floor.json")).ok();
@@ -14384,7 +14450,10 @@ mod tests {
             "export const OLDER_COMMIT_TOKEN = 7;\nneedle alpha\n",
         )
         .unwrap();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
         tx.send(stale).unwrap();
@@ -14417,7 +14486,7 @@ mod tests {
         std::fs::write(root.join("visible.ts"), "needle\n").unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14483,7 +14552,7 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14645,7 +14714,7 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14707,7 +14776,7 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14757,7 +14826,10 @@ mod tests {
         let storage = PathBuf::from(std::env::var_os("AFT_LEXICAL_KILL_STORAGE").unwrap());
         let root = PathBuf::from(root);
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         lexical_views_assert_public_parity(&ctx, &root);
         println!("LEXICAL_VIEW_PUBLISHED");
         use std::io::{Read, Write};
@@ -14818,7 +14890,10 @@ mod tests {
         )
         .unwrap();
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         lexical_views_assert_public_parity(&ctx, &root);
     }
 
@@ -14878,7 +14953,7 @@ mod tests {
         }
         let oracle = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_callgraph_views(&copy_root, storage.path(), false),
                 &oracle
             )
@@ -14954,8 +15029,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         callgraph_views_assert_parity(&ctx, &root);
 
@@ -14985,7 +15063,7 @@ mod tests {
         drop(ctx);
         let restarted = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_callgraph_views(&root, &storage, true),
                 &restarted
             )
@@ -15039,8 +15117,11 @@ mod tests {
         // A legacy store built for this very root must not answer either.
         let legacy = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, false), &legacy)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, false),
+                &legacy
+            )
+            .success
         );
         let legacy_store = {
             let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&legacy, 60_000);
@@ -15048,8 +15129,11 @@ mod tests {
         };
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         *ctx.callgraph_store().write().unwrap() = Some(legacy_store);
         let refused = Arc::new(Refused(Default::default()));
@@ -15112,8 +15196,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         let failed_file = root.join("a.ts");
         let load_error = format!(
@@ -15277,8 +15364,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         assert!(ctx.views_route_root());
         // The view load stage runs here; a routed root opens no v1 view.
@@ -15338,7 +15428,7 @@ mod tests {
         // Views off is not a routed root.
         let off = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_callgraph_views(&root, &temp.path().join("off-storage"), false),
                 &off
             )
@@ -15366,8 +15456,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         let grep = || crate::commands::grep::handle_grep(&grep_request("target"), &ctx);
         let callers = || {
@@ -15429,8 +15522,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         super::drain_deferred_configure_maintenance(&ctx);
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -24487,7 +24583,7 @@ mod tests {
                 "views": {"enabled": true},
             }))],
         }));
-        let response = handle_configure_for_test(&req, &ctx);
+        let response = handle_configure_and_settle_for_test(&req, &ctx);
         assert!(response.success, "{response:?}");
         assert!(ctx.heavy_root_work_allowed());
         assert!(ctx.config().indexes.trigram);

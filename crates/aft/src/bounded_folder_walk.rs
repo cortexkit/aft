@@ -382,11 +382,15 @@ mod tests {
     fn folder_admission_bounded_walk_retains_prefix_and_names_a_stall() {
         let root = tempfile::tempdir().unwrap();
         let found = root.path().join("found.rs");
-        let slow = root.path().join("slow");
+        // Root entries are all examined before descending, regardless of readdir order.
+        let slow = root.path().join("child/slow");
         std::fs::write(&found, "needle\n").unwrap();
-        std::fs::create_dir(&slow).unwrap();
+        std::fs::create_dir_all(&slow).unwrap();
         let stall = crate::bounded_io::stall_running_helper(&slow);
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(2))
+            // Poll for an I/O stall before the 2 s walk deadline. The stalled child
+            // must use its own 100 ms cap, not this default 200 ms access budget.
+            .with_access_budget(Duration::from_millis(200))
             .with_path_access_budget(&slow, Duration::from_millis(100));
         let response = crate::bounded_io::with_budget(Some(budget), || {
             let walked = walk(
@@ -406,6 +410,19 @@ mod tests {
         });
         assert!(response.success, "{}", response.data);
         assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("read_blocked")
+                && response.data["text"].as_str().unwrap().contains("0.100 s")
+                && !response.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(crate::bounded_io::WALK_PARTIAL_GAP),
+            "{}",
+            response.data
+        );
         assert!(
             response.data["text"]
                 .as_str()

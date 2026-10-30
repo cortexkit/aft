@@ -1311,16 +1311,21 @@ fn run_with_timeout<T: Send + 'static>(
                 let mut at = state.deadline;
                 drop(state);
                 let activity = probe.activity.lock().unwrap_or_else(|e| e.into_inner());
+                let blocked_path = activity.path.clone().unwrap_or_else(|| path.to_path_buf());
                 let access_started = if activity.walking {
                     activity.progress.unwrap_or(started)
                 } else {
                     started
                 };
-                let stalled_at = access_started + access_budget;
+                let blocked_budget = if activity.walking {
+                    self::access_budget(&blocked_path)
+                } else {
+                    access_budget
+                };
+                let stalled_at = access_started + blocked_budget;
                 if activity.walking {
                     at = request_deadline.map_or(stalled_at, |deadline| deadline.min(stalled_at));
                 }
-                let blocked_path = activity.path.clone().unwrap_or_else(|| path.to_path_buf());
                 let walk_deadline = activity.walking
                     && request_deadline.is_some_and(|deadline| deadline <= stalled_at);
                 drop(activity);
