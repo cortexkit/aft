@@ -195,9 +195,28 @@ fn main() {
     // below included) could inherit them. Standalone mode has no nonce and
     // never touches the descriptor.
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
+    // Startup can stop before the logger exists. Opt-in test diagnostics go
+    // straight to stderr so the supervisor fixture can retain the last phase.
+    let trace_subc_startup = cfg!(debug_assertions)
+        && subc_connection_file.is_some()
+        && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some();
+    let startup_started = Instant::now();
+    let startup_phase = |phase: &str| {
+        if trace_subc_startup {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "[aft-startup] pid={} phase={phase} elapsed_ms={}",
+                std::process::id(),
+                startup_started.elapsed().as_millis()
+            );
+        }
+    };
     if subc_connection_file.is_some() {
+        startup_phase("nonce_capture_start");
         aft::launch_nonce::capture_at_startup();
+        startup_phase("nonce_capture_done");
         aft::pinned_executable::capture_at_startup();
+        startup_phase("executable_source_captured");
     }
 
     // Only the binary embeds the per-commit revision. Declare it before CLI
@@ -354,21 +373,27 @@ fn main() {
     // Keep the lease outside every context and module-loop lifetime. It is
     // acquired before any cache can be prepared and remains held until process
     // exit; process::exit releases its kernel handle even when Rust skips Drop.
+    startup_phase("storage_lease_start");
     let _process_storage_lease = hold_process_storage_lease();
+    startup_phase("storage_lease_done");
 
     // Only the daemon's fixed deployment path can be replaced while it runs.
     // Standalone hosts use versioned paths and need no persistent image copy.
     // Pin before PATH discovery or application startup can launch children.
     if subc_connection_file.is_some() {
+        startup_phase("executable_pin_start");
         if let Err(error) = aft::pinned_executable::initialize() {
             eprintln!("cannot pin the running AFT executable: {error}");
             std::process::exit(1);
         }
+        startup_phase("executable_pin_done");
     }
 
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
+    startup_phase("path_start");
     aft::effective_path::initialize_process_path();
+    startup_phase("path_done");
 
     // A server process may itself have been spawned from a governed agent
     // shell (nested daemons in tests and tooling). Shed inherited governance
@@ -379,8 +404,11 @@ fn main() {
 
     // Environment capture and scrubbing must precede worker creation, while
     // the named global pool must precede context construction and index work.
+    startup_phase("rayon_start");
     initialize_global_rayon_pool();
+    startup_phase("rayon_done");
 
+    startup_phase("logging_start");
     if uses_subc_stderr(
         std::env::args().nth(1).as_deref(),
         subc_connection_file.is_some(),
@@ -389,6 +417,7 @@ fn main() {
     } else {
         aft::logging::init();
     }
+    startup_phase("logging_done");
     aft::effective_path::log_startup_probe_result();
 
     if std::env::args().nth(1).as_deref() == Some("profile") {
@@ -428,11 +457,15 @@ fn main() {
         // The supervised module holds the secret it authenticates to the
         // daemon with, so it loads only an ONNX Runtime it could hash first
         // (see ort_pin), never one found by bare name on the loader search path.
+        startup_phase("ort_pin_start");
         aft::ort_pin::require_pinned_onnx_runtime();
+        startup_phase("ort_pin_done");
         // A single AppContext serves the attached routes (N=1); subc tool calls
         // are routed through the per-actor executor once the first route binds.
+        startup_phase("context_start");
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+        startup_phase("context_done");
         // Tell the fleet backup service what this storage root holds; a
         // failure is logged and never stops the module from attaching.
         aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
@@ -453,6 +486,7 @@ fn main() {
         #[cfg(debug_assertions)]
         let _held_ort =
             std::env::var_os("AFT_TEST_HOLD_ORT_SECTION").and_then(|_| aft::ort_lifecycle::enter());
+        startup_phase("module_runtime_start");
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
             Ok(()) => {
