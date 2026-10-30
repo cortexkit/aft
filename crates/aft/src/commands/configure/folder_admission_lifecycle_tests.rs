@@ -458,7 +458,7 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
             &ctx,
         );
         assert!(grep.success, "{}", grep.data);
-        assert_eq!(grep.data["total_matches"], 1);
+        assert_eq!(grep.data["total_matches"], 1, "{}", grep.data);
         assert!(grep.data["text"].as_str().unwrap().contains("alpha"));
         let search = crate::commands::semantic_search::handle_semantic_search(
             &request(

@@ -463,7 +463,7 @@ pub(crate) fn admit_borrowed(
     let lock = root_probe_lock(root);
     let _probe = lock.lock();
     let raw = load_raw(&config, root);
-    let opened = raw.as_ref().is_some_and(|cache| {
+    let mut opened = raw.as_ref().is_some_and(|cache| {
         cache
             .decision
             .canonical_root
@@ -479,6 +479,18 @@ pub(crate) fn admit_borrowed(
         .ok()
         .flatten()
         .is_some();
+    if !opened {
+        // Previously saved text-search indexes may lack admission records. Their presence is
+        // historical indexing evidence, not current admission: validate the
+        // child below before reading any artifact bytes.
+        opened = crate::search_index::artifact_cache_key_read_only(root, storage)
+            .ok()
+            .is_some_and(|key| {
+                crate::search_index::resolve_cache_dir_with_key(&key, Some(storage))
+                    .join("cache.bin")
+                    .is_file()
+            });
+    }
     if !opened {
         return Err("not_opened".into());
     }
