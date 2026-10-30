@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-24"
+  ],
+  "note": "Test-only diagnostics: a semantic fill waiter timeout prints each fill's state and build-slot events; the tar precheck regression prints the child's lifecycle on a stall. No product code changes."
+}

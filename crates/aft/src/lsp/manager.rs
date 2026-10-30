@@ -161,13 +161,13 @@ fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
 pub(crate) const NOT_IN_TYPESCRIPT_PROJECT: &str = "not in any TypeScript project";
 
 /// The total grace period for draining every LSP client during process shutdown.
-/// It is a hard ceiling: forced termination of servers that ignore the
-/// graceful handshake happens inside it, not after it.
+/// It is a hard ceiling on the caller's wait: forced termination of servers
+/// that ignore the graceful handshake starts inside it, not after it.
 pub const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_millis(1500);
 
 /// The tail of [`LSP_SHUTDOWN_ALL_BUDGET`] reserved for forced termination.
 /// Servers still running when only this much of the budget is left are
-/// killed, and the rest of the budget is the only time spent waiting for
+/// assigned to the kill dispatcher, and the rest of the budget is spent waiting for
 /// those kills to be reaped. Killing at the end of the budget instead let
 /// the kill and reap run past it on a loaded machine.
 pub const LSP_FORCED_TERMINATION_RESERVE: Duration = Duration::from_millis(300);
@@ -1022,12 +1022,14 @@ impl IntoIterator for DrainedLspEvents {
 pub struct LspShutdownAllOutcome {
     pub graceful: usize,
     pub forced: usize,
-    /// Forcibly killed servers whose exit was not observed before the budget
-    /// ran out. Their process groups were sent a kill that cannot be ignored;
-    /// if this process exits first, the system reaps them.
+    /// Servers assigned to forced termination whose reap was not observed
+    /// before the budget ran out. Kill dispatch and reaping continue off the
+    /// caller's path; if this process exits first, the system reaps them.
     pub unreaped: usize,
     pub elapsed: Duration,
 }
+
+type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
 
 pub struct LspManager {
     #[cfg(test)]
@@ -1715,6 +1717,19 @@ impl LspManager {
         self.pushed_search_paths = Some(paths);
         self.clear_failed_spawns();
         true
+    }
+
+    /// Count currently replayable failed server/root starts without starting a server.
+    pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        let now = self.retry_clock.now();
+        let mut counts = std::collections::BTreeMap::new();
+        for (key, failure) in &self.failed_spawns {
+            if failure.retry_at.is_some_and(|at| now >= at) {
+                continue;
+            }
+            *counts.entry(key.kind.id_str().to_owned()).or_default() += 1;
+        }
+        counts
     }
 
     /// Resolve every configured server applicable to a root without starting it.
@@ -5689,13 +5704,40 @@ impl LspManager {
         budget: Duration,
         include_registered: bool,
     ) -> LspShutdownAllOutcome {
-        let started = Instant::now();
+        Self::shutdown_all_clients_with_wait(
+            clients,
+            child_registry,
+            budget,
+            include_registered,
+            Instant::now(),
+            |rx, until| rx.recv_deadline(until),
+        )
+    }
+
+    // Keep deadline selection shared with deterministic tests. Only receiving
+    // reports is replaceable; spawning, killing, dropping and reporting are real.
+    pub(super) fn shutdown_all_clients_with_wait(
+        clients: Vec<(ServerKey, LspClient)>,
+        child_registry: LspChildRegistry,
+        budget: Duration,
+        include_registered: bool,
+        started: Instant,
+        mut receive: impl FnMut(
+            &Receiver<ShutdownResult>,
+            Instant,
+        ) -> Result<ShutdownResult, RecvTimeoutError>,
+    ) -> LspShutdownAllOutcome {
         let mut pending_pids = clients
             .iter()
             .map(|(_, client)| client.child_pid())
             .collect::<HashSet<_>>();
+        let mut registered_only = Vec::new();
         if include_registered {
-            pending_pids.extend(child_registry.pids());
+            for pid in child_registry.pids() {
+                if pending_pids.insert(pid) {
+                    registered_only.push(pid);
+                }
+            }
         }
         let servers = pending_pids.len();
         let (result_tx, result_rx) = unbounded();
@@ -5710,7 +5752,19 @@ impl LspManager {
                 // has returned its shutdown summary. The drop also waits for the
                 // child, so a report means the process has been reaped.
                 drop(client);
-                let _ = result_tx.send((key, pid, result));
+                let _ = result_tx.send((Some(key), pid, result));
+            });
+        }
+        for pid in registered_only {
+            let result_tx = result_tx.clone();
+            std::thread::spawn(move || {
+                // Detached clients already have a reaping worker. Registry
+                // removal can precede its wait, so only process disappearance
+                // confirms that the worker (or the OS) has finished reaping.
+                while crate::bash_background::process::is_process_alive(pid) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = result_tx.send((None, pid, Ok(())));
             });
         }
         drop(result_tx);
@@ -5723,20 +5777,9 @@ impl LspManager {
         let force_at = deadline - LSP_FORCED_TERMINATION_RESERVE.min(budget / 2);
         let mut outcome = LspShutdownAllOutcome::default();
         while !pending_pids.is_empty() {
-            if include_registered {
-                let live = child_registry.pids();
-                pending_pids.retain(|pid| live.contains(pid));
-                if pending_pids.is_empty() {
-                    break;
-                }
-            }
-            let remaining = force_at.saturating_duration_since(Instant::now());
-            let wait = if include_registered {
-                remaining.min(Duration::from_millis(20))
-            } else {
-                remaining
-            };
-            match result_rx.recv_timeout(wait) {
+            // Pass the absolute cutoff through to the channel: descheduling
+            // before a receive must not restart a relative timeout later.
+            match receive(&result_rx, force_at) {
                 Ok((key, pid, result)) => {
                     if !pending_pids.remove(&pid) {
                         continue;
@@ -5745,16 +5788,13 @@ impl LspManager {
                         Ok(()) => outcome.graceful += 1,
                         Err(err) => {
                             outcome.forced += 1;
-                            Self::log_shutdown_error(&key, &err);
+                            if let Some(key) = key {
+                                Self::log_shutdown_error(&key, &err);
+                            }
                         }
                     }
                 }
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                    if !include_registered || Instant::now() >= force_at {
-                        break;
-                    }
-                    std::thread::sleep(wait);
-                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
 
@@ -5763,42 +5803,28 @@ impl LspManager {
             outcome.forced += pids.len();
             // The graceful workers are still blocked in their per-client
             // Shutdown request, so the shared registry kills the process
-            // groups directly. The kill cannot be ignored and does not wait;
-            // a killed server closes its pipes, which unblocks its worker,
-            // and the worker then reaps it and reports in.
-            child_registry.force_kill_pids(&pids);
+            // groups directly. Dispatch off the caller's path: even a kill
+            // syscall or registry cleanup can stall under process-creation
+            // load. A killed server closes its pipes, unblocking its worker,
+            // which reaps it and reports in. Never join the dispatcher here.
+            let kill_pids = pids.clone();
+            std::thread::spawn(move || {
+                child_registry.force_kill_pids(&kill_pids);
+            });
             let mut unreaped = pids.into_iter().collect::<HashSet<_>>();
             while !unreaped.is_empty() {
-                if include_registered {
-                    let live = child_registry.pids();
-                    unreaped.retain(|pid| live.contains(pid));
-                    if unreaped.is_empty() {
-                        break;
-                    }
-                }
-                // A zero timeout still takes a report that is already queued,
+                // An expired deadline still takes a report that is already queued,
                 // so a late wake-up counts every server reaped in the meantime.
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let wait = if include_registered {
-                    remaining.min(Duration::from_millis(20))
-                } else {
-                    remaining
-                };
-                match result_rx.recv_timeout(wait) {
+                match receive(&result_rx, deadline) {
                     Ok((_, pid, _)) => {
                         unreaped.remove(&pid);
                     }
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                        if !include_registered || Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(wait);
-                    }
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
                 }
             }
-            // Waiting longer would break the ceiling. Each of these was sent a
-            // kill for its whole process group; its worker thread reaps it if
-            // this process keeps running, and the system does if it exits.
+            // Waiting longer would break the ceiling. The dispatcher continues
+            // sending kills, and the client workers continue reaping, without
+            // holding up the caller. A pending kill is not a completed reap.
             outcome.unreaped = unreaped.len();
         }
 
@@ -9834,6 +9860,27 @@ mod transient_retry_tests {
             origin + Duration::from_millis(reader.load(Ordering::SeqCst))
         }));
         (manager, offset)
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_counts_replayable_failures_without_starting() {
+        let (mut manager, offset) = manager_with_clock();
+        assert!(manager.cached_start_failure_counts().is_empty());
+        manager.record_failed_spawn(&key(), spawn_failed(), FailureDurability::Transient);
+        let counts = manager.cached_start_failure_counts();
+        assert_eq!(counts.get(ServerKind::Rust.id_str()), Some(&1));
+        offset.store(30_000, Ordering::SeqCst);
+        assert!(manager.cached_start_failure_counts().is_empty());
+        manager.record_failed_spawn(&key(), spawn_failed(), FailureDurability::Permanent);
+        offset.store(3_600_000, Ordering::SeqCst);
+        assert_eq!(
+            manager
+                .cached_start_failure_counts()
+                .get(ServerKind::Rust.id_str()),
+            Some(&1)
+        );
+        manager.note_start_succeeded(&key());
+        assert!(manager.cached_start_failure_counts().is_empty());
     }
 
     fn reason(result: &ServerAttemptResult) -> &str {

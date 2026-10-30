@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rust-module-path-refresh"
+  ],
+  "note": "Call-graph refresh caches Rust module parents and caller module paths per refresh snapshot; every stored edge row is identical before and after (184,964 rows compared). No changed path matches RANKING_FENCE_PREFIXES."
+}

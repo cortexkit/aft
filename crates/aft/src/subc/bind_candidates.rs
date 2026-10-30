@@ -110,7 +110,7 @@ impl CandidateRequests {
         &mut self,
         a0: &A0Egress,
         routes: &HashMap<RouteChannel, RouteIdentity>,
-        management: &HashMap<RouteChannel, Option<Principal>>,
+        management: &HashMap<RouteChannel, ManagementIdentity>,
         metrics: &Arc<DispatchPathMetrics>,
     ) -> Result<(), SubcError> {
         let resolved: Vec<_> = self
@@ -278,7 +278,7 @@ mod tests {
                 route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                 ControlCompletion::ManagementAckWritten {
                     route: route_key(7, 1),
-                    principal: None,
+                    identity: ManagementIdentity::default(),
                     corr: 891
                 },
                 &metrics
@@ -290,7 +290,7 @@ mod tests {
             .unwrap();
         let mut ack = frames.recv().await.unwrap();
         assert!(ack.begin_ack_write());
-        let management = HashMap::from([(route_key(7, 1), None)]);
+        let management = HashMap::from([(route_key(7, 1), ManagementIdentity::default())]);
         candidates
             .release(&a0, &HashMap::new(), &management, &metrics)
             .await
@@ -340,7 +340,7 @@ mod tests {
                 route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                 ControlCompletion::ManagementAckWritten {
                     route: route_key(7, 1),
-                    principal: None,
+                    identity: ManagementIdentity::default(),
                     corr: 891
                 },
                 &metrics
@@ -350,7 +350,7 @@ mod tests {
         assert!(ack.begin_ack_write());
         ack.finish_ack_write(true);
         completed.recv().await.unwrap();
-        let management = HashMap::from([(route_key(7, 1), None)]);
+        let management = HashMap::from([(route_key(7, 1), ManagementIdentity::default())]);
         candidates
             .release(&a0, &HashMap::new(), &management, &metrics)
             .await

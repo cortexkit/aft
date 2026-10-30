@@ -2,11 +2,12 @@
 //! frames cross into the AFT child; no indexing or readiness internals are used.
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, BufRead, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subc_protocol::session::ModuleControlRequest;
 use subc_protocol::{
@@ -156,6 +157,42 @@ async fn main() {
     let mut corr = 100;
     for line in stdin.lock().lines() {
         let command: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if command["op"] == "batch" {
+            let mut pending = HashMap::new();
+            for request in command["requests"].as_array().expect("batch requests") {
+                corr += 1;
+                let channel = request["channel"].as_u64().unwrap_or(1) as u16;
+                let body = json!({"name":request["name"], "arguments":request["arguments"]});
+                pending.insert(corr, (request["id"].clone(), Instant::now()));
+                write_frame(
+                    &mut stream,
+                    &Frame::build(
+                        FrameType::Request,
+                        Flags::new(false, Priority::Interactive, false),
+                        channel,
+                        1,
+                        corr,
+                        serde_json::to_vec(&body).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(600), async {
+                while !pending.is_empty() {
+                    let frame = read_frame(&mut stream).await.unwrap().expect("subject disconnected");
+                    if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
+                        if let Some((id, started)) = pending.remove(&frame.header.corr) {
+                            let response: Value = serde_json::from_slice(&frame.body).unwrap();
+                            assert_ne!(frame.header.ty, FrameType::Error, "{response}");
+                            emit(json!({"id":id, "latency_ms":started.elapsed().as_secs_f64() * 1000.0, "response":response}));
+                        }
+                    }
+                }
+            }).await.expect("parallel public request deadline");
+            continue;
+        }
         corr += 1;
         let channel = command["channel"].as_u64().unwrap_or(0) as u16;
         let body = match command["op"].as_str().unwrap() {

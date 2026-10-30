@@ -84,6 +84,33 @@ pub(super) fn catalog(
     identity: &RouteIdentity,
     ctx: &AppContext,
 ) -> Result<Value, subc_protocol::ErrorBody> {
+    // The transport already gave this open a bounded asynchronous wait. Do not
+    // re-enter the open or silently skip a required preset/policy persistence.
+    let needs_database = catalog_needs_database(&body, identity);
+    if needs_database && ctx.database_runtime_initializing() {
+        return Err(if awaits_policy_store(ctx, identity) {
+            policy_unavailable()
+        } else {
+            subc_protocol::ErrorBody::new(
+                "database_initializing",
+                "catalog persistence is still opening",
+            )
+            .with_detail(json!({"retryable": true}))
+        });
+    }
+    if needs_database {
+        if let Some(refusal) = ctx.database_runtime_refusal("tool.catalog", "tool.catalog") {
+            return Err(subc_protocol::ErrorBody::new(
+                refusal.data["code"]
+                    .as_str()
+                    .unwrap_or("database_unavailable"),
+                refusal.data["message"]
+                    .as_str()
+                    .unwrap_or("catalog persistence unavailable"),
+            )
+            .with_detail(json!({"retryable": refusal.data["retryable"]})));
+        }
+    }
     let preset = body.get("preset").and_then(Value::as_str).unwrap_or("head");
     let key = catalog_preset_key(identity, preset);
     let answer = catalog_inner(body, identity, ctx)?;

@@ -425,10 +425,12 @@ async fn grants_stalled_restore_allows_checkout_read() {
     }
     let mut wire = WireRestore::new().await;
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call_tool(100, "read", json!({"path":"probe.txt"}))
+    // Let restoration exhaust its own budget before the client stops waiting;
+    // an already-expired queued read must be discarded rather than executed.
+    wire.call_tool_with_deadline(100, "read", json!({"path":"probe.txt"}), 30_000)
         .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reply = wire.reply(100, Duration::from_secs(3)).await.unwrap();
+    let reply = wire.reply(100, Duration::from_secs(15)).await.unwrap();
     wire.assert_unrestored();
     drop(stall);
     wire.stop().await;
@@ -458,10 +460,15 @@ async fn grants_stalled_restore_allows_independently_granted_read() {
         .unwrap();
     }
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call_tool(100, "read", json!({"path":healthy.join("probe.txt")}))
-        .await;
+    wire.call_tool_with_deadline(
+        100,
+        "read",
+        json!({"path":healthy.join("probe.txt")}),
+        30_000,
+    )
+    .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reply = wire.reply(100, Duration::from_secs(3)).await.unwrap();
+    let reply = wire.reply(100, Duration::from_secs(15)).await.unwrap();
     assert!(!wire
         .ctx
         .launch_grants_materialized(&scope_key(&wire.revived)));
@@ -780,9 +787,15 @@ async fn grants_stalled_restore_refuses_within_deadline_without_partial_grants()
     }
     let mut wire = WireRestore::new().await;
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call(100).await;
+    wire.call_tool_with_deadline(
+        100,
+        "read",
+        json!({"path":wire.target.join("probe.txt")}),
+        30_000,
+    )
+    .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reply = wire.reply(100, Duration::from_secs(2)).await;
+    let reply = wire.reply(100, Duration::from_secs(15)).await;
     wire.assert_unrestored();
     drop(stall);
     let target = wire.target.clone();
@@ -803,9 +816,15 @@ async fn grants_stalled_restore_retries_after_path_recovers() {
     }
     let mut wire = WireRestore::new().await;
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call(100).await;
+    wire.call_tool_with_deadline(
+        100,
+        "read",
+        json!({"path":wire.target.join("probe.txt")}),
+        30_000,
+    )
+    .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    let refused = wire.reply(100, Duration::from_secs(2)).await;
+    let refused = wire.reply(100, Duration::from_secs(15)).await;
     drop(stall);
     if refused.is_some() {
         wire.assert_unrestored();

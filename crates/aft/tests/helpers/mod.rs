@@ -15,7 +15,8 @@ mod shared_test_env;
 
 #[allow(unused_imports)]
 pub(crate) use shared_test_env::{
-    apply_hermetic_git_env, hermetic_git_env, hermetic_git_env_guard,
+    apply_hermetic_git_env, hermetic_git_env, hermetic_git_env_guard, process_env_lock,
+    process_env_lock_is_available, without_storage_override, ProcessEnvLockGuard,
 };
 
 use std::collections::VecDeque;

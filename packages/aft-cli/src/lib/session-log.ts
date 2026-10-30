@@ -20,20 +20,31 @@ export function readSessionLog(
   session: RecentSession,
   maxBytes = MAX_SCAN_BYTES,
 ): SessionLogResult {
+  return readLogHistory([path, `${path}.1`], session, maxBytes);
+}
+
+/** Share the scan and output budgets across newest-first diagnostic log files. */
+export function readLogHistory(
+  files: string[],
+  session: RecentSession | null,
+  maxBytes = MAX_SCAN_BYTES,
+): SessionLogResult {
   const lines: string[] = [];
   const errors: string[] = [];
   let remaining = maxBytes;
   let boundHit = false;
-  const bareId = session.id.replace(/^ses_/, "");
+  const bareId = session?.id.replace(/^ses_/, "");
   const selectedTags = [`[ses_${bareId}]`, `[${bareId}]`];
   const tagPattern = /\[ses_[^\]\s]+\]|\[[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\]/;
 
   const accept = (line: string) => {
     if (!line) return;
     const tag = tagPattern.exec(line)?.[0];
-    if (tag && !selectedTags.includes(tag)) return;
-    if (!tag) {
-      const stamp = /^\[([^\]]+)\]/.exec(line)?.[1];
+    if (session && tag && !selectedTags.includes(tag)) return;
+    if (session && !tag) {
+      const stamp =
+        /^\[([^\]]+)\]/.exec(line)?.[1] ??
+        /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) \[aft(?:-lsp)?\] /.exec(line)?.[1];
       const time = stamp ? Date.parse(stamp) : NaN;
       const inWindow =
         Number.isFinite(time) &&
@@ -51,7 +62,7 @@ export function readSessionLog(
     if (errors.length < 20 && isErrorLogLine(line)) errors.push(line);
   };
 
-  for (const file of [path, `${path}.1`]) {
+  for (const file of files) {
     if (remaining <= 0 || (lines.length >= 200 && errors.length >= 20)) break;
     let fd: number | undefined;
     try {

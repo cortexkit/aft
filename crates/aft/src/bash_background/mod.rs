@@ -565,9 +565,50 @@ thread_local! {
     static CURRENT_CALL_REQUESTER: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
     static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_RUNON_TIMINGS: std::cell::RefCell<Option<crate::exec_remote::LaunchTimings>> = const { std::cell::RefCell::new(None) };
     /// True only while dispatching a bash call admitted under the catalog's
     /// worker preset. Plugin worker-session flags do not set this marker.
     static CURRENT_WORKER_PRESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request-side timings stay scoped to this dispatch thread until the remote
+/// worker takes ownership of them. Early refusals discard the unfinished log.
+pub(crate) struct RunonTimingScope(Option<crate::exec_remote::LaunchTimings>);
+
+impl RunonTimingScope {
+    pub(crate) fn start(started: std::time::Instant) -> Self {
+        Self(CURRENT_RUNON_TIMINGS.with(|current| {
+            current.replace(Some(crate::exec_remote::LaunchTimings::new(
+                started,
+                "secret_preflight",
+            )))
+        }))
+    }
+}
+
+impl Drop for RunonTimingScope {
+    fn drop(&mut self) {
+        CURRENT_RUNON_TIMINGS.with(|current| {
+            current.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn enter_runon_phase(phase: &'static str) {
+    CURRENT_RUNON_TIMINGS.with(|current| {
+        if let Some(timings) = current.borrow_mut().as_mut() {
+            timings.enter(phase);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn take_runon_timings() -> crate::exec_remote::LaunchTimings {
+    CURRENT_RUNON_TIMINGS.with(|current| {
+        current.borrow_mut().take().unwrap_or_else(|| {
+            crate::exec_remote::LaunchTimings::new(std::time::Instant::now(), "task_setup")
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1084,6 +1125,7 @@ pub(crate) fn spawn_with_secrets(
     remote: Option<RemoteLaunch>,
     #[cfg(unix)] mut secret_launch: Option<secrets::Launch>,
 ) -> Response {
+    enter_runon_phase("spawn_setup");
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
             request_id,
@@ -1111,6 +1153,7 @@ pub(crate) fn spawn_with_secrets(
         .or_else(|| std::env::current_dir().ok())
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
+    enter_runon_phase("child_environment");
     enter_bash_startup_step(BashStartupStep::Environment);
     let mut env = env.unwrap_or_default();
     let config = ctx.config();
@@ -1152,6 +1195,7 @@ pub(crate) fn spawn_with_secrets(
     if !pty && config.bash.linux_scope {
         env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
     }
+    enter_runon_phase("sandbox_preflight");
     let task_kind = if pty {
         SandboxTaskKind::BashPty
     } else if require_background_flag {
@@ -1311,6 +1355,7 @@ pub(crate) fn spawn_with_secrets(
     // handle, which reads the registry as it is. An idle-evicted root has
     // released its registry, so load it again before the task can finish.
     ctx.reload_released_filter_registry();
+    enter_runon_phase("changed_files_baseline");
     let _changed_files =
         crate::bash_changed_files::Capture::start_for_spawn(ctx, request_id, &spawn_plan)
             .map(|capture| crate::bash_changed_files::scope(Some(capture)));

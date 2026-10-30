@@ -2018,12 +2018,16 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
     // A vanished mounted child can make ReadDir::drop panic after closedir
     // returns ENXIO, aborting the daemon. This background sweep must not open
     // checkpoint directories on a different filesystem.
-    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(checkpoints_dir) else {
-        crate::slog_warn!(
-            "cannot establish filesystem boundary for checkpoint sweep {}",
-            checkpoints_dir.display()
-        );
-        return;
+    let boundary = match crate::walk_boundary::DeviceBoundary::for_root(checkpoints_dir) {
+        Ok(boundary) => boundary,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => {
+            crate::slog_warn!(
+                "cannot establish filesystem boundary for checkpoint sweep {}",
+                checkpoints_dir.display()
+            );
+            return;
+        }
     };
     let mut skipped_foreign_mounts = 0usize;
     let Ok(session_entries) = fs::read_dir(checkpoints_dir) else {
@@ -2996,6 +3000,33 @@ mod tests {
         assert!(
             victim.exists(),
             "cleanup must not sweep empty dirs outside a `checkpoints` root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_sweep_boundary_missing_root_is_quiet_but_other_errors_warn() {
+        let storage = tempfile::tempdir().unwrap();
+        let missing = storage.path().join("checkpoints");
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            sweep_expired_durable_checkpoints(&missing, 0);
+        });
+        assert!(lines.is_empty(), "{lines:?}");
+
+        let loop_path = storage.path().join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let error = fs::metadata(&loop_path).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            sweep_expired_durable_checkpoints(&loop_path, 0);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!(
+                "WARN cannot establish filesystem boundary for checkpoint sweep {}",
+                loop_path.display()
+            )
         );
     }
 
