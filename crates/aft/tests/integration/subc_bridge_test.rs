@@ -13690,7 +13690,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
             .is_null(),
         "health and census polling must not count as admitted tools"
     );
-    expect_manifest_tool_success(&mut stream, 332, "status", json!({})).await;
+    expect_manifest_tool_success(&mut stream, 332, "glob", json!({"pattern":"*"})).await;
     send_management_request(&mut stream, 2, 333, json!({"op":"memory.census"})).await;
     let called = read_management_response(&mut stream, 2, 333, "memory.census").await;
     assert!(
@@ -13794,7 +13794,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         &mut stream,
         340,
         ModuleControlRequest::RouteBind {
-            route_channel: 5,
+            route_channel: 6,
             epoch: 1,
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
@@ -13831,7 +13831,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         ownership["roots"][0]["routes"][1]["principal"],
         "reserved:prefrontal-core"
     );
-    send_route_goodbye(&mut stream, 5, 342).await;
+    send_route_goodbye(&mut stream, 6, 342).await;
     send_management_request(&mut stream, 2, 343, json!({"op":"memory.census"})).await;
     let detached = read_management_response(&mut stream, 2, 343, "memory.census").await;
     assert_eq!(
