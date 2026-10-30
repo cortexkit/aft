@@ -2221,12 +2221,13 @@ pub(crate) fn join_selected_manifest(
     selected: Option<&BTreeSet<String>>,
     cached: &BTreeMap<String, ViewBindingDependencies>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
-    join_manifest_with_surfaces(manifest, blobs, selected, cached, None, None)
+    join_manifest_with_surfaces(manifest, blobs, selected, cached, None, None, true)
 }
 
 /// Rebind only changed callers or callers that probed changed membership. Other
 /// candidates replay their prior consumer-specific surface queries and retain
 /// their reference rows when every answer is unchanged.
+#[cfg(test)]
 pub(crate) fn join_selected_manifest_reusing_surfaces(
     manifest: &Manifest,
     blobs: &impl ManifestBlobReader,
@@ -2244,6 +2245,30 @@ pub(crate) fn join_selected_manifest_reusing_surfaces(
         cached,
         Some((changed, membership_changed, fact_invalidated)),
         dispatch_type_targets,
+        true,
+    )
+}
+
+/// Materialization consumes sorted rows, not the duplicate resolution-order
+/// audit vector returned by standalone joins.
+pub(crate) fn join_selected_manifest_for_materialization(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+    selected: Option<&BTreeSet<String>>,
+    cached: &BTreeMap<String, ViewBindingDependencies>,
+    changed: &BTreeSet<String>,
+    membership_changed: &BTreeSet<String>,
+    fact_invalidated: &BTreeSet<String>,
+    dispatch_type_targets: Option<DispatchTypeTargetPlan<'_>>,
+) -> Result<SelectedManifestJoin, ManifestJoinError> {
+    join_manifest_with_surfaces(
+        manifest,
+        blobs,
+        selected,
+        cached,
+        Some((changed, membership_changed, fact_invalidated)),
+        dispatch_type_targets,
+        false,
     )
 }
 
@@ -2254,6 +2279,7 @@ fn join_manifest_with_surfaces(
     cached: &BTreeMap<String, ViewBindingDependencies>,
     reuse: Option<(&BTreeSet<String>, &BTreeSet<String>, &BTreeSet<String>)>,
     dispatch_type_target_plan: Option<DispatchTypeTargetPlan<'_>>,
+    record_order: bool,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
     let mut profile = crate::views::materialization::profile::PhaseTimer::new("join");
     let loaded = std::cell::RefCell::new(BTreeMap::<BlobKey, Arc<[u8]>>::new());
@@ -2431,6 +2457,10 @@ fn join_manifest_with_surfaces(
             heap_parts[0], heap_parts[1], heap_parts[2], heap_parts[3], heap_parts[4]
         );
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if selected.is_none() {
+        crate::memory::relieve_allocator_pressure();
+    }
     profile.finish("decode_bind_index_entries");
     let mut replay_stage = crate::views::materialization::profile::StageTimer::new("join");
     let index = ManifestProjectIndex::from_parts(
@@ -2604,10 +2634,13 @@ fn join_manifest_with_surfaces(
                     }
                 }
             };
+            if record_order {
+                result.resolution_order.push(key.clone());
+            }
             result.rows.insert(DerivedRow {
-                caller_blob_key: key.caller_blob_key.clone(),
+                caller_blob_key: key.caller_blob_key,
                 ref_ordinal: key.ref_ordinal,
-                caller_path: key.caller_path.clone(),
+                caller_path: key.caller_path,
                 kind,
                 status: if target_file.is_some() {
                     ResolutionStatus::Resolved
@@ -2617,7 +2650,6 @@ fn join_manifest_with_surfaces(
                 target_path: target_file.map(String::into_bytes),
                 target_symbol,
             });
-            result.resolution_order.push(key);
         }
         resolved_bindings += resolutions.len();
         binding.surface_queries = caller_queries.into_iter().collect();

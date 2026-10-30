@@ -4723,12 +4723,9 @@ impl CompositePlane for CallgraphBridge {
                 attachment.downcast_ref::<super::callgraph::CallgraphAttachment>()
             {
                 keys.push((path.clone(), attachment.key));
-                payloads.push((
-                    attachment.key,
-                    attachment.payload().ok_or_else(|| {
-                        error("callgraph payload retired before base completion".into())
-                    })?,
-                ));
+                if let Some(payload) = attachment.payload() {
+                    payloads.push((attachment.key, payload));
+                }
             } else {
                 return Err(error(format!("{path:?}: callgraph attachment missing")));
             }
@@ -4762,6 +4759,21 @@ impl CompositePlane for CallgraphBridge {
                 ));
             }
         }
+        for (path, key) in &keys {
+            if let Some(attachment) = observed
+                .get(path)
+                .and_then(|entry| entry.attachments.get(&FamilyPlane::Callgraph))
+                .and_then(|a| a.downcast_ref::<super::callgraph::CallgraphAttachment>())
+                .filter(|a| a.key == *key)
+            {
+                attachment.retire();
+            }
+        }
+        drop(payloads);
+        // Successor publication builds the derived graph before returning. The
+        // protected blob rows, not reconciliation buffers, are its inputs.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         super::base_builder::publish_successor(
             claim,
             |manifest| {
@@ -4776,16 +4788,6 @@ impl CompositePlane for CallgraphBridge {
             None,
         )
         .map_err(|e| error(e.to_string()))?;
-        for (path, key) in &keys {
-            if let Some(attachment) = observed
-                .get(path)
-                .and_then(|entry| entry.attachments.get(&FamilyPlane::Callgraph))
-                .and_then(|a| a.downcast_ref::<super::callgraph::CallgraphAttachment>())
-                .filter(|a| a.key == *key)
-            {
-                attachment.retire();
-            }
-        }
         drop(live);
         Ok(())
     }
@@ -5217,6 +5219,7 @@ mod callgraph_bridge_tests {
     use super::super::contracts::{PlaneAdapter, PlaneLoader};
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn retired_v2_attachment_reuses_present_key_and_reextracts_a_missing_row() {
         let root = tempfile::tempdir().unwrap();
@@ -5226,6 +5229,15 @@ mod callgraph_bridge_tests {
             b"fn target() {} fn caller() { target(); }",
         )
         .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join("file.rs"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
         let bridge = Arc::new(CallgraphBridge::default());
         let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, bridge.clone());
         SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])

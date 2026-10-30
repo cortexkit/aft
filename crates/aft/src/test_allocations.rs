@@ -54,8 +54,12 @@ fn record_live(bytes: usize) {
 /// Run an isolated test process when comparing these process-wide counters.
 pub(crate) fn heap_marker(prefix: &str, phase: &str) {
     if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let rss = crate::memory::rss_bytes();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let rss: Option<u64> = None;
         eprintln!(
-            "view_heap {prefix}.{phase} live={} peak={}",
+            "view_heap {prefix}.{phase} live={} peak={} rss={rss:?}",
             LIVE_BYTES.load(Ordering::Relaxed),
             PEAK_BYTES.load(Ordering::Relaxed),
         );

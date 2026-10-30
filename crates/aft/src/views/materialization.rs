@@ -910,7 +910,7 @@ fn materialize_reading(
         join::DispatchTypeTargetPlan::All
     };
     let selected_join_probe = PhaseProbe::start(&transaction);
-    let joined = join::join_selected_manifest_reusing_surfaces(
+    let joined = join::join_selected_manifest_for_materialization(
         manifest,
         reader,
         selected.as_ref(),
@@ -926,7 +926,6 @@ fn materialize_reading(
         selected_join_probe.finish(&transaction),
     );
     profile.finish("selected_join");
-    drop(joined.result.resolution_order);
     stats.unattributed_callers = joined
         .bindings
         .values()
@@ -1144,6 +1143,8 @@ fn materialize_reading(
     let mut ref_deletes = Vec::new();
     let mut pending_refs = Vec::new();
     let mut pending_edges = Vec::new();
+    let mut ordinary_edge_refs = HashSet::new();
+    let mut rewritten_ref_files = BTreeSet::new();
     let mut load_refs = transaction.prepare("SELECT ref_id, caller_node, status, target_node, target_file, target_symbol FROM refs WHERE caller_file = ?1")?;
     #[cfg(test)]
     let mut control_lookup = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1 AND caller_node IS ?2 AND status=?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
@@ -1267,6 +1268,7 @@ fn materialize_reading(
                 target_path.clone(),
                 target_symbol.clone(),
             ) {
+                ordinary_edge_refs.insert(ref_id.clone());
                 pending_edges.push(PendingEdgeRow {
                     kind: match row.kind {
                         join::BlobRefKind::Construction
@@ -1302,6 +1304,7 @@ fn materialize_reading(
                 });
             }
         }
+        rewritten_ref_files.insert(caller_path.clone());
         pending_refs.push(PendingRefRow {
             ref_id,
             caller_node,
@@ -1324,6 +1327,18 @@ fn materialize_reading(
             target_symbol,
             relink,
         });
+        // Every row is emitted; the batch bounds temporary ownership, not output.
+        if private_cold && pending_refs.len() >= 4096 {
+            let (_, refs) = profile.measure(WritePhase::Refs, &transaction, || {
+                write_pending_refs(&transaction, &pending_refs, false)
+            })?;
+            let (_, edges) = profile.measure(WritePhase::Edges, &transaction, || {
+                write_pending_edges(&transaction, &pending_edges, false)
+            })?;
+            stats.inserted += refs + edges;
+            pending_refs.clear();
+            pending_edges.clear();
+        }
     }
     drop(load_refs);
     drop((nodes, loaded_paths));
@@ -1341,113 +1356,13 @@ fn materialize_reading(
             let deleted = ref_deletes.iter().try_fold(0, |count, ref_id| {
                 delete.execute([ref_id]).map(|written| count + written)
             })?;
-            let mut relinked = 0;
-            let mut owned = 0;
-            for row in &pending_refs {
-                let written = stable_rows::write(
-                    &transaction,
-                    "refs",
-                    &[
-                        "ref_id",
-                        "caller_node",
-                        "caller_file",
-                        "kind",
-                        "short_name",
-                        "full_ref",
-                        "module_path",
-                        "import_kind",
-                        "local_name",
-                        "requested_name",
-                        "namespace_alias",
-                        "wildcard",
-                        "line",
-                        "byte_start",
-                        "byte_end",
-                        "status",
-                        "target_node",
-                        "target_file",
-                        "target_symbol",
-                        "provenance",
-                        "callee_last_segment",
-                    ],
-                    params![
-                        row.ref_id,
-                        row.caller_node,
-                        row.caller_file,
-                        row.kind,
-                        row.short_name,
-                        row.full_ref,
-                        row.module_path,
-                        row.import_kind,
-                        row.local_name,
-                        row.requested_name,
-                        row.namespace_alias,
-                        i64::from(row.wildcard),
-                        i64::from(row.line),
-                        row.byte_start as i64,
-                        row.byte_end as i64,
-                        row.status,
-                        row.target_node,
-                        row.target_file,
-                        row.target_symbol,
-                        PROVENANCE_TREESITTER,
-                        row.short_name
-                            .as_deref()
-                            .map(crate::callgraph_store::callee_last_segment),
-                    ],
-                    changed.is_some(),
-                )?;
-                if row.relink {
-                    relinked += written;
-                } else {
-                    owned += written;
-                }
-            }
+            let (relinked, owned) =
+                write_pending_refs(&transaction, &pending_refs, changed.is_some())?;
             Ok((deleted, relinked, owned))
         })?;
-    let (relinked_edges, owned_edges) = profile.measure(
-        WritePhase::Edges,
-        &transaction,
-        || -> rusqlite::Result<_> {
-            let mut relinked = 0;
-            let mut owned = 0;
-            for row in &pending_edges {
-                let written = stable_rows::write(
-                    &transaction,
-                    "edges",
-                    &[
-                        "edge_id",
-                        "ref_id",
-                        "source_node",
-                        "target_node",
-                        "target_file",
-                        "target_symbol",
-                        "kind",
-                        "line",
-                        "provenance",
-                    ],
-                    params![
-                        format!("edge:{}", row.ref_id),
-                        row.ref_id,
-                        row.source_node,
-                        row.target_node,
-                        row.target_file,
-                        row.target_symbol,
-                        row.kind,
-                        i64::from(row.line),
-                        PROVENANCE_TREESITTER,
-                    ],
-                    changed.is_some(),
-                )?;
-                if row.relink {
-                    relinked += written;
-                } else {
-                    owned += written;
-                }
-            }
-            Ok((relinked, owned))
-        },
-    )?;
+    let (relinked_edges, owned_edges) = profile.measure(WritePhase::Edges, &transaction, || {
+        write_pending_edges(&transaction, &pending_edges, changed.is_some())
+    })?;
     stats.relinked_deleted += refs_deleted + edges_deleted;
     stats.relinked_inserted += relinked_refs + relinked_edges;
     stats.inserted += owned_refs + owned_edges;
@@ -1481,14 +1396,6 @@ fn materialize_reading(
         profile.record(WritePhase::IndexMaintenance, phase.finish(&transaction));
     }
     profile.observe_empty(WritePhase::IndexMaintenance);
-    let ordinary_edge_refs = pending_edges
-        .iter()
-        .map(|edge| edge.ref_id.clone())
-        .collect::<HashSet<_>>();
-    let rewritten_ref_files = pending_refs
-        .iter()
-        .map(|row| row.caller_file.clone())
-        .collect::<BTreeSet<_>>();
     drop((pending_refs, pending_edges, ref_deletes, existing));
     let mut dispatch_inputs = dispatch::DecodedFiles::default();
     for (path, emission) in &parsed {
@@ -1536,6 +1443,13 @@ fn materialize_reading(
         work.dispatch_type_target_files
             .fetch_add(joined.dispatch_type_targets.len() as u64, Relaxed);
     }
+    drop((
+        joined.dispatch_type_targets,
+        joined.resolved_callers,
+        joined.rebuilt_surface_paths,
+        ordinary_edge_refs,
+        rewritten_ref_files,
+    ));
     profile.finish("dispatch");
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
@@ -1584,6 +1498,10 @@ fn materialize_reading(
     drop(connection);
     if let Some(unpublished) = unpublished.as_mut() {
         unpublished.complete();
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if private_cold {
+        crate::memory::relieve_allocator_pressure();
     }
     profile.finish("cleanup_connections");
     Ok((stats, profile.into_timings()))
@@ -1772,7 +1690,9 @@ fn configure_private_connection(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "journal_mode", "OFF")?;
     connection.pragma_update(None, "synchronous", "OFF")?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
-    connection.pragma_update(None, "mmap_size", 268_435_456)?;
+    // The builder already owns decoded graph inputs. Avoid another 256 MiB
+    // of mapped resident pages; sealed readers retain their normal policy.
+    connection.pragma_update(None, "mmap_size", 0)?;
     Ok(())
 }
 
@@ -2069,6 +1989,120 @@ struct PendingEdgeRow {
     target_symbol: String,
     line: u32,
     relink: bool,
+}
+
+fn write_pending_refs(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[PendingRefRow],
+    preserve_rowids: bool,
+) -> rusqlite::Result<(usize, usize)> {
+    let mut relinked = 0;
+    let mut owned = 0;
+    for row in rows {
+        let written = stable_rows::write(
+            transaction,
+            "refs",
+            &[
+                "ref_id",
+                "caller_node",
+                "caller_file",
+                "kind",
+                "short_name",
+                "full_ref",
+                "module_path",
+                "import_kind",
+                "local_name",
+                "requested_name",
+                "namespace_alias",
+                "wildcard",
+                "line",
+                "byte_start",
+                "byte_end",
+                "status",
+                "target_node",
+                "target_file",
+                "target_symbol",
+                "provenance",
+                "callee_last_segment",
+            ],
+            params![
+                row.ref_id,
+                row.caller_node,
+                row.caller_file,
+                row.kind,
+                row.short_name,
+                row.full_ref,
+                row.module_path,
+                row.import_kind,
+                row.local_name,
+                row.requested_name,
+                row.namespace_alias,
+                i64::from(row.wildcard),
+                i64::from(row.line),
+                row.byte_start as i64,
+                row.byte_end as i64,
+                row.status,
+                row.target_node,
+                row.target_file,
+                row.target_symbol,
+                PROVENANCE_TREESITTER,
+                row.short_name
+                    .as_deref()
+                    .map(crate::callgraph_store::callee_last_segment)
+            ],
+            preserve_rowids,
+        )?;
+        if row.relink {
+            relinked += written;
+        } else {
+            owned += written;
+        }
+    }
+    Ok((relinked, owned))
+}
+
+fn write_pending_edges(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[PendingEdgeRow],
+    preserve_rowids: bool,
+) -> rusqlite::Result<(usize, usize)> {
+    let mut relinked = 0;
+    let mut owned = 0;
+    for row in rows {
+        let written = stable_rows::write(
+            transaction,
+            "edges",
+            &[
+                "edge_id",
+                "ref_id",
+                "source_node",
+                "target_node",
+                "target_file",
+                "target_symbol",
+                "kind",
+                "line",
+                "provenance",
+            ],
+            params![
+                format!("edge:{}", row.ref_id),
+                row.ref_id,
+                row.source_node,
+                row.target_node,
+                row.target_file,
+                row.target_symbol,
+                row.kind,
+                i64::from(row.line),
+                PROVENANCE_TREESITTER
+            ],
+            preserve_rowids,
+        )?;
+        if row.relink {
+            relinked += written;
+        } else {
+            owned += written;
+        }
+    }
+    Ok((relinked, owned))
 }
 
 struct EmissionParse {
