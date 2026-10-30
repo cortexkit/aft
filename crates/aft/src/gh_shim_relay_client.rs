@@ -913,6 +913,7 @@ struct Exchange<'a, Io> {
     budget: Duration,
 }
 
+#[derive(Debug)]
 enum SendFailure {
     Outcome(RouteOutcome),
     Module { code: String, message: String },
