@@ -469,6 +469,13 @@ pub(crate) async fn daemon_with_capabilities(
                                 let outcome = if initial { Outcome::Exit { code: 0 } } else if unknown { Outcome::OutcomeUnknown } else { Outcome::HistoryExpired };
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), outcome, 0, 0, 0))).unwrap()));
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            } else if attaching && matches!(script, Script::Submission { disconnect: true, .. }) {
+                                let from = body["params"]["from_seq"].as_u64().unwrap();
+                                for seq in from..4 {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(format!("line-{seq}\n").into_bytes())))).unwrap()));
+                                }
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 0, 0, 0))).unwrap()));
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
                             } else if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
                                 let mut request = body["params"].clone();
                                 let cursor = request.as_object_mut().unwrap().remove("resume_from_seq").and_then(|v| v.as_u64());
@@ -1013,6 +1020,7 @@ pub(crate) struct OutageDaemon {
     hold_next: Arc<std::sync::atomic::AtomicBool>,
     release_held: Arc<tokio::sync::Notify>,
     up: Arc<std::sync::atomic::AtomicBool>,
+    finish_job: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -1022,6 +1030,11 @@ impl OutageDaemon {
     /// Bring the provider back, as when ck-motor finishes restarting.
     pub(crate) fn restore(&self) {
         self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Complete the running job, even if no caller is attached yet.
+    pub(crate) fn finish_job(&self) {
+        self.finish_job.notify_one();
     }
 
     /// Hold the next connection's catalog request unanswered until
@@ -1093,6 +1106,20 @@ fn outage_job_records() -> Vec<StreamRecord> {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn outage_daemon() -> OutageDaemon {
+    outage_daemon_with_replay(OutageReplay::Finished).await
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) enum OutageReplay {
+    Running,
+    Finished,
+    NotFound,
+    Close,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) async fn outage_daemon_with_replay(replay: OutageReplay) -> OutageDaemon {
     use std::sync::atomic::{AtomicBool, Ordering};
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1106,6 +1133,8 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
     let hold_next = Arc::new(AtomicBool::new(false));
     let release_held = Arc::new(tokio::sync::Notify::new());
     let up = Arc::new(AtomicBool::new(true));
+    let finish_job = Arc::new(tokio::sync::Notify::new());
+    let server_finish_job = finish_job.clone();
     let (server_log, server_refused, server_up, server_key) = (
         log.clone(),
         refused_connects.clone(),
@@ -1136,6 +1165,7 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                 server_hold_next.clone(),
                 server_release.clone(),
             );
+            let finish_job = server_finish_job.clone();
             connections.spawn(async move {
                 if subc_transport::authenticate_server(
                     &mut socket,
@@ -1193,7 +1223,7 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                                 }
                                 // A provider that is restarting is absent from the catalog.
                                 let modules = if up.load(Ordering::SeqCst) {
-                                    json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":["exec-remote/v1"], "requires":[]}}])
+                                    json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":["exec-remote/v1", "exec-remote-submission-key/v1"], "requires":[]}}])
                                 } else {
                                     refused.send_modify(|count| *count += 1);
                                     json!([])
@@ -1219,26 +1249,37 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                                     }
                                     // The provider restarts: its route closes with the job
                                     // still running, and it stays away until restored.
+                                    replies.push(reply(FrameType::Error, json!({"code":"outcome_unknown", "message":"route closed by subc"})));
                                     up.store(false, Ordering::SeqCst);
                                     drop_route = true;
                                 }
                                 "exec.attach" => {
-                                    let from = body["params"]["from_seq"].as_u64().unwrap();
-                                    for job_record in outage_job_records() {
-                                        let seq = match &job_record {
-                                            StreamRecord::Started(started) => started.seq,
-                                            StreamRecord::Output(output) => output.seq,
-                                            _ => unreachable!(),
-                                        };
-                                        if seq >= from {
-                                            replies.push(record(&job_record));
+                                    assert_eq!(body["params"]["job_id"], id().to_string());
+                                    if matches!(replay, OutageReplay::Close) {
+                                        return;
+                                    }
+                                    if matches!(replay, OutageReplay::NotFound) {
+                                        replies.push(reply(FrameType::Error, json!({"code":"job_not_found", "message":"job not found"})));
+                                    } else {
+                                        let from = body["params"]["from_seq"].as_u64().unwrap();
+                                        for job_record in outage_job_records() {
+                                            let seq = match &job_record {
+                                                StreamRecord::Started(started) => started.seq,
+                                                StreamRecord::Output(output) => output.seq,
+                                                _ => unreachable!(),
+                                            };
+                                            if seq >= from {
+                                                replies.push(record(&job_record));
+                                            }
+                                        }
+                                        if !matches!(replay, OutageReplay::Running) {
+                                            let terminal =
+                                                TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0)
+                                                    .with_ran(Ran::Remote);
+                                            replies.push(record(&StreamRecord::Terminal(terminal)));
+                                            replies.push(frame_of(FrameType::StreamEnd, vec![]));
                                         }
                                     }
-                                    let terminal =
-                                        TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0)
-                                            .with_ran(Ran::Remote);
-                                    replies.push(record(&StreamRecord::Terminal(terminal)));
-                                    replies.push(frame_of(FrameType::StreamEnd, vec![]));
                                 }
                                 "exec.cancel" => replies.push(reply(
                                     FrameType::Response,
@@ -1252,6 +1293,16 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                     for response in replies {
                         if subc_transport::write_frame(&mut writer, &response).await.is_err() {
                             return;
+                        }
+                    }
+                    if body["method"] == "exec.attach" && matches!(replay, OutageReplay::Running) {
+                        finish_job.notified().await;
+                        let terminal = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0)
+                            .with_ran(Ran::Remote);
+                        for frame in [record(&StreamRecord::Terminal(terminal)), frame_of(FrameType::StreamEnd, vec![])] {
+                            if subc_transport::write_frame(&mut writer, &frame).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     if drop_route {
@@ -1295,6 +1346,7 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
         hold_next,
         release_held,
         up,
+        finish_job,
         server,
         _dir: dir,
     }
@@ -1435,6 +1487,52 @@ async fn interrupted_call_reattaches_with_next_durable_seq_without_resubmission(
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn accepted_transport_loss_reconnects_and_replays_terminal_exactly_once() {
+    let daemon = outage_daemon().await;
+    let identity = subc_protocol::BindIdentity::new("/workspace/task", "test", "session");
+    let client = ExecRemoteClient::connect(&daemon.connection, identity.clone())
+        .await
+        .unwrap();
+    let request = RunRequest::new(
+        "/workspace/task",
+        "/src/repo",
+        "/workspace/task",
+        "cargo test",
+    )
+    .with_submission_key("aft:accepted-transport-loss");
+    let mut stream = client.run(&request).await.unwrap();
+    let mut sink = MemorySink::default();
+    let Err(Error::RecoveryRequired {
+        resume: Some(point),
+        ..
+    }) = drain(&mut stream, &mut sink).await
+    else {
+        panic!("transport loss after acceptance must preserve its job ID")
+    };
+    assert_eq!(point.job_id, id());
+    assert_eq!(point.last_seq, Some(1));
+    assert_eq!(sink.stdout, b"A");
+    assert!(sink.terminals.is_empty());
+    daemon.restore();
+    let reconnected = ExecRemoteClient::connect(&daemon.connection, identity)
+        .await
+        .unwrap();
+    let mut attached = reconnected.attach(point).await.unwrap();
+    let verdict = drain(&mut attached, &mut sink).await.unwrap();
+    assert_eq!(verdict, Verdict::Exited { code: 0 });
+    assert_eq!(sink.stdout, b"AB");
+    assert_eq!(sink.seqs, vec![0, 1, 2]);
+    assert_eq!(sink.terminals, vec![verdict]);
+    assert!(matches!(
+        attached.next(&mut sink).await.unwrap(),
+        StreamProgress::Complete(Verdict::Exited { code: 0 })
+    ));
+    assert_eq!(sink.terminals.len(), 1);
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+    assert_eq!(daemon.methods("exec.attach")[0]["params"]["from_seq"], 2);
 }
 
 #[tokio::test]

@@ -360,7 +360,7 @@ pub(super) struct MemorySink {
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
     pub(super) seqs: Vec<u64>,
-    terminals: Vec<Verdict>,
+    pub(super) terminals: Vec<Verdict>,
     pub(super) truncations: Vec<u64>,
     unknown: Vec<(u64, Vec<u8>)>,
     started: Vec<Started>,

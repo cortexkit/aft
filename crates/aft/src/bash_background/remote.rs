@@ -2889,6 +2889,9 @@ impl BgTaskRegistry {
         );
         let mut retry_request = None;
         let resume_submission = initial.is_none()
+            // An accepted job without a terminal was detached by an AFT restart.
+            // Recover its existing job ID, even if the submission also has a key.
+            && !(remote.accepted && remote.job_id.is_some() && remote.terminal.is_none())
             && remote.resubmit_for_recovery()
             && (remote.terminal.as_ref().is_some_and(|record| {
                 exec::grade(record) == Verdict::OutcomeUnknown
@@ -3434,7 +3437,10 @@ impl BgTaskRegistry {
                         .remote
                         .as_ref()
                         .is_some_and(RemoteTask::resubmit_for_recovery);
-                    if keyed {
+                    // Prefer the accepted job over resubmitting the command with
+                    // its key. The shorter key-recovery limit must not abandon a
+                    // job that can still be queued or running on the executor.
+                    if keyed && stream.resume_point().is_none() {
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
                             .await?
@@ -3447,13 +3453,13 @@ impl BgTaskRegistry {
                     let Some(point) = stream.resume_point() else {
                         return Err(format!("remote outcome unknown; not resubmitted: {error}"));
                     };
+                    sink.checkpoint_progress().map_err(|e| e.to_string())?;
                     // Even an undecodable frame proves this was not an empty
                     // attach. A quiet but open stream has no output deadline.
                     if stream.received_frame() {
                         recovery.reset();
                     }
-                    // Without a submission key, only attach can recover an
-                    // accepted job without risking a second execution.
+                    // Use the same bounded attach path as an AFT restart.
                     recovery.pause(point.job_id).await?;
                     stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
