@@ -80,8 +80,9 @@ def patch_id(oid: str) -> str:
 
 def fix_notes(tag: str, version: str, fixes: list[str]) -> str:
     """Notes for a retry: the failed tag's approved notes with its version
-    renamed to the new one, plus one line per fix. Provenance checks constrain
-    code only, so the verifier requires the notes to exist but not this text."""
+    renamed to the new one, plus one line per fix. verify_lineage() only
+    requires the notes file to be non-empty: it guards which code can reach a
+    release, and notes are text, so their wording is not pinned there."""
     notes = git("show", f"{tag}:.alfonso/release-notes/{tag}.md")
     if not notes.strip():
         raise ValueError("failed tag has no approved release notes")

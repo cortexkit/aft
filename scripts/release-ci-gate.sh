@@ -2,7 +2,7 @@
 # Release CI gate: publish a tag only if tests.yml already passed on its commit.
 #
 # Queued release PRs land with a new merge OID. The publication gate checks the
-# Tests run for that exact final OID, not an earlier pull-request or merge-queue
+# Tests run for that exact final commit, not an earlier pull-request or merge-queue
 # candidate or an ancestor's green run. It proves three things about
 # the commit the tag points at:
 #
