@@ -22876,9 +22876,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let diagnostic = loop {
             let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
-            if diagnostic.contains("held-rebind-writer")
-                || std::time::Instant::now() >= deadline
-            {
+            if diagnostic.contains("held-rebind-writer") || std::time::Instant::now() >= deadline {
                 break diagnostic;
             }
             std::thread::sleep(Duration::from_millis(10));
