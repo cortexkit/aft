@@ -2994,3 +2994,50 @@ async fn real_route_open_policy_refusal_never_acquires_the_outage_retry_marker()
     assert!(daemon.requests().is_empty());
     assert_eq!(daemon.opens().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn shim_binding_version_check_retries_only_a_pre_send_outage_once() {
+    let live = crate::bash_background::registry::with_scope_spawn(Some(delegating_stamp()), || {
+        crate::gh_shim_ticket::ScopedTicket::issue(
+            "ses-binding-outage",
+            "call-binding-outage",
+            "/p",
+        )
+    });
+    let redeemed = crate::gh_shim_ticket::redeem(live.value().unwrap()).unwrap();
+    let unavailable = TransportError::Unavailable("connection refused".into());
+    let bindings = json!({"repo_binding_generation": 3, "bindings": []});
+    for recover in [true, false] {
+        let transport = FakeTransport::default();
+        transport.push_plexus(Err(unavailable.clone()));
+        transport.push_plexus(if recover {
+            Ok(bindings.clone())
+        } else {
+            Err(unavailable.clone())
+        });
+        let started = tokio::time::Instant::now();
+        let reply = bindings_read(&transport, &redeemed).await;
+        if recover {
+            assert_eq!(reply, RelayReply::relayed(bindings.clone()));
+        } else {
+            assert_eq!(reply, transport_refusal("plexus", unavailable.clone()));
+        }
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].2, calls[1].2);
+        assert_eq!(calls[0].2["arguments"]["op"], "bindings.read_for_agent");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(4)
+        );
+    }
+    let transport = FakeTransport::default();
+    let denied = TransportError::Refused {
+        code: "no_binding_row".into(),
+        message: "no binding".into(),
+    };
+    transport.push_plexus(Err(denied.clone()));
+    let reply = bindings_read(&transport, &redeemed).await;
+    assert_eq!(reply, transport_refusal("plexus", denied));
+    assert_eq!(transport.calls().len(), 1);
+}

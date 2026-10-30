@@ -176,15 +176,22 @@ impl PreSendRetry {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let retry_at = tokio::time::Instant::now() + self.delay;
-        if self.used || !error.retry_before_send || retry_at >= self.deadline {
+        if !self.wait(error.retry_before_send).await {
             return Err(error);
         }
-        self.used = true;
-        tokio::time::sleep_until(retry_at).await;
         tokio::time::timeout_at(self.deadline, call())
             .await
             .map_err(|_| timeout())?
+    }
+
+    async fn wait(&mut self, unreachable: bool) -> bool {
+        let retry_at = tokio::time::Instant::now() + self.delay;
+        if self.used || !unreachable || retry_at >= self.deadline {
+            return false;
+        }
+        self.used = true;
+        tokio::time::sleep_until(retry_at).await;
+        true
     }
 }
 
@@ -809,10 +816,28 @@ async fn bindings_read<T: RelayTransport>(
         }
     };
     let body = agent_bindings_call(agent);
-    match transport
-        .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
-        .await
-    {
+    let deadline = tokio::time::Instant::now() + RELAY_CALL_TIMEOUT;
+    let mut retry = PreSendRetry::new(deadline);
+    let attempt = || {
+        transport.plexus(
+            &redeemed.project_root,
+            &redeemed.session_id,
+            None,
+            body.clone(),
+        )
+    };
+    let result = tokio::time::timeout_at(deadline, async {
+        let first = attempt().await;
+        if let Err(error) = &first {
+            if retry.wait(error.unreachable_before_send()).await {
+                return attempt().await;
+            }
+        }
+        first
+    })
+    .await
+    .unwrap_or_else(|_| Err(TransportError::Unavailable("binding read timed out".into())));
+    match result {
         Ok(reply) => RelayReply::relayed(reply),
         Err(error) => transport_refusal("plexus", error),
     }
