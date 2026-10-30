@@ -445,6 +445,8 @@ pub struct ApplicableServerStartOutcomes {
 
 pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
 pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+
+const FILE_SERVER_RESTART_ATTEMPTS: usize = 3;
 pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
 pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
     "language-server startup notification queue is full; retry the file change";
@@ -691,8 +693,21 @@ where
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     // Start any missing server without the lock; the pulls below then only
     // open the document and send the requests under it.
-    start_servers_for_file_unlocked(&lock, file_path, config);
-    let pulls = lock().begin_file_pulls(file_path, config, deadline)?;
+    let mut pulls = None;
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let opened = ensure_file_open_unlocked(&lock, file_path, config)?;
+        let mut manager = lock();
+        if opened
+            .server_keys
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        pulls = Some(manager.begin_file_pulls(file_path, config, deadline)?);
+        break;
+    }
+    let pulls = pulls.ok_or_else(|| LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))?;
     // All requests are in flight at once; wait for each without the lock.
     let replies = pulls
         .into_iter()
@@ -751,7 +766,8 @@ where
 }
 
 /// Send an interactive request (hover, definition, references, rename) to the
-/// running server that owns `file_path` and wait for its reply.
+/// server that owns `file_path` and wait for its reply, restarting it if idle
+/// reaping detached it after the caller's startup check.
 ///
 /// The manager lock is held only to find the client and write the request.
 /// The wait for the reply, up to eight seconds on a busy server, runs without
@@ -773,6 +789,13 @@ where
 {
     let started = {
         let mut lsp = lock();
+        if lsp.client_for_file(file_path, config).is_none() {
+            drop(lsp);
+            if let Err(err) = ensure_file_open_unlocked(&lock, file_path, config) {
+                return Some(Err(err));
+            }
+            lsp = lock();
+        }
         let client = lsp.client_for_file_mut(file_path, config)?;
         client.start_request::<R>(params)
     };
@@ -1341,7 +1364,7 @@ fn next_transient_backoff(previous: Option<Duration>) -> Duration {
 
 /// A retry delay in whole seconds, rounded up so a pending retry never reads
 /// as "after 0s": `45s`, `2m`, `4m 30s`.
-fn format_retry_delay(delay: Duration) -> String {
+pub(crate) fn format_retry_delay(delay: Duration) -> String {
     let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
     match (seconds / 60, seconds % 60) {
         (0, seconds) => format!("{seconds}s"),
@@ -2416,11 +2439,10 @@ impl LspManager {
         key: &ServerKey,
         failure: StartFailure,
     ) -> ServerAttemptResult {
-        slog_error!("failed to spawn {}: {}", def.name, failure.error);
+        log_spawn_failure(def, key, &failure.error, self.retry_clock.now());
         let result = classify_spawn_error(&def.binary, &failure.error);
-        // Remember the failure so subsequent file events skip this
-        // (kind, root) pair instead of producing a fresh spawn attempt +
-        // ERROR log per request.
+        // Remember executable failures so subsequent file events skip this
+        // (kind, root) pair. Capacity refusals remain eligible on the next request.
         self.record_failed_spawn(key, result, failure.durability)
     }
 
@@ -5715,6 +5737,54 @@ impl LspManager {
         clients
     }
 
+    /// Detach idle clients while holding the manager lock, before stopping them.
+    /// Requests either reserve a pending response first or find the key absent
+    /// and start a replacement; they cannot acquire a half-stopped client.
+    pub(crate) fn take_idle_clients(
+        &mut self,
+        now: Instant,
+        ttl: Duration,
+        root_idle: bool,
+    ) -> Vec<(ServerKey, LspClient)> {
+        let keys: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(key, client)| {
+                // Startup document replay writes through a cloned writer while
+                // its reservation exists, so it is not idle work to interrupt.
+                if self.starting.contains_key(key) {
+                    return None;
+                }
+                let idle = now.saturating_duration_since(client.last_used_at());
+                ((root_idle || idle >= ttl) && !client.has_pending_requests()).then(|| key.clone())
+            })
+            .collect();
+        let mut clients = Vec::with_capacity(keys.len());
+        for key in keys {
+            let client = self.clients.remove(&key).expect("selected idle client");
+            let idle = now.saturating_duration_since(client.last_used_at());
+            let package = key
+                .root
+                .file_name()
+                .unwrap_or(key.root.as_os_str())
+                .to_string_lossy();
+            slog_info!(
+                "idle lsp reap {} {package}: after {}m (ttl {}m)",
+                key.kind.id_str(),
+                idle.as_secs() / 60,
+                ttl.as_secs() / 60
+            );
+            self.forget_server_state(Some(&key));
+            self.pending_diagnostic_observations
+                .retain(|observation| observation.server_key != key);
+            clients.push((key, client));
+        }
+        if !clients.is_empty() {
+            self.clients_generation = self.clients_generation.wrapping_add(1);
+        }
+        clients
+    }
+
     /// Forget instance-owned state without changing start reservations or
     /// failure backoff. Those have their own generation and retry lifecycles.
     fn forget_server_state(&mut self, key: Option<&ServerKey>) {
@@ -8942,17 +9012,28 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
-    if outcomes
-        .attempts
-        .iter()
-        .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
-    {
-        return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+        if outcomes
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+        {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
+        let mut manager = lock();
+        // An idle sweep can detach a server after startup resolves. Restart
+        // outside the lock rather than returning an empty document-open result.
+        if outcomes
+            .successful
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        return manager.ensure_file_open(&canonical_path, config);
     }
-    // Every server is now running or has a remembered failure, so this
-    // starts nothing under the lock unless a client vanished in between.
-    lock().ensure_file_open(&canonical_path, config)
+    Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))
 }
 
 /// rust-analyzer's own LSP request (not part of the LSP specification) that
@@ -9689,6 +9770,37 @@ fn process_start_durability(error: &LspError) -> FailureDurability {
     }
 }
 
+fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: Instant) {
+    let capacity = match error {
+        LspError::Io(io) => io
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<super::client::RustAnalyzerCapacityExhausted>()),
+        _ => None,
+    };
+    if let Some(capacity) = capacity {
+        // Admission is daemon-wide, so separate managers for the same root
+        // must share the log limit. Expire quiet roots instead of retaining
+        // every checkout the daemon has ever seen.
+        static LAST_LOG: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, Instant>>> =
+            std::sync::OnceLock::new();
+        let mut last_log = LAST_LOG.get_or_init(Default::default).lock();
+        last_log.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(3600));
+        if last_log.contains_key(&key.root) {
+            return;
+        }
+        last_log.insert(key.root.clone(), now);
+        drop(last_log);
+        slog_info!(
+            "rust-analyzer admission deferred root={} cap={} current={}; retry after another worker analyzer stops",
+            key.root.display(),
+            capacity.cap,
+            capacity.current
+        );
+    } else {
+        slog_error!("failed to spawn {}: {}", def.name, error);
+    }
+}
+
 /// Classify a server that died or failed during or after `initialize` from
 /// its failure text and stderr. Only configuration errors AFT recognises are
 /// permanent: typescript-language-server finding no usable TypeScript SDK,
@@ -9731,7 +9843,7 @@ fn env_binary_override_from(
 
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
-mod regression_tests;
+pub(crate) mod regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]
@@ -10207,6 +10319,68 @@ mod transient_retry_tests {
         assert_eq!(format_retry_delay(Duration::from_secs(45)), "45s");
         assert_eq!(format_retry_delay(Duration::from_secs(120)), "2m");
         assert_eq!(format_retry_delay(Duration::from_secs(270)), "4m 30s");
+    }
+
+    #[test]
+    fn rust_capacity_logs_info_once_per_root_per_hour_across_managers() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: dir.path().join("first"),
+        };
+        let other = ServerKey {
+            root: dir.path().join("second"),
+            ..key.clone()
+        };
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == ServerKind::Rust)
+            .unwrap();
+        let failure = || {
+            let error = LspError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 3 },
+            ));
+            let durability = process_start_durability(&error);
+            assert_eq!(durability, FailureDurability::Capacity);
+            StartFailure { error, durability }
+        };
+        let (mut first, offset) = manager_with_clock();
+        let mut second = LspManager::new();
+        second.set_retry_clock(first.retry_clock.clone());
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &key, failure());
+            offset.store(3_599_999, Ordering::SeqCst);
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &other, failure());
+            offset.store(3_600_000, Ordering::SeqCst);
+            second.record_file_start_failure(&def, &key, failure());
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(line.starts_with("INFO "), "{line}");
+            assert!(line.contains("cap=2 current=3"), "{line}");
+        }
+        assert!(lines[0].contains(&key.root.display().to_string()));
+        assert!(lines[1].contains(&other.root.display().to_string()));
+        assert!(lines[2].contains(&key.root.display().to_string()));
+
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::NotFound] {
+                let error = LspError::Io(std::io::Error::from(kind));
+                let durability = process_start_durability(&error);
+                first.record_file_start_failure(&def, &key, StartFailure { error, durability });
+            }
+        });
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ERROR "))
+                .count(),
+            2,
+            "real spawn failures must still log ERROR: {lines:?}"
+        );
     }
 
     #[test]

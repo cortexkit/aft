@@ -2232,7 +2232,7 @@ fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
             );
             assert!(!run.stderr.contains("outcome unknown"), "{}", row.name);
             if row.name == "resolve-thread-not-own" {
-                assert_eq!(run.stderr, "gh-shim: gh_shim_seam_refusal: plexus refused the bot write with a code this shim does not know: review_thread_not_own; it was not retried\n");
+                assert_eq!(run.stderr, "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by octocat. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.\n");
             }
         }
     }

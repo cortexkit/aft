@@ -1444,52 +1444,56 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     let grant_scope = crate::access_policy::current_scope();
     let ask_route = crate::access_policy::current_ask_route();
     let io_budget = crate::bounded_io::current().map(|budget| budget.capped(deadline.terminal_at));
-    std::thread::spawn(move || {
-        let _io = crate::bounded_io::enter(io_budget);
-        let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
-        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
-        let _config_pin = ctx.pin_config_to(admitted_config);
-        let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
-        let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
-        if ctx.checkout_query_runtime_active() {
-            // Pin the one final wait outcome even when diagnostics terminate
-            // before Tier-2 submission. Finalization below uses this same guard.
-            let _ = ctx.callgraph_store_for_ops();
-        }
-        // Queueing instead of sharing a response keeps request-specific scopes,
-        // phase logs, and terminals independent while bounding expensive work to
-        // one detached inspect body per root.
-        let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
-            Some(_permit) => run_blocking_inspect_body(
-                &request,
-                &ctx,
-                applicability,
-                reports_diagnostics,
-                phase_log,
-                deadline,
-            ),
-            None if inspect_cancellation_requested() => {
-                build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
+    std::thread::Builder::new()
+        .name("aft-inspect-request".into())
+        .spawn(move || {
+            let _io = crate::bounded_io::enter(io_budget);
+            let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
+            let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+            let _config_pin = ctx.pin_config_to(admitted_config);
+            let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
+            let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+            if ctx.checkout_query_runtime_active() {
+                // Resolve call-graph availability before diagnostics can end the
+                // request. Response finalization must report the same outcome
+                // even if no background scan is submitted.
+                let _ = ctx.callgraph_store_for_ops();
             }
-            None => build_inspect_terminal(
-                &request.id,
-                &phase_log,
-                request_deadline_terminal(next_phase(&applicability), deadline),
-            ),
-        };
-        crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
-        if response.success {
-            if let Some(payload) = response.data.as_object_mut() {
-                let sections = parse_sections(request.params.get("sections"))
-                    .expect("inspect sections were validated during preflight");
-                set_inspect_completion(payload, &sections);
+            // Queueing instead of sharing a response keeps request-specific scopes,
+            // phase logs, and terminals independent while bounding expensive work to
+            // one detached inspect body per root.
+            let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
+                Some(_permit) => run_blocking_inspect_body(
+                    &request,
+                    &ctx,
+                    applicability,
+                    reports_diagnostics,
+                    phase_log,
+                    deadline,
+                ),
+                None if inspect_cancellation_requested() => {
+                    build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
+                }
+                None => build_inspect_terminal(
+                    &request.id,
+                    &phase_log,
+                    request_deadline_terminal(next_phase(&applicability), deadline),
+                ),
+            };
+            crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
+            if response.success {
+                if let Some(payload) = response.data.as_object_mut() {
+                    let sections = parse_sections(request.params.get("sections"))
+                        .expect("inspect sections were validated during preflight");
+                    set_inspect_completion(payload, &sections);
+                }
             }
-        }
-        // After the completion verdict, so a watcher backlog still marks the
-        // result incomplete.
-        crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
-        let _ = tx.send(crate::bounded_io::finish_response(response));
-    });
+            // After the completion verdict, so a watcher backlog still marks the
+            // result incomplete.
+            crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
+            let _ = tx.send(crate::bounded_io::finish_response(response));
+        })
+        .expect("spawn inspect request worker");
     DispatchOutcome::Deferred(
         PendingResponse::from_receiver(
             completion_request_id,
@@ -7942,6 +7946,24 @@ mod deferred_terminal_tests {
         assert_eq!(initial, final_stats);
         assert_eq!(initial.0.len(), 3);
         assert_eq!(INSPECT_STAT_CALLS.with(std::cell::Cell::get), 6);
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
+    fn live_cpu_root_stats_checkout_cost() {
+        let root =
+            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        INSPECT_STAT_CALLS.with(|count| count.set(0));
+        crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.set(0));
+        let started = Instant::now();
+        let initial = capture_inspect_root_stats_until(&root, None).unwrap();
+        let first = started.elapsed();
+        let started = Instant::now();
+        let final_stats = capture_inspect_root_stats_until(&root, None).unwrap();
+        let second = started.elapsed();
+        assert_eq!(initial, final_stats);
+        println!("inspect root stats (unchanged algorithm): files={} first={first:?} second={second:?} per_inspect={:?} stat_calls={} walk_entries={}",
+            initial.0.len(), first + second, INSPECT_STAT_CALLS.with(std::cell::Cell::get), crate::callgraph::PROJECT_WALK_ENTRIES.with(std::cell::Cell::get));
     }
 
     #[test]

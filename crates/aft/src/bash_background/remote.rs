@@ -170,12 +170,23 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
 #[cfg(unix)]
 const REMOTE_REATTACH_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// ck-motor's default queue wait limit, used for a request that sets no
-/// `queue_wait_limit_s` (AFT never sets one).
-/// Time a job waits only behind its own workspace's earlier job is not counted
-/// against it, so this bounds the ordinary case, not every wait.
+/// ck-motor's queue wait for jobs eligible for Boat (at most eight vCPUs,
+/// without outbound networking). Hosted-only jobs may wait longer. AFT leaves
+/// `queue_wait_limit_s` unset so the runner chooses its capacity-aware default.
+/// This baseline also caps retries after a proven terminal refusal.
 #[cfg(unix)]
 const RUNNER_QUEUE_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// Bound queue time without duplicating ck-motor's routing decisions. Its
+/// default admission policy allows 300 seconds for Boat-eligible jobs, or
+/// min(1800 seconds, the run timeout) for hosted-only jobs. The larger of 300
+/// seconds and the run timeout therefore covers either queue before execution
+/// consumes its separate runtime budget. Both re-attach and submission-key
+/// recovery must allow that time before declaring a job's outcome unknown.
+#[cfg(unix)]
+fn recovery_queue_wait_allowance(run_timeout: Duration) -> Duration {
+    RUNNER_QUEUE_WAIT_LIMIT.max(run_timeout)
+}
 
 /// The first pause before re-attaching after a lost stream; each failed attempt
 /// without progress doubles it, up to [`REATTACH_BACKOFF_MAX`].
@@ -480,9 +491,9 @@ fn local_os_name() -> &'static str {
 /// Bounds how long AFT keeps re-attaching to an accepted job whose stream it
 /// lost. Silence on an open stream is never bounded; only recovery attempts
 /// that bring no record are. While the job may still be queued or running on
-/// the runner, AFT keeps trying: it stops only once the job's own limits (the
-/// runner's queue wait limit plus the command's run timeout, counted from AFT's
-/// latest submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
+/// the runner, AFT keeps trying: it stops only once a conservative queue
+/// allowance plus the command's run timeout (counted from AFT's latest
+/// submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
 /// after recovery began. Accepted jobs can disappear with a wiped runner state;
 /// AFT must not resubmit them.
 #[cfg(unix)]
@@ -509,8 +520,8 @@ struct ReattachBudget {
 #[cfg(unix)]
 impl ReattachBudget {
     fn new(_root: &Path, metadata: &PersistedTask) -> Self {
-        let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
         let (until_job_end, recorded_timeout, run_timeout) = Self::until_job_end(metadata);
+        let queue_wait = recovery_queue_wait_allowance(run_timeout);
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
@@ -522,7 +533,7 @@ impl ReattachBudget {
             None => (grace, until_job_end),
         };
         let limit_note = format!(
-            "ck-motor's queue wait limit of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
+            "a queue wait allowance of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
             retry_duration(duration_ms(queue_wait)),
             if recorded_timeout.is_some() { "" } else { "assumed " },
             retry_duration(duration_ms(run_timeout)),
@@ -569,7 +580,7 @@ impl ReattachBudget {
             .and_then(|retry| retry.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
         let job_end_ms = submitted_at
-            .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT))
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
             .saturating_add(duration_ms(run_timeout));
         (
             Duration::from_millis(job_end_ms.saturating_sub(unix_millis())),
@@ -598,7 +609,13 @@ impl ReattachBudget {
         }
     }
 
-    /// A record arrived: the job is alive, so recovery starts over.
+    fn observe(&mut self, progress: &StreamProgress) {
+        if matches!(progress, StreamProgress::Record) {
+            self.reset();
+        }
+    }
+
+    /// An execution record arrived: the job is alive, so recovery starts over.
     fn reset(&mut self) {
         self.deadline = None;
         self.attempts = 0;
@@ -902,24 +919,24 @@ pub(crate) struct KeyedSubmission {
 #[cfg(unix)]
 impl KeyedSubmission {
     fn expires_at(&self, metadata: &PersistedTask) -> u64 {
+        let run_timeout = metadata
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_BG_TIMEOUT);
         let submitted_at = metadata
             .remote
             .as_ref()
             .and_then(|r| r.retry.as_ref())
             .and_then(|r| r.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
+        // Admission can wait before execution starts; that wait does not
+        // consume the runner's execution timeout.
+        let job_end_ms = submitted_at
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
+            .saturating_add(duration_ms(run_timeout));
         self.created_at_ms
             .saturating_add(SUBMISSION_RETENTION_MS)
-            .min(
-                submitted_at.saturating_add(
-                    metadata
-                        .timeout_ms
-                        .unwrap_or(duration_ms(DEFAULT_BG_TIMEOUT))
-                        // Admission can wait before execution starts; that wait
-                        // does not consume the runner's execution timeout.
-                        .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT)),
-                ),
-            )
+            .min(job_end_ms)
     }
 }
 
@@ -1009,6 +1026,51 @@ impl RemotePhase {
 pub(crate) struct RemoteProgress {
     pub job_id: Option<Uuid>,
     pub phase: RemotePhase,
+}
+
+#[cfg(unix)]
+fn admission_progress_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 120;
+    let single_line: String = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let normalized = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Mask complete credentials before a display cut could split their shape.
+    let redacted = crate::log_redact::aft_redactor(&normalized);
+    if redacted.chars().count() <= MAX_DETAIL_CHARS {
+        return redacted.into_owned();
+    }
+    let (boundary, _) = redacted.char_indices().nth(MAX_DETAIL_CHARS - 1).unwrap();
+    format!("{}…", &redacted[..boundary])
+}
+
+#[cfg(unix)]
+fn admission_progress_line(progress: &exec::types::Progress) -> Option<String> {
+    use exec::types::ProgressPhase;
+    let step = match progress.phase() {
+        ProgressPhase::Upload => "uploading its files".to_owned(),
+        ProgressPhase::PlacementWait => "waiting for a free build host".to_owned(),
+        ProgressPhase::Connect => "connecting to its build host".to_owned(),
+        _ => return None,
+    };
+    let elapsed =
+        crate::lsp::manager::format_retry_delay(Duration::from_millis(progress.phase_elapsed_ms()));
+    let detail = progress
+        .detail()
+        .map(admission_progress_detail)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
+    Some(format!(
+        "The remote job is {step} ({elapsed} so far){detail}."
+    ))
 }
 
 impl RemoteProgress {
@@ -1638,6 +1700,22 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 
 #[cfg(unix)]
 impl OutputSink for TaskSink {
+    fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        let Some(note) = admission_progress_line(progress) else {
+            return;
+        };
+        let Ok(mut state) = self.task.state.lock() else {
+            return;
+        };
+        if !state.metadata.is_terminal()
+            && state.metadata.remote.as_ref().is_some_and(|r| !r.accepted)
+        {
+            // Replace, never append: pre-acceptance status is ephemeral and is
+            // not output, a resume checkpoint, or execution evidence.
+            state.remote_admission_note = Some(note);
+            self.task.publish_runon_launch_state(&state);
+        }
+    }
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         // Measure receipt before local persistence adds its own latency. An
         // attach after restart has no in-process exec.run send timestamp.
@@ -1670,6 +1748,7 @@ impl OutputSink for TaskSink {
             .state
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
+        state.remote_admission_note = None;
         append_executor_environment_disclosure(&mut state.metadata);
         if let Some(remote) = &state.metadata.remote {
             let note = remote_execution_note(remote);
@@ -3288,8 +3367,11 @@ impl BgTaskRegistry {
             } else {
                 true
             };
+            if let Ok(progress) = &result {
+                recovery.observe(progress);
+            }
             match result {
-                Ok(StreamProgress::Record) => recovery.reset(),
+                Ok(StreamProgress::AdmissionProgress | StreamProgress::Record) => {}
                 Ok(StreamProgress::Complete(Verdict::RunLocally {
                     reason,
                     refusal_detail,

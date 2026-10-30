@@ -119,6 +119,11 @@ pub(crate) enum Script {
     },
     Lost,
     Refused,
+    /// Hold the first record until `acceptance_gate`, then refuse without Accepted.
+    GatedPreStartRefusal {
+        reason: &'static str,
+        detail: Option<&'static str>,
+    },
     Restart,
     Cancel,
     /// Hold the run stream open until cancellation; attach returns this terminal.
@@ -471,6 +476,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
                             } else if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
                                 let mut request = body["params"].clone();
+                                request.as_object_mut().unwrap().remove("progress");
                                 let cursor = request.as_object_mut().unwrap().remove("resume_from_seq").and_then(|v| v.as_u64());
                                 let keyed = request["submission_key"].is_string();
                                 let same_key = keyed && submission.as_ref().is_some_and(|old| old["submission_key"] == request["submission_key"]);
@@ -502,6 +508,10 @@ pub(crate) async fn daemon_with_capabilities(
                                 }
                                 if !(disconnect && runs == 1) { replies.push(reply(FrameType::StreamEnd, Value::Null)); }
                             } else {
+                            if !attaching && body["params"]["progress"] == true && claims.iter().any(|claim| claim == PROGRESS_CAPABILITY) {
+                                let progress = Progress::new(ProgressPhase::Upload, 14_000, Some("plain <detail>".into())).unwrap();
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Progress(progress)).unwrap()));
+                            }
                             let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } | Script::SignerRefused { refusals, .. } if runs <= refusals)
                                 || matches!(script, Script::DrainingThenSigner { signer_refusals, .. } if runs <= 1 + signer_refusals)
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
@@ -513,7 +523,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 // Drop the connection and listener with the run in flight.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::GatedPreStartRefusal { .. } | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
@@ -549,7 +559,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedPreStartRefusal { .. } | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -727,6 +737,7 @@ pub(crate) async fn daemon_with_capabilities(
                     Script::GatedAcceptance
                         | Script::GatedAcceptanceThenExit
                         | Script::GatedAcceptanceThenRefused
+                        | Script::GatedPreStartRefusal { .. }
                 ) || matches!(script, Script::DrainingGatedAcceptance) && runs > 1)
                     && body["method"] == "exec.run"
                 {
@@ -734,22 +745,27 @@ pub(crate) async fn daemon_with_capabilities(
                     let gate = server_acceptance_gate.clone();
                     producers.push(tokio::spawn(async move {
                         gate.notified().await;
-                        let accepted = Frame::build_with_version(
-                            header.ver,
-                            FrameType::StreamData,
-                            header.flags,
-                            header.channel,
-                            header.epoch,
-                            header.corr,
-                            serde_json::to_vec(&StreamRecord::Accepted(Accepted::new(id(), 1)))
-                                .unwrap(),
-                        )
-                        .unwrap();
-                        let _ =
-                            subc_transport::write_frame(&mut *writer.lock().await, &accepted).await;
+                        if !matches!(script, Script::GatedPreStartRefusal { .. }) {
+                            let accepted = Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamData,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                serde_json::to_vec(&StreamRecord::Accepted(Accepted::new(id(), 1)))
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                            let _ =
+                                subc_transport::write_frame(&mut *writer.lock().await, &accepted)
+                                    .await;
+                        }
                         if matches!(
                             script,
-                            Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused
+                            Script::GatedAcceptanceThenExit
+                                | Script::GatedAcceptanceThenRefused
+                                | Script::GatedPreStartRefusal { .. }
                         ) {
                             let record = |ty, body: Vec<u8>| {
                                 Frame::build_with_version(
@@ -763,17 +779,24 @@ pub(crate) async fn daemon_with_capabilities(
                                 )
                                 .unwrap()
                             };
-                            let outcome = if matches!(script, Script::GatedAcceptanceThenRefused) {
-                                Outcome::RefusedBeforeStart {
-                                    reason: RefusalReason::Unreachable,
-                                }
-                            } else {
-                                Outcome::Exit { code: 0 }
-                            };
-                            let terminal = serde_json::to_vec(&StreamRecord::Terminal(
-                                TerminalRecord::new(id(), outcome, 1, 0, 0),
-                            ))
-                            .unwrap();
+                            let outcome =
+                                if let Script::GatedPreStartRefusal { reason, .. } = script {
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::Unknown(reason.into()),
+                                    }
+                                } else if matches!(script, Script::GatedAcceptanceThenRefused) {
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::Unreachable,
+                                    }
+                                } else {
+                                    Outcome::Exit { code: 0 }
+                                };
+                            let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
+                            if let Script::GatedPreStartRefusal { detail, .. } = script {
+                                terminal.refusal_detail = detail.map(str::to_owned);
+                            }
+                            let terminal =
+                                serde_json::to_vec(&StreamRecord::Terminal(terminal)).unwrap();
                             for frame in [
                                 record(FrameType::StreamData, terminal),
                                 record(FrameType::StreamEnd, vec![]),
@@ -1093,6 +1116,15 @@ fn outage_job_records() -> Vec<StreamRecord> {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn outage_daemon() -> OutageDaemon {
+    outage_daemon_with_started_job(true).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn queued_outage_daemon() -> OutageDaemon {
+    outage_daemon_with_started_job(false).await
+}
+
+async fn outage_daemon_with_started_job(started: bool) -> OutageDaemon {
     use std::sync::atomic::{AtomicBool, Ordering};
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1214,11 +1246,13 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                                         id(),
                                         1,
                                     ))));
-                                    for job_record in &outage_job_records()[..2] {
-                                        replies.push(record(job_record));
+                                    if started {
+                                        for job_record in &outage_job_records()[..2] {
+                                            replies.push(record(job_record));
+                                        }
                                     }
-                                    // The provider restarts: its route closes with the job
-                                    // still running, and it stays away until restored.
+                                    // The provider restarts while the job is still queued or running.
+                                    // Its route closes, and the provider stays unavailable until restored.
                                     up.store(false, Ordering::SeqCst);
                                     drop_route = true;
                                 }
@@ -1313,7 +1347,7 @@ async fn drain(stream: &mut RemoteStream, sink: &mut MemorySink) -> Result<Verdi
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match stream.next(sink).await? {
-                StreamProgress::Record => {}
+                StreamProgress::Record | StreamProgress::AdmissionProgress => {}
                 StreamProgress::Complete(verdict) => return Ok(verdict),
             }
         }
@@ -1370,6 +1404,50 @@ async fn daemon_route_uses_hyphenated_capability_and_dotted_operations() {
             .filter_map(|(_, body)| body["method"].as_str())
             .collect();
         assert_eq!(operations, ["exec.run", "exec.status", "exec.cancel"]);
+    }
+}
+
+#[tokio::test]
+async fn remote_progress_is_requested_only_with_the_advertised_capability() {
+    for supported in [false, true] {
+        let claims = if supported {
+            vec![client::CAPABILITY, PROGRESS_CAPABILITY]
+        } else {
+            vec![client::CAPABILITY]
+        };
+        let daemon = daemon_with_capabilities(Script::Utf8, &claims, 1).await;
+        let client = client(&daemon).await;
+        // Enable a default request on a new executor, but remove a saved
+        // opt-in when today's executor no longer advertises progress.
+        let request = RunRequest::new("/workspace", "/src/repo", "/workspace", "test")
+            .with_progress(!supported);
+        let mut stream = client.run(&request).await.unwrap();
+        let mut sink = MemorySink::default();
+        if supported {
+            assert_eq!(
+                stream.next(&mut sink).await.unwrap(),
+                StreamProgress::AdmissionProgress
+            );
+            assert!(!stream.received_frame());
+            assert_eq!(stream.resume_point(), None);
+            assert!(sink.seqs.is_empty());
+        }
+        assert_eq!(
+            drain(&mut stream, &mut sink).await.unwrap(),
+            Verdict::Exited { code: 0 }
+        );
+        let log = daemon.log.lock().unwrap();
+        let run = log
+            .iter()
+            .find(|(_, body)| body["method"] == "exec.run")
+            .unwrap();
+        assert_eq!(
+            run.1["params"]["progress"].as_bool().unwrap_or(false),
+            supported
+        );
+        if !supported {
+            assert!(run.1["params"].get("progress").is_none());
+        }
     }
 }
 

@@ -864,6 +864,7 @@ pub struct RemoteRefusal {
 pub(crate) struct RunonLaunchState {
     pub accepted: bool,
     pub progress: remote::RemoteProgress,
+    pub admission_note: Option<String>,
     pub terminal: Option<BgTaskSnapshot>,
 }
 
@@ -1869,6 +1870,8 @@ pub(crate) enum TaskRuntime {
 
 pub(crate) struct BgTaskState {
     pub(crate) metadata: PersistedTask,
+    /// Only the latest pre-acceptance line, never written to task metadata.
+    remote_admission_note: Option<String>,
     /// The path stays in persisted metadata until this worker result succeeds,
     /// so a crash or a full queue leaves enough information for the stale sweep.
     temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
@@ -5413,6 +5416,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -5857,6 +5861,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -6221,6 +6226,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -12740,6 +12746,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -16596,6 +16603,9 @@ impl BgTask {
         let launch = RunonLaunchState {
             accepted: remote.accepted,
             progress: remote::RemoteProgress::of(remote),
+            admission_note: (!remote.accepted && !state.metadata.is_terminal())
+                .then(|| state.remote_admission_note.clone())
+                .flatten(),
             // Before Accepted there is no command output; an accepted refusal
             // also never started. Accepted results keep the launch task handle.
             terminal: (state.metadata.is_terminal()
@@ -16697,7 +16707,14 @@ impl BgTask {
             elapsed_ms: (!metadata.status.is_terminal())
                 .then(|| self.elapsed_for_metadata(metadata).as_millis() as u64),
             remote_job_id: remote_job_id(metadata),
-            remote_phase_note: remote::remote_phase_note(metadata, unix_millis()),
+            remote_phase_note: state
+                .remote_admission_note
+                .as_ref()
+                .filter(|_| !metadata.is_terminal())
+                .filter(|_| metadata.child_pid.is_none())
+                .filter(|_| metadata.remote.as_ref().is_some_and(|r| !r.accepted))
+                .cloned()
+                .or_else(|| remote::remote_phase_note(metadata, unix_millis())),
         }
     }
 
