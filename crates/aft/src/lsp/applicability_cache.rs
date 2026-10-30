@@ -854,41 +854,39 @@ impl ApplicabilityCache {
                 &inputs,
             ));
             let mut state = flight.state.lock();
-            // Under continuous edits, return the scan to its original callers.
-            // Only unchanged complete scans may become applicability snapshots.
-            if state.generation == running.generation {
-                if let Err(
-                    error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. },
-                ) = &result
-                {
-                    let backoff = state
-                        .incomplete
-                        .as_ref()
-                        .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
-                            (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
-                        });
-                    // Partial dependencies cannot prove applicability. Watcher
-                    // invalidation resets this delay; unwatched areas retry on time.
-                    state.incomplete = Some(IncompleteWalk {
-                        error: error.clone(),
-                        retry_at: retry_clock() + backoff,
-                        backoff,
+            // Entry-limit failures throttle retries even if watcher events
+            // arrived during the scan. They never certify applicability.
+            if let Err(error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. }) =
+                &result
+            {
+                let backoff = state
+                    .incomplete
+                    .as_ref()
+                    .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
+                        (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
                     });
-                    crate::slog_warn!(
-                        "language-server applicability walk incomplete: root={} entries={} retry_in_seconds={}",
-                        root.display(), entries, backoff.as_secs()
-                    );
-                } else if let Ok(walk) = &result {
-                    state.incomplete = None;
-                    if unchanged(&dependencies) {
-                        state.input_dirs = input_dirs;
-                        state.config = Some(Arc::new(config.clone()));
-                        state.absorbed_entries = 0;
-                        state.result = Some(walk.clone());
-                        state.dependencies = dependencies;
-                        state.inputs = inputs;
-                        state.input_identities = input_identities;
-                    }
+                // Frequent log or database writes must not shorten the delay.
+                // Only a completed walk clears the failure's retry history.
+                state.incomplete = Some(IncompleteWalk {
+                    error: error.clone(),
+                    retry_at: retry_clock() + backoff,
+                    backoff,
+                });
+                crate::slog_warn!(
+                    "language-server applicability walk incomplete: root={} entries={} retry_in_seconds={}",
+                    root.display(), entries, backoff.as_secs()
+                );
+            } else if let Ok(walk) = &result {
+                state.incomplete = None;
+                // Only unchanged complete scans become applicability snapshots.
+                if state.generation == running.generation && unchanged(&dependencies) {
+                    state.input_dirs = input_dirs;
+                    state.config = Some(Arc::new(config.clone()));
+                    state.absorbed_entries = 0;
+                    state.result = Some(walk.clone());
+                    state.dependencies = dependencies;
+                    state.inputs = inputs;
+                    state.input_identities = input_identities;
                 }
             }
             drop(state);
@@ -908,7 +906,6 @@ impl ApplicabilityCache {
                 let mut state = flight.state.lock();
                 state.generation = state.generation.wrapping_add(1);
                 state.result = None;
-                state.incomplete = None;
                 state.cause = Some(cause);
                 affected.insert(cached_root.clone());
             }
