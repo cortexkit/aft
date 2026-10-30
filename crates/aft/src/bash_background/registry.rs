@@ -13490,7 +13490,7 @@ impl BgTaskRegistry {
         self.stop_secret_proxy(task_id);
         #[cfg(target_os = "linux")]
         {
-            // The leader can exit during group termination. Confirm its scope before sending signals.
+            // The leader can exit during group termination. Make sure of its scope before sending signals.
             let _ = self
                 .inner
                 .task_scopes
