@@ -10282,6 +10282,7 @@ export function bannerUnused() {}
             .tier2_run_with_reuse_job_result_with_options(
                 delete_job,
                 Tier2ReuseOptions {
+                    inventory: None,
                     force_rescan_paths: [deleted.clone()].into_iter().collect(),
                     allow_callgraph_cold_build: true,
                     require_callgraph_snapshot: false,
