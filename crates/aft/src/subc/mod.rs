@@ -1556,6 +1556,14 @@ struct RouteIdentity(Arc<RouteIdentityData>);
 struct ManagementIdentity {
     principal: Option<Principal>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
+    admission: ManagementAdmission,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum ManagementAdmission {
+    #[default]
+    FirstParty,
+    FlowOnly,
 }
 
 impl RouteIdentity {
@@ -5963,25 +5971,17 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
-                        // A flow has a non-empty flow_id in its bound scope. On a
-                        // management route it may call only diagnostics.findings;
-                        // refuse every other management op before it can read
-                        // stores. Flow-scoped tool routes are governed by the
-                        // call-mode contract instead (reads served, writes
-                        // refused), so they are not checked here.
-                        let scope = management_routes.get(&route).and_then(|identity| identity.scope.as_ref());
-                        if let Some(error) = flow_scope_refusal(scope) {
-                            let result = match decoded.body() {
-                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
-                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
-                                    scope, body, &health_rollup_cache, &executor,
-                                ).await,
-                                _ => send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await,
-                            };
-                            if let Err(error) = result {
-                                break Err(error);
+                        // Bind admission, not request-supplied scope data, limits
+                        // flow management routes to the manifest's flow operations
+                        // before any store, provider, or general tool dispatch.
+                        // Tool routes retain their separate call-mode contract.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
                             }
-                            continue;
                         }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
                             // Rich-UI chunk queries are provider reads that name no
@@ -6155,9 +6155,8 @@ where
                         let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
-                            // Management routes are bound only for first-party
-                            // principals (see the RouteBind arm), so the route
-                            // being here is the admission fact passed on.
+                            // Flow-only management routes were refused above;
+                            // reaching the relay requires first-party admission.
                             spawn_gh_relay(
                                 &writer_tx,
                                 &frame,
@@ -8346,7 +8345,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty) {
+                if !matches!(bind_trust, BindTrust::FirstParty)
+                    && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -8356,6 +8357,14 @@ async fn handle_control_request(
                     )
                     .await;
                 }
+                let admission = if scope
+                    .as_ref()
+                    .is_some_and(diagnostics_findings::is_flow_scope)
+                {
+                    ManagementAdmission::FlowOnly
+                } else {
+                    ManagementAdmission::FirstParty
+                };
                 if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                     if installed_epoch >= epoch {
                         return send_route_bind_error(
@@ -8417,7 +8426,11 @@ async fn handle_control_request(
                         ack,
                         ControlCompletion::ManagementAckWritten {
                             route: route_id,
-                            identity: ManagementIdentity { principal, scope },
+                            identity: ManagementIdentity {
+                                principal,
+                                scope,
+                                admission,
+                            },
                             corr: frame.header.corr,
                         },
                         metrics,
@@ -9763,21 +9776,23 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         })
 }
 
-fn flow_scope_refusal(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Option<ErrorBody> {
-    scope
-        .filter(|stamp| {
-            stamp
-                .attributes
-                .flow_id
-                .as_ref()
-                .is_some_and(|id| !id.is_empty())
-        })
-        .map(|_| {
-            ErrorBody::new(
-                "flow_scope_not_supported",
-                "a flow may call only diagnostics.findings on an AFT management route",
-            )
-        })
+fn admit_management_flow_request(
+    identity: &ManagementIdentity,
+    body: Option<&Value>,
+) -> Result<(), ErrorBody> {
+    if identity.admission != ManagementAdmission::FlowOnly {
+        return Ok(());
+    }
+    let operation = body
+        .and_then(|body| body.get("method").or_else(|| body.get("op")))
+        .and_then(Value::as_str);
+    if !operation.is_some_and(|operation| manifest::FLOW_OPERATIONS.contains(&operation)) {
+        return Err(ErrorBody::new(
+            "flow_scope_not_supported",
+            "a flow may call only diagnostics.findings on an AFT management route",
+        ));
+    }
+    diagnostics_findings::admit_flow(identity.scope.as_ref())
 }
 
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
