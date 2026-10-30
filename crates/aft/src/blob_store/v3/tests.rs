@@ -197,6 +197,8 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     let observed = std::rc::Rc::clone(&removed);
     let denied = std::rc::Rc::new(std::cell::RefCell::new(None));
     let hook_denied = std::rc::Rc::clone(&denied);
+    let race_modelled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_modelled = std::rc::Rc::clone(&race_modelled);
     WALK_BEFORE_STAT.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move |path| {
             if path == pending && !observed.replace(true) {
@@ -217,10 +219,19 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
                     std::io::Error::last_os_error()
                 );
                 *hook_denied.borrow_mut() = Some(deny_read_for_test(path.parent().unwrap()));
-                assert_eq!(
-                    fs::symlink_metadata(path).unwrap_err().raw_os_error(),
-                    Some(5)
-                );
+                // GitHub's hosted Windows runners can still stat this file;
+                // native machines fail with error 5 as in the CI incident.
+                // Where the race can't be modelled, the walk is still checked.
+                match fs::symlink_metadata(path) {
+                    Err(error) => {
+                        assert_eq!(error.raw_os_error(), Some(5), "{error}");
+                        hook_modelled.set(true);
+                    }
+                    Ok(_) => eprintln!(
+                        "note: this machine can stat a delete-pending file in a \
+                         listing-denied folder; the pathname-stat race is not modelled here"
+                    ),
+                }
             }
         }));
     });
@@ -229,6 +240,7 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     denied.borrow_mut().take();
 
     assert!(removed.get(), "the walk did not reach the pending file");
+    eprintln!("pathname-stat race modelled: {}", race_modelled.get());
     // The listing's length is a conservative charge until a later measurement.
     assert_eq!(result.unwrap(), Some(payload.len() as u64));
     drop(handle);
