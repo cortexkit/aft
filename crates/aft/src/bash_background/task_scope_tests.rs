@@ -372,6 +372,128 @@ fn task_scope_replay_adopts_and_keeps_output() {
 }
 
 #[test]
+fn task_scope_replay_identity_refusal_does_not_block_session() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let first = BgTaskRegistry::default();
+    first.inner.shutdown.store(true, Ordering::SeqCst);
+    let a = scope_spawn(
+        &first,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _a = StopOnDrop(a.clone());
+    let b = scope_spawn(
+        &first,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _b = StopOnDrop(b.clone());
+    let (bad, healthy) = if a < b { (&a, &b) } else { (&b, &a) };
+    let layout = super::super::persistence::resolve_task(root.path(), "task-scope", bad).unwrap();
+    let mut metadata = read_task_at(&layout).unwrap();
+    let healthy_metadata = first
+        .task(healthy)
+        .unwrap()
+        .lock_state()
+        .unwrap()
+        .metadata
+        .clone();
+    metadata.child_pid = healthy_metadata.child_pid;
+    metadata.child_start_time_ms = healthy_metadata.child_start_time_ms;
+    write_task_at(&layout, &metadata).unwrap();
+    first.detach();
+    let second = BgTaskRegistry::default();
+    second.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    second.replay_session(root.path(), "task-scope").unwrap();
+    let rejected = second.status(bad, "task-scope", None, None, 1024).unwrap();
+    assert_eq!(
+        rejected.info.status,
+        super::super::BgTaskStatus::FateUnknown
+    );
+    assert_eq!(rejected.exit_code, None);
+    assert_eq!(
+        second
+            .task(healthy)
+            .unwrap()
+            .lock_state()
+            .unwrap()
+            .metadata
+            .status,
+        super::super::BgTaskStatus::Running
+    );
+    second.kill(healthy, "task-scope").unwrap();
+}
+
+#[test]
+fn task_scope_kill_without_handle_uses_exact_identity() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let first = BgTaskRegistry::default();
+    let id = scope_spawn(&first, root.path(), "setsid /bin/sh -c 'trap \"\" TERM; echo $$ > escaped; while :; do sleep 1; done' & sleep 60", super::super::HardKill::Default, None);
+    let _stop = StopOnDrop(id.clone());
+    until(|| root.path().join("escaped").exists());
+    let task = first.task(&id).unwrap();
+    let metadata = task.lock_state().unwrap().metadata.clone();
+    let paths = task.paths.clone();
+    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
+    first.detach();
+    let second = BgTaskRegistry::default();
+    second.inner.shutdown.store(true, Ordering::SeqCst);
+    second
+        .insert_rehydrated_task(metadata, paths, true)
+        .unwrap();
+    assert!(second.inner.task_scopes.get(&id).is_none());
+    second.kill(&id, "task-scope").unwrap();
+    until(|| {
+        std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
+            .map_or(true, |text| text.lines().any(|line| line == "populated 0"))
+    });
+}
+
+#[test]
+fn task_scope_kill_without_handle_refuses_foreign_identity() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let first = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &first,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let task = first.task(&id).unwrap();
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.child_start_time_ms = metadata.child_start_time_ms.map(|start| start + 1);
+    first.detach();
+    let second = BgTaskRegistry::default();
+    second
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    second.kill_task_scope(&id).unwrap();
+    assert!(second.inner.task_scopes.get(&id).is_none());
+    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
+    assert!(
+        std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "populated 1")
+    );
+}
+
+#[test]
 fn task_scope_scoped_task_without_marker_is_fate_unknown() {
     if !manager_available() {
         return;

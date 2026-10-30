@@ -174,6 +174,8 @@ pub struct MemoryPolicy {
 }
 
 impl MemoryPolicy {
+    #[cfg(target_os = "linux")]
+    pub(crate) const TASK_SCOPE_MEMORY_KIND: &str = "Linux task scope memory.max";
     pub fn note(&self) -> String {
         format!("Memory cap: {} MiB ({}).", self.mib, self.kind)
     }
@@ -285,7 +287,7 @@ impl Monitor {
 
     pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Self, String> {
         #[cfg(target_os = "linux")]
-        if policy.kind == "Linux task scope memory.max" {
+        if policy.kind == MemoryPolicy::TASK_SCOPE_MEMORY_KIND {
             let scope = super::task_scope::lookup(task_id)?.ok_or("task memory scope is absent")?;
             return Self::from_task_scope(policy.mib, &scope);
         }
@@ -391,7 +393,7 @@ impl Monitor {
         Ok(Self {
             policy: MemoryPolicy {
                 mib,
-                kind: "Linux task scope memory.max".into(),
+                kind: MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
                 cgroup: Some(scope.cgroup().to_owned()),
             },
             last_sample: None,
@@ -454,15 +456,7 @@ mod linux {
     }
 
     fn helper_command(executable: &Path) -> std::process::Command {
-        let mut command = std::process::Command::new(executable);
-        // The user manager needs its session endpoint, not the daemon's credentials.
-        command.env_clear().env("PATH", "/usr/bin:/bin");
-        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        command
+        super::super::task_scope::user_manager_command(executable)
     }
 
     fn systemd_run_path_with(mut exists: impl FnMut(&Path) -> bool) -> Option<&'static Path> {

@@ -4016,7 +4016,6 @@ impl BgTaskRegistry {
                     &task.task_id,
                     hard_kill,
                     local.memory_limit_mib,
-                    local.plan.is_native_launcher(),
                 )
             })
             .transpose()?
@@ -4058,6 +4057,7 @@ impl BgTaskRegistry {
             }
             Ok(child)
         })?;
+        #[cfg(target_os = "linux")]
         if scope.is_some() {
             match self.scoped_memory_limit(local.memory_limit_mib, &task.task_id) {
                 Ok(monitor) => memory_monitor = monitor,

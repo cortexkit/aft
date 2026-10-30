@@ -2269,6 +2269,12 @@ pub fn validate_task_id(task_id: &str) -> io::Result<()> {
     }
 }
 
+pub(crate) fn is_harness_store_name(name: &str) -> bool {
+    matches!(name, "opencode" | "pi" | "runner")
+        || name.starts_with("mcp--")
+        || name.starts_with("fed--")
+}
+
 pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
     let session_hash = hash_session(session_id);
     let direct = storage_dir.join("bash-tasks").join(&session_hash);
@@ -2893,11 +2899,7 @@ pub(crate) fn discover_storage_task_records(
             StorageRecordLevel::Root | StorageRecordLevel::Harness if text == "bash-tasks" => {
                 Some(StorageRecordLevel::Sessions)
             }
-            StorageRecordLevel::Root
-                if matches!(text, "opencode" | "pi" | "runner")
-                    || text.starts_with("mcp--")
-                    || text.starts_with("fed--") =>
-            {
+            StorageRecordLevel::Root if is_harness_store_name(text) => {
                 Some(StorageRecordLevel::Harness)
             }
             StorageRecordLevel::Sessions => Some(StorageRecordLevel::Tasks),

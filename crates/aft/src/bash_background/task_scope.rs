@@ -104,11 +104,31 @@ mod linux {
                 .cloned()
         }
 
-        pub(crate) fn kill(&self, task_id: &str) -> io::Result<()> {
-            if let Some(handle) = self.get(task_id) {
+        pub(crate) fn kill(&self, task_id: &str, identity: Option<(u32, u64)>) -> io::Result<bool> {
+            if let Some(handle) = self.resolve_handle(task_id, identity) {
                 handle.kill()?;
+                return Ok(true);
             }
-            Ok(())
+            Ok(false)
+        }
+
+        pub(crate) fn resolve_handle(
+            &self,
+            task_id: &str,
+            identity: Option<(u32, u64)>,
+        ) -> Option<ScopeHandle> {
+            if let Some(handle) = self.get(task_id) {
+                return Some(handle);
+            }
+            if let Some((pid, start)) = identity {
+                if let Ok(Some(handle)) = self.adopt(task_id, pid, start) {
+                    return Some(handle);
+                }
+            } else {
+                let _ = lookup(task_id);
+            }
+            log_unconfirmed_scope();
+            None
         }
 
         pub(crate) fn adopt(
@@ -146,16 +166,28 @@ mod linux {
             let units = list_units()?;
             let mut stopped = 0;
             for unit in select_owned_units(&units, records, terminal_only) {
-                let id = task_unit_id(&unit).expect("selected validated unit");
-                if let Some(scope) = lookup(id)? {
-                    if recheck(id) {
+                let Some(id) = task_unit_id(&unit) else {
+                    log_unconfirmed_scope();
+                    continue;
+                };
+                match lookup(id) {
+                    Ok(Some(scope)) if recheck(id) => {
                         scope.stop()?;
                         stopped += 1;
                     }
+                    Err(_) => log_unconfirmed_scope(),
+                    _ => {}
                 }
             }
             Ok(stopped)
         }
+    }
+
+    pub(crate) fn log_unconfirmed_scope() {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            crate::slog_info!("bash task scope could not be confirmed; skipping scope operation")
+        });
     }
 
     pub(crate) struct ScopeRecord {
@@ -278,23 +310,27 @@ mod linux {
         args
     }
 
+    pub(crate) fn user_manager_command(executable: &Path) -> Command {
+        let mut command = Command::new(executable);
+        // Use only the session endpoint for the user manager, not daemon credentials.
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+    }
+
     fn run(command: &mut Command, limit: Duration) -> Result<Output, String> {
         let deadline = Instant::now() + limit;
         if limit.is_zero() {
             return Err("task scope command timed out".into());
         }
         command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Use only the session endpoint for the user manager, not daemon credentials.
-        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
         super::super::process::start_new_session(command);
         let mut child = command
             .spawn()
@@ -390,7 +426,7 @@ mod linux {
         let deadline = Instant::now() + limit;
         for expand in [true, false] {
             // Before systemd 254, argv is literal. More dollar characters change the shell input.
-            let mut command = Command::new(launcher);
+            let mut command = user_manager_command(launcher);
             command.args(prefix(expand)).arg("/bin/true");
             if run(
                 &mut command,
@@ -407,9 +443,12 @@ mod linux {
     pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
         let path = which::which("systemd-run").ok()?;
         let supports_expand_environment = probe_systemd_scope(&path, Duration::from_secs(1))?;
-        let version = run(Command::new(&path).arg("--version"), Duration::from_secs(1))
-            .ok()
-            .filter(|out| out.status.success());
+        let version = run(
+            user_manager_command(&path).arg("--version"),
+            Duration::from_secs(1),
+        )
+        .ok()
+        .filter(|out| out.status.success());
         let supports_scope_oom_policy = version
             .and_then(|out| String::from_utf8(out.stdout).ok())
             .and_then(|text| parse_version(&text))
@@ -433,7 +472,7 @@ mod linux {
     pub(crate) fn probe_user_manager(limit: Duration) -> Result<(), String> {
         let launcher = which::which("systemd-run").map_err(|e| e.to_string())?;
         successful(run(
-            Command::new(launcher).args(["--user", "--scope", "--quiet", "/bin/true"]),
+            user_manager_command(&launcher).args(["--user", "--scope", "--quiet", "/bin/true"]),
             limit.min(Duration::from_secs(1)),
         )?)
         .map(|_| ())
@@ -446,9 +485,7 @@ mod linux {
             task_id: &str,
             hard_kill: super::super::HardKill,
             memory_mib: Option<u64>,
-            native_launcher: bool,
         ) -> Result<Option<ScopeLaunch>, String> {
-            let _ = native_launcher;
             static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if !*UNIFIED.get_or_init(|| current_cgroup(std::process::id()).is_some()) {
                 static LOGGED: std::sync::Once = std::sync::Once::new();
@@ -643,7 +680,7 @@ mod linux {
     fn lookup_with(systemctl: &Path, task_id: &str) -> Result<Option<ScopeHandle>, String> {
         let unit = scope_unit(task_id).map_err(|e| e.to_string())?;
         let output = run(
-            Command::new(systemctl).args([
+            user_manager_command(systemctl).args([
                 "--user",
                 "show",
                 "--property=ControlGroup",
@@ -680,7 +717,7 @@ mod linux {
 
     fn list_with(systemctl: &Path) -> Result<Vec<String>, String> {
         let bytes = successful(run(
-            Command::new(systemctl).args([
+            user_manager_command(systemctl).args([
                 "--user",
                 "list-units",
                 "--all",
@@ -699,10 +736,13 @@ mod linux {
                 continue;
             };
             let Some(id) = task_unit_id(unit) else {
+                log_unconfirmed_scope();
                 continue;
             };
-            if scope_unit(id).is_ok() && lookup_with(systemctl, id)?.is_some() {
-                units.push(unit.into());
+            match lookup_with(systemctl, id) {
+                Ok(Some(_)) => units.push(unit.into()),
+                Err(_) => log_unconfirmed_scope(),
+                _ => {}
             }
         }
         units.sort();
@@ -715,10 +755,9 @@ mod linux {
     }
 
     fn stop_with(systemctl: &Path, unit: &str) -> Result<(), String> {
-        let id = task_unit_id(unit).ok_or("invalid task scope unit")?;
-        scope_unit(id).map_err(|e| e.to_string())?;
+        task_unit_id(unit).ok_or("invalid task scope unit")?;
         successful(run(
-            Command::new(systemctl).args(["--user", "stop", unit]),
+            user_manager_command(systemctl).args(["--user", "stop", unit]),
             Duration::from_secs(5),
         )?)
         .map(|_| ())
@@ -948,6 +987,14 @@ mod linux {
                 .contains("refused"));
             assert!(stop_with(&path, "--all").is_err());
         }
+
+        #[test]
+        fn task_scope_listing_skips_foreign_units() {
+            let foreign = "aft-task-bash-0000000000000001.scope";
+            let owned = "aft-task-bash-0000000000000002.scope";
+            let (_dir, path) = fake(&format!("case \"$2\" in\nlist-units) printf '%s\\n' '{foreign}' '{owned}' ;;\nshow) for unit in \"$@\"; do :; done; case \"$unit\" in\n'{foreign}') printf '/app.slice/{foreign}\\n' ;;\n*) printf '/aft.slice/{owned}\\n' ;;\nesac ;;\nesac"));
+            assert_eq!(list_with(&path).unwrap(), vec![owned.to_string()]);
+        }
         #[test]
         fn task_scope_version_capabilities() {
             assert_eq!(parse_version("systemd 253 (253.1)\n"), Some(253));
@@ -1085,7 +1132,6 @@ mod unsupported {
             _task_id: &str,
             _hard_kill: super::super::HardKill,
             _memory_mib: Option<u64>,
-            _native_launcher: bool,
         ) -> Result<Option<ScopeLaunch>, String> {
             Ok(None)
         }

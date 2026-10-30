@@ -2089,7 +2089,7 @@ impl BgTaskRegistry {
                         slot.retry_at = result
                             .as_ref()
                             .err()
-                            .map(|_| Instant::now() + Duration::from_secs(1));
+                            .map(|_| Instant::now() + CLEANUP_RETRY_BACKOFF);
                     }
                     match result {
                         Ok(_) => registry.request_persisted_gc(&root),
@@ -2102,7 +2102,7 @@ impl BgTaskRegistry {
                     .unwrap_or_else(|error| error.into_inner());
                 let slot = slots.entry(key).or_default();
                 slot.running = false;
-                slot.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                slot.retry_at = Some(Instant::now() + CLEANUP_RETRY_BACKOFF);
                 crate::slog_warn!("task scope cleanup worker could not start: {error}");
             }
         }
@@ -5058,12 +5058,12 @@ impl BgTaskRegistry {
         self.enqueue_completion_if_needed(metadata, Some(paths), true);
     }
 
+    #[cfg(target_os = "linux")]
     fn scoped_memory_limit(
         &self,
         mib: Option<u64>,
         task_id: &str,
     ) -> Result<Option<super::memory_limit::Monitor>, String> {
-        #[cfg(target_os = "linux")]
         if let Some(mib) = mib.filter(|mib| *mib > 0) {
             let scope = self
                 .inner
@@ -5072,8 +5072,17 @@ impl BgTaskRegistry {
                 .ok_or("task memory scope is absent")?;
             return super::memory_limit::Monitor::from_task_scope(mib, &scope).map(Some);
         }
-        let _ = (mib, task_id);
         Ok(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn task_scope_identity(&self, task_id: &str) -> Option<(u32, u64)> {
+        let task = self.task(task_id)?;
+        let state = task.lock_state().ok()?;
+        Some((
+            state.metadata.child_pid?,
+            state.metadata.child_start_time_ms?,
+        ))
     }
 
     pub(crate) fn kill_task_scope(&self, task_id: &str) -> Result<(), String> {
@@ -5082,7 +5091,8 @@ impl BgTaskRegistry {
             let unit = super::task_scope::scope_unit(task_id).map_err(|error| error.to_string())?;
             self.inner
                 .task_scopes
-                .kill(task_id)
+                .kill(task_id, self.task_scope_identity(task_id))
+                .map(|_| ())
                 .map_err(|error| format!("failed to kill task scope {unit}: {error}"))
         }
         #[cfg(not(target_os = "linux"))]
@@ -5500,13 +5510,9 @@ impl BgTaskRegistry {
             .task_scopes
             .policy(linux_scope, None, spawn_plan.is_native_launcher())
             .map(|policy| {
-                self.inner.task_scopes.prepare(
-                    policy,
-                    &task_id,
-                    hard_kill,
-                    memory_limit_mib,
-                    spawn_plan.is_native_launcher(),
-                )
+                self.inner
+                    .task_scopes
+                    .prepare(policy, &task_id, hard_kill, memory_limit_mib)
             })
             .transpose()?
             .flatten();
@@ -5587,6 +5593,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        #[cfg(target_os = "linux")]
         if scope.is_some() {
             match self.scoped_memory_limit(memory_limit_mib, &task_id) {
                 Ok(monitor) => memory_monitor = monitor,
@@ -7762,39 +7769,52 @@ impl BgTaskRegistry {
             {
                 let alive = process_is_alive(&metadata);
                 #[cfg(target_os = "linux")]
-                if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none() {
-                    if let Some(pid) = metadata.child_pid {
-                        let scope = if let Some(start) = metadata.child_start_time_ms {
-                            self.inner
-                                .task_scopes
-                                .adopt(&metadata.task_id, pid, start)?
-                        } else {
-                            if super::task_scope::lookup(&metadata.task_id)?.is_some() {
-                                return Err("task scope replay has no exact child identity".into());
-                            }
-                            None
-                        };
-                        if let Some(scope) = scope {
-                            if let Some(policy) = metadata.memory_policy.as_mut() {
-                                let monitor = super::memory_limit::Monitor::from_task_scope(
-                                    policy.mib, &scope,
-                                )?;
-                                *policy = monitor.policy.clone();
+                let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
+                {
+                    let recovered = (|| -> Result<(), String> {
+                        if let Some(pid) = metadata.child_pid {
+                            let scope = if let Some(start) = metadata.child_start_time_ms {
                                 self.inner
-                                    .memory_monitors
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .insert(metadata.task_id.clone(), monitor);
+                                    .task_scopes
+                                    .adopt(&metadata.task_id, pid, start)?
+                            } else {
+                                if super::task_scope::lookup(&metadata.task_id)?.is_some() {
+                                    return Err(
+                                        "task scope replay has no exact child identity".into()
+                                    );
+                                }
+                                None
+                            };
+                            if let Some(scope) = scope {
+                                if let Some(policy) = metadata.memory_policy.as_mut() {
+                                    let monitor = super::memory_limit::Monitor::from_task_scope(
+                                        policy.mib, &scope,
+                                    )?;
+                                    *policy = monitor.policy.clone();
+                                    self.inner
+                                        .memory_monitors
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .insert(metadata.task_id.clone(), monitor);
+                                }
+                            } else if metadata.memory_policy.as_ref().is_some_and(|policy| {
+                                policy.kind
+                                    == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
+                            }) {
+                                return Err("task memory scope is absent during replay".into());
                             }
-                        } else if metadata
-                            .memory_policy
-                            .as_ref()
-                            .is_some_and(|policy| policy.kind == "Linux task scope memory.max")
-                        {
-                            return Err("task memory scope is absent during replay".into());
                         }
+                        Ok(())
+                    })();
+                    if recovered.is_err() {
+                        super::task_scope::log_unconfirmed_scope();
+                        false
+                    } else {
+                        alive
                     }
-                }
+                } else {
+                    alive
+                };
                 if !alive {
                     // The wrapper writes its exit marker before exiting. It may
                     // have done both since our first read, so observe the marker
@@ -13468,6 +13488,14 @@ impl BgTaskRegistry {
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         #[cfg(unix)]
         self.stop_secret_proxy(task_id);
+        #[cfg(target_os = "linux")]
+        {
+            // The leader can exit during group termination. Confirm its scope before sending signals.
+            let _ = self
+                .inner
+                .task_scopes
+                .resolve_handle(task_id, self.task_scope_identity(task_id));
+        }
         let pending_memory_reason = task
             .lock_state()
             .ok()
@@ -16347,6 +16375,9 @@ fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
 }
 
 #[cfg(target_os = "linux")]
+const CLEANUP_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct TaskScopeCleanupSlot {
     running: bool,
@@ -16689,11 +16720,7 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
 fn is_harness_store(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(name, "opencode" | "pi" | "runner")
-                || name.starts_with("mcp--")
-                || name.starts_with("fed--")
-        })
+        .is_some_and(super::persistence::is_harness_store_name)
 }
 
 /// One bounded, resumable namespace discovery per storage base per minute,
