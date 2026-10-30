@@ -445,6 +445,8 @@ pub struct ApplicableServerStartOutcomes {
 
 pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
 pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+
+const FILE_SERVER_RESTART_ATTEMPTS: usize = 3;
 pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
 pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
     "language-server startup notification queue is full; retry the file change";
@@ -691,8 +693,21 @@ where
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     // Start any missing server without the lock; the pulls below then only
     // open the document and send the requests under it.
-    start_servers_for_file_unlocked(&lock, file_path, config);
-    let pulls = lock().begin_file_pulls(file_path, config, deadline)?;
+    let mut pulls = None;
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let opened = ensure_file_open_unlocked(&lock, file_path, config)?;
+        let mut manager = lock();
+        if opened
+            .server_keys
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        pulls = Some(manager.begin_file_pulls(file_path, config, deadline)?);
+        break;
+    }
+    let pulls = pulls.ok_or_else(|| LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))?;
     // All requests are in flight at once; wait for each without the lock.
     let replies = pulls
         .into_iter()
@@ -751,7 +766,8 @@ where
 }
 
 /// Send an interactive request (hover, definition, references, rename) to the
-/// running server that owns `file_path` and wait for its reply.
+/// server that owns `file_path` and wait for its reply, restarting it if idle
+/// reaping detached it after the caller's startup check.
 ///
 /// The manager lock is held only to find the client and write the request.
 /// The wait for the reply, up to eight seconds on a busy server, runs without
@@ -773,6 +789,13 @@ where
 {
     let started = {
         let mut lsp = lock();
+        if lsp.client_for_file(file_path, config).is_none() {
+            drop(lsp);
+            if let Err(err) = ensure_file_open_unlocked(&lock, file_path, config) {
+                return Some(Err(err));
+            }
+            lsp = lock();
+        }
         let client = lsp.client_for_file_mut(file_path, config)?;
         client.start_request::<R>(params)
     };
@@ -5715,6 +5738,54 @@ impl LspManager {
         clients
     }
 
+    /// Detach idle clients while holding the manager lock, before stopping them.
+    /// Requests either reserve a pending response first or find the key absent
+    /// and start a replacement; they cannot acquire a half-stopped client.
+    pub(crate) fn take_idle_clients(
+        &mut self,
+        now: Instant,
+        ttl: Duration,
+        root_idle: bool,
+    ) -> Vec<(ServerKey, LspClient)> {
+        let keys: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(key, client)| {
+                // Startup document replay writes through a cloned writer while
+                // its reservation exists, so it is not idle work to interrupt.
+                if self.starting.contains_key(key) {
+                    return None;
+                }
+                let idle = now.saturating_duration_since(client.last_used_at());
+                ((root_idle || idle >= ttl) && !client.has_pending_requests()).then(|| key.clone())
+            })
+            .collect();
+        let mut clients = Vec::with_capacity(keys.len());
+        for key in keys {
+            let client = self.clients.remove(&key).expect("selected idle client");
+            let idle = now.saturating_duration_since(client.last_used_at());
+            let package = key
+                .root
+                .file_name()
+                .unwrap_or(key.root.as_os_str())
+                .to_string_lossy();
+            slog_info!(
+                "idle lsp reap {} {package}: after {}m (ttl {}m)",
+                key.kind.id_str(),
+                idle.as_secs() / 60,
+                ttl.as_secs() / 60
+            );
+            self.forget_server_state(Some(&key));
+            self.pending_diagnostic_observations
+                .retain(|observation| observation.server_key != key);
+            clients.push((key, client));
+        }
+        if !clients.is_empty() {
+            self.clients_generation = self.clients_generation.wrapping_add(1);
+        }
+        clients
+    }
+
     /// Forget instance-owned state without changing start reservations or
     /// failure backoff. Those have their own generation and retry lifecycles.
     fn forget_server_state(&mut self, key: Option<&ServerKey>) {
@@ -8942,17 +9013,28 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
-    if outcomes
-        .attempts
-        .iter()
-        .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
-    {
-        return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+        if outcomes
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+        {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
+        let mut manager = lock();
+        // An idle sweep can detach a server after startup resolves. Restart
+        // outside the lock rather than returning an empty document-open result.
+        if outcomes
+            .successful
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        return manager.ensure_file_open(&canonical_path, config);
     }
-    // Every server is now running or has a remembered failure, so this
-    // starts nothing under the lock unless a client vanished in between.
-    lock().ensure_file_open(&canonical_path, config)
+    Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))
 }
 
 /// rust-analyzer's own LSP request (not part of the LSP specification) that
@@ -9731,7 +9813,7 @@ fn env_binary_override_from(
 
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
-mod regression_tests;
+pub(crate) mod regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]
