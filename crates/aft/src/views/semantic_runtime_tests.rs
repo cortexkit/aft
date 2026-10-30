@@ -723,7 +723,11 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
         })
     };
     let hang_guard = Duration::from_secs(20);
-    let parked = observer.rx.recv_timeout(hang_guard).ok();
+    let parked = observer
+        .rx
+        .recv_timeout(hang_guard)
+        .map(|event| event.state)
+        .ok();
     if parked != Some("parked") {
         slot.clear();
         worker.join().unwrap();
@@ -735,7 +739,7 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
     slot.wake();
     let deadline = Instant::now() + hang_guard;
     let finished = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("wake") => continue,
             event => break event.ok(),
         }
@@ -804,7 +808,11 @@ fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
             (result, attempts)
         })
     };
-    let parked = observer.rx.recv_timeout(Duration::from_secs(20)).ok();
+    let parked = observer
+        .rx
+        .recv_timeout(Duration::from_secs(20))
+        .map(|event| event.state)
+        .ok();
     if parked != Some("parked") {
         slot.clear();
         let (result, _) = worker.join().unwrap();
@@ -2596,6 +2604,8 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
     let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let models: Vec<_> = (0..2).map(|_| Arc::new(Model::default())).collect();
+    let requests: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
     let mut lanes = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         for file in 0..33 {
@@ -2628,6 +2638,8 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         let entered = entered_tx.clone();
         let release = release_rx.clone();
         let done = done_tx.clone();
+        let model = Arc::clone(&models[i]);
+        let requests = Arc::clone(&requests[i]);
         workers.push(std::thread::spawn(move || {
             let outcome = catch_up_with_limiters(
                 &weak,
@@ -2636,11 +2648,12 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
                 &schedule,
                 FillBudget::default(),
                 &mut |texts| {
+                    requests.fetch_add(1, Ordering::SeqCst);
                     entered.send(i).unwrap();
                     if i == 0 {
                         release.recv().unwrap();
                     }
-                    Model::default().embed(texts)
+                    model.embed(texts)
                 },
                 &preparation,
                 &inflight,
@@ -2662,9 +2675,35 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         std::thread::sleep(Duration::from_millis(5));
     };
     let both_waiting = done_rx.is_empty();
+    let diagnostics = || {
+        eprintln!("cold slots: {:#?}", cold.census());
+        eprintln!("cold admissions: {:#?}", cold.admission_events());
+        for (i, (slot, _, _, runtime)) in lanes.iter().enumerate() {
+            eprintln!(
+                "lane {i}: state={} refresh_attempts={} backend_requests={} backend_completed={} backend_texts={} progress={:#?}",
+                slot.describe(),
+                runtime.refresh_attempts(),
+                requests[i].load(Ordering::SeqCst),
+                models[i].calls(),
+                models[i].texts(),
+                crate::cold_build_limiter::progress::snapshot_for_root(roots[i].path(), 0),
+            );
+        }
+    };
+    if !yielded || !both_waiting {
+        diagnostics();
+    }
     release_tx.send(()).unwrap();
     let first_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if first_done.is_err() {
+        eprintln!("first fill completion: {first_done:?}");
+        diagnostics();
+    }
     let second_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if second_done.is_err() {
+        eprintln!("second fill completion: {second_done:?}");
+        diagnostics();
+    }
     if first_done.is_err() || second_done.is_err() {
         for (slot, _, _, _) in &lanes {
             slot.clear();
@@ -3289,7 +3328,11 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     // event waits have only a hang guard; no edit, wake or rebind drives recovery.
     let hang_guard = Duration::from_secs(60);
     // A second refused connection proves a timer fires without any wake.
-    let retried = observer.rx.recv_timeout(hang_guard).ok();
+    let retried = observer
+        .rx
+        .recv_timeout(hang_guard)
+        .map(|event| event.state)
+        .ok();
     if retried != Some("unavailable") {
         slot.clear();
         worker.join().unwrap();
@@ -3302,7 +3345,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     backend.start(200);
     let deadline = Instant::now() + hang_guard;
     let recovered = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("unavailable") => continue,
             event => break event.ok(),
         }
@@ -3531,7 +3574,7 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
     // and finish the fill; a fill that never settles still fails here.
     let deadline = Instant::now() + Duration::from_secs(30);
     let settled = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("retry") => continue,
             event => break event.ok(),
         }
@@ -4315,4 +4358,24 @@ fn no_subscription_refresh_installs_and_answers_complete() {
         cold(root.path(), "gamma rewritten").0
     );
     assert_eq!(pending_semantic(&runtime), 0);
+}
+
+#[test]
+fn fill_observer_waits_through_retry_until_settled() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    observe_fill(root.path(), "settled");
+    observer.wait_until_settled(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn fill_observer_retry_without_settlement_fails_with_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    let error = observer
+        .wait_until_settled(Duration::from_millis(20))
+        .unwrap_err();
+    assert!(error.contains("temporary backend failure"), "{error}");
 }

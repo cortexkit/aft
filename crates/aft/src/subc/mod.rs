@@ -264,6 +264,8 @@ pub(crate) mod watch_delivery;
 mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
+#[cfg(test)]
+mod stack_budget_tests;
 #[cfg(all(test, unix))]
 pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
@@ -2888,13 +2890,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -3965,21 +3966,24 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
-    // A released handle cannot receive queued work. Cancel only before the
-    // executor's start transition; already-running mutations keep their result.
-    let queued =
-        queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
-    for (corr, request) in queued {
-        let terminal = build_error_frame(
-            request.ver,
-            channel.channel,
-            channel.epoch,
-            corr,
-            request.flags,
-            "route_released",
-            "route released before execution; the tool did not run",
-        )?;
-        send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+    // A replacement project route keeps replayable calls, even those still
+    // waiting in the executor. Release queued calls only when no project route
+    // replaces the old handle; already-running mutations keep their result.
+    if replacement_root.is_none() {
+        let queued =
+            queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+        for (corr, request) in queued {
+            let terminal = build_error_frame(
+                request.ver,
+                channel.channel,
+                channel.epoch,
+                corr,
+                request.flags,
+                "route_released",
+                "route released before execution; the tool did not run",
+            )?;
+            send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+        }
     }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch allocation is a new daemon route/client handle. AFT retains
@@ -4229,7 +4233,8 @@ enum ModuleLoopExit {
 }
 
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
-/// owns an isolated current-thread tokio runtime for the async transport.
+/// owns an isolated current-thread tokio runtime on a dedicated, explicitly
+/// sized stack for the async transport. The caller joins that thread.
 /// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
 /// fall back to the standalone loop, to avoid split-brain index state.
 pub fn run_subc_mode(
@@ -4307,7 +4312,52 @@ fn run_subc_mode_with_probe(
     )
 }
 
+// A current-thread runtime polls its root future on the thread calling
+// block_on. Windows gives the process main thread only a 1 MiB stack; the
+// module loop and its callees need headroom even with their futures boxed.
+const MODULE_RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn with_module_runtime_stack<T: Send>(run: impl FnOnce() -> T + Send) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("aft-subc-runtime".to_string())
+            .stack_size(MODULE_RUNTIME_STACK_BYTES)
+            .spawn_scoped(scope, run)?;
+        match worker.join() {
+            Ok(result) => Ok(result),
+            // Keep the original panic payload and unwind the caller, rather
+            // than turning a module panic into a clean stop or a new panic.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 fn run_subc_mode_inner(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
+) -> Result<(), SubcError> {
+    with_module_runtime_stack(move || {
+        run_subc_mode_on_runtime_thread(
+            connection_file_path,
+            ctx,
+            executor,
+            dispatch,
+            user_config_path,
+            allow_native_passthrough,
+            tool_response_body_limit,
+            lifecycle_probe,
+        )
+    })
+    .map_err(SubcError::RuntimeThread)?
+}
+
+fn run_subc_mode_on_runtime_thread(
     connection_file_path: &Path,
     ctx: Arc<AppContext>,
     executor: Arc<Executor>,
@@ -17656,6 +17706,23 @@ mod tests {
         assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
         assert!(!executor.actor_registered(&root));
         assert!(!live_roots.contains_key(&root));
+    }
+
+    #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
     }
 
     #[test]

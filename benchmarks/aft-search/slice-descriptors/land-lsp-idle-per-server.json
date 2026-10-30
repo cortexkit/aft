@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "lsp-idle-per-server"
+  ],
+  "note": "Idle language servers stop per server after lsp.idle_minutes, even while other packages in the same project are busy; in-flight requests are protected and races restart the server with bounded retries. No changed path matches RANKING_FENCE_PREFIXES."
+}

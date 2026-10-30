@@ -1399,18 +1399,19 @@ impl SearchIndexSnapshot {
             };
             bytes_read += file.bytes.len();
             let text = String::from_utf8_lossy(&file.bytes);
+            let digest = blake3::hash(&file.bytes);
+            files_hashed += 1;
 
-            if let Some(candidates) = exact_lane::verify_exact_matches_in_text_with_member(
+            if let Some(candidates) = exact_lane::verify_cached_exact_matches_in_text_with_member(
                 &file_entry.path,
                 &text,
+                digest,
                 &norm_phrase,
                 &content_tokens,
                 member.as_ref().map(|member| member.member.as_str()),
             ) {
-                // Only a matching file needs its digest: the memo re-checks
-                // the digests of the files it serves, never of the rest.
-                files_hashed += 1;
-                let digest = blake3::hash(&file.bytes).to_hex().to_string();
+                // The same digest addresses prepared text and backs memo checks.
+                let digest = digest.to_hex().to_string();
                 for mut cand in candidates {
                     cand.evidence.generated = file.generated;
                     matches.push(ExactPassMatch {

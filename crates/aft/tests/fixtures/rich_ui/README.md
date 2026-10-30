@@ -36,10 +36,42 @@ or unknown status is a validation failure, not a default. `exitCode` maps the
 required nullable `exit_code`. Watch output previews, pattern matches and worker
 kill/wait metadata are not published. Poll reasons are match, exit, timeout.
 
-`result-vectors.json` and `handler-replies.json` are normalized schema vectors,
-not claims that the still-unimplemented carrier route has run. The subsequent
-carrier-serving slices must test real handler/outer-route replies against these
-same schemas. Projections drop unknown keys and never default a required field.
+`result-vectors.json` and `handler-replies.json` remain schema-only vectors;
+the generated samples below exercise real handler/outer-route replies against
+the same schemas. Projections drop unknown keys and never default a required field.
+
+## Generated handler samples
+
+`aft-rich-ui-manifest-v1.json` captures requests and complete carrier reply
+bodies for all ten operations, plus an ordinary handler error. Unlike the
+schema-only vectors above and the legacy `carrier-samples/` captures, these
+requests carry `rich_ui_op` and call-scoped requests bind the viewed call with
+`task`. They run through the real outer route and production handlers under a
+core-head policy route, using the **injected test manifest**, not a published
+production manifest. The project has a fixed two-function Rust source file,
+ready trigram/callgraph indexes and no semantic embedding service. Bash replies
+observe a persisted terminal task with stdout `one\n`, stderr `two\n` and exit
+code 0; no shell command or network request is run.
+
+`manifestDigest` identifies the injected manifest bytes. It is not a production
+publication tag; regenerate and review the samples when publishing the manifest.
+
+Normalization replaces the temporary project root with `${FIXTURE_ROOT}`, the
+fixture task id with `bash-SAMPLE`, and the viewed call key with `sample-CALL`.
+Numeric task timestamps and measured durations, if present, become 0. The
+projected Bash schemas currently omit these volatile fields. Exit codes, byte
+counts, wait limits, result fields and error messages are not normalized.
+
+Regenerate from the repository root:
+
+```sh
+cargo test -p agent-file-tools --lib -- regenerate_rich_ui_samples --ignored --nocapture
+```
+
+The normal `rich_ui_samples_match_handlers` test recaptures replies, validates
+their schemas and exact carrier body shape, and compares the normalized bytes
+with the committed file. Regeneration is opt-in and never happens in that test.
+`WORKER.md` lists both the regeneration command and the filtered drift check.
 
 ## Inputs, targets, media, messages
 

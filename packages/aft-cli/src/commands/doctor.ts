@@ -1,8 +1,10 @@
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -87,7 +89,7 @@ import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
-import { readSessionLog } from "../lib/session-log.js";
+import { readLogHistory, readSessionLog } from "../lib/session-log.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 import {
   checkGhStatus,
@@ -2099,6 +2101,36 @@ export function collectIssueLog(
   };
 }
 
+/** Collect engine history separately because plugin logs no longer duplicate it. */
+export function collectIssueEngineLog(path: string, selectedSession: RecentSession | null) {
+  const directory = dirname(path);
+  const files: { path: string; modified: number }[] = [];
+  try {
+    for (const name of readdirSync(directory)) {
+      if (!/^aft-\d+\.log(?:\.1)?$/.test(name)) continue;
+      try {
+        const candidate = join(directory, name);
+        const stat = lstatSync(candidate);
+        if (stat.isFile()) files.push({ path: candidate, modified: stat.mtimeMs });
+      } catch {
+        // Rotation or cleanup can remove a file during discovery.
+      }
+    }
+  } catch {
+    // Storage and its log directory are created lazily.
+  }
+  files.sort((a, b) => b.modified - a.modified || a.path.localeCompare(b.path));
+  const result = readLogHistory(
+    files.map((file) => file.path),
+    selectedSession,
+  );
+  return {
+    logText: result.lines.join("\n"),
+    errors: result.errors.join("\n"),
+    notice: result.boundHit ? "[scan limit reached; older engine lines may be missing]" : "",
+  };
+}
+
 /**
  * `aft doctor --issue` flow — collect diagnostics, sanitize user paths,
  * prompt for an issue description, optionally file via `gh`.
@@ -2131,13 +2163,20 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
-  const logResults = adapters.map((adapter) => {
+  const logResults = adapters.flatMap((adapter) => {
     const path = adapter.getLogFile();
     const { logText, errors, notice } = collectIssueLog(path, selectedSession);
-    return {
-      section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
-      errors,
-    };
+    const engine = collectIssueEngineLog(path, selectedSession);
+    return [
+      {
+        section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
+        errors,
+      },
+      {
+        section: `#### Engine logs (${dirname(path)})\n\n${engine.notice}\n\`\`\`\n${engine.logText || "<no log output>"}\n\`\`\`\n`,
+        errors: engine.errors,
+      },
+    ];
   });
   const logSections = logResults.map((result) => result.section).join("\n");
   const recentErrorLines = extractRecentErrors(
@@ -2173,8 +2212,8 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     toolFailuresSection,
     "",
     selectedSession
-      ? `## Logs (last 200 lines for session ${selectedSession.id}; project ${selectedSession.projectRoot ?? "unknown"}, ${selectedSession.startedAt !== undefined ? new Date(selectedSession.startedAt).toISOString() : "unknown start"}–${new Date(selectedSession.lastActivity).toISOString()})`
-      : "## Logs (last 200 lines per harness)",
+      ? `## Logs (last 200 lines per source for session ${selectedSession.id}; project ${selectedSession.projectRoot ?? "unknown"}, ${selectedSession.startedAt !== undefined ? new Date(selectedSession.startedAt).toISOString() : "unknown start"}–${new Date(selectedSession.lastActivity).toISOString()})`
+      : "## Logs (last 200 lines per source)",
     logSections,
     "_Usernames and home paths have been stripped from this report._",
   ].join("\n");

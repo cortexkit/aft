@@ -1,6 +1,214 @@
 use super::*;
 use crate::bash_background::persistence::{read_task, write_task};
 use crate::exec_remote::wire_tests::{daemon, id, Script};
+
+#[test]
+fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
+    use exec::types::{Progress, ProgressPhase};
+    for (phase, elapsed, without, with) in [
+        (ProgressPhase::Upload, 14_000,
+         "The remote job is uploading its files (14s so far).",
+         "The remote job is uploading its files (14s so far): <room> & **capacity**."),
+        (ProgressPhase::PlacementWait, 130_000,
+         "The remote job is waiting for a free build host (2m 10s so far).",
+         "The remote job is waiting for a free build host (2m 10s so far): <room> & **capacity**."),
+        (ProgressPhase::Connect, 3_000,
+         "The remote job is connecting to its build host (3s so far).",
+         "The remote job is connecting to its build host (3s so far): <room> & **capacity**."),
+    ] {
+        for detail in [None, Some(String::new()), Some(" \u{2003}  ".into())] {
+            assert_eq!(admission_progress_line(&Progress::new(phase.clone(), elapsed, detail).unwrap()).as_deref(), Some(without));
+        }
+        assert_eq!(admission_progress_line(&Progress::new(phase, elapsed, Some("<room> & **capacity**".into())).unwrap()).as_deref(), Some(with));
+    }
+    assert_eq!(
+        admission_progress_line(
+            &Progress::new(
+                ProgressPhase::Unknown("future_phase".into()),
+                40_000,
+                Some("unrecognized".into())
+            )
+            .unwrap()
+        ),
+        None
+    );
+}
+
+#[test]
+fn remote_admission_progress_detail_is_normalized_redacted_and_character_bounded() {
+    use exec::types::{Progress, ProgressPhase};
+    let token = format!("ghp_{}", "a".repeat(36));
+    assert_eq!(
+        admission_progress_line(
+            &Progress::new(
+                ProgressPhase::Upload,
+                14_000,
+                Some(format!(" \u{2003}{token}  "))
+            )
+            .unwrap()
+        )
+        .as_deref(),
+        Some("The remote job is uploading its files (14s so far): <REDACTED_SECRET>.")
+    );
+    // Exercise the display boundary directly: the wire decoder independently
+    // rejects multiline or oversized detail before constructing Progress.
+    let detail = format!(
+        "begin\n\r\0\u{001b} {token}\u{2028}\u{2029}end\t{}",
+        "界".repeat(121)
+    );
+    let rendered = admission_progress_detail(&detail);
+    assert_eq!(
+        rendered,
+        format!("begin <REDACTED_SECRET> end {}…", "界".repeat(91))
+    );
+    assert_eq!(rendered.chars().count(), 120);
+    assert!(!rendered.contains("ghp_"));
+    assert!(!rendered
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')));
+    assert!(!rendered.contains("  "));
+
+    let boundary_token = admission_progress_detail(&format!("{} {token}", "x".repeat(110)));
+    assert!(
+        !boundary_token.contains("ghp_"),
+        "credentials must be redacted before the character cut"
+    );
+    assert_eq!(boundary_token.chars().count(), 120);
+    assert!(boundary_token.ends_with('…'));
+    assert_eq!(
+        admission_progress_detail(&"界".repeat(120)),
+        "界".repeat(120)
+    );
+    assert_eq!(
+        admission_progress_detail(&"界".repeat(121)),
+        format!("{}…", "界".repeat(119))
+    );
+    assert_eq!(admission_progress_detail(" \r\n\t\0\u{2028}\u{2029}"), "");
+}
+
+#[tokio::test]
+async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timers_or_cursor() {
+    use exec::types::{Progress, ProgressPhase};
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused-connection"), "true");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.accepted = false;
+        remote.explicit_runon = true;
+        remote.last_seq = Some(7);
+        remote.retry = Some(DrainingRetry {
+            request_digest: "unchanged".into(),
+            attempts: 2,
+            first_refusal_at_ms: Some(1),
+            next_retry_at_ms: Some(2),
+            waited_ms: Some(3),
+            resubmitted_at_ms: Some(4),
+        });
+        registry.persist_task(&paths, &state.metadata).unwrap();
+    }
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    let saved = fs::read(&paths.json).unwrap();
+    let started = task.started;
+    let launch_ready = task.remote_launch_ready.load(Ordering::Acquire);
+    let last_checkpoint = sink.last_progress_persist;
+    let mut recovery = ReattachBudget::new(dir.path(), &metadata);
+    recovery.deadline();
+    recovery.attempts = 3;
+    let deadlines = (
+        recovery.job_end,
+        recovery.deadline,
+        recovery.grace,
+        recovery.attempts,
+    );
+    let mut consumer = exec::StreamConsumer::keyed_run(Some(7));
+    let unknown = StreamRecord::Progress(
+        Progress::new(ProgressPhase::Unknown("future_phase".into()), 40_000, None).unwrap(),
+    );
+    let previous_phase_note = task.snapshot(0).remote_phase_note;
+    consumer.consume(unknown.clone(), &mut sink).unwrap();
+    assert!(task.state.lock().unwrap().remote_admission_note.is_none());
+    assert_eq!(task.snapshot(0).remote_phase_note, previous_phase_note);
+    for elapsed in 0..10_000 {
+        let bytes = serde_json::to_vec(&StreamRecord::Progress(
+            Progress::new(ProgressPhase::Upload, elapsed, Some("latest".into())).unwrap(),
+        ))
+        .unwrap();
+        consumer.consume_bytes(&bytes, &mut sink).unwrap();
+        recovery.observe(&StreamProgress::AdmissionProgress);
+        assert!(consumer.resume_point().is_none());
+        let state = task.state.lock().unwrap();
+        assert!(state.remote_admission_note.as_ref().unwrap().len() < 100);
+    }
+    consumer.consume(unknown, &mut sink).unwrap();
+    let latest = "The remote job is uploading its files (10s so far): latest.";
+    assert_eq!(task.snapshot(0).remote_phase_note.as_deref(), Some(latest));
+    assert_eq!(
+        registry
+            .runon_launch_state(&task_id, "session")
+            .unwrap()
+            .admission_note
+            .as_deref(),
+        Some(latest)
+    );
+    assert_eq!(
+        serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap(),
+        serde_json::to_value(&metadata).unwrap()
+    );
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+    assert_eq!(fs::metadata(&paths.stdout).unwrap().len(), 0);
+    assert_eq!(task.started, started);
+    assert_eq!(sink.last_progress_persist, last_checkpoint);
+    assert_eq!(sink.output_progress.last_seq, Some(7));
+    assert_eq!(
+        (
+            recovery.job_end,
+            recovery.deadline,
+            recovery.grace,
+            recovery.attempts
+        ),
+        deadlines
+    );
+    assert_eq!(
+        task.remote_launch_ready.load(Ordering::Acquire),
+        launch_ready
+    );
+
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)
+        .unwrap();
+    let cursor = consumer.resume_point();
+    let accepted = serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap();
+    consumer
+        .consume(
+            StreamRecord::Progress(Progress::new(ProgressPhase::Connect, 3_000, None).unwrap()),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(consumer.resume_point(), cursor);
+    assert_eq!(
+        serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap(),
+        accepted
+    );
+    assert!(task.state.lock().unwrap().remote_admission_note.is_none());
+    assert!(registry
+        .runon_launch_state(&task_id, "session")
+        .unwrap()
+        .admission_note
+        .is_none());
+    assert!(!task
+        .snapshot(0)
+        .remote_phase_note
+        .unwrap()
+        .contains("so far"));
+    // A sink reused by an attach also refuses late display updates.
+    sink.admission_progress(&Progress::new(ProgressPhase::Connect, 3_000, None).unwrap());
+    assert!(task.state.lock().unwrap().remote_admission_note.is_none());
+}
+
 fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
     static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Duration>>> =
         std::sync::OnceLock::new();
@@ -148,6 +356,24 @@ pub(super) fn after_local_fallback_marker(task: &str) {
 
 fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
+}
+
+type RemoteLaunchLogCapture = Arc<Mutex<Vec<String>>>;
+
+fn remote_launch_log_captures() -> &'static Mutex<HashMap<PathBuf, RemoteLaunchLogCapture>> {
+    static CAPTURES: std::sync::OnceLock<Mutex<HashMap<PathBuf, RemoteLaunchLogCapture>>> =
+        std::sync::OnceLock::new();
+    CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn capture_remote_launch_logs<R>(task: &BgTask, run: impl FnOnce() -> R) -> R {
+    let root = task.state.lock().unwrap().metadata.project_root.clone();
+    let capture = root.and_then(|root| remote_launch_log_captures().lock().unwrap().remove(&root));
+    if let Some(capture) = capture {
+        crate::logging::capture_log_lines_into(capture, run)
+    } else {
+        run()
+    }
 }
 
 fn exited_remote_workers() -> &'static Mutex<HashSet<String>> {
@@ -1031,6 +1257,134 @@ fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
         job_id.map_or_else(String::new, |job_id| format!("; remote job {job_id}")),
     );
     assert_eq!(response.data["message"], expected, "{response:?}");
+}
+
+#[tokio::test]
+async fn runon_pre_acceptance_refusal_ends_standalone_foreground_wait_promptly() {
+    for (reason, detail) in [
+        ("runner_full", Some("hosted_host_full")),
+        ("network_unsupported", None),
+        ("queue_wait_exceeded", None),
+    ] {
+        let daemon = daemon(
+            Script::GatedPreStartRefusal { reason, detail },
+            "exec-remote/v1",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(remote_test_context(dir.path()));
+        let request = orchestrated_request(serde_json::json!({
+            "command": "printf must-not-run",
+            "workdir": dir.path(),
+            "runon": "linux",
+            "wait": true,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }));
+        let spawned = crate::bash_background::with_remote_policy(
+            Some(launch(daemon.connection.clone())),
+            || crate::commands::bash::handle(&request, &ctx),
+        );
+        let task_id = spawned.data["task_id"].as_str().unwrap().to_owned();
+        let crate::response_finalize::DispatchOutcome::Deferred(mut pending) =
+            crate::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawned)
+        else {
+            panic!("foreground must wait while the executor holds its refusal");
+        };
+        let crate::response_finalize::DispatchOutcome::Deferred(mut watch) =
+            crate::commands::bash_watch::handle_deferred(
+                &crate::protocol::RawRequest {
+                    id: "refusal-watch".into(),
+                    command: "bash_watch".into(),
+                    session_id: Some("session".into()),
+                    lsp_hints: None,
+                    params: serde_json::json!({"task_id": task_id, "worker_session": true}),
+                },
+                ctx.clone(),
+            )
+        else {
+            panic!("watch must wait while the executor holds its refusal");
+        };
+        daemon.wait_for_requests("exec.run", 1).await;
+        daemon.acceptance_gate.notify_one();
+        let (response, watch_response) = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut foreground_reply = None;
+            let mut watch_reply = None;
+            loop {
+                foreground_reply = foreground_reply.or_else(|| (pending.poll)(&ctx));
+                watch_reply = watch_reply.or_else(|| (watch.poll)(&ctx));
+                if foreground_reply.is_some() && watch_reply.is_some() {
+                    return (foreground_reply.unwrap(), watch_reply.unwrap());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a pre-start refusal must not consume the thirty-minute wait budget");
+        assert_runon_refusal(&response, &rendered_refusal_reason(reason, detail));
+        assert_eq!(
+            ctx.bash_background()
+                .runon_inputs_captured(&task_id, "session"),
+            Some(false)
+        );
+        let status = crate::commands::bash_status::handle(
+            &crate::protocol::RawRequest {
+                id: "refusal-status".into(),
+                command: "bash_status".into(),
+                session_id: Some("session".into()),
+                lsp_hints: None,
+                params: serde_json::json!({"task_id": task_id}),
+            },
+            &ctx,
+        );
+        assert_eq!(response.data["code"], status.data["code"]);
+        assert_eq!(response.data["message"], status.data["message"]);
+        assert_eq!(watch_response.data["waited"]["reason"], "exited");
+        assert_eq!(
+            watch_response.data["remote_refusal"]["code"],
+            status.data["code"]
+        );
+        assert_eq!(
+            watch_response.data["remote_refusal"]["message"],
+            status.data["message"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn runon_pre_submission_failures_end_standalone_foreground_wait_promptly() {
+    for unavailable_connection in [false, true] {
+        let daemon = daemon(Script::Plain, "unrelated/v1").await;
+        if unavailable_connection {
+            std::fs::remove_file(&daemon.connection).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = remote_test_context(dir.path());
+        let (response, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            orchestrated_reply_with_probe(
+                &ctx,
+                &daemon,
+                serde_json::json!({
+                    "command": "printf must-not-run", "runon": "linux", "wait": true,
+                    "foreground_orchestrate": true, "compressed": false,
+                }),
+                |_| true,
+            ),
+        )
+        .await
+        .expect("a capability or connection refusal must end the foreground wait");
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+        assert!(
+            response.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("command did not run"),
+            "{response:?}"
+        );
+        assert!(exec_runs(&daemon).is_empty());
+    }
 }
 
 #[test]
@@ -2176,7 +2530,7 @@ async fn exec_remote_bash_route_outage_gives_up_after_the_jobs_own_limits() {
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
     assert!(
         done.output_preview.contains(&format!(
-            "job {} could not be re-attached before its own time limit passed (ck-motor's queue wait limit of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun",
+            "job {} could not be re-attached before its own time limit passed (a queue wait allowance of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun",
             id()
         )),
         "{}",
@@ -2205,6 +2559,151 @@ fn reattach_backoff_doubles_from_a_tenth_of_a_second_up_to_thirty_seconds() {
             .map(Duration::from_millis)
     );
     assert_eq!(reattach_backoff(u32::MAX), Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
+    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let mut remote = launch(daemon.connection.clone());
+    remote.explicit_runon = true;
+    remote.requested_vcpus = Some(16);
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        remote,
+        crate::bash_background::HardKill::After(DEFAULT_BG_TIMEOUT),
+    );
+    daemon.after_refused_connects(3).await;
+    assert_eq!(
+        registry.remote_progress(&task_id, "session").unwrap().phase,
+        RemotePhase::Queued { position: 1 }
+    );
+    let run = &daemon.methods("exec.run")[0];
+    assert_eq!(run["params"]["weight_hint"], 16);
+    assert_eq!(run["params"]["timeout"], 1800);
+    assert!(
+        run["params"].get("queue_wait_limit_s").is_none(),
+        "the runner owns admission policy"
+    );
+
+    // Pass the old 5m queue + 30m run + 5m grace deadline without real waiting.
+    clock.advance(Duration::from_secs(41 * 60));
+    let refused = *daemon.refused_connects.borrow();
+    let still_trying = wait_for("the queued job must still be recoverable", || {
+        let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+        if snapshot.info.status.is_terminal() {
+            return Some(Err(snapshot));
+        }
+        (*daemon.refused_connects.borrow() >= refused + 3).then_some(Ok(()))
+    })
+    .await;
+    assert!(
+        still_trying.is_ok(),
+        "queued job abandoned: {still_trying:?}"
+    );
+
+    let metadata = registry
+        .task(&task_id)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .clone();
+    let submission = KeyedSubmission {
+        key: "queued-submission".into(),
+        created_at_ms: metadata.started_at,
+        request_digest: "digest".into(),
+        attempts: 1,
+        fresh_key_used: false,
+        resuming: false,
+        reattached: false,
+        refusal: None,
+    };
+    assert_eq!(
+        submission.expires_at(&metadata),
+        metadata.started_at + 60 * 60 * 1000,
+        "a lost Accepted must remain recoverable for the same queue and runtime allowance"
+    );
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(
+        fs::read(&registry.task(&task_id).unwrap().paths.stdout).unwrap(),
+        b"AB"
+    );
+    assert_eq!(
+        daemon.methods("exec.run").len(),
+        1,
+        "recovery must not submit another job"
+    );
+    assert!(!daemon.methods("exec.attach").is_empty());
+}
+
+#[tokio::test]
+async fn large_queued_runon_recovery_ends_after_queue_runtime_and_grace() {
+    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let mut remote = launch(daemon.connection.clone());
+    remote.explicit_runon = true;
+    remote.requested_vcpus = Some(16);
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        remote,
+        crate::bash_background::HardKill::After(DEFAULT_BG_TIMEOUT),
+    );
+    daemon.after_refused_connects(3).await;
+    clock.advance(Duration::from_secs(66 * 60));
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(done.output_preview.contains(&format!(
+        "job {} could not be re-attached before its own time limit passed (a queue wait allowance of 30m and its run timeout of 30m have passed since AFT submitted it, plus 5m of grace); command not rerun", id()
+    )), "{}", done.output_preview);
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+}
+
+#[tokio::test]
+async fn short_queued_runon_keeps_the_five_minute_queue_allowance() {
+    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let mut remote = launch(daemon.connection.clone());
+    remote.explicit_runon = true;
+    remote.requested_vcpus = Some(8);
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        remote,
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    daemon.after_refused_connects(3).await;
+    let metadata = registry
+        .task(&task_id)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .clone();
+    let (remaining, _, _) = ReattachBudget::until_job_end(&metadata);
+    assert!(
+        (Duration::from_secs(325)..=Duration::from_secs(330)).contains(&remaining),
+        "{remaining:?}"
+    );
+    clock.advance(Duration::from_secs(11 * 60));
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(done.output_preview.contains(&format!(
+        "job {} could not be re-attached before its own time limit passed (a queue wait allowance of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun", id()
+    )), "{}", done.output_preview);
+    assert_eq!(daemon.methods("exec.run").len(), 1);
 }
 
 #[test]
@@ -4888,6 +5387,7 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
                             capture_pipeline: false,
                         },
                     )),
+                    None,
                 )
                 .unwrap();
         }
@@ -5747,6 +6247,136 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
         rendered.ends_with("changed files: not reported by the runner"),
         "{rendered}"
     );
+}
+
+#[tokio::test]
+async fn runon_launch_logs_send_phases_and_acceptance_capture_time() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(dir.path().canonicalize().unwrap(), capture.clone());
+    let command = "printf runon-diagnostic-command";
+    let secret = "runon-diagnostic-secret-value";
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": command,
+            "runon": "linux",
+            "env": {"DIAGNOSTIC_TOKEN": secret},
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    wait_for(
+        "exec.run sent must be logged before the executor accepts",
+        || {
+            capture
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("runon: exec.run sent "))
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(!capture
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("runon: remote task accepted ")));
+    daemon.acceptance_gate.notify_one();
+    wait_for("executor acceptance must be logged", || {
+        capture
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("runon: remote task accepted "))
+            .then_some(())
+    })
+    .await;
+    let registry = ctx.bash_background().clone();
+    let kill_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || registry.kill(&kill_id, "session"))
+        .await
+        .unwrap()
+        .unwrap();
+    terminal(ctx.bash_background(), task_id).await;
+    remote_worker_exited(task_id).await;
+    let lines = capture.lock().unwrap().clone();
+    let sent: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("runon: exec.run sent "))
+        .collect();
+    assert_eq!(sent.len(), 1, "{lines:?}");
+    let (sent_index, sent) = sent[0];
+    assert!(sent.starts_with("INFO "), "{sent}");
+    assert!(
+        sent.contains(&format!("task_id={task_id} session=session ")),
+        "{sent}"
+    );
+    let (_, timings) = sent.split_once("pre_send_ms=").unwrap();
+    let (total, phases) = timings.split_once(" phases=").unwrap();
+    let total: u128 = total.parse().unwrap();
+    let phases: Vec<_> = phases
+        .split(',')
+        .map(|phase| {
+            let (name, millis) = phase.split_once(':').unwrap();
+            (name, millis.parse::<u128>().unwrap())
+        })
+        .collect();
+    for required in [
+        "secret_preflight",
+        "workdir_return_paths",
+        "permission_preflight",
+        "sandbox_preflight",
+        "changed_files_baseline",
+        "workdir_repository_git",
+        "cd_snapshot_git",
+        "worker_dispatch",
+        "connect_route",
+        "supports_submission_key",
+        "submission_persistence",
+        "send",
+    ] {
+        assert!(
+            phases.iter().any(|(name, _)| *name == required),
+            "missing {required}: {sent}"
+        );
+    }
+    let phase_total: u128 = phases.iter().map(|(_, millis)| millis).sum();
+    assert!(
+        phase_total <= total && total - phase_total < phases.len() as u128,
+        "{sent}"
+    );
+    let (accepted_index, accepted) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains("runon: remote task accepted "))
+        .unwrap();
+    assert!(sent_index < accepted_index, "{lines:?}");
+    assert!(
+        accepted.contains(&format!(
+            "task_id={task_id} session=session job_id={}",
+            id()
+        )),
+        "{accepted}"
+    );
+    accepted
+        .split_once("capture_ms=")
+        .unwrap()
+        .1
+        .parse::<u128>()
+        .unwrap();
+    for line in [sent, accepted] {
+        assert!(!line.contains(command) && !line.contains(secret), "{line}");
+    }
 }
 
 #[tokio::test]
@@ -7261,8 +7891,8 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
             .as_secs_f64()
             / 60.0
     };
-    // 5 minutes of queue wait plus 30 of run, counted from the submission.
-    let full_window = 35.0;
+    // A conservative 30-minute queue allowance plus 30 of run, counted from submission.
+    let full_window = 60.0;
 
     let mut budget = ReattachBudget::new(dir.path(), &metadata);
     let before = minutes_left(&budget);

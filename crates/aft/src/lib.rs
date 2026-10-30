@@ -158,6 +158,7 @@ pub mod path_identity;
 pub mod path_status;
 pub mod pattern_compile;
 pub mod persisted_format;
+pub mod pinned_executable;
 pub mod pins;
 mod platform_tls;
 #[cfg(unix)]

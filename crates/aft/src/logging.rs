@@ -259,25 +259,37 @@ static INDEX_EVENT_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
-    static LOG_LINE_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static LOG_LINE_CAPTURE: RefCell<Option<Arc<Mutex<Vec<String>>>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let result = capture_log_lines_into(capture.clone(), f);
+    let lines = capture.lock().unwrap().clone();
+    (result, lines)
+}
+
+/// Share a worker thread's captured records with the test while it is running.
+#[cfg(test)]
+pub(crate) fn capture_log_lines_into<R>(
+    capture: Arc<Mutex<Vec<String>>>,
+    f: impl FnOnce() -> R,
+) -> R {
     // Keep the test representative of a libtest process where another test
     // may already have installed the global logger.
     let _ = env_logger::builder().is_test(true).try_init();
-    LOG_LINE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let previous = LOG_LINE_CAPTURE.with(|slot| slot.replace(Some(capture)));
     let result = f();
-    let lines = LOG_LINE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default());
-    (result, lines)
+    LOG_LINE_CAPTURE.with(|slot| slot.replace(previous));
+    result
 }
 
 #[cfg(test)]
 fn capture_log_line(level: log::Level, line: &str) {
     LOG_LINE_CAPTURE.with(|slot| {
-        if let Some(lines) = slot.borrow_mut().as_mut() {
-            lines.push(format!("{level} {line}"));
+        if let Some(lines) = slot.borrow().as_ref() {
+            lines.lock().unwrap().push(format!("{level} {line}"));
         }
     });
 }
@@ -1042,6 +1054,29 @@ pub(crate) fn daemon_log_path() -> PathBuf {
         .unwrap_or_else(|| crate::bash_background::storage_dir(None));
     root.join("logs")
         .join(format!("aft-{}.log", std::process::id()))
+}
+
+/// The standalone gh shim runs before logger initialization. Preserve its rare
+/// authority diagnostics in the process log without adding agent-visible stderr.
+pub(crate) fn write_preinit_warning(message: &str) -> io::Result<()> {
+    write_preinit_warning_to(&daemon_log_path(), message)
+}
+
+fn write_preinit_warning_to(path: &Path, message: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_log_dir(parent)?;
+    }
+    let mut line = Vec::new();
+    write_log_line(
+        &mut line,
+        &format_utc_timestamp(),
+        log::Level::Warn,
+        "aft::gh_shim_speech",
+        &format_args!("{message}"),
+    )?;
+    let mut file = open_private_log_file(path, false)?;
+    file.write_all(&crate::log_redact::aft_redact_bytes(&line))?;
+    file.sync_all()
 }
 
 fn bounded_panic_text(args: std::fmt::Arguments<'_>, max_bytes: usize) -> String {
@@ -2507,9 +2542,17 @@ pub fn perf_tick(executor: Option<&Executor>) {
     });
 
     let completion_counts = executor.map_or((0, 0), Executor::completion_counts);
-    let tool_call_count = PERF.tool_call_count.load(Ordering::Relaxed);
+    report_perf_tick(&PERF, sample, completion_counts);
+}
+
+fn report_perf_tick(
+    perf: &PerfMetrics,
+    sample: Option<ExecutorSample>,
+    completion_counts: (u64, u64),
+) {
+    let tool_call_count = perf.tool_call_count.load(Ordering::Relaxed);
     let (completed_interactive, completed_maintenance, new_tool_calls) = {
-        let Ok(mut reporter) = PERF.reporter.lock() else {
+        let Ok(mut reporter) = perf.reporter.lock() else {
             return;
         };
         if reporter.last_report.elapsed() < perf_tick_interval() {
@@ -2531,22 +2574,22 @@ pub fn perf_tick(executor: Option<&Executor>) {
         completed
     };
 
-    let watcher_ingested = PERF.watcher_ingested.swap(0, Ordering::Relaxed);
-    let watcher_paths = PERF.watcher_paths.swap(0, Ordering::Relaxed);
-    let watcher_dropped = PERF.watcher_dropped.swap(0, Ordering::Relaxed);
-    let drain_slices = PERF.drain_slices.swap(0, Ordering::Relaxed);
-    let semantic_collects = PERF.semantic_collects.swap(0, Ordering::Relaxed);
-    let semantic_files = PERF.semantic_files.swap(0, Ordering::Relaxed);
-    let semantic_chunks = PERF.semantic_chunks.swap(0, Ordering::Relaxed);
-    let semantic_ms = PERF.semantic_ms.swap(0, Ordering::Relaxed);
-    let callgraph_invalidations = PERF.callgraph_invalidations.swap(0, Ordering::Relaxed);
-    let file_lines_dropped = PERF.file_lines_dropped.swap(0, Ordering::Relaxed);
-    let tier2 = PERF
+    let watcher_ingested = perf.watcher_ingested.swap(0, Ordering::Relaxed);
+    let watcher_paths = perf.watcher_paths.swap(0, Ordering::Relaxed);
+    let watcher_dropped = perf.watcher_dropped.swap(0, Ordering::Relaxed);
+    let drain_slices = perf.drain_slices.swap(0, Ordering::Relaxed);
+    let semantic_collects = perf.semantic_collects.swap(0, Ordering::Relaxed);
+    let semantic_files = perf.semantic_files.swap(0, Ordering::Relaxed);
+    let semantic_chunks = perf.semantic_chunks.swap(0, Ordering::Relaxed);
+    let semantic_ms = perf.semantic_ms.swap(0, Ordering::Relaxed);
+    let callgraph_invalidations = perf.callgraph_invalidations.swap(0, Ordering::Relaxed);
+    let file_lines_dropped = perf.file_lines_dropped.swap(0, Ordering::Relaxed);
+    let tier2 = perf
         .tier2
         .lock()
         .map(|mut tier2| std::mem::take(&mut *tier2))
         .unwrap_or_default();
-    let tool_calls = PERF
+    let tool_calls = perf
         .tool_calls
         .lock()
         .map(|samples| summarize_tool_calls(&samples))
@@ -2561,7 +2604,6 @@ pub fn perf_tick(executor: Option<&Executor>) {
     let active = watcher_ingested > 0
         || watcher_paths > 0
         || watcher_dropped > 0
-        || drain_slices > 0
         || semantic_collects > 0
         || callgraph_invalidations > 0
         || completed_interactive > 0
@@ -2689,6 +2731,19 @@ fn perf_tick_interval() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gh_shim_preinit_warning_is_durable_and_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("aft-shim.log");
+        super::write_preinit_warning_to(&path, "gh speech snapshot invalid: first").unwrap();
+        super::write_preinit_warning_to(&path, "gh speech snapshot invalid: second").unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with(" [aft] WARN gh speech snapshot invalid: first"));
+        assert!(lines[1].ends_with(" [aft] WARN gh speech snapshot invalid: second"));
+    }
+
     #[test]
     fn terminal_sync_redacts_both_sinks() {
         let directory = tempfile::tempdir().unwrap();
@@ -3954,6 +4009,39 @@ mod tests {
         assert_eq!(summary.max_total_ms, 9);
         assert_eq!(summary.p50_queue_ms, 2);
         assert_eq!(summary.max_queue_ms, 5);
+    }
+
+    #[test]
+    fn perf_tick_skips_empty_drains_but_keeps_real_work_and_drain_counts() {
+        for activity in ["drain", "watcher", "semantic"] {
+            let perf = PerfMetrics::default();
+            perf.reporter.lock().unwrap().last_report = Instant::now() - perf_tick_interval();
+            perf.drain_slices.store(1, Ordering::Relaxed);
+            if activity == "watcher" {
+                perf.watcher_ingested.store(2, Ordering::Relaxed);
+                perf.watcher_paths.store(1, Ordering::Relaxed);
+            } else if activity == "semantic" {
+                perf.semantic_collects.store(1, Ordering::Relaxed);
+                perf.semantic_files.store(2, Ordering::Relaxed);
+                perf.semantic_chunks.store(3, Ordering::Relaxed);
+                perf.semantic_ms.store(4, Ordering::Relaxed);
+            }
+            let (_, lines) = capture_log_lines(|| report_perf_tick(&perf, None, (0, 0)));
+            if activity == "drain" {
+                assert!(lines.is_empty(), "{lines:?}");
+            } else {
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert!(lines[0].starts_with("INFO perf tick:"), "{lines:?}");
+                assert!(lines[0].contains(" drains=1 "), "{lines:?}");
+                let expected = if activity == "watcher" {
+                    "watcher={ingested:2,paths:1,dropped:0}"
+                } else {
+                    "semantic={collects:1,files:2,chunks:3,ms:4}"
+                };
+                assert!(lines[0].contains(expected), "{lines:?}");
+            }
+            assert_eq!(perf.drain_slices.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]

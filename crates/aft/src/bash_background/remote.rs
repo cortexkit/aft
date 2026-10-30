@@ -170,12 +170,23 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
 #[cfg(unix)]
 const REMOTE_REATTACH_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// ck-motor's default queue wait limit, used for a request that sets no
-/// `queue_wait_limit_s` (AFT never sets one).
-/// Time a job waits only behind its own workspace's earlier job is not counted
-/// against it, so this bounds the ordinary case, not every wait.
+/// ck-motor's queue wait for jobs eligible for Boat (at most eight vCPUs,
+/// without outbound networking). Hosted-only jobs may wait longer. AFT leaves
+/// `queue_wait_limit_s` unset so the runner chooses its capacity-aware default.
+/// This baseline also caps retries after a proven terminal refusal.
 #[cfg(unix)]
 const RUNNER_QUEUE_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// Bound queue time without duplicating ck-motor's routing decisions. Its
+/// default admission policy allows 300 seconds for Boat-eligible jobs, or
+/// min(1800 seconds, the run timeout) for hosted-only jobs. The larger of 300
+/// seconds and the run timeout therefore covers either queue before execution
+/// consumes its separate runtime budget. Both re-attach and submission-key
+/// recovery must allow that time before declaring a job's outcome unknown.
+#[cfg(unix)]
+fn recovery_queue_wait_allowance(run_timeout: Duration) -> Duration {
+    RUNNER_QUEUE_WAIT_LIMIT.max(run_timeout)
+}
 
 /// The first pause before re-attaching after a lost stream; each failed attempt
 /// without progress doubles it, up to [`REATTACH_BACKOFF_MAX`].
@@ -480,9 +491,9 @@ fn local_os_name() -> &'static str {
 /// Bounds how long AFT keeps re-attaching to an accepted job whose stream it
 /// lost. Silence on an open stream is never bounded; only recovery attempts
 /// that bring no record are. While the job may still be queued or running on
-/// the runner, AFT keeps trying: it stops only once the job's own limits (the
-/// runner's queue wait limit plus the command's run timeout, counted from AFT's
-/// latest submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
+/// the runner, AFT keeps trying: it stops only once a conservative queue
+/// allowance plus the command's run timeout (counted from AFT's latest
+/// submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
 /// after recovery began. Accepted jobs can disappear with a wiped runner state;
 /// AFT must not resubmit them.
 #[cfg(unix)]
@@ -509,8 +520,8 @@ struct ReattachBudget {
 #[cfg(unix)]
 impl ReattachBudget {
     fn new(_root: &Path, metadata: &PersistedTask) -> Self {
-        let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
         let (until_job_end, recorded_timeout, run_timeout) = Self::until_job_end(metadata);
+        let queue_wait = recovery_queue_wait_allowance(run_timeout);
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
@@ -522,7 +533,7 @@ impl ReattachBudget {
             None => (grace, until_job_end),
         };
         let limit_note = format!(
-            "ck-motor's queue wait limit of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
+            "a queue wait allowance of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
             retry_duration(duration_ms(queue_wait)),
             if recorded_timeout.is_some() { "" } else { "assumed " },
             retry_duration(duration_ms(run_timeout)),
@@ -569,7 +580,7 @@ impl ReattachBudget {
             .and_then(|retry| retry.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
         let job_end_ms = submitted_at
-            .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT))
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
             .saturating_add(duration_ms(run_timeout));
         (
             Duration::from_millis(job_end_ms.saturating_sub(unix_millis())),
@@ -598,7 +609,13 @@ impl ReattachBudget {
         }
     }
 
-    /// A record arrived: the job is alive, so recovery starts over.
+    fn observe(&mut self, progress: &StreamProgress) {
+        if matches!(progress, StreamProgress::Record) {
+            self.reset();
+        }
+    }
+
+    /// An execution record arrived: the job is alive, so recovery starts over.
     fn reset(&mut self) {
         self.deadline = None;
         self.attempts = 0;
@@ -902,24 +919,24 @@ pub(crate) struct KeyedSubmission {
 #[cfg(unix)]
 impl KeyedSubmission {
     fn expires_at(&self, metadata: &PersistedTask) -> u64 {
+        let run_timeout = metadata
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_BG_TIMEOUT);
         let submitted_at = metadata
             .remote
             .as_ref()
             .and_then(|r| r.retry.as_ref())
             .and_then(|r| r.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
+        // Admission can wait before execution starts; that wait does not
+        // consume the runner's execution timeout.
+        let job_end_ms = submitted_at
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
+            .saturating_add(duration_ms(run_timeout));
         self.created_at_ms
             .saturating_add(SUBMISSION_RETENTION_MS)
-            .min(
-                submitted_at.saturating_add(
-                    metadata
-                        .timeout_ms
-                        .unwrap_or(duration_ms(DEFAULT_BG_TIMEOUT))
-                        // Admission can wait before execution starts; that wait
-                        // does not consume the runner's execution timeout.
-                        .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT)),
-                ),
-            )
+            .min(job_end_ms)
     }
 }
 
@@ -1009,6 +1026,51 @@ impl RemotePhase {
 pub(crate) struct RemoteProgress {
     pub job_id: Option<Uuid>,
     pub phase: RemotePhase,
+}
+
+#[cfg(unix)]
+fn admission_progress_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 120;
+    let single_line: String = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let normalized = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Mask complete credentials before a display cut could split their shape.
+    let redacted = crate::log_redact::aft_redactor(&normalized);
+    if redacted.chars().count() <= MAX_DETAIL_CHARS {
+        return redacted.into_owned();
+    }
+    let (boundary, _) = redacted.char_indices().nth(MAX_DETAIL_CHARS - 1).unwrap();
+    format!("{}…", &redacted[..boundary])
+}
+
+#[cfg(unix)]
+fn admission_progress_line(progress: &exec::types::Progress) -> Option<String> {
+    use exec::types::ProgressPhase;
+    let step = match progress.phase() {
+        ProgressPhase::Upload => "uploading its files".to_owned(),
+        ProgressPhase::PlacementWait => "waiting for a free build host".to_owned(),
+        ProgressPhase::Connect => "connecting to its build host".to_owned(),
+        _ => return None,
+    };
+    let elapsed =
+        crate::lsp::manager::format_retry_delay(Duration::from_millis(progress.phase_elapsed_ms()));
+    let detail = progress
+        .detail()
+        .map(admission_progress_detail)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
+    Some(format!(
+        "The remote job is {step} ({elapsed} so far){detail}."
+    ))
 }
 
 impl RemoteProgress {
@@ -1175,6 +1237,7 @@ struct TaskSink {
     // metadata until the files are synced. Cancellation also saves that metadata.
     output_progress: OutputProgress,
     last_progress_persist: Instant,
+    sent_at: Option<Instant>,
     #[cfg(test)]
     progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
     /// Runs between the checkpoint snapshot and its file write, so a test can
@@ -1295,6 +1358,7 @@ impl TaskSink {
                 ..OutputProgress::of(&remote)
             },
             last_progress_persist: Instant::now(),
+            sent_at: None,
             #[cfg(test)]
             progress_clock: None,
             #[cfg(test)]
@@ -1636,7 +1700,29 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 
 #[cfg(unix)]
 impl OutputSink for TaskSink {
+    fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        let Some(note) = admission_progress_line(progress) else {
+            return;
+        };
+        let Ok(mut state) = self.task.state.lock() else {
+            return;
+        };
+        if !state.metadata.is_terminal()
+            && state.metadata.remote.as_ref().is_some_and(|r| !r.accepted)
+        {
+            // Replace, never append: pre-acceptance status is ephemeral and is
+            // not output, a resume checkpoint, or execution evidence.
+            state.remote_admission_note = Some(note);
+            self.task.publish_runon_launch_state(&state);
+        }
+    }
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
+        // Measure receipt before local persistence adds its own latency. An
+        // attach after restart has no in-process exec.run send timestamp.
+        let capture_ms = self
+            .sent_at
+            .map(|sent_at| sent_at.elapsed().as_millis().to_string())
+            .unwrap_or_else(|| "unknown".into());
         // A resubmitted job returns its files afresh.
         if let Some(returns) = self.returns.as_mut() {
             returns.reset();
@@ -1662,6 +1748,7 @@ impl OutputSink for TaskSink {
             .state
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
+        state.remote_admission_note = None;
         append_executor_environment_disclosure(&mut state.metadata);
         if let Some(remote) = &state.metadata.remote {
             let note = remote_execution_note(remote);
@@ -1677,10 +1764,11 @@ impl OutputSink for TaskSink {
             *existing = note + &suffix;
         }
         crate::slog_info!(
-            "runon: remote task accepted task_id={} session={} job_id={}",
+            "runon: remote task accepted task_id={} session={} job_id={} capture_ms={}",
             self.task.task_id,
             state.metadata.session_id,
             accepted.job_id,
+            capture_ms,
         );
         self.registry
             .persist_task_locked(&self.task, &state.metadata, &mut db)?;
@@ -2278,6 +2366,8 @@ impl BgTaskRegistry {
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let mut timings = super::super::take_runon_timings();
+        timings.enter("task_setup");
         let canonical_project_root = canonicalized_path(root.as_deref().unwrap_or(&workdir));
         let _admission = self.background_admission_guard(slot);
         self.check_background_slot_typed(slot, &session_id)?;
@@ -2286,6 +2376,7 @@ impl BgTaskRegistry {
             None => allocate_task_layout(&storage_dir, &session_id).map_err(|e| e.to_string())?,
         };
         let layout_cleanup = UncommittedLayout::new(&layout);
+        timings.enter("sandbox_payload");
         if plan.prepared_task().is_none() {
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
@@ -2301,6 +2392,7 @@ impl BgTaskRegistry {
             plan = plan.with_prepared_task(prepared);
         }
         let task_id = layout.paths.task_id.clone();
+        timings.enter("task_metadata");
         let requested_vcpus = launch.requested_vcpus;
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -2363,6 +2455,7 @@ impl BgTaskRegistry {
             &shell_path,
         );
         attach_sandbox_metadata(&mut metadata, &plan);
+        timings.enter("fallback_snapshot");
         let digest = crate::sandbox_spawn::save_local_launch(
             &plan,
             root.as_deref().unwrap_or(&workdir),
@@ -2374,6 +2467,7 @@ impl BgTaskRegistry {
             memory_limit_mib,
         )?;
         metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
+        timings.enter("task_registration");
         let handles =
             TaskIoHandles::create(&layout, BgMode::Pipes, true).map_err(|e| e.to_string())?;
         write_task_at(&layout, &metadata).map_err(|e| e.to_string())?;
@@ -2402,6 +2496,7 @@ impl BgTaskRegistry {
             .map_err(|_| "task lock poisoned")?
             .io_handles = Some(handles);
         let request_root = root.as_deref().unwrap_or(&workdir);
+        timings.enter("remote_environment");
         let linux_scope = env
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
@@ -2461,6 +2556,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         let explicit_runon = launch.explicit_runon;
+        timings.enter("workdir_repository_git");
         let request = environment.and_then(|environment| {
             *task
                 .completion_secrets
@@ -2491,6 +2587,7 @@ impl BgTaskRegistry {
                 },
             )
         });
+        timings.enter("cd_snapshot_git");
         let request = request
             .map_err(RemoteRequestError::Build)
             .and_then(|request| {
@@ -2511,13 +2608,14 @@ impl BgTaskRegistry {
             env,
             capture_pipeline,
         };
-        self.start_remote_worker(task, Some((request, fallback)))?;
+        timings.enter("worker_dispatch");
+        self.start_remote_worker(task, Some((request, fallback)), Some(timings))?;
         self.start_watchdog();
         Ok(task_id)
     }
 
     pub(super) fn resume_remote_task(&self, task_id: &str) -> Result<(), String> {
-        self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None)
+        self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None, None)
     }
 
     async fn key_fresh_request(
@@ -2525,11 +2623,14 @@ impl BgTaskRegistry {
         client: &ExecRemoteClient,
         task: &Arc<BgTask>,
         request: RunRequest,
+        timings: &mut exec::LaunchTimings,
     ) -> Result<RunRequest, String> {
+        timings.enter("supports_submission_key");
         let supported = client
             .supports_submission_key()
             .await
             .map_err(|e| e.to_string())?;
+        timings.enter("submission_persistence");
         let previous = task
             .state
             .lock()
@@ -2588,6 +2689,7 @@ impl BgTaskRegistry {
     ) -> Result<Option<exec::RemoteStream>, String> {
         sink.checkpoint_progress().map_err(|e| e.to_string())?;
         loop {
+            let mut timings = exec::LaunchTimings::new(Instant::now(), "submission_recovery");
             let metadata = sink
                 .task
                 .state
@@ -2658,10 +2760,11 @@ impl BgTaskRegistry {
                 return Ok(None);
             }
             let submit = async {
+                timings.enter("supports_submission_key");
                 if !client.supports_submission_key().await? {
                     return Ok(None);
                 }
-                let result = client.run(&request).await;
+                let result = run_diagnosed(client, &sink.task, &request, timings).await;
                 #[cfg(test)]
                 let result = if result.is_ok() && tests::lose_submission_replies(root) {
                     // A round trip confirms dispatch reached the fake executor
@@ -2704,6 +2807,7 @@ impl BgTaskRegistry {
         &self,
         task: Arc<BgTask>,
         initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
+        timings: Option<exec::LaunchTimings>,
     ) -> Result<(), String> {
         {
             // A finished task whose owed runner cancel the startup pass
@@ -2765,11 +2869,19 @@ impl BgTaskRegistry {
         std::thread::Builder::new()
             .name(format!("aft-remote-{}", task.task_id))
             .spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())
-                    .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial)));
+                let run = || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())
+                        .and_then(|rt| {
+                            rt.block_on(registry.run_remote_task(task.clone(), initial, timings))
+                        })
+                };
+                #[cfg(test)]
+                let result = tests::capture_remote_launch_logs(&task, run);
+                #[cfg(not(test))]
+                let result = run();
                 if let Err(error) = result {
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
@@ -2824,7 +2936,10 @@ impl BgTaskRegistry {
         &self,
         task: Arc<BgTask>,
         mut initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
+        timings: Option<exec::LaunchTimings>,
     ) -> Result<(), String> {
+        let mut timings =
+            timings.unwrap_or_else(|| exec::LaunchTimings::new(Instant::now(), "recovery_setup"));
         let remote = task
             .state
             .lock()
@@ -2841,6 +2956,7 @@ impl BgTaskRegistry {
             .project_root
             .clone()
             .unwrap_or_else(|| PathBuf::from("/"));
+        timings.enter("worker_setup");
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
         let mut recovery = ReattachBudget::new(
             &root,
@@ -2933,6 +3049,7 @@ impl BgTaskRegistry {
             );
             return Ok(());
         }
+        timings.enter("connect_route");
         let connection = remote
             .connection_file
             .as_ref()
@@ -3016,6 +3133,7 @@ impl BgTaskRegistry {
                 }
             }
         };
+        timings.enter("retry_preparation");
         let mut fallback = None;
         let mut hinted: Option<HintedRetry> = None;
         if remote.accepted && !platform_acknowledged(&remote) {
@@ -3123,7 +3241,9 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
                 hinted = Some(HintedRetry::start(&root, request.clone()));
             }
-            let request = self.key_fresh_request(&client, &task, request).await?;
+            let request = self
+                .key_fresh_request(&client, &task, request, &mut timings)
+                .await?;
             if task
                 .state
                 .lock()
@@ -3138,7 +3258,7 @@ impl BgTaskRegistry {
                 }
                 return Ok(());
             }
-            match client.run(&request).await {
+            match run_diagnosed(&client, &task, &request, timings).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
                     return if remote.explicit_runon {
@@ -3218,6 +3338,7 @@ impl BgTaskRegistry {
                     return Err(PRE_ACCEPTANCE_CANCELLED.into());
                 }
             }
+            sink.sent_at = stream.sent_at();
             let result = tokio::select! {
                 result=stream.next(&mut sink)=>result,
                 _=tokio::time::sleep(Duration::from_millis(50))=>{
@@ -3246,8 +3367,11 @@ impl BgTaskRegistry {
             } else {
                 true
             };
+            if let Ok(progress) = &result {
+                recovery.observe(progress);
+            }
             match result {
-                Ok(StreamProgress::Record) => recovery.reset(),
+                Ok(StreamProgress::AdmissionProgress | StreamProgress::Record) => {}
                 Ok(StreamProgress::Complete(Verdict::RunLocally {
                     reason,
                     refusal_detail,
@@ -3508,6 +3632,7 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         root: &Path,
     ) -> Result<Option<(exec::RemoteStream, HintedRetry)>, String> {
+        let mut timings = exec::LaunchTimings::new(Instant::now(), "draining_retry");
         // Recheck after connecting: reconnect time also consumes the retry budget.
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
@@ -3515,7 +3640,7 @@ impl BgTaskRegistry {
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
         let keyed_request = self
-            .key_fresh_request(client, task, request.clone())
+            .key_fresh_request(client, task, request.clone(), &mut timings)
             .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
@@ -3552,7 +3677,7 @@ impl BgTaskRegistry {
         }
         // A fresh submission gets its own signer-retry allowance, counted from now.
         let hinted = HintedRetry::start(root, request);
-        match resubmit(client, &keyed_request, root).await {
+        match resubmit(client, task, &keyed_request, root, timings).await {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -3582,6 +3707,7 @@ impl BgTaskRegistry {
         root: &Path,
         retry: &mut HintedRetry,
     ) -> Result<HintedRetryStep, String> {
+        let mut timings = exec::LaunchTimings::new(Instant::now(), "hinted_retry");
         let (terminal, started) = {
             let state = task.state.lock().map_err(|_| "task lock poisoned")?;
             let remote = state
@@ -3657,7 +3783,7 @@ impl BgTaskRegistry {
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
         let request = self
-            .key_fresh_request(client, task, retry.request.clone())
+            .key_fresh_request(client, task, retry.request.clone(), &mut timings)
             .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
@@ -3692,7 +3818,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
-        match resubmit(client, &request, root).await {
+        match resubmit(client, task, &request, root, timings).await {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -5520,8 +5646,10 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
 #[cfg(unix)]
 async fn resubmit(
     client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
     request: &RunRequest,
     _root: &Path,
+    timings: exec::LaunchTimings,
 ) -> Result<exec::RemoteStream, exec::Error> {
     #[cfg(test)]
     if tests::refuse_resubmission(_root) {
@@ -5529,7 +5657,26 @@ async fn resubmit(
             "test: resubmission failed before it was sent".into(),
         ));
     }
-    client.run(request).await
+    run_diagnosed(client, task, request, timings).await
+}
+
+#[cfg(unix)]
+async fn run_diagnosed(
+    client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
+    request: &RunRequest,
+    timings: exec::LaunchTimings,
+) -> Result<exec::RemoteStream, exec::Error> {
+    client
+        .run_with_diagnostics(
+            request,
+            Some(exec::RunDiagnostics {
+                task_id: &task.task_id,
+                session: &task.session_id,
+                timings,
+            }),
+        )
+        .await
 }
 
 #[cfg(unix)]
