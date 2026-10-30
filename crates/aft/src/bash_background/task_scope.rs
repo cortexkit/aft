@@ -93,7 +93,6 @@ mod linux {
                 .insert(handle.task_id.clone(), handle);
         }
 
-        #[expect(dead_code, reason = "used by Task 7: scope termination")]
         pub(crate) fn get(&self, task_id: &str) -> Option<ScopeHandle> {
             self.handles
                 .lock()
@@ -119,12 +118,10 @@ mod linux {
             expect(dead_code, reason = "used by Task 8: owned scope cleanup")
         )]
         unit: String,
-        #[expect(dead_code, reason = "used by Task 6: scoped memory monitor")]
         cgroup: PathBuf,
     }
 
     impl ScopeHandle {
-        #[expect(dead_code, reason = "used by Task 6: scoped memory monitor")]
         pub(crate) fn cgroup(&self) -> &Path {
             &self.cgroup
         }
@@ -541,10 +538,6 @@ mod linux {
         membership_path(task_id, proc_cgroup).is_some()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 8: replay scope lookup")
-    )]
     fn lookup_with(systemctl: &Path, task_id: &str) -> Result<Option<ScopeHandle>, String> {
         let unit = scope_unit(task_id).map_err(|e| e.to_string())?;
         let output = run(
@@ -579,10 +572,6 @@ mod linux {
         }))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 8: replay scope lookup")
-    )]
     pub(crate) fn lookup(task_id: &str) -> Result<Option<ScopeHandle>, String> {
         lookup_with(Path::new("systemctl"), task_id)
     }
@@ -675,7 +664,6 @@ mod linux {
     }
 
     impl ScopeHandle {
-        #[expect(dead_code, reason = "used by Task 7: scoped termination")]
         pub(crate) fn kill(&self) -> io::Result<()> {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -695,8 +683,11 @@ mod linux {
         pub(crate) fn stop(&self) -> Result<(), String> {
             stop_unit(&self.unit)
         }
-        #[expect(dead_code, reason = "used by Task 6: scoped memory monitor")]
         pub(crate) fn ensure_oom_group(&self) -> Result<(), String> {
+            #[cfg(test)]
+            if let Some(error) = OOM_GROUP_ERROR.with(|slot| slot.borrow().clone()) {
+                return Err(error);
+            }
             let path = self.cgroup.join("memory.oom.group");
             if std::fs::read_to_string(&path)
                 .map_err(|e| e.to_string())?
@@ -718,6 +709,31 @@ mod linux {
                 return Err("task scope memory.oom.group did not become 1".into());
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! { static OOM_GROUP_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+    #[cfg(test)]
+    pub(crate) fn with_oom_group_error_for_test<T>(run: impl FnOnce() -> T) -> T {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OOM_GROUP_ERROR.with(|slot| slot.take());
+            }
+        }
+        OOM_GROUP_ERROR
+            .with(|slot| slot.replace(Some("task scope memory.oom.group write denied".into())));
+        let _restore = Restore;
+        run()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_for_test(task_id: &str, cgroup: PathBuf) -> ScopeHandle {
+        ScopeHandle {
+            task_id: task_id.into(),
+            unit: scope_unit(task_id).unwrap(),
+            cgroup,
         }
     }
 

@@ -4010,7 +4010,6 @@ impl BgTaskRegistry {
                 Some(Duration::from_secs(local.linux_scope_max_runtime_secs)),
                 local.plan.is_native_launcher(),
             )
-            .filter(|_| local.memory_limit_mib.is_none())
             .map(|policy| {
                 self.inner.task_scopes.prepare(
                     policy,
@@ -4022,7 +4021,11 @@ impl BgTaskRegistry {
             })
             .transpose()?
             .flatten();
-        let mut memory_monitor = Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
+        let mut memory_monitor = if scope.is_some() {
+            None
+        } else {
+            Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?
+        };
         let gated = scope.is_some() || memory_monitor.is_some();
         let mut spawn_child = |scope: Option<&super::super::task_scope::ScopeLaunch>| {
             spawn_detached_child(
@@ -4035,7 +4038,7 @@ impl BgTaskRegistry {
                 &local.env,
                 state.io_handles.as_mut().ok_or("task handles absent")?,
                 local.capture_pipeline,
-                memory_monitor.is_some(),
+                local.memory_limit_mib.is_some(),
                 scope,
                 if gated {
                     LocalIdentityGate::Required
@@ -4048,11 +4051,26 @@ impl BgTaskRegistry {
             if let Some(launch) = scope.as_ref() {
                 if self.place_task_scope(&mut child, launch)? {
                     scope = None;
+                    memory_monitor =
+                        Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
                     return spawn_child(None);
                 }
             }
             Ok(child)
         })?;
+        if scope.is_some() {
+            match self.scoped_memory_limit(local.memory_limit_mib, &task.task_id) {
+                Ok(monitor) => memory_monitor = monitor,
+                Err(error) => {
+                    drop(child.stdin.take());
+                    if let Some(scope) = scope.as_ref() {
+                        let _ = scope.stop();
+                    }
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child.id()) {
                 super::super::process::terminate_pgid(child.id() as i32, None);

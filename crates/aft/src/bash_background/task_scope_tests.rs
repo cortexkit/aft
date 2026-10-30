@@ -132,6 +132,77 @@ fn task_scope_spawn_has_named_membership() {
 }
 
 #[test]
+fn task_scope_memory_uses_the_task_scope() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &r,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        Some(64),
+    );
+    let _stop = StopOnDrop(id.clone());
+    let task = r.task(&id).unwrap();
+    let policy = task
+        .lock_state()
+        .unwrap()
+        .metadata
+        .memory_policy
+        .clone()
+        .unwrap();
+    let path = policy.cgroup.clone().unwrap();
+    let max = std::fs::read_to_string(path.join("memory.max")).unwrap();
+    let swap = std::fs::read_to_string(path.join("memory.swap.max")).unwrap();
+    let group = std::fs::read_to_string(path.join("memory.oom.group")).unwrap();
+    r.kill(&id, "task-scope").unwrap();
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        format!("aft-task-{id}.scope")
+    );
+    assert_eq!(max.trim(), "67108864");
+    assert_eq!(swap.trim(), "0");
+    assert_eq!(group.trim(), "1");
+}
+
+#[test]
+fn task_scope_memory_denied_setup_keeps_payload_gate_closed() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    let result = super::super::task_scope::with_oom_group_error_for_test(|| {
+        r.spawn_with_shell_in_slot_typed(
+            SpawnPlan::Unsandboxed,
+            "printf unsafe > payload-ran",
+            super::super::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "denied-group".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            Some(64),
+            root.path().into(),
+            super::super::TaskSlot::Background { max: 8 },
+            false,
+            false,
+            None,
+            true,
+        )
+    });
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("memory.oom.group write denied"));
+    assert!(!root.path().join("payload-ran").exists());
+}
+
+#[test]
 fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
     if !manager_available() {
         return;

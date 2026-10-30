@@ -4931,6 +4931,24 @@ impl BgTaskRegistry {
         self.enqueue_completion_if_needed(metadata, Some(paths), true);
     }
 
+    fn scoped_memory_limit(
+        &self,
+        mib: Option<u64>,
+        task_id: &str,
+    ) -> Result<Option<super::memory_limit::Monitor>, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(mib) = mib.filter(|mib| *mib > 0) {
+            let scope = self
+                .inner
+                .task_scopes
+                .get(task_id)
+                .ok_or("task memory scope is absent")?;
+            return super::memory_limit::Monitor::from_task_scope(mib, &scope).map(Some);
+        }
+        let _ = (mib, task_id);
+        Ok(None)
+    }
+
     pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
         let mut state = task.lock_state().ok()?;
         if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
@@ -4974,7 +4992,9 @@ impl BgTaskRegistry {
         }
         if let Ok(monitors) = self.inner.memory_monitors.lock() {
             if let Some(monitor) = monitors.get(&task.task_id) {
-                monitor.terminate();
+                if !monitor.is_task_scope() {
+                    monitor.terminate();
+                }
             }
         }
         let _ = self.kill_with_status_reason(
@@ -5326,7 +5346,6 @@ impl BgTaskRegistry {
             .inner
             .task_scopes
             .policy(linux_scope, None, spawn_plan.is_native_launcher())
-            .filter(|_| memory_limit_mib.is_none())
             .map(|policy| {
                 self.inner.task_scopes.prepare(
                     policy,
@@ -5339,7 +5358,11 @@ impl BgTaskRegistry {
             .transpose()?
             .flatten();
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
-        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        let mut memory_monitor = if scope.is_some() {
+            None
+        } else {
+            Self::prepare_memory_limit(memory_limit_mib, &task_id)?
+        };
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -5372,7 +5395,7 @@ impl BgTaskRegistry {
                 &env,
                 &mut io_handles,
                 capture_pipeline_status,
-                memory_monitor.is_some(),
+                memory_limit_mib.is_some(),
                 scope,
                 LocalIdentityGate::Required,
             )
@@ -5381,6 +5404,7 @@ impl BgTaskRegistry {
             if let Some(launch) = scope.as_ref() {
                 if self.place_task_scope(&mut child, launch)? {
                     scope = None;
+                    memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
                     return spawn_child(None);
                 }
             }
@@ -5410,6 +5434,20 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        if scope.is_some() {
+            match self.scoped_memory_limit(memory_limit_mib, &task_id) {
+                Ok(monitor) => memory_monitor = monitor,
+                Err(error) => {
+                    drop(child.stdin.take());
+                    if let Some(scope) = scope.as_ref() {
+                        let _ = scope.stop();
+                    }
+                    let _ = child.wait();
+                    self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
+                    return Err(error.into());
+                }
+            }
+        }
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
             if let Some(scope) = scope.as_ref() {
