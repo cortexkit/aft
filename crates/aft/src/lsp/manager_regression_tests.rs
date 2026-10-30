@@ -152,15 +152,19 @@ fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() 
     fixture.hover(&fixture.idle);
     fixture.hover(&fixture.busy);
     // A retired reader's exit must not remove the new client or its state.
-    fixture.ctx.lsp().handle_event(
-        &LspEvent::ServerExited {
-            server_kind: key.kind.clone(),
-            root: key.root.clone(),
-            pid: old_pid,
-            reason: ServerExitReason::Eof,
-        }
-        .into(),
-    );
+    fixture
+        .ctx
+        .lsp()
+        .handle_event(
+            &LspEvent::ServerExited {
+                server_kind: key.kind.clone(),
+                root: key.root.clone(),
+                pid: old_pid,
+                reason: ServerExitReason::Eof,
+            }
+            .into(),
+        )
+        .unwrap();
     fixture.ctx.lsp().drain_events();
     fixture.hover(&fixture.idle);
 }
@@ -209,15 +213,17 @@ fn idle_lsp_document_notifications_refresh_last_use_but_push_diagnostics_do_not(
     refreshed!(client.send_did_save_borrowed(&uri, None).unwrap());
     refreshed!(client.record_startup_sync(&uri, true, None));
     client.set_last_used_at_for_test(old);
-    manager.handle_event(
-        &LspEvent::Notification {
-            server_kind: ServerKind::TypeScript,
-            root: fixture.idle.parent().unwrap().to_path_buf(),
-            method: "textDocument/publishDiagnostics".into(),
-            params: Some(json!({"uri": uri.as_str(), "diagnostics": []})),
-        }
-        .into(),
-    );
+    manager
+        .handle_event(
+            &LspEvent::Notification {
+                server_kind: ServerKind::TypeScript,
+                root: fixture.idle.parent().unwrap().to_path_buf(),
+                method: "textDocument/publishDiagnostics".into(),
+                params: Some(json!({"uri": uri.as_str(), "diagnostics": []})),
+            }
+            .into(),
+        )
+        .unwrap();
     assert_eq!(
         manager
             .client_for_file(&fixture.idle, &fixture.config)
