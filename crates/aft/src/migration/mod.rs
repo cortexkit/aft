@@ -304,6 +304,9 @@ pub(crate) fn store_live_semantic_blobs(
     let view = ViewStore::open(&request.storage, &request.view)?;
     let mut candidates = Vec::new();
     for file in parsed.files {
+        if file.incomplete {
+            continue;
+        }
         let Some(rel_path) = legacy_path_to_rel_path(&file.path, &root) else {
             continue;
         };
@@ -1153,6 +1156,56 @@ mod tests {
             1,
             "control: releasing the handoff must expose the otherwise unreferenced blob"
         );
+    }
+
+    #[test]
+    fn live_semantic_handoff_does_not_cache_refused_files_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let healthy = root.join("src/healthy.rs");
+        let refused = root.join("src/refused.rs");
+        let source = b"pub fn entry() {}\n";
+        fs::write(&healthy, source).unwrap();
+        fs::write(&refused, source).unwrap();
+        let mut index = crate::semantic_index::SemanticIndex::build(
+            &root,
+            &[healthy, refused.clone()],
+            &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            64,
+        )
+        .unwrap();
+        let fingerprint = crate::semantic_index::SemanticIndexFingerprint {
+            dimension: 2,
+            chunking_version: 2,
+            ..Default::default()
+        };
+        index.set_fingerprint(fingerprint.clone());
+        index.apply_refused_rows_update(BTreeMap::from([(refused, 1)]));
+        let request = SemanticMigrationRequest::for_root(
+            dir.path().join("storage"),
+            &root,
+            fingerprint.as_string(),
+        );
+        let handoff = store_live_semantic_blobs(&request, &index).unwrap();
+        assert_eq!(handoff.keys.len(), 1);
+        assert!(handoff.keys.contains_key(b"src/healthy.rs".as_slice()));
+        let refused_key = SemanticKey::from_bytes(
+            source,
+            b"src/refused.rs",
+            &request.chunker_version,
+            &request.embed_template_version,
+            &request.configured_model_fingerprint,
+        )
+        .full_key();
+        let store = BlobStore::open(
+            &request.storage,
+            &request.family,
+            crate::blob_store::BlobPlane::Semantic,
+        )
+        .unwrap();
+        assert!(store.get(&refused_key).unwrap().is_none());
     }
 
     #[test]
