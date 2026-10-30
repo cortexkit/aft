@@ -4400,6 +4400,7 @@ fn run_subc_mode_on_runtime_thread(
         let base_task_scope_runtime = Some((
             ctx.bash_background().clone(),
             Duration::from_secs(ctx.config().bash.linux_scope_max_runtime_secs),
+            ctx.storage_dir(),
         ));
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
@@ -5202,7 +5203,7 @@ async fn run_module_loop_with_task_scopes<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
-    base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration)>,
+    base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration, PathBuf)>,
     connection_end_lsp: QuiescedLsp,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
@@ -5278,11 +5279,12 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
-    if let Some((registry, max_runtime)) = base_task_scope_runtime.as_ref() {
+    if let Some((registry, max_runtime, storage_dir)) = base_task_scope_runtime.as_ref() {
         registry.configure_task_scope_runtime(
             shared_app.subc_connection_file().is_some(),
             *max_runtime,
         );
+        registry.start_task_scope_cleanup(storage_dir);
     }
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test

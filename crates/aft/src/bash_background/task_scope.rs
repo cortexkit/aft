@@ -48,6 +48,9 @@ mod linux {
     }
 
     impl TaskScopes {
+        pub(crate) fn is_daemon(&self) -> bool {
+            self.daemon_mode.load(Ordering::Acquire)
+        }
         pub(crate) fn configure_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
             *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner()) = max_runtime;
             self.daemon_mode.store(daemon_mode, Ordering::Release);
@@ -107,15 +110,119 @@ mod linux {
             }
             Ok(())
         }
+
+        pub(crate) fn adopt(
+            &self,
+            task_id: &str,
+            pid: u32,
+            start: u64,
+        ) -> Result<Option<ScopeHandle>, String> {
+            let handle = adopt_with(
+                task_id,
+                pid,
+                start,
+                lookup,
+                |pid| {
+                    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                        .map_err(|error| error.to_string())
+                },
+                |pid| {
+                    crate::root_cache::process_start_time_ms(pid)
+                        .ok_or_else(|| "task scope process identity is unavailable".into())
+                },
+            )?;
+            if let Some(scope) = &handle {
+                self.register(scope.clone());
+            }
+            Ok(handle)
+        }
+
+        pub(crate) fn cleanup_owned(
+            &self,
+            records: &[ScopeRecord],
+            terminal_only: bool,
+            mut recheck: impl FnMut(&str) -> bool,
+        ) -> Result<usize, String> {
+            let units = list_units()?;
+            let mut stopped = 0;
+            for unit in select_owned_units(&units, records, terminal_only) {
+                let id = task_unit_id(&unit).expect("selected validated unit");
+                if let Some(scope) = lookup(id)? {
+                    if recheck(id) {
+                        scope.stop()?;
+                        stopped += 1;
+                    }
+                }
+            }
+            Ok(stopped)
+        }
+    }
+
+    pub(crate) struct ScopeRecord {
+        pub task_id: String,
+        pub terminal: bool,
+    }
+
+    pub(crate) fn select_owned_units(
+        units: &[String],
+        records: &[ScopeRecord],
+        terminal_only: bool,
+    ) -> Vec<String> {
+        let mut owned = std::collections::HashMap::new();
+        for record in records {
+            owned
+                .entry(record.task_id.as_str())
+                .and_modify(|value| *value = None)
+                .or_insert(Some(record.terminal));
+        }
+        let mut seen = std::collections::HashSet::new();
+        units
+            .iter()
+            .filter(|unit| {
+                task_unit_id(unit)
+                    .and_then(|id| owned.get(id))
+                    .is_some_and(|terminal| {
+                        terminal.is_some_and(|terminal| !terminal_only || terminal)
+                    })
+                    && seen.insert(unit.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn adopt_with(
+        task_id: &str,
+        pid: u32,
+        start: u64,
+        lookup: impl FnOnce(&str) -> Result<Option<ScopeHandle>, String>,
+        mut membership: impl FnMut(u32) -> Result<String, String>,
+        mut identity: impl FnMut(u32) -> Result<u64, String>,
+    ) -> Result<Option<ScopeHandle>, String> {
+        let before = identity(pid).and_then(|actual| membership(pid).map(|text| (actual, text)));
+        let Some(scope) = lookup(task_id)? else {
+            return Ok(None);
+        };
+        let (actual, text) = before?;
+        if actual != start
+            || !matches_membership(task_id, &text)
+            || membership_path(task_id, &text).as_deref() != Some(scope.cgroup())
+        {
+            return Err("task scope replay identity mismatch".into());
+        }
+        let actual = identity(pid)?;
+        let text = membership(pid)?;
+        if actual != start
+            || !matches_membership(task_id, &text)
+            || membership_path(task_id, &text).as_deref() != Some(scope.cgroup())
+        {
+            return Err("task scope replay identity changed".into());
+        }
+        Ok(Some(scope))
     }
 
     #[derive(Clone, Debug)]
     pub(crate) struct ScopeHandle {
         task_id: String,
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "used by Task 8: owned scope cleanup")
-        )]
         unit: String,
         cgroup: PathBuf,
     }
@@ -529,10 +636,6 @@ mod linux {
         run()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 8: replay scope identity")
-    )]
     pub(crate) fn matches_membership(task_id: &str, proc_cgroup: &str) -> bool {
         membership_path(task_id, proc_cgroup).is_some()
     }
@@ -575,10 +678,6 @@ mod linux {
         lookup_with(Path::new("systemctl"), task_id)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 8: owned scope cleanup")
-    )]
     fn list_with(systemctl: &Path) -> Result<Vec<String>, String> {
         let bytes = successful(run(
             Command::new(systemctl).args([
@@ -611,7 +710,6 @@ mod linux {
         Ok(units)
     }
 
-    #[expect(dead_code, reason = "used by Task 8: owned scope cleanup")]
     pub(crate) fn list_units() -> Result<Vec<String>, String> {
         list_with(Path::new("systemctl"))
     }
@@ -681,10 +779,6 @@ mod linux {
                 Err(e) => Err(e),
             }
         }
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "used by Task 8: owned scope cleanup")
-        )]
         pub(crate) fn stop(&self) -> Result<(), String> {
             stop_unit(&self.unit)
         }
@@ -860,6 +954,54 @@ mod linux {
             assert_eq!(parse_version("unknown 262"), None);
             assert_eq!(parse_version("systemd unknown"), None);
         }
+
+        #[test]
+        fn task_scope_adopt_rejects_other_scope() {
+            let id = "bash-0123456789abcdef";
+            let events = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let result = with_kill_events_for_test(events.clone(), || {
+                adopt_with(
+                    id,
+                    42,
+                    99,
+                    |_| Ok(Some(handle_for_test(id, "/fake".into()))),
+                    |_| Ok("0::/aft.slice/aft-task-bash-0000000000000000.scope\n".into()),
+                    |_| Ok(99),
+                )
+            });
+            assert!(result.unwrap_err().contains("identity mismatch"));
+            assert!(events.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn task_scope_adopt_rejects_changed_start_time() {
+            let id = "bash-0123456789abcdef";
+            for changed_at in [0, 1] {
+                let mut reads = 0;
+                let events = std::sync::Arc::new(Mutex::new(Vec::new()));
+                let result = with_kill_events_for_test(events.clone(), || {
+                    adopt_with(
+                        id,
+                        42,
+                        99,
+                        |_| {
+                            Ok(Some(handle_for_test(
+                                id,
+                                format!("/sys/fs/cgroup/aft.slice/aft-task-{id}.scope").into(),
+                            )))
+                        },
+                        |_| Ok(format!("0::/aft.slice/aft-task-{id}.scope\n")),
+                        |_| {
+                            let value = if reads >= changed_at { 100 } else { 99 };
+                            reads += 1;
+                            Ok(value)
+                        },
+                    )
+                });
+                assert!(result.is_err(), "changed identity was adopted");
+                assert!(events.lock().unwrap().is_empty());
+            }
+        }
         #[test]
         fn task_scope_runtime_properties_use_the_launch_policy() {
             let launcher = || SystemdScopeLauncher {
@@ -979,6 +1121,32 @@ mod tests {
     use super::*;
     use crate::bash_background::HardKill;
     use std::{ffi::OsString, path::Path, time::Duration};
+
+    #[test]
+    fn task_scope_cleanup_never_claims_unknown_units() {
+        let terminal = "aft-task-bash-0000000000000001.scope".to_string();
+        let running = "aft-task-bash-0000000000000002.scope".to_string();
+        let foreign = "aft-task-bash-0000000000000003.scope".to_string();
+        let records = vec![
+            ScopeRecord {
+                task_id: "bash-0000000000000001".into(),
+                terminal: true,
+            },
+            ScopeRecord {
+                task_id: "bash-0000000000000002".into(),
+                terminal: false,
+            },
+        ];
+        let units = vec![terminal.clone(), running.clone(), foreign];
+        assert_eq!(
+            select_owned_units(&units, &records, true),
+            vec![terminal.clone()]
+        );
+        assert_eq!(
+            select_owned_units(&units, &records, false),
+            vec![terminal, running]
+        );
+    }
 
     #[test]
     fn task_scope_argv_and_backstop() {

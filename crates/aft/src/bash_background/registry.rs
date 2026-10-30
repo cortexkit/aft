@@ -1983,6 +1983,133 @@ impl BgTaskRegistry {
             .configure_runtime(daemon_mode, max_runtime);
     }
 
+    #[cfg(target_os = "linux")]
+    fn cleanup_recorded_task_scopes(
+        &self,
+        storage_dir: &Path,
+        terminal_only: bool,
+    ) -> Result<usize, String> {
+        let mut cursor = match super::persistence::StorageTaskRecordCursor::new(storage_dir) {
+            Ok(cursor) => cursor,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut records = HashMap::new();
+        loop {
+            let batch = super::persistence::discover_storage_task_records(storage_dir, &mut cursor)
+                .map_err(|error| error.to_string())?;
+            for record in batch.records {
+                records.insert(record.task_id.clone(), record);
+            }
+            if batch.finished {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        records.retain(|id, _| !cursor.rejected_task_ids.contains(id));
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let scope_records = records
+            .values()
+            .map(|record| super::task_scope::ScopeRecord {
+                task_id: record.task_id.clone(),
+                terminal: record.terminal,
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .task_scopes
+            .cleanup_owned(&scope_records, terminal_only, |id| {
+                records
+                    .get(id)
+                    .and_then(|record| super::persistence::reread_storage_task_record(record).ok())
+                    .is_some_and(|metadata| !terminal_only || metadata.is_terminal())
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cleanup_terminal_task_scopes(&self, storage_dir: &Path) -> Result<usize, String> {
+        self.cleanup_recorded_task_scopes(storage_dir, true)
+    }
+
+    /// The maintainer can call `ctx.bash_background().end_all_task_scopes(&ctx.storage_dir())`.
+    /// Do not call this from the frame loop or with the scheduler lock. It reads storage and waits for systemctl.
+    pub fn end_all_task_scopes(&self, storage_dir: &Path) -> Result<usize, String> {
+        #[cfg(target_os = "linux")]
+        {
+            self.cleanup_recorded_task_scopes(storage_dir, false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = storage_dir;
+            Ok(0)
+        }
+    }
+
+    pub(crate) fn start_task_scope_cleanup(&self, storage_dir: &Path) {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.inner.task_scopes.is_daemon() {
+                return;
+            }
+            let key = canonicalized_path(storage_dir);
+            {
+                let mut slots = task_scope_cleanup_slots()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let slot = slots.entry(key.clone()).or_default();
+                if slot.running
+                    || slot.done
+                    || slot.retry_at.is_some_and(|when| Instant::now() < when)
+                {
+                    return;
+                }
+                slot.running = true;
+                #[cfg(test)]
+                {
+                    slot.runs += 1;
+                }
+            }
+            let registry = self.clone();
+            let root = key.clone();
+            let spawned = std::thread::Builder::new()
+                .name("aft-task-scope-cleanup".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        registry.cleanup_terminal_task_scopes(&root)
+                    }))
+                    .unwrap_or_else(|_| Err("task scope cleanup worker panicked".into()));
+                    {
+                        let mut slots = task_scope_cleanup_slots()
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        let slot = slots.entry(root.clone()).or_default();
+                        slot.running = false;
+                        slot.done = result.is_ok();
+                        slot.retry_at = result
+                            .as_ref()
+                            .err()
+                            .map(|_| Instant::now() + Duration::from_secs(1));
+                    }
+                    match result {
+                        Ok(_) => registry.request_persisted_gc(&root),
+                        Err(error) => crate::slog_warn!("task scope cleanup failed: {error}"),
+                    }
+                });
+            if let Err(error) = spawned {
+                let mut slots = task_scope_cleanup_slots()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let slot = slots.entry(key).or_default();
+                slot.running = false;
+                slot.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                crate::slog_warn!("task scope cleanup worker could not start: {error}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = storage_dir;
+    }
+
     #[cfg(unix)]
     fn place_task_scope(
         &self,
@@ -5041,8 +5168,13 @@ impl BgTaskRegistry {
             .or(state.metadata.child_pid.map(|pid| pid as i32))
             .unwrap_or(0);
         let mut updated = false;
+        let mut kill_scope = false;
         if monitor.exceeded(pgid) {
-            monitor.terminate();
+            if monitor.is_task_scope() {
+                kill_scope = true;
+            } else {
+                monitor.terminate();
+            }
             state
                 .metadata
                 .mark_terminal(BgTaskStatus::Failed, Some(137), Some(monitor.reason()));
@@ -5069,6 +5201,11 @@ impl BgTaskRegistry {
             } else {
                 task.terminal_persist_dirty.store(false, Ordering::SeqCst);
             }
+        }
+        drop(monitors);
+        drop(state);
+        if kill_scope {
+            self.kill_task_scope(&task.task_id)?;
         }
         Ok(())
     }
@@ -6542,6 +6679,18 @@ impl BgTaskRegistry {
         // own harness and checks recorded processes under every harness, so
         // the harness that configured this root has no bearing on it.
         let key = canonicalized_path(storage_dir);
+        // Scope cleanup uses durable records. GC must not remove them before cleanup.
+        #[cfg(target_os = "linux")]
+        if self.inner.task_scopes.is_daemon()
+            && !task_scope_cleanup_slots()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&key)
+                .is_some_and(|slot| slot.done)
+        {
+            self.start_task_scope_cleanup(storage_dir);
+            return;
+        }
         {
             let mut slots = persisted_gc_slots()
                 .lock()
@@ -6939,6 +7088,7 @@ impl BgTaskRegistry {
             self.retire_orphaned_watch_tombstones(session_id)?;
             self.start_watchdog();
         }
+        self.start_task_scope_cleanup(storage_dir);
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -7611,6 +7761,40 @@ impl BgTaskRegistry {
                 && (metadata.status == BgTaskStatus::Starting || metadata.mode != BgMode::Pty)
             {
                 let alive = process_is_alive(&metadata);
+                #[cfg(target_os = "linux")]
+                if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none() {
+                    if let Some(pid) = metadata.child_pid {
+                        let scope = if let Some(start) = metadata.child_start_time_ms {
+                            self.inner
+                                .task_scopes
+                                .adopt(&metadata.task_id, pid, start)?
+                        } else {
+                            if super::task_scope::lookup(&metadata.task_id)?.is_some() {
+                                return Err("task scope replay has no exact child identity".into());
+                            }
+                            None
+                        };
+                        if let Some(scope) = scope {
+                            if let Some(policy) = metadata.memory_policy.as_mut() {
+                                let monitor = super::memory_limit::Monitor::from_task_scope(
+                                    policy.mib, &scope,
+                                )?;
+                                *policy = monitor.policy.clone();
+                                self.inner
+                                    .memory_monitors
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(metadata.task_id.clone(), monitor);
+                            }
+                        } else if metadata
+                            .memory_policy
+                            .as_ref()
+                            .is_some_and(|policy| policy.kind == "Linux task scope memory.max")
+                        {
+                            return Err("task memory scope is absent during replay".into());
+                        }
+                    }
+                }
                 if !alive {
                     // The wrapper writes its exit marker before exiting. It may
                     // have done both since our first read, so observe the marker
@@ -16160,6 +16344,23 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TaskScopeCleanupSlot {
+    running: bool,
+    done: bool,
+    retry_at: Option<Instant>,
+    #[cfg(test)]
+    runs: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn task_scope_cleanup_slots() -> &'static Mutex<HashMap<PathBuf, TaskScopeCleanupSlot>> {
+    static SLOTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, TaskScopeCleanupSlot>>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
 }
 
 /// The remote cancellation outcome `bash.kill_scope` reports for a stopped

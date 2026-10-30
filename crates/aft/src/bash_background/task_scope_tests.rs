@@ -314,6 +314,208 @@ fn task_scope_kill_reports_live_controller_permission_failure() {
 }
 
 #[test]
+fn task_scope_replay_adopts_and_keeps_output() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let first = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &first,
+        root.path(),
+        "echo before; while [ ! -e release ]; do sleep .02; done; echo after; exit 7",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let paths = first.task(&id).unwrap().paths.clone();
+    until(|| {
+        std::fs::read_to_string(&paths.stdout)
+            .unwrap_or_default()
+            .contains("before")
+    });
+    first.detach();
+    let second = BgTaskRegistry::default();
+    second.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    second.replay_session(root.path(), "task-scope").unwrap();
+    assert!(
+        second.inner.task_scopes.get(&id).is_some(),
+        "replay did not retain the exact scope"
+    );
+    assert_eq!(
+        second
+            .task(&id)
+            .unwrap()
+            .lock_state()
+            .unwrap()
+            .metadata
+            .status,
+        super::super::BgTaskStatus::Running
+    );
+    std::fs::write(root.path().join("release"), "1").unwrap();
+    until(|| {
+        let task = second.task(&id).unwrap();
+        second.poll_task(&task).unwrap();
+        task.is_terminal()
+    });
+    assert_eq!(
+        second
+            .status(&id, "task-scope", None, None, 1024)
+            .unwrap()
+            .exit_code,
+        Some(7)
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.stdout).unwrap(),
+        "before\nafter\n"
+    );
+}
+
+#[test]
+fn task_scope_scoped_task_without_marker_is_fate_unknown() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let first = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &first,
+        root.path(),
+        "echo ready; sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let task = first.task(&id).unwrap();
+    let paths = task.paths.clone();
+    let pid = task.lock_state().unwrap().metadata.child_pid.unwrap();
+    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
+    until(|| std::fs::read_to_string(&paths.stdout).unwrap_or_default() == "ready\n");
+    drop(task);
+    first.detach();
+    scope.kill().unwrap();
+    until(|| {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        waited == pid as i32
+            || (waited == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+    });
+    assert!(
+        read_exit_marker(&paths).unwrap().is_none(),
+        "fixture unexpectedly wrote an exit marker"
+    );
+    let second = BgTaskRegistry::default();
+    second.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    second.replay_session(root.path(), "task-scope").unwrap();
+    let snapshot = second.status(&id, "task-scope", None, None, 1024).unwrap();
+    assert_eq!(
+        snapshot.info.status,
+        super::super::BgTaskStatus::FateUnknown
+    );
+    assert_eq!(snapshot.exit_code, None, "replay invented an exit code");
+}
+
+#[test]
+fn task_scope_cleanup_and_hook_require_readable_owned_records() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let foreign_root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let terminal = scope_spawn(
+        &r,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _terminal = StopOnDrop(terminal.clone());
+    let running = scope_spawn(
+        &r,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _running = StopOnDrop(running.clone());
+    let foreign = scope_spawn(
+        &r,
+        foreign_root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _foreign = StopOnDrop(foreign.clone());
+    let unreadable = scope_spawn(
+        &r,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _unreadable = StopOnDrop(unreadable.clone());
+    let task =
+        super::super::persistence::resolve_task(root.path(), "task-scope", &terminal).unwrap();
+    let mut metadata = read_task_at(&task).unwrap();
+    metadata.mark_terminal(super::super::BgTaskStatus::Completed, Some(0), None);
+    write_task_at(&task, &metadata).unwrap();
+    let unreadable_task =
+        super::super::persistence::resolve_task(root.path(), "task-scope", &unreadable).unwrap();
+    std::fs::write(&unreadable_task.paths.json, "corrupt").unwrap();
+    assert_eq!(r.cleanup_terminal_task_scopes(root.path()).unwrap(), 1);
+    for id in [&running, &foreign, &unreadable] {
+        assert!(
+            super::super::task_scope::lookup(id).unwrap().is_some(),
+            "cleanup stopped an unowned or running scope"
+        );
+    }
+    assert_eq!(r.end_all_task_scopes(root.path()).unwrap(), 1);
+    for id in [&foreign, &unreadable] {
+        assert!(
+            super::super::task_scope::lookup(id).unwrap().is_some(),
+            "hook used the handle cache as ownership proof"
+        );
+    }
+}
+
+#[test]
+fn task_scope_cleanup_worker_is_root_keyed_and_daemon_only() {
+    let root = tempfile::tempdir().unwrap();
+    let first = BgTaskRegistry::default();
+    let second = BgTaskRegistry::default();
+    first.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    second.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    first.start_task_scope_cleanup(root.path());
+    second.start_task_scope_cleanup(&root.path().join("."));
+    let key = canonicalized_path(root.path());
+    until(|| {
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|slot| slot.done)
+    });
+    assert_eq!(
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .runs,
+        1
+    );
+    let standalone_root = tempfile::tempdir().unwrap();
+    BgTaskRegistry::default().start_task_scope_cleanup(standalone_root.path());
+    assert!(!task_scope_cleanup_slots()
+        .lock()
+        .unwrap()
+        .contains_key(&canonicalized_path(standalone_root.path())));
+}
+
+#[test]
 fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
     if !manager_available() {
         return;
