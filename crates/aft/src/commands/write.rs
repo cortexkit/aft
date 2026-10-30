@@ -467,12 +467,11 @@ mod audit_regressions {
         let response = handle_write(&request, &ctx);
         assert!(response.success, "{response:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"after");
-        #[cfg(unix)]
+        // The backup reuses the bytes captured at read time on every platform.
+        // Before reuse, the version check proves the file is unchanged: by stat
+        // identity on Unix, and on Windows, where that token is unavailable, by
+        // comparing the file's full bytes, which is not a capture read.
         assert_eq!(crate::backup::capture_read_count(&path), 1);
-        // DiskFileVersion only proves identity on Unix. Windows must read a
-        // fresh backup rather than trust bytes captured without an identity token.
-        #[cfg(windows)]
-        assert_eq!(crate::backup::capture_read_count(&path), 2);
         let mut store = ctx.backup().lock();
         let history = store.history(request.session(), &path);
         assert_eq!(history.len(), 1);
