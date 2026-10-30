@@ -1018,22 +1018,48 @@ pub(crate) struct RemoteProgress {
 }
 
 #[cfg(unix)]
-fn admission_progress_line(progress: &exec::types::Progress) -> String {
+fn admission_progress_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 120;
+    let single_line: String = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let normalized = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Mask complete credentials before a display cut could split their shape.
+    let redacted = crate::log_redact::aft_redactor(&normalized);
+    if redacted.chars().count() <= MAX_DETAIL_CHARS {
+        return redacted.into_owned();
+    }
+    let (boundary, _) = redacted.char_indices().nth(MAX_DETAIL_CHARS - 1).unwrap();
+    format!("{}…", &redacted[..boundary])
+}
+
+#[cfg(unix)]
+fn admission_progress_line(progress: &exec::types::Progress) -> Option<String> {
     use exec::types::ProgressPhase;
     let step = match progress.phase() {
         ProgressPhase::Upload => "uploading its files".to_owned(),
         ProgressPhase::PlacementWait => "waiting for a free build host".to_owned(),
         ProgressPhase::Connect => "connecting to its build host".to_owned(),
-        phase => format!("in step {}", String::from(phase.clone())),
+        _ => return None,
     };
     let elapsed =
         crate::lsp::manager::format_retry_delay(Duration::from_millis(progress.phase_elapsed_ms()));
     let detail = progress
         .detail()
+        .map(admission_progress_detail)
         .filter(|detail| !detail.is_empty())
         .map(|detail| format!(": {detail}"))
         .unwrap_or_default();
-    format!("The remote job is {step} ({elapsed} so far){detail}.")
+    Some(format!(
+        "The remote job is {step} ({elapsed} so far){detail}."
+    ))
 }
 
 impl RemoteProgress {
@@ -1664,6 +1690,9 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 #[cfg(unix)]
 impl OutputSink for TaskSink {
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        let Some(note) = admission_progress_line(progress) else {
+            return;
+        };
         let Ok(mut state) = self.task.state.lock() else {
             return;
         };
@@ -1672,7 +1701,7 @@ impl OutputSink for TaskSink {
         {
             // Replace, never append: pre-acceptance status is ephemeral and is
             // not output, a resume checkpoint, or execution evidence.
-            state.remote_admission_note = Some(admission_progress_line(progress));
+            state.remote_admission_note = Some(note);
             self.task.publish_runon_launch_state(&state);
         }
     }

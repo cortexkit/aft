@@ -15,15 +15,75 @@ fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
         (ProgressPhase::Connect, 3_000,
          "The remote job is connecting to its build host (3s so far).",
          "The remote job is connecting to its build host (3s so far): <room> & **capacity**."),
-        (ProgressPhase::Unknown("future_phase".into()), 40_000,
-         "The remote job is in step future_phase (40s so far).",
-         "The remote job is in step future_phase (40s so far): <room> & **capacity**."),
     ] {
-        for detail in [None, Some(String::new())] {
-            assert_eq!(admission_progress_line(&Progress::new(phase.clone(), elapsed, detail).unwrap()), without);
+        for detail in [None, Some(String::new()), Some(" \u{2003}  ".into())] {
+            assert_eq!(admission_progress_line(&Progress::new(phase.clone(), elapsed, detail).unwrap()).as_deref(), Some(without));
         }
-        assert_eq!(admission_progress_line(&Progress::new(phase, elapsed, Some("<room> & **capacity**".into())).unwrap()), with);
+        assert_eq!(admission_progress_line(&Progress::new(phase, elapsed, Some("<room> & **capacity**".into())).unwrap()).as_deref(), Some(with));
     }
+    assert_eq!(
+        admission_progress_line(
+            &Progress::new(
+                ProgressPhase::Unknown("future_phase".into()),
+                40_000,
+                Some("unrecognized".into())
+            )
+            .unwrap()
+        ),
+        None
+    );
+}
+
+#[test]
+fn remote_admission_progress_detail_is_normalized_redacted_and_character_bounded() {
+    use exec::types::{Progress, ProgressPhase};
+    let token = format!("ghp_{}", "a".repeat(36));
+    assert_eq!(
+        admission_progress_line(
+            &Progress::new(
+                ProgressPhase::Upload,
+                14_000,
+                Some(format!(" \u{2003}{token}  "))
+            )
+            .unwrap()
+        )
+        .as_deref(),
+        Some("The remote job is uploading its files (14s so far): <REDACTED_SECRET>.")
+    );
+    // Exercise the display boundary directly: the wire decoder independently
+    // rejects multiline or oversized detail before constructing Progress.
+    let detail = format!(
+        "begin\n\r\0\u{001b} {token}\u{2028}\u{2029}end\t{}",
+        "界".repeat(121)
+    );
+    let rendered = admission_progress_detail(&detail);
+    assert_eq!(
+        rendered,
+        format!("begin <REDACTED_SECRET> end {}…", "界".repeat(91))
+    );
+    assert_eq!(rendered.chars().count(), 120);
+    assert!(!rendered.contains("ghp_"));
+    assert!(!rendered
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')));
+    assert!(!rendered.contains("  "));
+
+    let boundary_token = admission_progress_detail(&format!("{} {token}", "x".repeat(110)));
+    assert!(
+        !boundary_token.contains("ghp_"),
+        "credentials must be redacted before the character cut"
+    );
+    assert_eq!(boundary_token.chars().count(), 120);
+    assert!(boundary_token.ends_with('…'));
+    assert_eq!(
+        admission_progress_detail(&"界".repeat(120)),
+        "界".repeat(120)
+    );
+    assert_eq!(
+        admission_progress_detail(&"界".repeat(121)),
+        format!("{}…", "界".repeat(119))
+    );
+    assert_eq!(admission_progress_detail(" \r\n\t\0\u{2028}\u{2029}"), "");
 }
 
 #[tokio::test]
@@ -65,6 +125,13 @@ async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timer
         recovery.attempts,
     );
     let mut consumer = exec::StreamConsumer::keyed_run(Some(7));
+    let unknown = StreamRecord::Progress(
+        Progress::new(ProgressPhase::Unknown("future_phase".into()), 40_000, None).unwrap(),
+    );
+    let previous_phase_note = task.snapshot(0).remote_phase_note;
+    consumer.consume(unknown.clone(), &mut sink).unwrap();
+    assert!(task.state.lock().unwrap().remote_admission_note.is_none());
+    assert_eq!(task.snapshot(0).remote_phase_note, previous_phase_note);
     for elapsed in 0..10_000 {
         let bytes = serde_json::to_vec(&StreamRecord::Progress(
             Progress::new(ProgressPhase::Upload, elapsed, Some("latest".into())).unwrap(),
@@ -76,6 +143,7 @@ async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timer
         let state = task.state.lock().unwrap();
         assert!(state.remote_admission_note.as_ref().unwrap().len() < 100);
     }
+    consumer.consume(unknown, &mut sink).unwrap();
     let latest = "The remote job is uploading its files (10s so far): latest.";
     assert_eq!(task.snapshot(0).remote_phase_note.as_deref(), Some(latest));
     assert_eq!(

@@ -355,6 +355,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "bash_background/remote.rs",
+        enclosing_item: "admission_progress_detail",
+        location_or_primitive: "MAX_DETAIL_CHARS character preview",
+        reason: "pre-acceptance progress detail is one display string, not a result list; its redacted text is ellipsized at a Unicode character boundary without omitting any task or output records",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/bash_output.rs",
         enclosing_item: "page, stream_items",
         location_or_primitive: "limit, PAGE_BYTES, ITEM_BYTES",
