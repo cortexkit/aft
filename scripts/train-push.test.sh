@@ -251,6 +251,12 @@ if [ "$json" = "databaseId,headSha,headBranch" ] && [ -f "$STATE/watch_seen" ]; 
     echo 'dial tcp: i/o timeout' >&2
     exit 1
   fi
+  # GitHub's truncated HTTP 200 body, as gh reports it.
+  if [ -f "$STATE/fail_truncated_json_once" ] && [ ! -f "$STATE/truncated_json_seen" ]; then
+    : > "$STATE/truncated_json_seen"
+    echo 'unexpected end of JSON input' >&2
+    exit 1
+  fi
 fi
 
 # Fault injection: a field listed in fail_json makes the combined `run view`
@@ -1618,6 +1624,16 @@ test_gh_query_retry() {
     ok 'a GitHub rate-limit response retries and the successful query can land'
   else
     fail "a GitHub rate-limit response retries and the successful query can land (rc=$LAST_RC)"
+  fi
+
+  dir="$(new_fixture gh-truncated-json-retry)"
+  add_train_commit "$dir/work" gh-truncated-json-retry
+  : > "$dir/ci-state/fail_truncated_json_once"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" gh-truncated-json-retry
+  if [ "$LAST_RC" -eq 0 ] && [[ "$LAST_OUT" == *'failed transiently; retrying (attempt 2 of 5 after 0s)'* ]]; then
+    ok 'a truncated GitHub JSON body retries and the successful query can land'
+  else
+    fail "a truncated GitHub JSON body retries and the successful query can land (rc=$LAST_RC)"
   fi
 
   dir="$(new_fixture gh-network-retry)"
@@ -3187,6 +3203,8 @@ expect_out "cannot race this train" "the run says why it proceeds"
 # the lock-claim barrier after attempting directory creation; a git shim slows
 # ls-remote so the winner remains active while the other proves it was refused.
 test_race_lock
+test_skew_log_query_fallback
+test_gh_query_retry
 
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
