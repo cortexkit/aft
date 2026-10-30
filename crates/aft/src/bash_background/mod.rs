@@ -2045,6 +2045,14 @@ fn repair_legacy_root_tasks_with(
     if !dir_has_entries(&root_tasks) {
         return;
     }
+    let harness_tasks = storage_root
+        .join(harness.storage_segment())
+        .join("bash-tasks");
+    // A populated destination prevents migration regardless of writer liveness.
+    // Check it before reading every legacy task on each session's configure.
+    if dir_has_entries(&harness_tasks) {
+        return;
+    }
     // Detached writers retain both open output handles and absolute marker paths.
     // Even a same-volume rename can strand their later path-based writes. Keep
     // the entire legacy tree readable in place until every task is quiescent.
@@ -2052,9 +2060,7 @@ fn repair_legacy_root_tasks_with(
         return;
     }
 
-    let harness_tasks = storage_root
-        .join(harness.storage_segment())
-        .join("bash-tasks");
+    // The destination may have been populated while quiescence was checked.
     if dir_has_entries(&harness_tasks) {
         return;
     }
@@ -2127,6 +2133,13 @@ fn repair_legacy_root_tasks_with(
 }
 
 fn legacy_root_tasks_quiescent(root: &std::path::Path) -> std::io::Result<bool> {
+    legacy_root_tasks_quiescent_with(root, || {})
+}
+
+fn legacy_root_tasks_quiescent_with(
+    root: &std::path::Path,
+    mut before_metadata_read: impl FnMut(),
+) -> std::io::Result<bool> {
     use persistence::{discover_task_ids, read_exit_marker, read_task_at, resolve_task_layout};
     for session in std::fs::read_dir(root)? {
         let session = session?;
@@ -2139,6 +2152,7 @@ fn legacy_root_tasks_quiescent(root: &std::path::Path) -> std::io::Result<bool> 
         }
         for id in ids {
             let task = resolve_task_layout(&session.path(), &id)?;
+            before_metadata_read();
             let metadata = read_task_at(&task)?;
             if read_exit_marker(&task.paths)?.is_some() {
                 continue;
@@ -2491,14 +2505,16 @@ mod legacy_root_task_repair_tests {
         for run in 0..3 {
             let start = std::time::Instant::now();
             let mut scans = 0;
+            let mut reads = 0;
             super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |root| {
                 scans += 1;
-                super::legacy_root_tasks_quiescent(root)
+                super::legacy_root_tasks_quiescent_with(root, || reads += 1)
             });
             println!(
-                "legacy_repair run={run} checkout={} sessions=100 task_bundles=5000 scans={scans} task_metadata_reads={} elapsed_us={}",
-                project.display(), scans * 5000, start.elapsed().as_micros()
+                "legacy_repair run={run} checkout={} sessions=100 task_bundles=5000 scans={scans} task_metadata_reads={reads} elapsed_us={}",
+                project.display(), start.elapsed().as_micros()
             );
+            assert_eq!(reads, 0);
         }
     }
 
