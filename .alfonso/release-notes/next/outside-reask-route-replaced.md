@@ -1,0 +1,1 @@
+- Outside-access prompts ask again after a reconnect during approval, instead of stopping the tool.
