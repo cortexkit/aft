@@ -5140,13 +5140,10 @@ impl BgTaskRegistry {
                 }
                 Ok(None) => return None,
                 Err(_) => {
-                    static WARNING: std::sync::Once = std::sync::Once::new();
-                    WARNING.call_once(|| {
-                        crate::slog_warn!(
-                            "bash memory monitor recovery failed; no memory breach was observed"
-                        )
-                    });
-                    return None;
+                    let reason = "Command stopped: memory monitor recovery failed.".to_string();
+                    state.pending_terminal_override = Some(BgTaskStatus::Failed);
+                    state.metadata.status_reason = Some(reason.clone());
+                    return Some(reason);
                 }
             }
         }

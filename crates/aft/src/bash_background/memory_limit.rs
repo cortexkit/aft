@@ -288,13 +288,7 @@ impl Monitor {
     pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Option<Self>, String> {
         #[cfg(target_os = "linux")]
         if policy.kind == MemoryPolicy::TASK_SCOPE_MEMORY_KIND {
-            let scope = match super::task_scope::lookup_state(task_id)? {
-                super::task_scope::ScopeLookup::Present(scope) => Some(scope),
-                super::task_scope::ScopeLookup::Unreachable => {
-                    super::task_scope::lookup_local(task_id)?
-                }
-                super::task_scope::ScopeLookup::Absent => None,
-            };
+            let scope = super::task_scope::lookup_local(task_id)?;
             return Ok(scope.map(|scope| Self::recover_task_scope(policy.mib, &scope)));
         }
         #[cfg(windows)]

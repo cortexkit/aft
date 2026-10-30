@@ -955,7 +955,7 @@ fn task_scope_replay_keeps_live_identity_without_user_manager() {
 }
 
 #[test]
-fn task_scope_monitor_recovery_error_is_not_a_breach() {
+fn task_scope_monitor_recovery_error_fails_closed() {
     let root = tempfile::tempdir().unwrap();
     let source = BgTaskRegistry::default();
     let (_, task) = tests::insert_terminal_piped_task(&source, &root, "true", "", "", false);
@@ -984,15 +984,15 @@ fn task_scope_monitor_recovery_error_is_not_a_breach() {
         .get("invalid")
         .unwrap()
         .clone();
-    assert!(
-        registry.memory_limit_exceeded(&task).is_none(),
-        "monitor recovery error was treated as a cap breach"
+    assert_eq!(
+        registry.memory_limit_exceeded(&task).as_deref(),
+        Some("Command stopped: memory monitor recovery failed."),
+        "monitor recovery error did not fail closed"
     );
-    assert!(task
-        .lock_state()
-        .unwrap()
-        .pending_terminal_override
-        .is_none());
+    assert_eq!(
+        task.lock_state().unwrap().pending_terminal_override,
+        Some(super::super::BgTaskStatus::Failed)
+    );
 }
 
 #[test]
