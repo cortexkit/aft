@@ -4526,6 +4526,126 @@ fn live_view_holders_match_runtimes_and_planes_have_unique_ids() {
 }
 
 #[test]
+fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
+    let _git_env = crate::test_env::hermetic_git_env_guard();
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("a.ts", "export const value = 'needle';\n")]);
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            views: crate::config::ViewsConfig { enabled: true },
+            ..Default::default()
+        },
+    );
+    ctx.set_canonical_cache_root(root.path().to_path_buf());
+    let slot = ctx.checkout_semantic();
+    let (epoch, wake) = slot.begin();
+    let status = ctx.semantic_index_status_handle();
+    let config = WorkerConfig {
+        root: root.path().to_path_buf(),
+        storage: crate::root_cache::StoragePaths::same(storage.path()),
+        family: "family".into(),
+        scope: "busy-semantic".into(),
+        semantic: crate::config::SemanticBackendConfig::default(),
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        },
+        status: Arc::clone(&status),
+        drivers: InstalledDriver::default(),
+        schedule: fast_schedule(root.path()),
+    };
+    let runtime = CheckoutSemantic::new(
+        &config.storage,
+        &config.family,
+        &config.scope,
+        root.path(),
+        producer(),
+        Arc::downgrade(slot),
+    )
+    .unwrap();
+    let mut attempts = 0;
+    let result = retry_activation(
+        &Arc::downgrade(slot),
+        epoch,
+        &wake,
+        &config,
+        "view load",
+        || {
+            attempts += 1;
+            assert!(
+                attempts <= 2,
+                "a stopped writer must not keep the load busy"
+            );
+            if attempts == 1 {
+                let (result, writes) = crate::blob_store::v3::with_changing_namespace_for_test(
+                    storage.path(),
+                    "family",
+                    |_| runtime.load().map(|_| ()),
+                );
+                assert!(writes >= 8);
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("reservation_ledger_busy: measure registry"),
+                    "{error}"
+                );
+                return Err(error);
+            }
+            assert!(matches!(slot.state(), Some(CheckoutSemanticState::Loading)));
+            assert!(lock(&slot.retry).is_some());
+            assert!(
+                matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Building { stage, .. } if stage == CHECKOUT_VIEW_LOADING_STAGE)
+            );
+            let response = crate::commands::semantic_search::handle_semantic_search(
+                &crate::protocol::RawRequest {
+                    id: "semantic-measurement-busy".into(),
+                    command: "semantic_search".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: serde_json::json!({"query": "needle"}),
+                },
+                &ctx,
+            );
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["semantic_status"], "building");
+            let rendered = crate::subc_format::format_response("search", &response, false);
+            assert_eq!(
+                rendered.lines().next(),
+                Some("Semantic index is building; lexical fallback results follow.")
+            );
+            assert_eq!(
+                rendered.lines().find(|line| line.starts_with("semantic:")),
+                Some("semantic: building")
+            );
+            assert_eq!(
+                rendered.lines().last(),
+                Some("Search status: partial/incomplete.")
+            );
+            assert!(!rendered.contains("This is an AFT bug"));
+            assert!(ctx
+                .try_health_snapshot(root.path())
+                .view_load_failures
+                .is_empty());
+            runtime
+                .load()
+                .expect("the semantic view must load after the writer stops");
+            Ok(())
+        },
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(attempts, 2);
+    assert!(lock(&slot.retry).is_none());
+    assert!(slot.install(epoch, Arc::new(runtime)));
+    assert!(matches!(
+        slot.state(),
+        Some(CheckoutSemanticState::Ready(_))
+    ));
+}
+
+#[test]
 fn only_busy_and_checkout_races_are_transient_load_errors() {
     for transient in [
         super::super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,

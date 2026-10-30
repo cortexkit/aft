@@ -436,13 +436,15 @@ impl PlaneAdapter for CallgraphPlane {
 pub(crate) struct CallgraphViewError {
     pub reason: String,
     pub busy: bool,
+    pub completion_busy: bool,
 }
 
 impl From<String> for CallgraphViewError {
     fn from(reason: String) -> Self {
         Self {
+            busy: super::trigram::bind_is_busy(&reason),
+            completion_busy: reason.contains(&format!("{V3_BASE_COMPLETION_BUSY}: Busy {{")),
             reason,
-            busy: false,
         }
     }
 }
@@ -458,11 +460,15 @@ impl From<PlaneError> for CallgraphViewError {
         let reason = reason
             .strip_prefix("family registry I/O error: ")
             .unwrap_or(reason);
+        let completion_busy = reason
+            .strip_prefix(V3_BASE_COMPLETION_BUSY)
+            .is_some_and(|outcome| outcome.starts_with(": Busy {"));
         Self {
             busy: reason.starts_with(DERIVED_STORE_BUSY)
                 || reason.starts_with(V3_STORE_BUSY)
-                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX)
-                || reason.starts_with(V3_BASE_COMPLETION_BUSY),
+                || super::trigram::bind_is_busy(reason)
+                || completion_busy,
+            completion_busy,
             reason: error.to_string(),
         }
     }
@@ -656,7 +662,7 @@ pub(crate) struct CallgraphView {
     family: String,
     policy: crate::blob_store::v2::TrigramPolicy,
     source: Arc<dyn CallgraphReaderSource>,
-    query: std::sync::Mutex<()>,
+    query: std::sync::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
     ready: std::sync::atomic::AtomicBool,
 }
 
@@ -739,7 +745,7 @@ impl CallgraphView {
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(()),
+            query: std::sync::Mutex::new(super::contracts::LoadRetry::default()),
             ready: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -769,15 +775,29 @@ impl CallgraphView {
         self.source.extraction_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retry_due_for_test(&self) {
+        if let Some((deadline, _)) = &mut self.query.lock().unwrap().pending {
+            *deadline = std::time::Instant::now();
+        }
+    }
+
     /// Acquires a reader pinned to one verified generation. Acquisitions are
     /// serialized so an installed membership and its graph come from the
     /// same reconciliation.
     pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
-        let _query = self
+        self.reader_with_clock(std::time::Instant::now)
+    }
+
+    fn reader_with_clock(
+        &self,
+        now: impl Fn() -> std::time::Instant,
+    ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        let mut retry = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = self.source.acquire();
+        let result = retry.run(now, |error| error.busy, || self.source.acquire());
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
         result
@@ -916,6 +936,7 @@ mod tests {
         );
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
+        graph.retry_due_for_test();
         assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
     }
 
@@ -1021,6 +1042,20 @@ mod tests {
     }
 
     #[test]
+    fn base_completion_refusal_is_not_live_owner_contention() {
+        let error = CallgraphViewError::from(PlaneError::loader(
+            super::super::contracts::LoaderStage::Driver,
+            format!("{V3_BASE_COMPLETION_BUSY}: CapReached {{ live_bases: 4 }}"),
+        ));
+        assert!(!error.busy);
+        assert!(!error.completion_busy);
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(error))),
+            crate::context::CallgraphStoreAccess::Error(_)
+        ));
+    }
+
+    #[test]
     fn v3_base_completion_owned_by_another_driver_answers_building_then_ready() {
         use super::super::base_builder::{build_base, BaseBuild, BaseBuildInput};
         use super::super::eviction::DiskBudget;
@@ -1044,7 +1079,12 @@ mod tests {
                 },
                 semantic_producer: None,
                 callgraph_producer: PRODUCER.into(),
-                ignore_fingerprint: None,
+                ignore_fingerprint: Some(
+                    super::super::verification::BindGuard::capture(&root, None)
+                        .unwrap()
+                        .policy
+                        .digest,
+                ),
                 history: None,
                 budget: DiskBudget::default(),
             },
@@ -1061,10 +1101,9 @@ mod tests {
             _ => panic!("the live base owner must fence another completion driver"),
         };
         assert_eq!(owner_pid, std::process::id());
-        let error = CallgraphViewError::from(PlaneError::loader(
-            super::super::contracts::LoaderStage::Driver,
-            format!("{V3_BASE_COMPLETION_BUSY}: {outcome:?}"),
-        ));
+        let graph = view(&root, &storage);
+        let mut now = std::time::Instant::now();
+        let error = graph.reader_with_clock(|| now).unwrap_err();
         assert!(error.busy, "{error}");
         assert!(error.reason.contains(V3_BASE_COMPLETION_BUSY), "{error}");
         assert!(
@@ -1073,20 +1112,151 @@ mod tests {
                 .contains(&format!("owner_pid: {}", std::process::id())),
             "{error}"
         );
+        assert!(!graph.is_ready());
         assert!(matches!(
             crate::context::checkout_view_callgraph_access(Some(Err(error))),
-            crate::context::CallgraphStoreAccess::Error(error)
-                if error.is_transient_lock_contention()
+            crate::context::CallgraphStoreAccess::Building
         ));
 
+        for (attempt, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            assert!(graph
+                .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
+                .is_err());
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            now = deadline;
+            if attempt < 6 {
+                assert!(matches!(
+                    crate::context::checkout_view_callgraph_access(Some(
+                        graph.reader_with_clock(|| now)
+                    )),
+                    crate::context::CallgraphStoreAccess::Building
+                ));
+            }
+        }
+
         claim.release().unwrap();
-        let graph = view(&root, &storage);
         let crate::context::CallgraphStoreAccess::Ready(ready) =
-            crate::context::checkout_view_callgraph_access(Some(graph.reader()))
+            crate::context::checkout_view_callgraph_access(Some(graph.reader_with_clock(|| now)))
         else {
             panic!("the completed base must serve a ready call graph")
         };
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        assert!(graph.query.lock().unwrap().pending.is_none());
+        assert!(graph.query.lock().unwrap().delay.is_zero());
+    }
+
+    #[test]
+    fn failed_base_completion_releases_claim_for_callgraph() {
+        use super::super::first_load::{
+            CallgraphBridge, CheckoutDriver, CompositePlane, ConfiguredMembershipWalker,
+            TrigramBridge,
+        };
+
+        struct FailedCompletion(CallgraphBridge);
+        impl CompositePlane for FailedCompletion {
+            fn plane(&self) -> FamilyPlane {
+                FamilyPlane::Callgraph
+            }
+            fn applies_to(&self, path: &RelPath) -> bool {
+                self.0.applies_to(path)
+            }
+            fn attachment(
+                &self,
+                path: &RelPath,
+                bytes: &[u8],
+            ) -> Result<super::super::snapshot::PlaneAttachment, PlaneError> {
+                self.0.attachment(path, bytes)
+            }
+            fn completes_fresh_base(&self) -> bool {
+                true
+            }
+            fn complete_v3_base(
+                &self,
+                _: &super::super::base_builder::BuildClaim,
+                _: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,
+            ) -> Result<(), PlaneError> {
+                Err(PlaneError::loader(
+                    super::super::contracts::LoaderStage::Driver,
+                    "injected base completion failure",
+                ))
+            }
+            fn materialize(
+                &self,
+                _: &super::super::registry::ViewRegistration,
+                _: &str,
+                _: &Snapshot,
+                _: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,
+                _: &mut super::super::manifest_v2::ManifestV2,
+                _: &mut crate::pins::LivePin,
+                _: bool,
+            ) -> Result<(), PlaneError> {
+                unreachable!("completion fails before worker materialization")
+            }
+            fn finish_generation(
+                &self,
+                _: &super::super::registry::ViewRegistration,
+                _: &str,
+                _: &str,
+            ) -> Result<(), PlaneError> {
+                unreachable!("completion fails before worker publication")
+            }
+        }
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let storage = temp.path().join("storage");
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let failed = CheckoutDriver::new_v3(
+            &storage,
+            "donor-reuse",
+            "failed-callgraph",
+            &root,
+            super::super::manifest_v2::Producers {
+                trigram: policy.fingerprint_hex(),
+                semantic: None,
+                callgraph: PRODUCER.into(),
+            },
+            Arc::new(ConfiguredMembershipWalker),
+            vec![
+                Arc::new(TrigramBridge::new(storage.clone(), policy)),
+                Arc::new(FailedCompletion(CallgraphBridge::default())),
+            ],
+        )
+        .unwrap();
+        let error = failed
+            .verified_bind(
+                &failed.access(),
+                failed.installed_snapshot().generation().clone(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected base completion failure"),
+            "{error}"
+        );
+
+        // Keep the failed completion driver alive: its process is still live, so
+        // another driver can finish the graph only if the failed bind released
+        // its completion claim rather than waiting for process-death takeover.
+        let graph = view(&root, &storage);
+        let ready = graph
+            .reader()
+            .expect("a failed bind must not strand a live claim");
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert_eq!(failed.installed_snapshot().generation().name(), "empty");
     }
 
     #[test]

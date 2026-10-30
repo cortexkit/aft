@@ -1669,6 +1669,35 @@ pub struct CheckoutDriver {
     work: std::sync::Mutex<ReconcileWork>,
 }
 
+/// A bind owns only its synchronous base work. Deferred planes acquire their
+/// own claims. Release the base claim on error or unwind so another driver can
+/// finish the base without waiting for this process to exit.
+struct BaseCompletionClaim<'a>(&'a std::sync::Mutex<Option<super::base_builder::BuildClaim>>);
+
+impl BaseCompletionClaim<'_> {
+    fn release(&self) -> Result<(), PlaneError> {
+        if let Some(claim) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            claim
+                .release()
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BaseCompletionClaim<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            crate::slog_warn!("releasing failed bind's base completion claim: {}", error);
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeliveryState {
     seq: u64,
@@ -1893,6 +1922,7 @@ impl CheckoutDriver {
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
         self.check_owner(access)?;
+        let completion_claim = BaseCompletionClaim(&self.base_claim);
         if !self.owner.registry().is_v3_only() {
             return Err(SiblingLoader::error(
                 "verified_bind requires a v3-only registration",
@@ -1940,24 +1970,8 @@ impl CheckoutDriver {
             return Ok((snapshot, revision));
         }
         let own = self.build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING);
-        // Every plane of a fresh bootstrap has completed its base entries by
-        // now (lexical in the build, others in `bootstrap_v3_base`).
-        if self
-            .planes
-            .iter()
-            .all(|plane| plane.plane() == FamilyPlane::Trigram || plane.completes_fresh_base())
-        {
-            if let Some(claim) = self
-                .base_claim
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                claim
-                    .release()
-                    .map_err(|e| SiblingLoader::error(e.to_string()))?;
-            }
-        }
+        // Synchronous completion is done; deferred planes take their own claim.
+        completion_claim.release()?;
         let own = own?;
         let mut delta = LiveDelta::from_snapshot(&snapshot);
         let draft = super::snapshot::derive_successor(
@@ -2143,9 +2157,11 @@ impl CheckoutDriver {
                     }
                 }
                 outcome => {
+                    let reason =
+                        format!("v3 base plane completion is owned elsewhere: {outcome:?}");
                     return Err(SiblingLoader::error(format!(
-                        "v3 base plane completion is owned elsewhere: {outcome:?}"
-                    )))
+                        "{reason} (base_scope={scope})"
+                    )));
                 }
             }
         }
@@ -6714,6 +6730,57 @@ mod v3_bootstrap_tests {
         )
         .unwrap()
         .with_adapters(vec![plane.adapter.clone()])
+    }
+
+    #[test]
+    fn failed_or_panicked_post_bootstrap_reconciliation_releases_live_claim() {
+        struct FailSecondWalk {
+            calls: std::sync::atomic::AtomicUsize,
+            panic: bool,
+        }
+        impl MembershipWalker for FailSecondWalk {
+            fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    assert!(!self.panic, "injected post-bootstrap panic");
+                    return Err(SiblingLoader::error("injected post-bootstrap failure"));
+                }
+                ConfiguredMembershipWalker.files(root)
+            }
+        }
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for panic in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("checkout");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("a.ts"), "export function target() {}\n").unwrap();
+            let storage = temp.path().join("storage");
+            let mut driver = trigram_driver(&root, &storage);
+            driver.walker = Arc::new(FailSecondWalk {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                panic,
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                driver.verified_bind(
+                    &driver.access(),
+                    driver.installed_snapshot().generation().clone(),
+                )
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result
+                    .unwrap()
+                    .unwrap_err()
+                    .reason
+                    .contains("injected post-bootstrap failure"));
+            }
+            assert!(driver
+                .base_claim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none());
+        }
     }
 
     #[test]

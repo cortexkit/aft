@@ -228,6 +228,39 @@ pub struct BuildClaim {
     attempt: i64,
 }
 
+/// A base builder owns its claim until it hands a published base to its caller.
+/// Admission, publication or reservation cleanup can fail while another writer
+/// changes the namespace; those exits must not leave a live owner blocking retry.
+struct BuildAttempt(Option<BuildClaim>);
+
+impl std::ops::Deref for BuildAttempt {
+    type Target = BuildClaim;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("an unfinished build owns its claim")
+    }
+}
+
+impl BuildAttempt {
+    fn release(mut self) -> Result<()> {
+        self.0.take().unwrap().release()
+    }
+
+    fn finish(mut self) -> BuildClaim {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for BuildAttempt {
+    fn drop(&mut self) {
+        if let Some(claim) = self.0.take() {
+            if let Err(error) = claim.release() {
+                crate::slog_warn!("releasing an unfinished base build claim: {}", error);
+            }
+        }
+    }
+}
+
 /// What [`claim_base`] found.
 #[derive(Debug)]
 pub enum ClaimOutcome {
@@ -721,7 +754,7 @@ pub fn build_base(
     }
     let identity = BaseIdentity::of(family, &manifest)?;
     let claim = match claim_base(storage, family, &identity.scope, observer)? {
-        ClaimOutcome::Claimed(claim) => claim,
+        ClaimOutcome::Claimed(claim) => BuildAttempt(Some(claim)),
         ClaimOutcome::Busy { .. } => return Ok(BaseBuild::Busy),
         ClaimOutcome::CapReached { .. } => return Ok(BaseBuild::Strict("live_base_cap".into())),
     };
@@ -775,7 +808,7 @@ pub fn build_base(
     Ok(BaseBuild::Published {
         identity,
         generation,
-        claim,
+        claim: claim.finish(),
     })
 }
 

@@ -14360,6 +14360,143 @@ mod tests {
     }
 
     #[test]
+    fn views_busy_measurement_retries_without_bug_guidance_or_failure_counts() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for callgraph in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("project");
+            init_git_fixture(&root);
+            std::fs::write(
+                root.join("a.ts"),
+                "export function target() { return 'needle'; }\nexport function caller() { return target(); }\n",
+            )
+            .unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let storage = temp.path().join("storage");
+            let ctx = test_context();
+            assert!(
+                handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx,)
+                    .success
+            );
+            // A new file requires publication during the next bind, even if
+            // configure already warmed the lexical member.
+            let added = root.join("added.ts");
+            std::fs::write(&added, "export const extra = 'needle';\n").unwrap();
+            ctx.record_checkout_watcher_change(&added);
+            let family = ctx.memoized_artifact_cache_key(&root);
+            let callers = RawRequest {
+                id: "measurement-busy-callers".into(),
+                command: "callers".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"file": root.join("a.ts"), "symbol": "target"}),
+            };
+            let request = || {
+                if callgraph {
+                    crate::commands::callers::handle_callers(&callers, &ctx)
+                } else {
+                    crate::commands::grep::handle_grep(&grep_request("needle"), &ctx)
+                }
+            };
+            let ((first, held, first_writes, held_writes), writes) =
+                crate::blob_store::v3::with_changing_namespace_for_test(
+                    &storage,
+                    &family,
+                    |completed| {
+                        let first = request();
+                        let first_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        let held = request();
+                        let held_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        (first, held, first_writes, held_writes)
+                    },
+                );
+            assert!(first_writes >= 8, "the load must exhaust a measurement");
+            assert_eq!(
+                held_writes, first_writes,
+                "backoff must not repeat the measurement"
+            );
+            assert_eq!(writes, first_writes);
+            assert!(!first.success, "{:?}", first.data);
+            assert_eq!(first.data, held.data);
+            let text = if callgraph {
+                crate::subc_format::format_response_with_context(
+                    "callgraph",
+                    &first,
+                    &crate::subc_format::FormatContext {
+                        callgraph_op: Some("callers".into()),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                crate::subc_format::format_response("grep", &first, false)
+            };
+            if callgraph {
+                assert_eq!(first.data["code"], "callgraph_building");
+                assert_eq!(text, "callers: callgraph_building — callers: persisted callgraph store is busy; retry shortly");
+                let cause = ctx.callgraph_view_read_diagnostics().last_error.unwrap();
+                assert!(
+                    cause.contains("reservation_ledger_busy: measure registry"),
+                    "{cause}"
+                );
+                assert!(
+                    cause.contains("namespace size did not stabilize after 8 measurements"),
+                    "{cause}"
+                );
+            } else {
+                assert_eq!(first.data["code"], "busy");
+                assert_eq!(first.data["retryable"], true);
+                let cause = format!(
+                    "view loader [driver]: family registry I/O error: v3 store busy: reservation_ledger_busy: measure registry {}: v3 store busy: namespace size did not stabilize after 8 measurements",
+                    crate::blob_store::v3::family_dir(&storage, &family).unwrap().display(),
+                );
+                assert_eq!(first.data["message"], cause);
+                assert_eq!(text, cause);
+                let search = crate::commands::semantic_search::handle_semantic_search(
+                    &semantic_search_request("needle"),
+                    &ctx,
+                );
+                let glob = crate::commands::glob::handle_glob(
+                    &RawRequest {
+                        id: "measurement-busy-glob".into(),
+                        command: "glob".into(),
+                        lsp_hints: None,
+                        session_id: None,
+                        params: json!({"pattern": "**/*.ts"}),
+                    },
+                    &ctx,
+                );
+                for (name, response) in [("search", search), ("glob", glob)] {
+                    assert_eq!(response.data["code"], "busy");
+                    assert_eq!(response.data["retryable"], true);
+                    let expected = if name == "search" {
+                        format!("semantic_search: busy — {cause}")
+                    } else {
+                        cause.clone()
+                    };
+                    assert_eq!(
+                        crate::subc_format::format_response(name, &response, false),
+                        expected
+                    );
+                }
+            }
+            assert!(!text.contains("This is an AFT bug"), "{text}");
+            let health = ctx.try_health_snapshot(&root);
+            assert!(health.view_load_failures.is_empty(), "{health:?}");
+            assert!(health.view_load_failure_last.is_none());
+            assert!(!ctx
+                .degraded_reasons()
+                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+            // Stopping the writer alone does not bypass the pending timer.
+            assert!(!request().success);
+            ctx.view_load_retry_due_for_test();
+            let recovered = request();
+            assert!(recovered.success, "{:?}", recovered.data);
+            assert!(ctx.try_health_snapshot(&root).view_load_failures.is_empty());
+        }
+    }
+
+    #[test]
     fn lexical_view_load_failure_counts_and_degrades_until_recovery() {
         let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
         // Holds the process environment lock for the whole test, like the

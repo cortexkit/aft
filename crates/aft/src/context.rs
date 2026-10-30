@@ -1131,7 +1131,26 @@ pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
 /// Add reporting guidance only when a view-load failure becomes an agent reply.
 /// Health and logs retain the loader's raw error.
 pub(crate) fn view_load_failure_message(error: impl std::fmt::Display) -> String {
+    let error = error.to_string();
+    if crate::views::trigram::bind_is_busy(&error) {
+        return error;
+    }
     format!("{error}\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.")
+}
+
+/// Render a prepared lexical load diagnostic without treating contention as
+/// an internal failure. No other index or filesystem walk answers in its place.
+pub(crate) fn view_load_error_response(id: &str, message: String) -> crate::protocol::Response {
+    if crate::views::trigram::bind_is_busy(&message) {
+        crate::protocol::Response::error_with_data(
+            id,
+            "busy",
+            message,
+            serde_json::json!({"retryable": true}),
+        )
+    } else {
+        crate::protocol::Response::error(id, "internal_error", message)
+    }
 }
 
 /// Error-level log throttle: one line per project and plane per minute.
@@ -1277,8 +1296,9 @@ pub struct RootHealthSnapshot {
     pub views: Option<ViewHealthSnapshot>,
     /// Checkout view loads that failed for this project since this process
     /// started, keyed `"plane:cause"` (for example `"trigram:unavailable"`
-    /// or `"callgraph:busy"). A failed load fails the query that attempted
-    /// it; there is no fallback walk or legacy-index answer. Kept as history:
+    /// or `"callgraph:io"`). Busy loads are retried, not counted. A failed load
+    /// fails the query that attempted it; there is no fallback walk or
+    /// legacy-index answer. Kept as history:
     /// a later successful load clears the degraded flag but never resets these.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub view_load_failures: BTreeMap<String, u64>,
@@ -4679,8 +4699,12 @@ pub struct AppContext {
     view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
     checkout_driver: crate::views::first_load::InstalledDriver,
     lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
+    lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    callgraph_construction_retry: parking_lot::Mutex<
+        crate::views::contracts::LoadRetry<crate::views::callgraph::CallgraphViewError>,
+    >,
     callgraph_view_read_diagnostics: parking_lot::Mutex<CallgraphViewReadDiagnostics>,
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
     /// Read by the health snapshot; written by every query that loads a view.
@@ -5056,10 +5080,10 @@ pub(crate) fn checkout_view_callgraph_access(
 ) -> CallgraphStoreAccess {
     match reader {
         Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+        Some(Err(error)) if error.completion_busy => CallgraphStoreAccess::Building,
         // Transient contention while opening a view (a locked derived
-        // database, or another driver finishing the shared base) says nothing
-        // about the graph. Report SQLite's busy error, which every caller
-        // already presents as busy/pending with a retry.
+        // database or ledger) says nothing about the graph. Report SQLite's
+        // busy error, which every caller presents as busy/pending with a retry.
         Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
@@ -5589,8 +5613,10 @@ impl AppContext {
             view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
+            lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_construction_retry: parking_lot::Mutex::new(Default::default()),
             callgraph_view_read_diagnostics: parking_lot::Mutex::new(
                 CallgraphViewReadDiagnostics::default(),
             ),
@@ -9248,6 +9274,8 @@ impl AppContext {
         if !next.views.enabled || project_root_changed {
             self.lexical_view.lock().take();
             self.callgraph_view.lock().take();
+            *self.lexical_load_retry.lock() = Default::default();
+            *self.callgraph_construction_retry.lock() = Default::default();
         }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
@@ -9771,6 +9799,9 @@ impl AppContext {
     /// time, marks the project degraded until the next successful load, and
     /// logs at error level at most once a minute per plane.
     pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
+        if crate::views::trigram::bind_is_busy(error) {
+            return;
+        }
         let cause = view_load_cause(error);
         let now = Instant::now();
         let (count, suppressed) = {
@@ -12378,6 +12409,7 @@ impl AppContext {
         &self,
         source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
     ) {
+        *self.lexical_load_retry.lock() = Default::default();
         let root = self.canonical_cache_root();
         let family = self.memoized_artifact_cache_key(&root);
         *self.lexical_view.lock() =
@@ -12422,34 +12454,31 @@ impl AppContext {
         // can take long on a cold or loaded machine, and other queries may
         // wait behind them. None of it is this request's read, so it does not
         // spend the request's filesystem deadline.
-        let acquired = crate::bounded_io::excluding_wait(|| {
-            let view = {
-                let mut slot = self.lexical_view.lock();
-                if !slot
-                    .as_ref()
-                    .is_some_and(|view| view.matches(&root, &storage, &family, policy))
-                {
-                    match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
-                        Ok(view) => *slot = Some(Arc::new(view)),
-                        Err(error) => return Err(error),
-                    }
-                }
-                slot.as_ref().unwrap().clone()
-            };
-            self.record_checkout_pending_watcher_gap();
-            Ok(view.snapshot())
+        let result = crate::bounded_io::excluding_wait(|| {
+            self.lexical_load_retry.lock().run(
+                Instant::now,
+                |error| crate::views::trigram::bind_is_busy(error),
+                || {
+                    let view = {
+                        let mut slot = self.lexical_view.lock();
+                        if !slot
+                            .as_ref()
+                            .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+                        {
+                            match crate::views::trigram::LexicalView::new(
+                                root, storage, family, policy,
+                            ) {
+                                Ok(view) => *slot = Some(Arc::new(view)),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        slot.as_ref().unwrap().clone()
+                    };
+                    self.record_checkout_pending_watcher_gap();
+                    view.snapshot()
+                },
+            )
         });
-        let result = match acquired {
-            Ok(result) => result,
-            Err(error) => {
-                // A failed load fails the query: no fallback walk or legacy
-                // index may answer for a checkout view. The error text is
-                // returned unchanged; the counter, degraded flag and log are
-                // recorded here.
-                self.note_view_load_failure("trigram", &error);
-                return Some(Err(error));
-            }
-        };
         if pinned_config_for(self.config_pin_key()).is_some() {
             LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
                 snapshots
@@ -12511,6 +12540,7 @@ impl AppContext {
         &self,
         source: Arc<dyn crate::views::callgraph::CallgraphReaderSource>,
     ) {
+        *self.callgraph_construction_retry.lock() = Default::default();
         let root = self.canonical_cache_root();
         let family = self.memoized_artifact_cache_key(&root);
         *self.callgraph_view.lock() = Some(Arc::new(
@@ -12575,7 +12605,11 @@ impl AppContext {
                 .as_ref()
                 .is_some_and(|view| view.matches(&root, &storage, &family, policy))
             {
-                match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
+                match self.callgraph_construction_retry.lock().run(
+                    Instant::now,
+                    |error| error.busy,
+                    || crate::views::callgraph::CallgraphView::new(root, storage, family, policy),
+                ) {
                     Ok(view) => *slot = Some(Arc::new(view)),
                     Err(error) => {
                         // Like the lexical view, a failed callgraph load fails
@@ -12608,6 +12642,19 @@ impl AppContext {
     /// Executed v3 call-graph acquisitions (one per pinned request).
     pub fn callgraph_view_route_count(&self) -> u64 {
         self.callgraph_view_routes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_load_retry_due_for_test(&self) {
+        if let Some((deadline, _)) = &mut self.lexical_load_retry.lock().pending {
+            *deadline = Instant::now();
+        }
+        if let Some((deadline, _)) = &mut self.callgraph_construction_retry.lock().pending {
+            *deadline = Instant::now();
+        }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.retry_due_for_test();
+        }
     }
 
     /// Files a views-routed symbol prewarm served from or stored into the
@@ -14656,6 +14703,8 @@ impl AppContext {
         // generation.
         self.lexical_view.lock().take();
         self.callgraph_view.lock().take();
+        *self.lexical_load_retry.lock() = Default::default();
+        *self.callgraph_construction_retry.lock() = Default::default();
         self.borrowed_index_cache.lock().clear();
         self.clear_semantic_refresh_worker();
         *self.semantic_embedding_model.lock() = None;
@@ -18985,6 +19034,7 @@ mod callgraph_store_for_ops_tests {
         assert!(detail.contains("database is locked"), "{detail}");
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
+        ctx.view_load_retry_due_for_test();
         assert!(matches!(
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Ready(_)
@@ -21158,6 +21208,7 @@ mod callgraph_store_for_ops_tests {
             "callers: persisted callgraph store is busy; retry shortly"
         );
         drop(busy);
+        fixture.ctx.view_load_retry_due_for_test();
         let response = fixture.callers();
         assert!(response.success, "{:#}", response.data);
     }
@@ -21219,6 +21270,7 @@ mod callgraph_store_for_ops_tests {
         );
 
         drop(busy);
+        fixture.ctx.view_load_retry_due_for_test();
         let response = inspect();
         assert!(response.success, "{:#}", response.data);
         assert!(
@@ -21278,6 +21330,7 @@ mod callgraph_store_for_ops_tests {
         );
         // Once the database is free again the same zoom reads the graph.
         drop(busy);
+        fixture.ctx.view_load_retry_due_for_test();
         let response = zoom();
         assert!(response.success, "{:#}", response.data);
         assert!(
@@ -22795,14 +22848,14 @@ mod view_load_health_tests {
             snapshot.view_load_failures.get("trigram:unavailable"),
             Some(&2)
         );
-        assert_eq!(snapshot.view_load_failures.get("callgraph:busy"), Some(&1));
+        assert!(!snapshot.view_load_failures.contains_key("callgraph:busy"));
         let last = snapshot
             .view_load_failure_last
             .as_ref()
             .expect("last failure");
         assert_eq!(last.plane, "trigram");
         assert_eq!(last.cause, "unavailable");
-        assert_eq!((last.count, last.total), (2, 3));
+        assert_eq!((last.count, last.total), (2, 2));
         assert!(degraded(&ctx));
         // The health report carries the same map and last error.
         let json = serde_json::to_value(&snapshot).expect("snapshot serializes");

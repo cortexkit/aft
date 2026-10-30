@@ -2195,6 +2195,17 @@ pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
     tests::serial()
 }
 
+/// Runs load code while a separate graph-database writer changes the namespace
+/// between every measurement and its confirmation. The hook is thread-local.
+#[cfg(test)]
+pub(crate) fn with_changing_namespace_for_test<T>(
+    storage: &Path,
+    family: &str,
+    run: impl FnOnce(&std::sync::atomic::AtomicUsize) -> T,
+) -> (T, usize) {
+    tests::with_changing_namespace(storage, family, run)
+}
+
 #[cfg(test)]
 mod copy_tests;
 #[cfg(test)]

@@ -52,6 +52,9 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")
         || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
+        || reason.contains("callgraph derived store is busy:")
+        || reason.contains("callgraph v3 store is busy:")
+        || reason.contains("v3 base plane completion is owned elsewhere: Busy {")
 }
 
 /// Checkout-local lexical authority, independent of the semantic worker's
