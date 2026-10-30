@@ -213,6 +213,15 @@ impl LockConfig {
     fn cross_host_stale_heartbeat_ms(self) -> u64 {
         self.stale_heartbeat_ms.saturating_mul(5)
     }
+
+    fn live_owner_warning_age_ms(self) -> u64 {
+        // A healthy lease can now be older than the old warning window. Allow
+        // one wake of jitter without changing the foreign-host takeover bound.
+        self.stale_heartbeat_ms.max(
+            self.heartbeat_refresh_interval_ms
+                .saturating_add(self.heartbeat_interval_ms),
+        )
+    }
 }
 
 impl Default for LockConfig {
@@ -767,7 +776,7 @@ fn acquire_with_deadline(
         }
         dead_reclaim_blocked_attempts = 0;
 
-        if since_heartbeat > config.stale_heartbeat_ms && live_owner_log.first_stale() {
+        if since_heartbeat > config.live_owner_warning_age_ms() && live_owner_log.first_stale() {
             // Same-host PID plus start-time identity is authoritative. A
             // SIGSTOP'd process, suspended VM, or sleeping laptop can miss
             // heartbeats and later resume inside the critical section. Breaking
@@ -3469,6 +3478,14 @@ mod tests {
     fn inode(path: &Path) -> u64 {
         use std::os::unix::fs::MetadataExt;
         fs::metadata(path).expect("lock metadata").ino()
+    }
+
+    #[test]
+    fn healthy_refresh_cadence_does_not_trigger_stale_warning() {
+        let config = LockConfig::default();
+        assert_eq!(config.live_owner_warning_age_ms(), 30_000);
+        assert_eq!(config.cross_host_stale_heartbeat_ms(), 75_000);
+        assert_eq!(test_config().live_owner_warning_age_ms(), 2_000);
     }
 
     #[test]
