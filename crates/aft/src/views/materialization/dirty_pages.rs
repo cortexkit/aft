@@ -107,22 +107,45 @@ unsafe extern "C" fn open(
         let wal = flags & ffi::SQLITE_OPEN_WAL != 0;
         files().lock().unwrap().insert(file as usize, (path, wal));
         let original = unsafe { (*file).pMethods };
-        if !original.is_null() {
-            let mut tables = methods().lock().unwrap();
-            let patched = tables
-                .iter()
-                .find(|(_, value)| **value == original as usize)
-                .map(|(key, _)| *key)
-                .unwrap_or_else(|| {
-                    let mut copy = unsafe { *original };
-                    copy.xWrite = Some(write);
-                    let key = Box::into_raw(Box::new(copy)) as usize;
-                    tables.insert(key, original as usize);
-                    key
-                });
-            unsafe { (*file).pMethods = patched as *const ffi::sqlite3_io_methods };
+        if let Some(original) = unsafe { original.as_ref() } {
+            unsafe { (*file).pMethods = patch_methods(original) };
         }
         rc
+    })
+}
+
+fn patch_methods(original: &ffi::sqlite3_io_methods) -> *const ffi::sqlite3_io_methods {
+    // The accounting VFS keeps its methods inside each file, not in a static
+    // table. Reusing that address after close can change the methods (journals
+    // lack xShmMap, for example), so a cached copy can make a main file reject WAL.
+    let mut copy = *original;
+    copy.xWrite = Some(write);
+    copy.xClose = Some(close);
+    let patched = Box::into_raw(Box::new(copy));
+    methods()
+        .lock()
+        .unwrap()
+        .insert(patched as usize, std::ptr::from_ref(original) as usize);
+    patched
+}
+
+unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> c_int {
+    ffi_result(|| {
+        let Some(file_ref) = (unsafe { file.as_mut() }) else {
+            return ffi::SQLITE_IOERR_CLOSE;
+        };
+        let patched = file_ref.pMethods;
+        let Some(original) = methods().lock().unwrap().remove(&(patched as usize)) else {
+            return ffi::SQLITE_IOERR_CLOSE;
+        };
+        files().lock().unwrap().remove(&(file as usize));
+        file_ref.pMethods = original as *const ffi::sqlite3_io_methods;
+        let original_close = unsafe { (*file_ref.pMethods).xClose };
+        unsafe { drop(Box::from_raw(patched.cast_mut())) };
+        match original_close {
+            Some(close) => unsafe { close(file) },
+            None => ffi::SQLITE_IOERR_CLOSE,
+        }
     })
 }
 
@@ -231,6 +254,49 @@ fn missing_write_method_returns_sqlite_error() {
         unsafe { write(&mut file, std::ptr::null(), 0, 0) },
         ffi::SQLITE_IOERR_WRITE
     );
+}
+
+#[test]
+fn reused_method_address_preserves_wal_capability() {
+    unsafe extern "C" fn base_close(_: *mut ffi::sqlite3_file) -> c_int {
+        ffi::SQLITE_OK
+    }
+    unsafe extern "C" fn shm_map(
+        _: *mut ffi::sqlite3_file,
+        _: c_int,
+        _: c_int,
+        _: c_int,
+        _: *mut *mut c_void,
+    ) -> c_int {
+        ffi::SQLITE_OK
+    }
+
+    // Model an allocator reusing a journal's inline accounting table for a main
+    // database. The address stays fixed, but only the main file supports WAL.
+    let mut original: ffi::sqlite3_io_methods = unsafe { std::mem::zeroed() };
+    original.iVersion = 2;
+    original.xClose = Some(base_close);
+    let mut file = ffi::sqlite3_file {
+        pMethods: patch_methods(&original),
+    };
+    assert!(unsafe { (*file.pMethods).xShmMap }.is_none());
+    assert_eq!(
+        unsafe { ((*file.pMethods).xClose.unwrap())(&mut file) },
+        ffi::SQLITE_OK
+    );
+    original.xShmMap = Some(shm_map);
+    file.pMethods = patch_methods(&original);
+    assert!(
+        unsafe { (*file.pMethods).xShmMap }.is_some(),
+        "a reopened main file must retain xShmMap or SQLite rejects WAL with SQLITE_CANTOPEN"
+    );
+    let patched = file.pMethods as usize;
+    assert_eq!(
+        unsafe { ((*file.pMethods).xClose.unwrap())(&mut file) },
+        ffi::SQLITE_OK
+    );
+    assert_eq!(file.pMethods, std::ptr::from_ref(&original));
+    assert!(!methods().lock().unwrap().contains_key(&patched));
 }
 
 #[test]
