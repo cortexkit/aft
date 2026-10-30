@@ -17953,22 +17953,38 @@ mod tests {
         // them under one budget, killing the server that ignores Shutdown.
         let clients = ctx.lsp().take_all_clients();
         assert_eq!(clients.len(), 1);
+        let shutdown_started = Instant::now();
+        let exit_observer = std::thread::spawn(move || {
+            let deadline = shutdown_started + Duration::from_secs(30);
+            while crate::bash_background::process::is_process_alive(pid) {
+                assert!(Instant::now() < deadline, "server {pid} never exited");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            shutdown_started.elapsed()
+        });
         let outcome = crate::lsp::manager::LspManager::shutdown_at_process_exit(
             clients,
             ctx.lsp_child_registry(),
         );
         assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
-        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
         // The forced kill does not wait; its worker thread reaps the child
         // right after. Hang guard only.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
             assert!(
                 Instant::now() < deadline,
                 "exit sweep left server {pid} running"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        let registry_empty_after = shutdown_started.elapsed();
+        let process_exited_after = exit_observer.join().unwrap();
+        eprintln!(
+            "exit sweep observation: pid={pid} outcome={outcome:?} process_exit_observed_after={process_exited_after:?} registry_empty_observed_after={registry_empty_after:?}"
+        );
+        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
 
         // Admission stays closed: a late request (an inspect job that outlived
         // its route) cannot start a replacement server after the sweep.
