@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-import-existing"
+  ],
+  "note": "Views on: background import of existing trigram and symbol caches into v3 (independent of semantic), fresh-base trigram row reuse, resumable cancellable claims, borrow-only write refusal. Views stay off by default. No changed path matches RANKING_FENCE_PREFIXES."
+}
