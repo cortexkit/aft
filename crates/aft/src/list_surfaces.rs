@@ -355,6 +355,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "bash_background/remote.rs",
+        enclosing_item: "admission_progress_detail",
+        location_or_primitive: "MAX_DETAIL_CHARS character preview",
+        reason: "pre-acceptance progress detail is one display string, not a result list; its redacted text is ellipsized at a Unicode character boundary without omitting any task or output records",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/bash_output.rs",
         enclosing_item: "page, stream_items",
         location_or_primitive: "limit, PAGE_BYTES, ITEM_BYTES",
@@ -475,6 +481,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded deduplication bookkeeping, not a result list; evicting an idle session only repeats its next bar and never suppresses a changed value",
     },
     ExclusionEntry {
+        file: "lsp/manager.rs",
+        enclosing_item: "remember",
+        location_or_primitive: "WATCHED_LIFECYCLE_CAP / oldest pop_first",
+        reason: "per-server watched-file echo bookkeeping, not a result list; eviction can only forward a duplicate lifecycle event, never hide a file change",
+    },
+    ExclusionEntry {
         file: "edit.rs",
         enclosing_item: "drop, notify_full_validation_start",
         location_or_primitive: "FULL_VALIDATION_START_HOOK Option::take",
@@ -533,6 +545,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
         location_or_primitive: "root row removal, optional root subfield removal, path/refusal character caps, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
         reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last actionable row is abbreviated with a full identity digest, status and refusal code instead of omitted; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
+    },
+    ExclusionEntry {
+        file: "subc/route_census.rs",
+        enclosing_item: "snapshot, ScopeDescriptions::record",
+        location_or_primitive: "ROOT_LIMIT, ROUTE_LIMIT, PRINCIPAL_LIMIT, DESCRIPTION_LIMIT",
+        reason: "management-only ownership diagnostics, not an agent result list; root and per-root route details and principal groups have exact omitted counts while summary counts include omitted rows; the latest-result scope cache is bounded and reports evictions, with absent observations remaining unknown",
     },
     ExclusionEntry {
         file: "gc/family.rs",
@@ -940,6 +958,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "inspect_outline_file_content",
         location_or_primitive: "bounded line-count byte reader",
         reason: "caps bytes inspected for a file's line-count statistic; the file remains in the outline with an unknown line count, so no agent-visible list items are removed",
+    },
+    ExclusionEntry {
+        file: "commands/outline.rs",
+        enclosing_item: "files_walk_stall_keeps_examined_paths_and_named_gap",
+        location_or_primitive: "collection_truncated regression assertion",
+        reason: "a test observes incomplete discovery; the assertion does not cut an agent-visible list",
     },
     ExclusionEntry {
         file: "commands/read.rs",

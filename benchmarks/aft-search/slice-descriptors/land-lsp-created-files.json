@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "lsp-created-files"
+  ],
+  "note": "AFT tools that create, delete or move files now send the matching watched-file events to language servers, coalescing watcher echoes in a bounded per-server cache. No changed path matches RANKING_FENCE_PREFIXES."
+}

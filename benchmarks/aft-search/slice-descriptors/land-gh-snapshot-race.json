@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-snapshot-race"
+  ],
+  "note": "The GitHub shim's final bot-write gate accepts the known lifecycle generation steps (first seal of a candidate, activation) only when the stored authority record is otherwise identical; every other change still refuses before sending. No changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -864,6 +864,7 @@ pub struct RemoteRefusal {
 pub(crate) struct RunonLaunchState {
     pub accepted: bool,
     pub progress: remote::RemoteProgress,
+    pub admission_note: Option<String>,
     pub terminal: Option<BgTaskSnapshot>,
 }
 
@@ -1560,6 +1561,15 @@ impl BashDrainReplyCache {
     }
 }
 
+pub(crate) struct RouteCensusTask {
+    pub harness: Option<String>,
+    pub session_id: String,
+    pub scope: Option<subc_protocol::scope::ScopeStamp>,
+    pub running: bool,
+    pub active_watches: usize,
+    pub last_work_age_ms: u64,
+}
+
 pub(crate) struct BgTask {
     changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
     /// Absent after replay: secret values must never be persisted or recovered
@@ -1869,6 +1879,8 @@ pub(crate) enum TaskRuntime {
 
 pub(crate) struct BgTaskState {
     pub(crate) metadata: PersistedTask,
+    /// Only the latest pre-acceptance line, never written to task metadata.
+    remote_admission_note: Option<String>,
     /// The path stays in persisted metadata until this worker result succeeds,
     /// so a crash or a full queue leaves enough information for the stale sweep.
     temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
@@ -5413,6 +5425,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -5857,6 +5870,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -6221,6 +6235,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -8330,6 +8345,33 @@ impl BgTaskRegistry {
             .lock()
             .map(|registry| registry.active_count(task_id))
             .unwrap_or(0)
+    }
+
+    /// Counts and work ages only: no snapshots, output reads, process probes or database access.
+    pub(crate) fn try_route_census(&self) -> Option<Vec<RouteCensusTask>> {
+        let tasks = self.inner.tasks.try_lock().ok()?;
+        let watches = self.inner.watch_registry.try_lock().ok()?;
+        let now_ms = unix_millis();
+        let mut rows = Vec::with_capacity(tasks.len());
+        for task in tasks.values() {
+            let state = task.state.try_lock().ok()?;
+            let metadata = &state.metadata;
+            let running = !metadata.status.is_terminal();
+            let age_ms = if running {
+                0
+            } else {
+                now_ms.saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at))
+            };
+            rows.push(RouteCensusTask {
+                harness: metadata.harness.clone(),
+                session_id: task.session_id.clone(),
+                scope: metadata.scope.clone(),
+                running,
+                active_watches: watches.active_count(&task.task_id),
+                last_work_age_ms: age_ms,
+            });
+        }
+        Some(rows)
     }
 
     fn task_watch_state(&self, task_id: &str) -> (bool, bool) {
@@ -12740,6 +12782,7 @@ impl BgTaskRegistry {
             remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
+                remote_admission_note: None,
                 temp_cleanup: None,
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
@@ -16596,6 +16639,9 @@ impl BgTask {
         let launch = RunonLaunchState {
             accepted: remote.accepted,
             progress: remote::RemoteProgress::of(remote),
+            admission_note: (!remote.accepted && !state.metadata.is_terminal())
+                .then(|| state.remote_admission_note.clone())
+                .flatten(),
             // Before Accepted there is no command output; an accepted refusal
             // also never started. Accepted results keep the launch task handle.
             terminal: (state.metadata.is_terminal()
@@ -16697,7 +16743,14 @@ impl BgTask {
             elapsed_ms: (!metadata.status.is_terminal())
                 .then(|| self.elapsed_for_metadata(metadata).as_millis() as u64),
             remote_job_id: remote_job_id(metadata),
-            remote_phase_note: remote::remote_phase_note(metadata, unix_millis()),
+            remote_phase_note: state
+                .remote_admission_note
+                .as_ref()
+                .filter(|_| !metadata.is_terminal())
+                .filter(|_| metadata.child_pid.is_none())
+                .filter(|_| metadata.remote.as_ref().is_some_and(|r| !r.accepted))
+                .cloned()
+                .or_else(|| remote::remote_phase_note(metadata, unix_millis())),
         }
     }
 

@@ -73,7 +73,15 @@ impl BotRequest {
         run: Option<&ScopeStamp>,
     ) -> Result<Self, Refusal> {
         if nonce.is_empty() || expect.app_handle_id.is_empty() {
-            return Err(Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid"));
+            return Err(super::snapshot_invalid(
+                "gh_shim_speech::partner::BotRequest::new",
+                if nonce.is_empty() {
+                    "nonce_empty"
+                } else {
+                    "app_handle_empty"
+                },
+                json!({"binding_generation": expect.repo_binding_generation}),
+            ));
         }
         Ok(Self {
             op: "bot_request",
@@ -186,7 +194,29 @@ pub(crate) fn map_refusal(result: &Value, route_role: ScopeRole) -> Option<Refus
             _ => return None,
         },
         "invalid_request" | "nonce_payload_mismatch" => {
-            Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid")
+            // Provider diagnostics are untrusted; only known schema field names
+            // are safe to copy into the authority log.
+            let field = result
+                .get("field")
+                .and_then(Value::as_str)
+                .map(|field| match field {
+                    "op"
+                    | "request"
+                    | "request_nonce"
+                    | "expect"
+                    | "expect.app_handle_id"
+                    | "expect.repo_binding_generation"
+                    | "run_scope"
+                    | "run_scope.owner"
+                    | "run_scope.ref"
+                    | "run_scope.epoch" => field,
+                    _ => "unrecognized",
+                });
+            super::snapshot_invalid(
+                "gh_shim_speech::partner::map_refusal",
+                code,
+                json!({"route_role": route_role, "scope_role": role, "field": field}),
+            )
         }
         "delegation_withdrawn" => Refusal::new(Code::AuthorityUnavailable, "delegation_withdrawn"),
         "scope_ended" => Refusal::scoped(Code::ScopeEnded, "ended", role),

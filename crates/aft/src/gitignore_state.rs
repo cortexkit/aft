@@ -111,26 +111,23 @@ impl IgnoreInputSnapshot {
             .join("exclude");
         push_input(&mut inputs, info_exclude, root.clone(), false);
 
-        let walker = ignore::WalkBuilder::new(&root)
-            .same_file_system(true)
-            .standard_filters(true)
-            .hidden(false)
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    "node_modules" | "target" | ".git" | ".opencode" | ".alfonso"
-                )
-            })
-            .build();
-        let mut nested_ignore_files = walker
+        // Ignore files below an excluded directory cannot affect membership.
+        // Probe names in admitted directories rather than relying on the walk
+        // to yield the files: an ignore file can itself have an ignored name.
+        let mut nested_ignore_files = crate::search_index::project_walk_builder(&root)
+            .build()
             .flatten()
-            .filter_map(|entry| {
-                let file_name = entry.file_name();
-                let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
-                let is_nested_aftignore =
-                    file_name == ".aftignore" && entry.path() != root_aftignore;
-                (is_nested_gitignore || is_nested_aftignore).then(|| entry.into_path())
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_dir()))
+            .inspect(|_entry| {
+                #[cfg(test)]
+                SNAPSHOT_DIRECTORY_VISITS.with(|visits| visits.set(visits.get() + 1));
+            })
+            .filter(|entry| entry.depth() != 0)
+            .flat_map(|entry| {
+                [
+                    entry.path().join(".gitignore"),
+                    entry.path().join(".aftignore"),
+                ]
             })
             .collect::<Vec<_>>();
         nested_ignore_files.sort_by(|left, right| nested_input_order(&root, left, right));
@@ -258,6 +255,11 @@ impl IgnoreInputSnapshot {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_DIRECTORY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn push_input(inputs: &mut Vec<IgnoreInput>, path: PathBuf, scope: PathBuf, nested: bool) {
@@ -577,6 +579,111 @@ pub(crate) mod ignore_rules_fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_prunes_ignored_directories_outside_git() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".gitignore"), "git-excluded/\n").unwrap();
+        std::fs::write(root.path().join(".aftignore"), "aft-excluded/\n").unwrap();
+        for parent in ["git-excluded", "aft-excluded", "node_modules", "target"] {
+            for n in 0..64 {
+                let dir = root.path().join(parent).join(format!("repo{n}/src"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(".gitignore"), "*.rs\n").unwrap();
+            }
+        }
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/.gitignore"), "*.tmp\n").unwrap();
+        SNAPSHOT_DIRECTORY_VISITS.with(|visits| visits.set(0));
+        let inputs = IgnoreInputSnapshot::collect(root.path().to_path_buf(), None);
+        assert_eq!(SNAPSHOT_DIRECTORY_VISITS.with(|visits| visits.get()), 2);
+        assert_eq!(inputs.inputs.iter().filter(|input| input.nested).count(), 1);
+        assert!(inputs
+            .inputs
+            .iter()
+            .any(|input| input.path == root.path().join("src/.gitignore")));
+    }
+
+    #[test]
+    fn snapshot_reads_self_ignored_policy_and_rediscovers_unignored_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(root.path().join("vendor/src")).unwrap();
+        let policy = root.path().join("src/.aftignore");
+        std::fs::write(&policy, "*.tmp\n").unwrap();
+        std::fs::write(root.path().join("vendor/src/.gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "vendor/\n.aftignore\n").unwrap();
+        let before = IgnoreInputSnapshot::collect(root.path().to_path_buf(), None);
+        assert!(before.inputs.iter().any(|input| input.path == policy));
+        assert!(!before
+            .inputs
+            .iter()
+            .any(|input| input.path.starts_with(root.path().join("vendor"))));
+        std::fs::write(root.path().join(".gitignore"), ".aftignore\n").unwrap();
+        let after = IgnoreInputSnapshot::collect(root.path().to_path_buf(), None);
+        assert!(after
+            .inputs
+            .iter()
+            .any(|input| input.path == root.path().join("vendor/src/.gitignore")));
+        assert!(!after.has_same_effective_inputs(Some(&before)));
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
+    fn live_cpu_ignore_snapshot_checkout_cost() {
+        let root =
+            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let before = std::time::Instant::now();
+        let mut inputs = Vec::new();
+        if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+            push_input(&mut inputs, global, root.clone(), false);
+        }
+        for path in [
+            root.join(".gitignore"),
+            root.join(".aftignore"),
+            root.join(".git/info/exclude"),
+        ] {
+            push_input(&mut inputs, path, root.clone(), false);
+        }
+        let mut directories = 0;
+        let mut nested = ignore::WalkBuilder::new(&root)
+            .same_file_system(true)
+            .standard_filters(true)
+            .hidden(false)
+            .filter_entry(|entry| {
+                !matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    "node_modules" | "target" | ".git" | ".opencode" | ".alfonso"
+                )
+            })
+            .build()
+            .flatten()
+            .inspect(|entry| {
+                directories += usize::from(entry.file_type().is_some_and(|kind| kind.is_dir()));
+            })
+            .filter_map(|entry| {
+                matches!(
+                    entry.file_name().to_str(),
+                    Some(".gitignore" | ".aftignore")
+                )
+                .then(|| entry.into_path())
+            })
+            .filter(|path| path.parent() != Some(root.as_path()))
+            .collect::<Vec<_>>();
+        nested.sort_by(|left, right| nested_input_order(&root, left, right));
+        for path in nested {
+            let scope = path.parent().unwrap().to_path_buf();
+            push_input(&mut inputs, path, scope, true);
+        }
+        std::hint::black_box(hash_inputs(&root, &inputs));
+        let before_time = before.elapsed();
+        SNAPSHOT_DIRECTORY_VISITS.with(|visits| visits.set(0));
+        let after = std::time::Instant::now();
+        let snapshot = IgnoreInputSnapshot::collect(root, None);
+        let after_time = after.elapsed();
+        println!("ignore snapshot: before={before_time:?} directories={directories} inputs={} after={after_time:?} directories={} inputs={}",
+            inputs.len(), SNAPSHOT_DIRECTORY_VISITS.with(|visits| visits.get()), snapshot.inputs.len());
+    }
 
     fn snapshot(root: &Path, bytes: &[u8]) -> IgnoreInputSnapshot {
         let path = root.join("nested/.gitignore");

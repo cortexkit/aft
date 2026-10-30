@@ -428,11 +428,8 @@ impl SemanticArena {
     }
 
     /// Serializes bounded chunk-vector batches across all views of the family.
-    pub(crate) fn chunk_batch(&self) -> MutexGuard<'_, ()> {
-        lock(&self.chunk_batch)
-    }
-
-    /// A cold-admitted fill must yield its slot rather than block on this gate.
+    /// A fill holding capacity permits must return pending rather than wait on
+    /// this gate, so its owner can finish and release those permits.
     pub(crate) fn try_chunk_batch(&self) -> Option<MutexGuard<'_, ()>> {
         match self.chunk_batch.try_lock() {
             Ok(guard) => Some(guard),

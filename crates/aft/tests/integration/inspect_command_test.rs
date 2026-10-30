@@ -7030,7 +7030,7 @@ fn unscoped_inspect_current_content_timeout_names_the_file_instead_of_old_result
         "old errors must not be returned: {response:#}"
     );
     assert!(uncovered_files(&response).iter().any(|(file, reason)| file == "broken.ts" && reason ==
-        "diagnostics for the file's current content were not confirmed before the check deadline; retry aft_inspect"), "{response:#}");
+        "no diagnostics for the current file content arrived in time; retry aft_inspect"), "{response:#}");
 }
 
 #[test]

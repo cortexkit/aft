@@ -38,7 +38,7 @@ const EXPLICIT_CHECK_RUNNING_REASON: &str = "cargo check running for aft_inspect
 /// PROPOSED AGENT-VISIBLE WORDING — approval is required before merge.
 /// Used for named file gaps, not as a checked-clean fallback.
 pub(crate) const CURRENT_CONTENT_UNVERIFIED_REASON: &str =
-    "diagnostics for the file's current content were not confirmed before the check deadline; retry aft_inspect";
+    "no diagnostics for the current file content arrived in time; retry aft_inspect";
 
 /// The cargo check inspect runs itself for one Rust producer whose automatic
 /// checks are off. Its outcome arrives on `outcome`: `Ok` once the result is

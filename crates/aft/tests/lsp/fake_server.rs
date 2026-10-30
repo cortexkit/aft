@@ -922,6 +922,9 @@ pub(crate) fn main() -> io::Result<()> {
                     )?;
                 }
                 "shutdown" => {
+                    if std::env::var("AFT_FAKE_LSP_REPORT_SHUTDOWN").as_deref() == Ok("1") {
+                        write_custom_notification(&mut writer, "aft-test/shutdownReceived", Value::Null, Value::Null)?;
+                    }
                     if !ignore_shutdown {
                         write_response(&mut writer, id, Value::Null)?;
                     }
