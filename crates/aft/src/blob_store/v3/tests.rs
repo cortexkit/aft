@@ -117,9 +117,10 @@ fn publication_survives_a_sidecar_disappearing_during_accounting() {
 #[cfg(windows)]
 #[test]
 fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
-    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
-        DeleteFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let root = tempdir().unwrap();
@@ -129,20 +130,29 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     let payload = b"delete-pending lock bytes";
     fs::write(&pending, payload).unwrap();
     let handle = fs::OpenOptions::new()
-        .read(true)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(&pending)
         .unwrap();
+    let handle = std::rc::Rc::new(handle);
+    let pending_handle = std::rc::Rc::clone(&handle);
     let removed = std::rc::Rc::new(std::cell::Cell::new(false));
     let observed = std::rc::Rc::clone(&removed);
     WALK_BEFORE_STAT.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move |path| {
             if path == pending && !observed.replace(true) {
-                let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                // Use legacy deletion: Rust's remove_file can unlink immediately
-                // with POSIX semantics instead of leaving a delete-pending name.
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                // Set legacy disposition explicitly: pathname deletion can use
+                // POSIX semantics instead of leaving a delete-pending name.
                 assert_ne!(
-                    unsafe { DeleteFileW(wide.as_ptr()) },
+                    unsafe {
+                        SetFileInformationByHandle(
+                            pending_handle.as_raw_handle(),
+                            FileDispositionInfo,
+                            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                            std::mem::size_of_val(&disposition) as u32,
+                        )
+                    },
                     0,
                     "{}",
                     std::io::Error::last_os_error()
