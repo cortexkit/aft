@@ -5088,12 +5088,9 @@ impl BgTaskRegistry {
     pub(crate) fn kill_task_scope(&self, task_id: &str) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
-            let unit = super::task_scope::scope_unit(task_id).map_err(|error| error.to_string())?;
             self.inner
                 .task_scopes
                 .kill(task_id, self.task_scope_identity(task_id))
-                .map(|_| ())
-                .map_err(|error| format!("failed to kill task scope {unit}: {error}"))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -7773,19 +7770,21 @@ impl BgTaskRegistry {
                 {
                     let recovered = (|| -> Result<(), String> {
                         if let Some(pid) = metadata.child_pid {
-                            let scope = if let Some(start) = metadata.child_start_time_ms {
+                            let answer = if let Some(start) = metadata.child_start_time_ms {
                                 self.inner
                                     .task_scopes
                                     .adopt(&metadata.task_id, pid, start)?
                             } else {
-                                if super::task_scope::lookup(&metadata.task_id)?.is_some() {
-                                    return Err(
-                                        "task scope replay has no exact child identity".into()
-                                    );
+                                match super::task_scope::lookup_state(&metadata.task_id)? {
+                                    super::task_scope::ScopeLookup::Present(_) => {
+                                        return Err(
+                                            "task scope replay has no exact child identity".into()
+                                        )
+                                    }
+                                    other => other,
                                 }
-                                None
                             };
-                            if let Some(scope) = scope {
+                            if let super::task_scope::ScopeLookup::Present(scope) = answer {
                                 if let Some(policy) = metadata.memory_policy.as_mut() {
                                     let monitor = super::memory_limit::Monitor::from_task_scope(
                                         policy.mib, &scope,
@@ -7797,11 +7796,6 @@ impl BgTaskRegistry {
                                         .unwrap_or_else(|error| error.into_inner())
                                         .insert(metadata.task_id.clone(), monitor);
                                 }
-                            } else if metadata.memory_policy.as_ref().is_some_and(|policy| {
-                                policy.kind
-                                    == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
-                            }) {
-                                return Err("task memory scope is absent during replay".into());
                             }
                         }
                         Ok(())
@@ -13490,7 +13484,7 @@ impl BgTaskRegistry {
         self.stop_secret_proxy(task_id);
         #[cfg(target_os = "linux")]
         {
-            // The leader can exit during group termination. Make sure of its scope before sending signals.
+            // The leader can exit during group termination. Check its scope before sending signals.
             let _ = self
                 .inner
                 .task_scopes

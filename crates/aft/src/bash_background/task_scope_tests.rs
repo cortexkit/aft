@@ -526,7 +526,7 @@ fn task_scope_kill_reports_live_controller_permission_failure() {
     assert!(r
         .kill_task_scope(&id)
         .unwrap_err()
-        .contains(&format!("failed to kill task scope aft-task-{id}.scope")));
+        .contains("failed to confirm or kill task scope"));
     std::fs::remove_file(&control).unwrap();
     assert!(
         r.kill_task_scope(&id).is_err(),
@@ -708,7 +708,10 @@ fn task_scope_kill_without_handle_refuses_foreign_identity() {
     second
         .insert_rehydrated_task(metadata, task.paths.clone(), true)
         .unwrap();
-    second.kill_task_scope(&id).unwrap();
+    assert!(
+        second.kill_task_scope(&id).is_err(),
+        "unconfirmed scope kill reported success"
+    );
     assert!(second.inner.task_scopes.get(&id).is_none());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     assert!(
@@ -717,6 +720,126 @@ fn task_scope_kill_without_handle_refuses_foreign_identity() {
             .lines()
             .any(|line| line == "populated 1")
     );
+}
+
+#[test]
+fn task_scope_kill_distinguishes_absent_unconfirmed_and_failed() {
+    if !manager_available() {
+        return;
+    }
+    let registry = BgTaskRegistry::default();
+    registry.kill_task_scope(&random_slug()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let id = scope_spawn(
+        &registry,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let other = BgTaskRegistry::default();
+    assert!(
+        other.kill_task_scope(&id).is_err(),
+        "present scope without identity reported success"
+    );
+    let fake = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fake.path().join("cgroup.kill")).unwrap();
+    other
+        .inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(
+            &id,
+            fake.path().into(),
+        ));
+    let error = other.kill_task_scope(&id).unwrap_err();
+    assert_eq!(error, "failed to confirm or kill task scope");
+}
+
+#[test]
+fn task_scope_replay_keeps_live_identity_without_user_manager() {
+    const ROOT: &str = "AFT_TEST_SCOPE_REPLAY_ROOT";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = PathBuf::from(root);
+        let id = std::fs::read_to_string(root.join("task-id")).unwrap();
+        let registry = BgTaskRegistry::default();
+        registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
+        registry.replay_session(&root, "task-scope").unwrap();
+        let status = registry
+            .status(&id, "task-scope", None, None, 1024)
+            .unwrap();
+        let expected = if std::env::var_os("AFT_TEST_SCOPE_GONE").is_some() {
+            super::super::BgTaskStatus::FateUnknown
+        } else {
+            super::super::BgTaskStatus::Running
+        };
+        assert_eq!(
+            status.info.status, expected,
+            "manager failure changed live process status"
+        );
+        assert_eq!(status.exit_code, None);
+        registry.detach();
+        return;
+    }
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &registry,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    std::fs::write(root.path().join("task-id"), &id).unwrap();
+    let pid = registry
+        .task(&id)
+        .unwrap()
+        .lock_state()
+        .unwrap()
+        .metadata
+        .child_pid
+        .unwrap();
+    let mut owned_child = {
+        let task = registry.task(&id).unwrap();
+        let mut state = task.lock_state().unwrap();
+        match &mut state.runtime {
+            TaskRuntime::Piped(child) => child.take().unwrap(),
+            _ => unreachable!(),
+        }
+    };
+    registry.detach();
+    for (broken, gone) in [(false, false), (true, false), (true, true)] {
+        if gone {
+            super::super::task_scope::lookup(&id)
+                .unwrap()
+                .unwrap()
+                .kill()
+                .unwrap();
+            until(|| owned_child.try_wait().unwrap().is_some());
+            until(|| crate::root_cache::process_start_time_ms(pid).is_none());
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "bash_background::registry::task_scope_tests::task_scope_replay_keeps_live_identity_without_user_manager", "--nocapture"]).env(ROOT, root.path());
+        if broken {
+            child
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/nonexistent/aft-probe-bus",
+                )
+                .env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime");
+        }
+        if gone {
+            child.env("AFT_TEST_SCOPE_GONE", "1");
+        }
+        assert!(
+            child.status().unwrap().success(),
+            "replay subprocess failed"
+        );
+    }
 }
 
 #[test]

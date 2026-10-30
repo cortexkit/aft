@@ -104,31 +104,43 @@ mod linux {
                 .cloned()
         }
 
-        pub(crate) fn kill(&self, task_id: &str, identity: Option<(u32, u64)>) -> io::Result<bool> {
-            if let Some(handle) = self.resolve_handle(task_id, identity) {
-                handle.kill()?;
-                return Ok(true);
+        pub(crate) fn kill(
+            &self,
+            task_id: &str,
+            identity: Option<(u32, u64)>,
+        ) -> Result<(), String> {
+            if let Some(handle) = self.resolve_handle(task_id, identity)? {
+                handle
+                    .kill()
+                    .map_err(|_| "failed to confirm or kill task scope".to_string())?;
             }
-            Ok(false)
+            Ok(())
         }
 
         pub(crate) fn resolve_handle(
             &self,
             task_id: &str,
             identity: Option<(u32, u64)>,
-        ) -> Option<ScopeHandle> {
+        ) -> Result<Option<ScopeHandle>, String> {
             if let Some(handle) = self.get(task_id) {
-                return Some(handle);
+                return Ok(Some(handle));
             }
-            if let Some((pid, start)) = identity {
-                if let Ok(Some(handle)) = self.adopt(task_id, pid, start) {
-                    return Some(handle);
-                }
+            let answer = if let Some((pid, start)) = identity {
+                self.adopt(task_id, pid, start)
             } else {
-                let _ = lookup(task_id);
+                match lookup_state(task_id) {
+                    Ok(ScopeLookup::Present(_)) => Err("task scope identity is missing".into()),
+                    other => other,
+                }
+            };
+            match answer {
+                Ok(ScopeLookup::Present(handle)) => Ok(Some(handle)),
+                Ok(ScopeLookup::Absent) => Ok(None),
+                _ => {
+                    log_unconfirmed_scope();
+                    Err("failed to confirm or kill task scope".into())
+                }
             }
-            log_unconfirmed_scope();
-            None
         }
 
         pub(crate) fn adopt(
@@ -136,12 +148,12 @@ mod linux {
             task_id: &str,
             pid: u32,
             start: u64,
-        ) -> Result<Option<ScopeHandle>, String> {
+        ) -> Result<ScopeLookup, String> {
             let handle = adopt_with(
                 task_id,
                 pid,
                 start,
-                lookup,
+                lookup_state,
                 |pid| {
                     std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
                         .map_err(|error| error.to_string())
@@ -151,7 +163,7 @@ mod linux {
                         .ok_or_else(|| "task scope process identity is unavailable".into())
                 },
             )?;
-            if let Some(scope) = &handle {
+            if let ScopeLookup::Present(scope) = &handle {
                 self.register(scope.clone());
             }
             Ok(handle)
@@ -226,15 +238,26 @@ mod linux {
         task_id: &str,
         pid: u32,
         start: u64,
-        lookup: impl FnOnce(&str) -> Result<Option<ScopeHandle>, String>,
+        lookup: impl FnOnce(&str) -> Result<ScopeLookup, String>,
         mut membership: impl FnMut(u32) -> Result<String, String>,
         mut identity: impl FnMut(u32) -> Result<u64, String>,
-    ) -> Result<Option<ScopeHandle>, String> {
-        let before = identity(pid).and_then(|actual| membership(pid).map(|text| (actual, text)));
-        let Some(scope) = lookup(task_id)? else {
-            return Ok(None);
+    ) -> Result<ScopeLookup, String> {
+        let before = identity(pid);
+        let before_membership = membership(pid);
+        let scope = match lookup(task_id)? {
+            ScopeLookup::Absent => return Ok(ScopeLookup::Absent),
+            ScopeLookup::Unreachable => {
+                // A bus failure does not prove process death. Keep the saved start-time check.
+                if before? != start || identity(pid)? != start {
+                    return Err("task scope replay identity changed".into());
+                }
+                log_unconfirmed_scope();
+                return Ok(ScopeLookup::Unreachable);
+            }
+            ScopeLookup::Present(scope) => scope,
         };
-        let (actual, text) = before?;
+        let actual = before?;
+        let text = before_membership?;
         if actual != start
             || !matches_membership(task_id, &text)
             || membership_path(task_id, &text).as_deref() != Some(scope.cgroup())
@@ -249,7 +272,14 @@ mod linux {
         {
             return Err("task scope replay identity changed".into());
         }
-        Ok(Some(scope))
+        Ok(ScopeLookup::Present(scope))
+    }
+
+    #[derive(Debug)]
+    pub(crate) enum ScopeLookup {
+        Absent,
+        Present(ScopeHandle),
+        Unreachable,
     }
 
     #[derive(Clone, Debug)]
@@ -677,38 +707,51 @@ mod linux {
         membership_path(task_id, proc_cgroup).is_some()
     }
 
-    fn lookup_with(systemctl: &Path, task_id: &str) -> Result<Option<ScopeHandle>, String> {
+    fn lookup_state_with(systemctl: &Path, task_id: &str) -> Result<ScopeLookup, String> {
         let unit = scope_unit(task_id).map_err(|e| e.to_string())?;
         let output = run(
             user_manager_command(systemctl).args([
                 "--user",
                 "show",
                 "--property=ControlGroup",
-                "--value",
+                "--property=LoadState",
                 &unit,
             ]),
             Duration::from_secs(1),
-        )?;
+        );
+        let Ok(output) = output else {
+            return Ok(ScopeLookup::Unreachable);
+        };
+        let text = std::str::from_utf8(&output.stdout).map_err(|_| "invalid task scope status")?;
+        let property = |name| text.lines().find_map(|line| line.strip_prefix(name));
+        if property("LoadState=") == Some("not-found") {
+            return Ok(ScopeLookup::Absent);
+        }
         if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            if error.contains("could not be found") || error.contains("not found") {
-                return Ok(None);
-            }
+            return Ok(ScopeLookup::Unreachable);
         }
-        let bytes = successful(output)?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|e| e.to_string())?
-            .trim();
-        if text.is_empty() {
-            return Ok(None);
+        if property("LoadState=") != Some("loaded") {
+            return Err("task scope load state could not be confirmed".into());
         }
-        let cgroup = cgroup_path(task_id, text)
+        let cgroup = cgroup_path(task_id, property("ControlGroup=").unwrap_or_default())
             .ok_or("task scope ControlGroup is outside its exact aft.slice unit")?;
-        Ok(Some(ScopeHandle {
+        Ok(ScopeLookup::Present(ScopeHandle {
             task_id: task_id.into(),
             unit,
             cgroup,
         }))
+    }
+
+    pub(crate) fn lookup_state(task_id: &str) -> Result<ScopeLookup, String> {
+        lookup_state_with(Path::new("systemctl"), task_id)
+    }
+
+    fn lookup_with(systemctl: &Path, task_id: &str) -> Result<Option<ScopeHandle>, String> {
+        match lookup_state_with(systemctl, task_id)? {
+            ScopeLookup::Absent => Ok(None),
+            ScopeLookup::Present(handle) => Ok(Some(handle)),
+            ScopeLookup::Unreachable => Err("task scope user manager is unreachable".into()),
+        }
     }
 
     pub(crate) fn lookup(task_id: &str) -> Result<Option<ScopeHandle>, String> {
@@ -960,6 +1003,26 @@ mod linux {
                 .contains("timed out"));
             assert!(start.elapsed() < Duration::from_secs(1));
         }
+
+        #[test]
+        fn task_scope_lookup_classifies_manager_answers() {
+            let id = "bash-0123456789abcdef";
+            let (_dir, path) = fake("printf 'LoadState=not-found\\nControlGroup=\\n'; exit 4");
+            assert!(matches!(
+                lookup_state_with(&path, id).unwrap(),
+                ScopeLookup::Absent
+            ));
+            let (_dir, path) = fake("printf 'LoadState=loaded\\nControlGroup=/aft.slice/aft-task-bash-0123456789abcdef.scope\\n'");
+            assert!(matches!(
+                lookup_state_with(&path, id).unwrap(),
+                ScopeLookup::Present(_)
+            ));
+            let (_dir, path) = fake("echo 'bus not found' >&2; exit 1");
+            assert!(matches!(
+                lookup_state_with(&path, id).unwrap(),
+                ScopeLookup::Unreachable
+            ));
+        }
         #[test]
         fn task_scope_control_group_validation() {
             let id = "bash-0123456789abcdef";
@@ -968,7 +1031,14 @@ mod linux {
                 "/app.slice/aft-task-bash-0123456789abcdef.scope",
                 "/../aft.slice/aft-task-bash-0123456789abcdef.scope",
             ] {
-                let (_dir, path) = fake(&format!("printf '%s' '{text}'"));
+                let state = if text.is_empty() {
+                    "not-found"
+                } else {
+                    "loaded"
+                };
+                let (_dir, path) = fake(&format!(
+                    "printf 'LoadState={state}\\nControlGroup=%s\\n' '{text}'"
+                ));
                 let result = lookup_with(&path, id);
                 if text.is_empty() {
                     assert!(result.unwrap().is_none());
@@ -992,7 +1062,7 @@ mod linux {
         fn task_scope_listing_skips_foreign_units() {
             let foreign = "aft-task-bash-0000000000000001.scope";
             let owned = "aft-task-bash-0000000000000002.scope";
-            let (_dir, path) = fake(&format!("case \"$2\" in\nlist-units) printf '%s\\n' '{foreign}' '{owned}' ;;\nshow) for unit in \"$@\"; do :; done; case \"$unit\" in\n'{foreign}') printf '/app.slice/{foreign}\\n' ;;\n*) printf '/aft.slice/{owned}\\n' ;;\nesac ;;\nesac"));
+            let (_dir, path) = fake(&format!("case \"$2\" in\nlist-units) printf '%s\\n' '{foreign}' '{owned}' ;;\nshow) for unit in \"$@\"; do :; done; case \"$unit\" in\n'{foreign}') printf 'LoadState=loaded\\nControlGroup=/app.slice/{foreign}\\n' ;;\n*) printf 'LoadState=loaded\\nControlGroup=/aft.slice/{owned}\\n' ;;\nesac ;;\nesac"));
             assert_eq!(list_with(&path).unwrap(), vec![owned.to_string()]);
         }
         #[test]
@@ -1011,7 +1081,7 @@ mod linux {
                     id,
                     42,
                     99,
-                    |_| Ok(Some(handle_for_test(id, "/fake".into()))),
+                    |_| Ok(ScopeLookup::Present(handle_for_test(id, "/fake".into()))),
                     |_| Ok("0::/aft.slice/aft-task-bash-0000000000000000.scope\n".into()),
                     |_| Ok(99),
                 )
@@ -1032,7 +1102,7 @@ mod linux {
                         42,
                         99,
                         |_| {
-                            Ok(Some(handle_for_test(
+                            Ok(ScopeLookup::Present(handle_for_test(
                                 id,
                                 format!("/sys/fs/cgroup/aft.slice/aft-task-{id}.scope").into(),
                             )))
