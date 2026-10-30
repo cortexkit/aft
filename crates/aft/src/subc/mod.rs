@@ -22869,7 +22869,18 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (slot, _) = fixture.ctx.database_open_slot();
         let locked = slot.lock();
-        let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock it reports None, by design. Retry while the slot stays
+        // held, so the assertions below check what the snapshot names rather
+        // than lock timing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let diagnostic = loop {
+            let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
+            if diagnostic.contains("held-rebind-writer") || std::time::Instant::now() >= deadline {
+                break diagnostic;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         drop(locked);
         release_tx.send(()).unwrap();
         assert!(writer.blocking_recv().unwrap().success);
