@@ -180,6 +180,8 @@ fn kill_deadline_sentence_at(
     );
     let source = match deadline.source {
         HardKillSource::Timeout => "(the `timeout` you passed)".to_string(),
+        HardKillSource::Scope => "(its fixed Linux task scope limit; waits cannot extend this limit)".to_string(),
+        HardKillSource::ScopedDefault => "(its default background limit; worker waits can extend this deadline, but cannot extend the fixed Linux task scope limit)".to_string(),
         HardKillSource::Default if worker_session => "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit".to_string(),
         HardKillSource::Default => "(its default background limit) unless you pass a longer `timeout`".to_string(),
     };

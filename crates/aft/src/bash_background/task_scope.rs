@@ -633,6 +633,10 @@ mod linux {
     }
 
     impl ScopeLaunch {
+        pub(crate) fn runtime_ms(&self) -> u64 {
+            self.runtime.as_millis().try_into().unwrap_or(u64::MAX)
+        }
+
         fn new(
             launcher: SystemdScopeLauncher,
             policy: ScopePolicy,

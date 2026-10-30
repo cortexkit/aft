@@ -1949,6 +1949,8 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_scope_runtime_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) memory_policy: Option<super::memory_limit::MemoryPolicy>,
     /// Missing job-wide output ranges, independent of execution outcome.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2049,6 +2051,7 @@ impl PersistedTask {
             scope: super::registry::scope_for_spawn(),
             remote: None,
             execution_note: None,
+            task_scope_runtime_ms: None,
             memory_policy: None,
             incomplete_output: Vec::new(),
             stripped_env_names: Vec::new(),
@@ -2214,6 +2217,7 @@ impl From<BashTaskRow> for PersistedTask {
             scope: None,
             remote: None,
             execution_note: None,
+            task_scope_runtime_ms: None,
             memory_policy: None,
             incomplete_output: Vec::new(),
             stripped_env_names: Vec::new(),

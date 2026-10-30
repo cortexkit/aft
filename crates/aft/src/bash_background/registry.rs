@@ -828,6 +828,8 @@ pub enum HardKillSource {
     Default,
     /// The caller's explicit `timeout`.
     Timeout,
+    Scope,
+    ScopedDefault,
 }
 
 /// A task's own kill deadline: it is killed once it has run `limit_ms`.
@@ -839,6 +841,25 @@ pub struct HardKillDeadline {
 }
 
 impl HardKillDeadline {
+    fn reported(metadata: &PersistedTask, renewable: bool) -> Option<Self> {
+        let deadline = Self::from_metadata(metadata.timeout_ms, renewable);
+        match metadata.task_scope_runtime_ms {
+            Some(limit_ms) if deadline.is_none_or(|deadline| limit_ms <= deadline.limit_ms) => {
+                Some(Self {
+                    limit_ms,
+                    source: HardKillSource::Scope,
+                })
+            }
+            Some(_) => deadline.map(|mut deadline| {
+                if deadline.source == HardKillSource::Default {
+                    deadline.source = HardKillSource::ScopedDefault;
+                }
+                deadline
+            }),
+            None => deadline,
+        }
+    }
+
     /// The deadline a task record carries. `renewable` is the record's
     /// `default_hard_kill`; for a record written before AFT stored it, a
     /// limit equal to the default is taken to be the default.
@@ -1522,7 +1543,7 @@ pub(crate) struct BashDrainReplyState {
 impl BashDrainReplyCache {
     fn publish_metadata(&self, metadata: &PersistedTask, renewable: bool) {
         let note = rendered_execution_note(metadata);
-        let deadline = HardKillDeadline::from_metadata(metadata.timeout_ms, renewable)
+        let deadline = HardKillDeadline::reported(metadata, renewable)
             .map(|deadline| (deadline, metadata.started_at));
         let inputs_captured = metadata
             .remote
@@ -5671,6 +5692,10 @@ impl BgTaskRegistry {
                 canonical_project_root,
             );
             return Err(format!("failed to persist background task metadata: {error}").into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
         }
         metadata.mark_running(child_pid, child_pid as i32);
         if crate::privacy_spawn::requested(&env) {
@@ -10816,7 +10841,7 @@ impl BgTaskRegistry {
         if state.metadata.remote.is_some() {
             return None;
         }
-        HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
+        HardKillDeadline::reported(&state.metadata, task.hard_kill_renewable)
     }
 
     /// Time left until the task's own hard kill, measured from its monotonic
@@ -10841,7 +10866,7 @@ impl BgTaskRegistry {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.lock_state().ok()?;
         Some((
-            HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)?,
+            HardKillDeadline::reported(&state.metadata, task.hard_kill_renewable)?,
             state.metadata.started_at,
         ))
     }
@@ -16831,15 +16856,16 @@ pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
     let limit = crate::commands::bash_orchestrate::format_wait_limit(deadline.limit_ms);
     let default_ms = DEFAULT_BG_TIMEOUT.as_millis() as u64;
     match deadline.source {
-        HardKillSource::Default if deadline.limit_ms > default_ms => format!(
+        HardKillSource::Default | HardKillSource::ScopedDefault if deadline.limit_ms > default_ms => format!(
             "killed by AFT's default background limit, which waits on it had extended to {limit}, after the waits stopped (exit 124); the command itself did not fail"
         ),
-        HardKillSource::Default => format!(
+        HardKillSource::Default | HardKillSource::ScopedDefault => format!(
             "killed by AFT's default background limit of {limit} (exit 124); the command itself did not fail, pass a longer `timeout` if it needs more time"
         ),
         HardKillSource::Timeout => {
             format!("killed by the `timeout` of {limit} you passed (exit 124)")
         }
+        HardKillSource::Scope => format!("killed by the fixed Linux task scope limit of {limit} (exit 124)"),
     }
 }
 
@@ -16867,8 +16893,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
     });
     let live_descendants_summary = live_descendants_summary(&metadata);
     let live_descendants_unavailable = live_descendants_unavailable(&metadata);
-    let hard_kill =
-        HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
+    let hard_kill = HardKillDeadline::reported(&metadata, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
     let remote_inputs_captured = metadata
         .remote
@@ -17106,7 +17131,7 @@ impl BgTask {
             kill_reached: 0,
             remote_cancel: None,
             hard_kill: if metadata.remote.is_none() {
-                HardKillDeadline::from_metadata(metadata.timeout_ms, self.hard_kill_renewable)
+                HardKillDeadline::reported(metadata, self.hard_kill_renewable)
             } else {
                 None
             },

@@ -281,6 +281,20 @@ fn task_scope_fixed_backstop_works_without_registry() {
     let _stop = StopOnDrop(id.clone());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     until(|| root.path().join("alive").exists());
+    assert_eq!(
+        registry
+            .hard_kill_deadline(&id, "task-scope")
+            .unwrap()
+            .limit_ms,
+        1000,
+        "reply ignored the earlier scope deadline"
+    );
+    let note =
+        crate::commands::bash_orchestrate::kill_deadline_note(&registry, &id, "task-scope", true);
+    assert!(
+        !note.contains("so it is not killed while you keep waiting"),
+        "{note}"
+    );
     registry.detach();
     let deadline = Instant::now() + Duration::from_secs(5);
     while std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
