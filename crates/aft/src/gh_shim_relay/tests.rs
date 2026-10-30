@@ -2808,7 +2808,13 @@ async fn governed_write_reply_after_lease_budget_is_still_unknown_without_resend
         "{response:?}"
     );
     assert_eq!(daemon.requests().len(), 1);
-    assert_eq!(daemon.closes(1).await.len(), 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !transport.leases.holders.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timeout must release the lease even when its failed connection is closed");
 }
 
 #[tokio::test(start_paused = true)]
