@@ -18,36 +18,62 @@ fn first_load_memory_corpus() {
         max_file_size: 1 << 20,
     };
     let trigram = Arc::new(TrigramBridge::new(storage.clone(), policy.clone()));
-    let registry = crate::views::registry::FamilyRegistry::open(&storage, "memory").unwrap();
-    let owner = registry
-        .register_view_with_storage(&storage, "worker", &root)
-        .unwrap();
-    let driver = Arc::new(
+    let legacy = std::env::var_os("AFT_VIEW_MEMORY_LEGACY").is_some();
+    let producers = Producers {
+        trigram: policy.fingerprint_hex(),
+        semantic: None,
+        callgraph: crate::views::callgraph::PRODUCER.into(),
+    };
+    let driver = if legacy {
+        let registry = crate::views::registry::FamilyRegistry::open(&storage, "memory").unwrap();
+        let owner = registry
+            .register_view_with_storage(&storage, "worker", &root)
+            .unwrap();
         CheckoutDriver::new(
             owner,
-            Producers {
-                trigram: policy.fingerprint_hex(),
-                semantic: None,
-                callgraph: crate::views::callgraph::PRODUCER.into(),
-            },
+            producers,
             None,
             Arc::new(ConfiguredMembershipWalker),
             vec![trigram, bridge.clone()],
         )
-        .with_adapters(vec![bridge.adapter.clone()]),
-    );
+    } else {
+        CheckoutDriver::new_v3(
+            &storage,
+            "memory",
+            "worker",
+            &root,
+            producers,
+            Arc::new(ConfiguredMembershipWalker),
+            vec![trigram, bridge.clone()],
+        )
+        .unwrap()
+    };
+    let driver = Arc::new(driver.with_adapters(vec![bridge.adapter.clone()]));
     let access = driver.access();
-    let loader = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()]);
     let start = std::time::Instant::now();
-    let result = loader.load(&access).unwrap();
-    assert!(
-        result.pending_planes.is_empty(),
-        "{:?}",
-        result.pending_planes
-    );
-    let reader = bridge.adapter.reader(&access, &result.snapshot).unwrap();
+    let snapshot = if legacy {
+        let result = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])
+            .load(&access)
+            .unwrap();
+        assert!(
+            result.pending_planes.is_empty(),
+            "{:?}",
+            result.pending_planes
+        );
+        result.snapshot
+    } else {
+        let seed = driver.installed_snapshot().generation().clone();
+        let (snapshot, revision) = driver.verified_bind(&access, seed).unwrap();
+        driver.install(&access, &snapshot, revision).unwrap();
+        snapshot
+    };
+    let reader = bridge.adapter.reader(&access, &snapshot).unwrap();
     assert!(reader.store.indexed_file_count().unwrap() > 0);
     crate::test_allocations::heap_marker("first_load", "ready");
+    eprintln!(
+        "first_load_memory database={}",
+        reader.store.sqlite_path().display()
+    );
     eprintln!(
         "first_load_memory wall_s={:.3} files={} storage={}",
         start.elapsed().as_secs_f64(),
