@@ -3806,18 +3806,21 @@ impl BgTaskRegistry {
             // Back off, then reconnect and attach again; never resubmit.
             recovery.pause(point.job_id).await?;
             if let Some(path) = &remote.connection_file {
+                let identity = subc_protocol::BindIdentity::new(
+                    root.display().to_string(),
+                    remote.harness.clone(),
+                    remote.session.clone(),
+                );
                 let reconnected = recovery
-                    .wait(
-                        point.job_id,
-                        ExecRemoteClient::connect(
-                            path,
-                            subc_protocol::BindIdentity::new(
-                                root.display().to_string(),
-                                remote.harness.clone(),
-                                remote.session.clone(),
-                            ),
-                        ),
-                    )
+                    .wait(point.job_id, async {
+                        // The SDK reconnects its transport, but the old provider
+                        // route stays closed. Reuse that connection when possible;
+                        // reread the connection file if the daemon itself changed.
+                        match client.reopen_route(identity.clone()).await {
+                            Ok(reconnected) => Ok(reconnected),
+                            Err(_) => ExecRemoteClient::connect(path, identity).await,
+                        }
+                    })
                     .await?;
                 if let Ok(reconnected) = reconnected {
                     *client = reconnected;

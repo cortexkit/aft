@@ -13248,7 +13248,14 @@ async fn submission_key_queue_wait_does_not_consume_execution_timeout() {
         terminal(&restarted, &task_id).await.info.status,
         BgTaskStatus::Completed
     );
-    assert_eq!(submission_runs(&daemon).len(), 2);
+    assert_eq!(submission_runs(&daemon).len(), 1);
+    let log = daemon.log.lock().unwrap();
+    let attach = log
+        .iter()
+        .find(|(_, body)| body["method"] == "exec.attach")
+        .unwrap();
+    assert_eq!(attach.1["params"]["job_id"], id().to_string());
+    assert_eq!(attach.1["params"]["from_seq"], 0);
 }
 
 fn lost_submission_roots() -> &'static Mutex<HashSet<PathBuf>> {

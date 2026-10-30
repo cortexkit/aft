@@ -469,7 +469,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 let outcome = if initial { Outcome::Exit { code: 0 } } else if unknown { Outcome::OutcomeUnknown } else { Outcome::HistoryExpired };
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), outcome, 0, 0, 0))).unwrap()));
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
-                            } else if attaching && matches!(script, Script::Submission { disconnect: true, .. }) {
+                            } else if attaching && matches!(script, Script::Submission { .. }) {
                                 let from = body["params"]["from_seq"].as_u64().unwrap();
                                 for seq in from..4 {
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(format!("line-{seq}\n").into_bytes())))).unwrap()));
