@@ -517,7 +517,72 @@ impl RunWithFixture {
 }
 
 fn exact_policy_refusal(reason: &str) -> String {
-    format!("gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one ({reason}); use a permitted operation, or ask the operator to update the policy and start the command again.")
+    let mut text = format!("gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one ({reason}); use a permitted operation, or ask the operator to update the policy and start the command again.");
+    if reason == "not_governed" {
+        text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
+    }
+    text
+}
+
+#[test]
+fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
+    let _fixture = RunWithFixture::new(&manifest);
+    let _provisioned = Env::set(
+        crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+        Some(OsStr::new("1")),
+    );
+    let args: Vec<OsString> = ["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let (_capture, lines) = capture_refusals_for_test();
+    let exit = run_with(
+        &args,
+        |_| panic!("head write delegated without bypass"),
+        |_, _, _, _| panic!("head refusal must not need a probe"),
+    );
+    assert_eq!(exit, REFUSAL_EXIT_STATUS);
+    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one (not_governed); use a permitted operation, or ask the operator to update the policy and start the command again. This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.".to_string()]);
+}
+
+#[test]
+fn provisioned_worker_run_rerun_never_suggests_the_operator_bypass() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
+    let _fixture = RunWithFixture::new(&manifest);
+    let _provisioned = Env::set(
+        crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+        Some(OsStr::new("1")),
+    );
+    let _worker = Env::set(
+        crate::gh_shim_speech::start_view::WORKER_POLICY_ENV,
+        Some(OsStr::new("1")),
+    );
+    let args: Vec<OsString> = ["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    for bypass in [None, Some(OsStr::new("operator"))] {
+        let _bypass = Env::set("GH_SHIM_BYPASS", bypass);
+        let (_capture, lines) = capture_refusals_for_test();
+        let exit = run_with(
+            &args,
+            |_| panic!("worker write delegated"),
+            |_, _, _, _| panic!("worker refusal must not need a probe"),
+        );
+        assert_eq!(exit, REFUSAL_EXIT_STATUS);
+        let lines = lines.lock().unwrap();
+        assert_eq!(*lines, vec!["gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead".to_string()]);
+        assert!(!lines[0].contains("GH_SHIM_BYPASS"));
+    }
 }
 
 #[test]
