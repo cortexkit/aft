@@ -847,7 +847,8 @@ impl AftProcess {
         self.wait_for_child_exit(timeout, context)
     }
 
-    /// Send a configure command with project_root.
+    /// Configure a fixture and wait for its folder decision. Tests of the
+    /// acknowledgement itself use `send` or `send_silent` instead.
     pub fn configure(&mut self, project_root: &std::path::Path) -> serde_json::Value {
         // Build via serde_json so Windows paths (with backslashes) are
         // escaped correctly in the wire format. Hand-formatted JSON would
@@ -858,17 +859,17 @@ impl AftProcess {
             "harness": "opencode",
             "project_root": project_root.to_string_lossy(),
         });
-        self.send(&request.to_string())
+        let response = self.send(&request.to_string());
+        if response["success"] == true {
+            self.wait_for_folder_admission();
+        }
+        response
     }
 
     /// Configure an ordinary tool-behavior fixture, not a folder-admission test.
     pub fn configure_project(&mut self, project_root: &std::path::Path) -> serde_json::Value {
         project::ensure_project(project_root).expect("mark test project");
-        let response = self.configure(project_root);
-        if response["success"] == true {
-            self.wait_for_folder_admission();
-        }
-        response
+        self.configure(project_root)
     }
 
     /// The configure acknowledgement precedes the folder decision. Fixtures
