@@ -8300,22 +8300,35 @@ mod grant_path_tests {
 
         // Model the scheduler/callback gap with admitted=false while keeping
         // the occupant stable, without relying on operating-system scheduling.
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock the refusal falls back to the generic sentence, by design.
+        // Retry until a read gets through, so the assertions below compare the
+        // own-job and other-job answers rather than lock timing.
         let ((own, other), lines) = crate::logging::capture_log_lines(|| {
             let refusal = |token: &JobCancellation| {
-                startup_deadline_response(
-                    "waiting-call",
-                    &crate::bash_background::StartupOutcome::Refused,
-                    80,
-                    None,
-                    false,
-                    false,
-                    false,
-                    &executor,
-                    &root,
-                    token,
-                    false,
-                    crate::bash_background::BashStartupStep::Admission,
-                )
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let response = startup_deadline_response(
+                        "waiting-call",
+                        &crate::bash_background::StartupOutcome::Refused,
+                        80,
+                        None,
+                        false,
+                        false,
+                        false,
+                        &executor,
+                        &root,
+                        token,
+                        false,
+                        crate::bash_background::BashStartupStep::Admission,
+                    );
+                    if response.data.get("detail").is_some()
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return response;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             };
             (refusal(&current), refusal(&JobCancellation::new()))
         });
