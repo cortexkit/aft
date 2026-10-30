@@ -150,29 +150,35 @@ fn open_permission_fixture(
 }
 
 #[cfg(windows)]
+fn icacls_for_test(path: &Path, action: &str, rights: &str) {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args([action, rights])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "icacls: {output:?}");
+}
+
+#[cfg(windows)]
+pub(crate) struct DeniedReadForTest(PathBuf);
+
+#[cfg(windows)]
+impl Drop for DeniedReadForTest {
+    fn drop(&mut self) {
+        icacls_for_test(&self.0, "/remove:d", "*S-1-1-0");
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn deny_read_for_test<T>(
     path: &Path,
     operation: &str,
     probe: impl FnOnce() -> std::io::Result<T>,
-) -> (impl Drop, bool) {
-    fn icacls(path: &Path, action: &str, rights: &str) {
-        let output = std::process::Command::new("icacls")
-            .arg(path)
-            .args([action, rights])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "icacls: {output:?}");
-    }
-    struct Restore(PathBuf);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            icacls(&self.0, "/remove:d", "*S-1-1-0");
-        }
-    }
+) -> (DeniedReadForTest, bool) {
     // Everyone's read-data right is also the directory-listing right. A SID
     // avoids depending on the localized account name on the Windows runner.
-    icacls(path, "/deny", "*S-1-1-0:(RD)");
-    let restore = Restore(path.to_path_buf());
+    icacls_for_test(path, "/deny", "*S-1-1-0:(RD)");
+    let restore = DeniedReadForTest(path.to_path_buf());
     // Installing an access control entry does not prove the process observes it.
     // Probe the operation the fixture needs denied before asserting denial-dependent behavior.
     let enforced = match probe() {
