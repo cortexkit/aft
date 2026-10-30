@@ -339,7 +339,7 @@ fn write_failure_marker(path: &Path) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(b"sandbox_unavailable")?;
-    file.sync_all()
+    aft::sync_cli_failure_marker(&file, path)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -727,6 +727,26 @@ mod tests {
         assert!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } >= 0);
         drop(file);
         assert_eq!(std::fs::read(path).unwrap(), b"sandbox_unavailable");
+    }
+
+    #[test]
+    fn failure_marker_is_durable_on_the_project_filesystem() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Use the project mount, not the system temp mount, to cover shared
+        // filesystems that support fsync but reject Apple's full-sync command.
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let directory = tempfile::tempdir_in(scratch).unwrap();
+        let path = directory.path().join("failure");
+
+        write_failure_marker(&path).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"sandbox_unavailable");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

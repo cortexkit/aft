@@ -1180,18 +1180,23 @@ impl DirtyOutput {
         stdout: &fs::File,
         stderr: &fs::File,
         unknown: Option<&fs::File>,
+        paths: &super::super::persistence::TaskPaths,
     ) -> io::Result<()> {
-        fn sync_dirty(file: &fs::File, dirty: &mut bool) -> io::Result<()> {
+        fn sync_dirty(file: &fs::File, path: &Path, dirty: &mut bool) -> io::Result<()> {
             if *dirty {
-                super::super::persistence::sync_task_file(file)?;
+                super::super::persistence::sync_task_file(file, path)?;
                 *dirty = false;
             }
             Ok(())
         }
-        sync_dirty(stdout, &mut self.stdout)?;
-        sync_dirty(stderr, &mut self.stderr)?;
+        sync_dirty(stdout, &paths.stdout, &mut self.stdout)?;
+        sync_dirty(stderr, &paths.stderr, &mut self.stderr)?;
         if let Some(file) = unknown {
-            sync_dirty(file, &mut self.unknown)?;
+            sync_dirty(
+                file,
+                &paths.io_dir.join("remote-unknown-output"),
+                &mut self.unknown,
+            )?;
         }
         Ok(())
     }
@@ -1382,8 +1387,12 @@ impl TaskSink {
         )
         .collect();
         if !losses.is_empty() {
-            sink.dirty
-                .sync(&sink.stdout, &sink.stderr, sink.unknown.as_ref())?;
+            sink.dirty.sync(
+                &sink.stdout,
+                &sink.stderr,
+                sink.unknown.as_ref(),
+                &sink.task.paths,
+            )?;
             let mut db = DeferredDbWrites::new(registry, &sink.task);
             let mut state = sink
                 .task
@@ -1453,8 +1462,12 @@ impl TaskSink {
     fn commit(&mut self, update: impl FnOnce(&mut RemoteTask)) -> io::Result<()> {
         // Acceptance, start, and terminal records save output progress too, so
         // their metadata must not become durable before the output files.
-        self.dirty
-            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
+        self.dirty.sync(
+            &self.stdout,
+            &self.stderr,
+            self.unknown.as_ref(),
+            &self.task.paths,
+        )?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
         let mut state = self
             .task
@@ -1529,8 +1542,12 @@ impl TaskSink {
     fn checkpoint_progress(&mut self) -> io::Result<()> {
         // A saved cursor must never cover output bytes that are not yet on
         // disk: after a restart the output files are cut to the saved lengths.
-        self.dirty
-            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
+        self.dirty.sync(
+            &self.stdout,
+            &self.stderr,
+            self.unknown.as_ref(),
+            &self.task.paths,
+        )?;
         let progress = self.output_progress;
         let (snapshot, json_writes_seen, previous) = {
             let mut state = self
@@ -2006,8 +2023,12 @@ impl TaskSink {
     }
 
     fn truncate_output(&mut self, before_seq: u64, kind: MissingRecords) -> io::Result<()> {
-        self.dirty
-            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
+        self.dirty.sync(
+            &self.stdout,
+            &self.stderr,
+            self.unknown.as_ref(),
+            &self.task.paths,
+        )?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
         let mut state = self
             .task
@@ -2064,7 +2085,8 @@ fn save_retry_request(task: &BgTask, request: &RunRequest) -> Result<String, Str
         &bytes,
     )
     .map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
+    crate::durability::sync_file(&file, &task.paths.control_dir.join("remote-retry-request"))
+        .map_err(|e| e.to_string())?;
     Ok(retry_request_digest(task, &bytes))
 }
 

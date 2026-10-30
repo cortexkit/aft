@@ -760,7 +760,7 @@ fn copy_dir_recursive(root: &Path, source: &Path, target: &Path) -> io::Result<u
         };
         bytes = bytes.saturating_add(copied);
     }
-    sync_path(target);
+    let _ = crate::durability::sync_dir(target);
     Ok(bytes)
 }
 
@@ -1053,7 +1053,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 
 fn sync_path(path: &Path) {
     if let Ok(file) = File::open(path) {
-        let _ = file.sync_all();
+        let _ = crate::durability::sync_file(&file, path);
     }
 }
 

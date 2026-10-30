@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/lib.rs"
+  ],
+  "slices": [
+    "macos-fullsync-fallback"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/lib.rs, which only gains a doc-hidden sync helper for the CLI binary. Durable writes fall back from F_FULLFSYNC to fsync on macOS filesystems that reject full sync, and every production sync goes through the shared helper. No search, indexing, query routing or ranking code changes; ranked rows must remain byte-identical to the committed reference."
+}

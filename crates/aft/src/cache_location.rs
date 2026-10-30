@@ -1204,7 +1204,7 @@ pub fn prepare_cache_root(
                         })
                         .map_err(io::Error::other)?,
                     )?;
-                    marker.sync_all()?;
+                    crate::durability::sync_file(&marker, &lease.root.path().join(OWNER))?;
                 }
                 Err(error) => return Err(error),
             }

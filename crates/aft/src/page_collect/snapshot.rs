@@ -349,12 +349,13 @@ pub(crate) struct Builder {
 impl SnapshotSink for Builder {
     fn add(&mut self, path: &str, bytes: &[u8]) -> io::Result<FileRecord> {
         let disk_name = format!("f{}", self.files.len());
+        let file_path = self.dir.join(&disk_name);
         let mut file = crate::private_storage::options()
             .write(true)
             .create_new(true)
-            .open(self.dir.join(&disk_name))?;
+            .open(&file_path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, &file_path)?;
         let record = FileRecord {
             path: path.to_string(),
             size: bytes.len() as u64,
