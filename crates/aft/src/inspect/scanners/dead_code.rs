@@ -13,9 +13,9 @@ use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
-    canonicalize_normalized, dead_code_skipped_language, is_test_tree_file, language_name,
-    ExcludedTestTally, CALLGRAPH_PROVENANCE_REEXPORT, CALLGRAPH_PROVENANCE_TREESITTER,
-    DISPATCHED_CALLEE_SEPARATOR,
+    canonicalize_normalized as canonicalize_uncached, dead_code_skipped_language,
+    is_test_tree_file, language_name, ExcludedTestTally, CALLGRAPH_PROVENANCE_REEXPORT,
+    CALLGRAPH_PROVENANCE_TREESITTER, DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
@@ -41,6 +41,60 @@ const RUST_MACRO_REF_SHAPE_STRUCT: &str = "struct";
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 
 type ExportNode = (String, String);
+
+// A scan and its rollup share physical path identities, including on Rayon
+// workers. Never retain them across jobs: a symlink or missing file can change
+// between requests, and the next job must resolve it again.
+#[derive(Default)]
+struct CanonicalPaths {
+    paths: parking_lot::RwLock<HashMap<PathBuf, PathBuf>>,
+}
+
+thread_local! {
+    static CANONICAL_PATHS: std::cell::RefCell<Option<Arc<CanonicalPaths>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn current_canonical_paths() -> Option<Arc<CanonicalPaths>> {
+    CANONICAL_PATHS.with(|slot| slot.borrow().clone())
+}
+
+struct CanonicalPathsScope(Option<Arc<CanonicalPaths>>);
+
+impl Drop for CanonicalPathsScope {
+    fn drop(&mut self) {
+        CANONICAL_PATHS.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn canonical_paths_scope(paths: Option<Arc<CanonicalPaths>>) -> CanonicalPathsScope {
+    CanonicalPathsScope(CANONICAL_PATHS.with(|slot| slot.replace(paths)))
+}
+
+fn with_canonical_paths<T>(paths: Option<Arc<CanonicalPaths>>, run: impl FnOnce() -> T) -> T {
+    let _restore = canonical_paths_scope(paths);
+    run()
+}
+
+fn with_job_canonical_paths<T>(run: impl FnOnce() -> T) -> T {
+    with_canonical_paths(Some(Arc::default()), run)
+}
+
+fn canonicalize_normalized(path: &Path) -> PathBuf {
+    match current_canonical_paths() {
+        Some(paths) => {
+            if let Some(canonical) = paths.paths.read().get(path) {
+                return canonical.clone();
+            }
+            paths
+                .paths
+                .write()
+                .entry(path.to_path_buf())
+                .or_insert_with(|| canonicalize_uncached(path))
+                .clone()
+        }
+        None => canonicalize_uncached(path),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GraphTargets {
@@ -469,6 +523,14 @@ fn run_dead_code_scan_with_oxc_started(
     oxc_result: Option<&OxcEngineResult>,
     started: Instant,
 ) -> InspectResult {
+    with_job_canonical_paths(|| run_dead_code_scan_body(job, oxc_result, started))
+}
+
+fn run_dead_code_scan_body(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    started: Instant,
+) -> InspectResult {
     let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
         let success = InspectScanSuccess {
             scanned_files: job.scope_files.clone(),
@@ -508,6 +570,7 @@ fn run_dead_code_scan_with_oxc_started(
         .unwrap_or_default();
 
     let cancellation = crate::executor::current_job_cancellation();
+    let canonical_paths = current_canonical_paths();
     let contributions = job
         .scope_files
         .par_iter()
@@ -519,15 +582,17 @@ fn run_dead_code_scan_with_oxc_started(
                 return None;
             }
             let mut file_analyzer = DeadCodeFileAnalyzer::default();
-            Some(gather_file_contribution(
-                job,
-                file,
-                &fallback_exports_by_file,
-                &oxc_facts_by_file,
-                &oxc_parse_errors_by_file,
-                &oxc_skipped_files,
-                &mut file_analyzer,
-            ))
+            Some(with_canonical_paths(canonical_paths.clone(), || {
+                gather_file_contribution(
+                    job,
+                    file,
+                    &fallback_exports_by_file,
+                    &oxc_facts_by_file,
+                    &oxc_parse_errors_by_file,
+                    &oxc_skipped_files,
+                    &mut file_analyzer,
+                )
+            }))
         })
         .collect::<Vec<_>>();
     if crate::executor::current_job_cancelled() {
@@ -539,14 +604,18 @@ fn run_dead_code_scan_with_oxc_started(
         return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
     }
     let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
-    let aggregate = aggregate_dead_code_contributions_with_snapshot(
+    let aggregate = aggregate_dead_code_contributions_incremental_body(
         &job.project_root,
         snapshot,
         &contributions,
         &public_api_files,
         &roles,
         None,
-    );
+        None,
+        None,
+        &BTreeSet::new(),
+    )
+    .0;
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
         contributions,
@@ -951,6 +1020,33 @@ pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate_dead_code_contributions_incremental(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    contributions: &[FileContribution],
+    public_api_files: &BTreeSet<String>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
+    drill_down_limit: Option<usize>,
+    cache_key: Option<&str>,
+    previous: Option<&DeadCodeRollupState>,
+    changed_files: &BTreeSet<String>,
+) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
+    with_job_canonical_paths(|| {
+        aggregate_dead_code_contributions_incremental_body(
+            project_root,
+            snapshot,
+            contributions,
+            public_api_files,
+            roles,
+            drill_down_limit,
+            cache_key,
+            previous,
+            changed_files,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_dead_code_contributions_incremental_body(
     project_root: &Path,
     snapshot: &CallgraphSnapshot,
     contributions: &[FileContribution],
@@ -7434,6 +7530,162 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uncached_relative_path(root: &Path, path: &Path) -> String {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let root = canonicalize_uncached(root);
+        let path = canonicalize_uncached(&absolute);
+        path.strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    #[test]
+    fn relative_paths_resolve_once_per_job_across_parallel_items() {
+        let (_temp, root, _) = canonical_fixture(&[("src/a.rs", "fn a() {}\n")]);
+        let files = [
+            root.join("src/a.rs"),
+            PathBuf::from("src/a.rs"),
+            root.join("src/missing.rs"),
+        ];
+        let requests = (0..64)
+            .flat_map(|_| files.iter().cloned())
+            .collect::<Vec<_>>();
+        let expected = requests
+            .iter()
+            .map(|path| uncached_relative_path(&root, path))
+            .collect::<Vec<_>>();
+        let paths = Arc::new(CanonicalPaths::default());
+        let actual = with_canonical_paths(Some(Arc::clone(&paths)), || {
+            requests
+                .par_iter()
+                .map(|path| {
+                    with_canonical_paths(Some(Arc::clone(&paths)), || relative_path(&root, path))
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let resolved = paths.paths.read();
+        assert_eq!(
+            resolved.len(),
+            3,
+            "one root and two distinct absolute paths"
+        );
+        assert!(resolved.contains_key(&root));
+        assert!(resolved.contains_key(&root.join("src/a.rs")));
+        assert!(resolved.contains_key(&root.join("src/missing.rs")));
+        assert!(current_canonical_paths().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_job_cache_preserves_aliases_and_rechecks_next_job() {
+        let (temp, root, _) =
+            canonical_fixture(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let link = root.join("src/link.rs");
+        std::os::unix::fs::symlink("a.rs", &link).unwrap();
+        with_job_canonical_paths(|| {
+            for path in [
+                &link,
+                &alias.join("src/link.rs"),
+                &root.join("src/missing/../a.rs"),
+            ] {
+                assert_eq!(
+                    relative_path(&alias, path),
+                    uncached_relative_path(&alias, path)
+                );
+            }
+            assert_eq!(relative_path(&alias, &link), "src/a.rs");
+        });
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("b.rs", &link).unwrap();
+        assert_eq!(
+            with_job_canonical_paths(|| relative_path(&alias, &link)),
+            "src/b.rs"
+        );
+    }
+
+    #[test]
+    fn cached_scan_keeps_contribution_and_aggregate_bytes() {
+        let (_temp, root, files) = canonical_fixture(&[(
+            "main.rs",
+            "fn main() { helper(); }\nfn helper() {}\nfn unused() {}\n",
+        )]);
+        let graph = snapshot(
+            files.clone(),
+            vec![
+                export(&root, "main.rs", "helper", "function"),
+                export(&root, "main.rs", "unused", "function"),
+            ],
+            vec![outbound(&root, "main.rs", "main", "helper")],
+        );
+        let job = job(&root, files, graph);
+        let before = run_dead_code_scan_body(&job, None, Instant::now())
+            .outcome
+            .unwrap();
+        let after = run_dead_code_scan(&job).outcome.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&before.aggregate).unwrap(),
+            serde_json::to_vec(&after.aggregate).unwrap()
+        );
+        let payloads = |success: &InspectScanSuccess| {
+            serde_json::to_vec(
+                &success
+                    .contributions
+                    .iter()
+                    .map(|row| &row.contribution)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        assert_eq!(payloads(&before), payloads(&after));
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
+    fn live_cpu_relative_paths_checkout_cost() {
+        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let mut parser = crate::parser::SymbolCache::new();
+        let mut requests = Vec::new();
+        let mut files = 0;
+        for path in crate::callgraph::walk_project_files(&root) {
+            if let Ok(symbols) = parser.extract_symbols(&path) {
+                files += 1;
+                requests.extend(symbols.iter().map(|_| path.clone()));
+            }
+        }
+        let before = Instant::now();
+        let expected = requests
+            .par_iter()
+            .map(|path| uncached_relative_path(&root, path))
+            .collect::<Vec<_>>();
+        let before_time = before.elapsed();
+        let paths = Arc::new(CanonicalPaths::default());
+        let after = Instant::now();
+        let actual = requests
+            .par_iter()
+            .map(|path| {
+                with_canonical_paths(Some(Arc::clone(&paths)), || relative_path(&root, path))
+            })
+            .collect::<Vec<_>>();
+        let after_time = after.elapsed();
+        assert_eq!(
+            serde_json::to_vec(&expected).unwrap(),
+            serde_json::to_vec(&actual).unwrap()
+        );
+        println!("relative paths: files={files} items={} before={before_time:?} realpath_calls={} after={after_time:?} realpath_calls={}", requests.len(), requests.len() * 2, paths.paths.read().len());
+    }
+
     use std::fs;
     #[test]
     fn cached_dead_code_decode_gap_is_named_incomplete_and_repairable() {
