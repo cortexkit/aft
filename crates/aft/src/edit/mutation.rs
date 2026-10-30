@@ -185,20 +185,23 @@ type BeforeCheck = std::sync::Arc<dyn Fn() + Send + Sync>;
 static BEFORE_CHECK: LazyLock<Mutex<HashMap<PathBuf, BeforeCheck>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Hooks are keyed by the resolved path, so a hook set for a test's path
+/// fires however a tool spells it (on Windows, `apply_patch` and the test can
+/// differ by the `\\?\` prefix).
 #[cfg(test)]
 pub(crate) fn set_before_check(path: &Path, hook: Option<BeforeCheck>) {
     let mut hooks = BEFORE_CHECK.lock();
     if let Some(hook) = hook {
-        hooks.insert(path.to_path_buf(), hook);
+        hooks.insert(resolved(path), hook);
     } else {
-        hooks.remove(path);
+        hooks.remove(&resolved(path));
     }
 }
 
 pub(crate) fn before_check(path: &Path) {
     #[cfg(test)]
     {
-        let hook = BEFORE_CHECK.lock().get(path).cloned();
+        let hook = BEFORE_CHECK.lock().get(&resolved(path)).cloned();
         if let Some(hook) = hook {
             hook();
         }
