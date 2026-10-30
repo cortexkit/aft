@@ -954,6 +954,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "caps bytes inspected for a file's line-count statistic; the file remains in the outline with an unknown line count, so no agent-visible list items are removed",
     },
     ExclusionEntry {
+        file: "commands/outline.rs",
+        enclosing_item: "files_walk_stall_keeps_examined_paths_and_named_gap",
+        location_or_primitive: "collection_truncated regression assertion",
+        reason: "a test observes incomplete discovery; the assertion does not cut an agent-visible list",
+    },
+    ExclusionEntry {
         file: "commands/read.rs",
         enclosing_item: "handle_streaming_range_read",
         location_or_primitive: "bounded streamed line window",
