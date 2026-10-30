@@ -57,8 +57,8 @@ const MANAGED_GIT_HOOK_NAMES: &[&str] = &[
     "post-index-change",
     "reference-transaction",
 ];
-const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
-const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
+pub(crate) const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
+pub(crate) const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";

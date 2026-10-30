@@ -339,6 +339,16 @@ async fn pinned_executable_real_server_survives_binary_replacement_and_cleans_de
         "clean exit removed another daemon's pin"
     );
 
+    // Repair must use the open startup image, not the replacement executable
+    // now occupying the deployment pathname.
+    std::fs::remove_dir_all(&first_pin).unwrap();
+    let repaired = foreground(&mut aft, "gh --shim-version").await;
+    assert_eq!(repaired["status"], "completed", "{repaired:?}");
+    let output = repaired["output"].as_str().unwrap();
+    assert!(output.contains("\"shim_version\""), "{repaired:?}");
+    assert!(!output.contains("REPLACEMENT_IMAGE"), "{repaired:?}");
+    assert_eq!(std::fs::read_link(&gh).unwrap(), pinned_image);
+
     // A crash cannot run exit cleanup; the next daemon must reclaim its pin.
     aft.module.child.kill().unwrap();
     assert!(!aft.module.wait_for_exit("crashed pinned daemon").success());

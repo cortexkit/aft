@@ -1564,29 +1564,30 @@ pub fn resolve_sandbox_spawn(
 
     #[cfg(unix)]
     {
-        let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
-            Ok(profile) => profile,
-            Err(error) => {
-                return sandbox_setup_refusal(ctx, principal, error);
-            }
-        };
-        let launcher_path = match native_launcher_path(ctx) {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = cleanup_task_temp_dir(&profile.temp_dir);
-                return sandbox_setup_refusal(
-                    ctx,
-                    principal,
-                    format!("failed to locate the aft executable: {error}"),
-                );
-            }
-        };
-        crate::slog_info!(
+        let resolved = crate::pinned_executable::with_task_image(task_bundle_dir, || {
+            let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return sandbox_setup_refusal(ctx, principal, error);
+                }
+            };
+            let launcher_path = match native_launcher_path(ctx) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = cleanup_task_temp_dir(&profile.temp_dir);
+                    return sandbox_setup_refusal(
+                        ctx,
+                        principal,
+                        format!("failed to locate the aft executable: {error}"),
+                    );
+                }
+            };
+            crate::slog_info!(
             "sandbox profile apply: tier=native task_kind={task_kind:?} writable_roots={} read_deny={}",
             profile.writable_roots.len(),
             profile.read_deny.len()
         );
-        crate::slog_debug!(
+            crate::slog_debug!(
             "sandbox profile paths: tier=native writable_roots={:?} write_deny_nested={:?} read_deny={:?} socket_deny={:?} cache_roots={:?} temp_dir={:?}",
             profile.writable_roots,
             profile.write_deny_nested,
@@ -1595,9 +1596,18 @@ pub fn resolve_sandbox_spawn(
             profile.cache_roots,
             profile.temp_dir
         );
-        SpawnPlan::Launcher {
-            profile,
-            launcher_path,
+            SpawnPlan::Launcher {
+                profile,
+                launcher_path,
+            }
+        });
+        match resolved {
+            Ok(plan) => plan,
+            Err(error) => sandbox_setup_refusal(
+                ctx,
+                principal,
+                format!("failed to retain the startup executable for the task: {error}"),
+            ),
         }
     }
 
@@ -5720,9 +5730,13 @@ fn isolated_environment_for_plan(
     }
     match plan.policy() {
         SpawnPlan::Host { environment, .. } => Some(environment.clone()),
-        SpawnPlan::Launcher { profile, .. } => {
+        SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        } => {
             let mut environment =
                 sandboxed_child_environment(request_environment, &profile.temp_dir);
+            crate::pinned_executable::task_environment(launcher_path, &mut environment);
             #[cfg(target_os = "macos")]
             if profile.temp_dir.join(".worker-bin/mktemp").is_file() {
                 let mut paths = vec![profile.temp_dir.join(".worker-bin")];
