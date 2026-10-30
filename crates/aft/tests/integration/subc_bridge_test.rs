@@ -13799,7 +13799,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(root1.clone(), "opencode".into(), "census-scoped".into()),
+            identity: BindIdentity::new(root1.clone(), "opencode", "census-scoped"),
             principal: Some(owner),
             scope: Some(stamp),
             consumer_capabilities: None,
