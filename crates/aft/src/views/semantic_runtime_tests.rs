@@ -723,7 +723,11 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
         })
     };
     let hang_guard = Duration::from_secs(20);
-    let parked = observer.rx.recv_timeout(hang_guard).ok();
+    let parked = observer
+        .rx
+        .recv_timeout(hang_guard)
+        .map(|event| event.state)
+        .ok();
     if parked != Some("parked") {
         slot.clear();
         worker.join().unwrap();
@@ -735,7 +739,7 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
     slot.wake();
     let deadline = Instant::now() + hang_guard;
     let finished = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("wake") => continue,
             event => break event.ok(),
         }
@@ -804,7 +808,11 @@ fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
             (result, attempts)
         })
     };
-    let parked = observer.rx.recv_timeout(Duration::from_secs(20)).ok();
+    let parked = observer
+        .rx
+        .recv_timeout(Duration::from_secs(20))
+        .map(|event| event.state)
+        .ok();
     if parked != Some("parked") {
         slot.clear();
         let (result, _) = worker.join().unwrap();
@@ -3320,7 +3328,11 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     // event waits have only a hang guard; no edit, wake or rebind drives recovery.
     let hang_guard = Duration::from_secs(60);
     // A second refused connection proves a timer fires without any wake.
-    let retried = observer.rx.recv_timeout(hang_guard).ok();
+    let retried = observer
+        .rx
+        .recv_timeout(hang_guard)
+        .map(|event| event.state)
+        .ok();
     if retried != Some("unavailable") {
         slot.clear();
         worker.join().unwrap();
@@ -3333,7 +3345,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     backend.start(200);
     let deadline = Instant::now() + hang_guard;
     let recovered = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("unavailable") => continue,
             event => break event.ok(),
         }
@@ -3562,7 +3574,7 @@ fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
     // and finish the fill; a fill that never settles still fails here.
     let deadline = Instant::now() + Duration::from_secs(30);
     let settled = loop {
-        match observer.rx.recv_deadline(deadline) {
+        match observer.rx.recv_deadline(deadline).map(|event| event.state) {
             Ok("retry") => continue,
             event => break event.ok(),
         }
@@ -4346,4 +4358,24 @@ fn no_subscription_refresh_installs_and_answers_complete() {
         cold(root.path(), "gamma rewritten").0
     );
     assert_eq!(pending_semantic(&runtime), 0);
+}
+
+#[test]
+fn fill_observer_waits_through_retry_until_settled() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    observe_fill(root.path(), "settled");
+    observer.wait_until_settled(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn fill_observer_retry_without_settlement_fails_with_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    observe_fill_with_reason(root.path(), "retry", Some("temporary backend failure"));
+    let error = observer
+        .wait_until_settled(Duration::from_millis(20))
+        .unwrap_err();
+    assert!(error.contains("temporary backend failure"), "{error}");
 }
