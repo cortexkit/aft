@@ -1319,7 +1319,8 @@ fn a_changed_binding_generation_triggers_a_new_check() {
 
 #[test]
 fn production_governed_relay_budget_covers_the_post_send_wait() {
-    assert_eq!(RELAY_BUDGET, Duration::from_secs(180));
+    assert_eq!(RELAY_BUDGET, Duration::from_secs(210));
+    assert_eq!(MIN_WRITE_DISPATCH_BUDGET, Duration::from_secs(175));
     assert_eq!(READ_RELAY_BUDGET, Duration::from_secs(30));
     if std::env::var_os(REQUEST_TIMEOUT_TEST_ENV).is_none() {
         assert_eq!(RelayContext::from_process().relay_budget, RELAY_BUDGET);
@@ -1367,7 +1368,7 @@ async fn write_exchange_allows_the_long_reply_but_binding_reads_remain_short() {
         .unwrap();
     assert_eq!(
         *io.timeouts.lock().unwrap(),
-        vec![Duration::from_secs(30), Duration::from_secs(170)]
+        vec![Duration::from_secs(30), Duration::from_secs(200)]
     );
 }
 
@@ -1781,4 +1782,73 @@ fn a_github_head_refusal_is_relayed_verbatim_and_never_retried() {
             .code,
         "pr_head_cross_repository"
     );
+}
+
+#[test]
+fn a_late_known_refusal_declines_retry_before_dispatch_with_the_approved_not_run_line() {
+    struct LateRefusal {
+        now: std::cell::Cell<Instant>,
+        sent: std::cell::RefCell<Vec<Value>>,
+    }
+    impl ExchangeIo for LateRefusal {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        async fn sleep(&self, delay: Duration) {
+            self.now.set(self.now() + delay);
+        }
+        async fn request(&self, bytes: Vec<u8>, _: CallOptions) -> Result<Vec<u8>, CallError> {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if body["op"] == BINDINGS_READ_OPERATION {
+                return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+            }
+            self.sent.borrow_mut().push(body);
+            self.now.set(self.now() + Duration::from_secs(40));
+            Ok(serde_json::to_vec(&plexus_refused("store_failure")).unwrap())
+        }
+    }
+    let started = Instant::now();
+    let io = LateRefusal {
+        now: std::cell::Cell::new(started),
+        sent: Default::default(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(temp.path().join("state"));
+    let manifest = v12_manifest();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let timing = Exchange {
+        io: &io,
+        ticket: "test-ticket",
+        stage: &stage,
+        started,
+        budget: RELAY_BUDGET,
+    };
+    let body = json!({"op":BOT_REQUEST_OPERATION,"params":{"request_nonce":"same-nonce"}});
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            TRANSIENT_RETRY_DELAYS,
+        ));
+    let RouteOutcome::GovernanceUnavailableTimedOut { stage, elapsed_ms } = outcome else {
+        panic!("expected a proven not-sent timeout, not outcome_unknown: {outcome:?}");
+    };
+    assert_eq!(stage, ProbeStage::Request);
+    assert_eq!(elapsed_ms, 45_000);
+    assert_eq!(
+        io.sent.borrow().as_slice(),
+        &[body],
+        "only the known-refused attempt reached the wire"
+    );
+    assert_eq!(super::super::governance_probe_timeout_text(elapsed_ms, stage),
+        "governance probe timed out after 45000 ms at request (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry");
 }

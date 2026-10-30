@@ -37,7 +37,10 @@ const RELAY_MODULE_ID: &str = "aft";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for the whole governed exchange, including preflight and cleanup
 /// around the daemon's 160 s post-send write wait. Retries share this ceiling.
-const RELAY_BUDGET: Duration = Duration::from_secs(180);
+const RELAY_BUDGET: Duration = Duration::from_secs(210);
+// A management dispatch still has up to 9.75 s of daemon preflight before
+// Plexus's 160 s reply wait, followed by at most 5 s of route cleanup.
+const MIN_WRITE_DISPATCH_BUDGET: Duration = Duration::from_secs(175);
 const READ_RELAY_BUDGET: Duration = Duration::from_secs(30);
 /// Debug builds only: lets the binary-level tests shorten the relay budget
 /// so a silent daemon does not cost them the full production wait.
@@ -724,6 +727,17 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
             .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
         let now = self.io.now();
         let remaining = self.deadline().saturating_duration_since(now);
+        // Explicit debug/test budget overrides deliberately allow shorter waits.
+        // Production must not enqueue a write that cannot get its full reply window.
+        if body["op"] == BOT_REQUEST_OPERATION
+            && self.budget == RELAY_BUDGET
+            && remaining < MIN_WRITE_DISPATCH_BUDGET
+        {
+            return Err(RouteOutcome::GovernanceUnavailableTimedOut {
+                stage: ProbeStage::Request,
+                elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
+            });
+        }
         if remaining.is_zero() {
             return Err(RouteOutcome::Unavailable(format!(
                 "the gh relay's {} ms budget ran out before the request could be sent; nothing was sent",
