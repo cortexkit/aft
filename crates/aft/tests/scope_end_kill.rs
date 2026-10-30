@@ -194,7 +194,12 @@ impl Daemon {
         let child = command.spawn().unwrap();
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
-            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "module did not attach: {error}; stderr: {}",
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                )
+            })
             .unwrap();
         authenticate_server(
             &mut socket,
