@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 enum Key {
     Path(PathBuf),
     File(FileIdentity),
+    Entry(FileIdentity, std::ffi::OsString),
 }
 
 static HELD: LazyLock<(Mutex<HashMap<Key, usize>>, Condvar)> =
@@ -47,6 +48,7 @@ fn resolved(path: &Path) -> PathBuf {
 /// Admit a sorted set in one registry turn, never holding one file while
 /// waiting for another. Native identities also serialize hard-link aliases;
 /// resolved names remain stable when an atomic rename changes the inode.
+/// Parent identities protect new names reached through directory aliases too.
 pub(crate) fn lock_files(paths: &[&Path]) -> Vec<FileLock> {
     let mut entries: Vec<_> = paths
         .iter()
@@ -58,6 +60,17 @@ pub(crate) fn lock_files(paths: &[&Path]) -> Vec<FileLock> {
         .iter()
         .map(|(name, path, _)| {
             let mut keys = vec![Key::Path(name.clone())];
+            if let (Some(parent), Some(leaf)) = (name.parent(), name.file_name()) {
+                if let Ok((_, identity)) = crate::file_identity::metadata(parent) {
+                    if identity != FileIdentity::Unavailable {
+                        #[cfg(windows)]
+                        let leaf = std::ffi::OsString::from(leaf.to_string_lossy().to_lowercase());
+                        #[cfg(not(windows))]
+                        let leaf = leaf.to_os_string();
+                        keys.push(Key::Entry(identity, leaf));
+                    }
+                }
+            }
             if let Ok((_, identity)) = crate::file_identity::metadata(path) {
                 if identity != FileIdentity::Unavailable {
                     keys.push(Key::File(identity));
@@ -96,19 +109,19 @@ pub(crate) struct Version {
 }
 
 impl Version {
-    pub(crate) fn read(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn read(path: &Path) -> Self {
         let mut version = Self::existing(path, std::sync::Arc::from([]));
         match std::fs::read(path) {
             Ok(bytes) => {
                 version.bytes = Some(bytes.into());
-                Ok(version)
+                version
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::missing(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::missing(path),
             // Preserve the tool's ordinary per-file I/O failure handling. Stat
             // evidence still protects unreadable paths and directories.
             Err(_) => {
                 version.bytes = None;
-                Ok(version)
+                version
             }
         }
     }

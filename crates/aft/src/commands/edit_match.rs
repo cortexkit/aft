@@ -203,10 +203,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         return edit::no_change_response(&req.id);
     }
 
-    let version = match edit::mutation::Version::read(path.as_path()) {
-        Ok(version) => version,
-        Err(error) => return Response::error(&req.id, "io_error", error.to_string()),
-    };
+    let version = edit::mutation::Version::read(path.as_path());
     edit::mutation::before_check(path.as_path());
     let file_locks = edit::mutation::lock_files(&[path.as_path()]);
     if let Err(error) = version.check(path.as_path()) {

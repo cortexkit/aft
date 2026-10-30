@@ -46,15 +46,8 @@ impl PatchAdmission {
         paths.sort();
         let versions: Vec<_> = paths
             .iter()
-            .map(|path| {
-                edit::mutation::Version::read(path).map_err(|error| {
-                    crate::error::AftError::IoError {
-                        path: path.display().to_string(),
-                        message: error.to_string(),
-                    }
-                })
-            })
-            .collect::<Result<_, _>>()?;
+            .map(|path| edit::mutation::Version::read(path))
+            .collect();
         for path in &paths {
             edit::mutation::before_check(path);
         }

@@ -38,7 +38,7 @@ fn request(tool: Tool, path: &Path, number: usize) -> RawRequest {
         ),
         Tool::Ast => (
             "ast_replace",
-            json!({"paths": [path], "lang": "typescript", "pattern": "const value = 1;", "rewrite": format!("const value = {number};")}),
+            json!({"paths": [path], "lang": "typescript", "pattern": "const value = 1;", "rewrite": format!("const value = {number};"), "dry_run": false}),
         ),
         Tool::Import => (
             "add_import",
@@ -50,7 +50,7 @@ fn request(tool: Tool, path: &Path, number: usize) -> RawRequest {
         ),
         Tool::Symbol => (
             "edit_symbol",
-            json!({"file": path, "symbol": "value", "operation": "replace", "content": format!("export const value = {number};")}),
+            json!({"file": path, "symbol": "value", "operation": "replace", "content": format!("const value = {number};")}),
         ),
     };
     let mut value = params;
@@ -110,12 +110,23 @@ fn assert_winner(tool: Tool, path: &Path, number: usize) {
 }
 
 fn race(tool: Tool) {
+    race_paths(tool, false);
+}
+
+fn race_paths(tool: Tool, hard_link: bool) {
     let dir = tempfile::tempdir().unwrap();
     let outer = std::fs::canonicalize(dir.path()).unwrap();
     let inner = outer.join("nested");
     std::fs::create_dir(&inner).unwrap();
     let path = inner.join("shared.ts");
     std::fs::write(&path, ORIGINAL).unwrap();
+    let other_path = if hard_link {
+        let alias = inner.join("alias.ts");
+        std::fs::hard_link(&path, &alias).unwrap();
+        alias
+    } else {
+        path.clone()
+    };
     let contexts = [context(&outer), context(&inner)];
     let roots = [
         ProjectRootId::from_path(&outer).unwrap(),
@@ -128,23 +139,27 @@ fn race(tool: Tool) {
     let (arrived, arrival) = crossbeam_channel::bounded(2);
     let (release, released) = crossbeam_channel::bounded(2);
     let checks = AtomicUsize::new(0);
-    set_before_check(
-        &path,
-        Some(Arc::new(move || {
-            if checks.fetch_add(1, Ordering::SeqCst) < 2 {
-                arrived.send(()).unwrap();
-                released
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("release both observed writers");
-            }
-        })),
-    );
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if checks.fetch_add(1, Ordering::SeqCst) < 2 {
+            arrived.send(()).unwrap();
+            released
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release both observed writers");
+        }
+    });
+    set_before_check(&path, Some(Arc::clone(&hook)));
+    set_before_check(&other_path, Some(hook));
     let _hook = Hook(path.clone());
+    let _other_hook = Hook(other_path.clone());
     let handles: Vec<_> = roots
         .into_iter()
         .enumerate()
         .map(|(index, root)| {
-            let req = request(tool, &path, index + 2);
+            let req = request(
+                tool,
+                if index == 0 { &path } else { &other_path },
+                index + 2,
+            );
             executor.submit(
                 root,
                 Lane::Mutating,
@@ -176,7 +191,10 @@ fn race(tool: Tool) {
     );
     for (index, reply) in replies.iter().enumerate() {
         let session = format!("session-{}", index + 2);
-        let history = contexts[index].backup().lock().history(&session, &path);
+        let history = contexts[index]
+            .backup()
+            .lock()
+            .history(&session, if index == 0 { &path } else { &other_path });
         if reply.success {
             assert_winner(tool, &path, index + 2);
             assert_eq!(history.len(), 1, "winner has its normal undo snapshot");
@@ -189,6 +207,12 @@ fn race(tool: Tool) {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_write_hard_link_aliases_share_admission() {
+    race_paths(Tool::Edit, true);
 }
 
 #[test]
@@ -299,6 +323,28 @@ fn stale_write_after_backup_discards_undo() {
         std::fs::read_to_string(&path).unwrap(),
         "// external winner\n"
     );
+    assert!(ctx.backup().lock().history(req.session(), &path).is_empty());
+}
+
+#[test]
+fn stale_write_binary_original_is_also_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let path = root.join("original.bin");
+    std::fs::write(&path, [0xff, 0xfe]).unwrap();
+    let ctx = context(&root);
+    let changed_path = path.clone();
+    set_before_check(
+        &path,
+        Some(Arc::new(move || {
+            std::fs::write(&changed_path, [0xff, 0xaa]).unwrap();
+        })),
+    );
+    let _hook = Hook(path.clone());
+    let req = request(Tool::Write, &path, 2);
+    let reply = run(&req, &ctx);
+    assert_eq!(reply.data["code"], "file_changed_since_read", "{reply:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xaa]);
     assert!(ctx.backup().lock().history(req.session(), &path).is_empty());
 }
 
