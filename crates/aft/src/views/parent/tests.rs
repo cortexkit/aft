@@ -67,6 +67,36 @@ fn discovery_finds_children_and_reports_the_rest_as_skipped_and_outside() {
 }
 
 #[test]
+fn admitted_child_aliases_are_not_reported_as_outside_projects() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    for name in ["a", "b"] {
+        git_init(&root.join(name));
+    }
+    let mut admission = isolated(&root, || {
+        crate::folder_admission::probe(
+            &root,
+            &Default::default(),
+            crate::folder_admission::ProbeBudgets {
+                time: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+    });
+    assert_eq!(
+        admission.classification,
+        crate::folder_admission::FolderClassification::Workspace
+    );
+    admission.coverage.workspace_complete = false;
+    admission.immediate_directories = vec![root.join("a/../a"), root.join("b/../b")];
+
+    let found = discovery_from_admission(&root, &admission, DEFAULT_MAX_CHILD_REPOS);
+    assert_eq!(found.children, vec![root.join("a"), root.join("b")]);
+    assert!(found.skipped.is_empty());
+    assert!(found.outside.is_empty(), "{:?}", found.outside);
+}
+
+#[test]
 fn discovery_refuses_checkouts_and_folders_without_repositories() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();

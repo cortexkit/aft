@@ -985,10 +985,13 @@ mod tests {
         assert_eq!(result.reason, AdmissionReason::MultipleChildProjects);
         assert_eq!(result.observed.child_projects, 2);
         assert_eq!(result.observed.non_bulk_root_directories, 4);
-        assert!(result.child_roots.contains(&nested.canonicalize().unwrap()));
+        let nested = crate::path_identity::ProjectRootId::from_path(&nested).unwrap();
+        assert!(result.child_roots.contains(&nested.as_path().to_path_buf()));
+        let container =
+            crate::path_identity::ProjectRootId::from_path(&root.path().join("two")).unwrap();
         assert!(!result
             .child_roots
-            .contains(&root.path().join("two").canonicalize().unwrap()));
+            .contains(&container.as_path().to_path_buf()));
     }
 
     #[test]

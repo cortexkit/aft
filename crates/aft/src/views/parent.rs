@@ -45,7 +45,7 @@ mod worker;
 pub use query::route;
 pub(crate) use query::{attach_gaps, glob_fan_out, grep_fan_out};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
@@ -232,6 +232,13 @@ fn discovery_from_admission(
         note_outside(&mut found, root, path);
     }
     if !admission.coverage.workspace_complete {
+        // Admission uses routing identities, while discovery returns filesystem
+        // canonical paths. Windows can spell those paths with different prefixes.
+        let discovered_roots = found
+            .repositories
+            .iter()
+            .filter_map(|child| crate::path_identity::ProjectRootId::from_path(child).ok())
+            .collect::<HashSet<_>>();
         for path in &admission.immediate_directories {
             let name = path
                 .file_name()
@@ -239,7 +246,8 @@ fn discovery_from_admission(
                 .unwrap_or_default();
             if !name.starts_with('.')
                 && !SKIPPED_DIRECTORY_NAMES.contains(&name)
-                && !found.repositories.iter().any(|child| child == path)
+                && !crate::path_identity::ProjectRootId::from_path(path)
+                    .is_ok_and(|identity| discovered_roots.contains(&identity))
             {
                 note_outside(&mut found, root, path);
             }
