@@ -1162,6 +1162,7 @@ async fn exchange(
         }
     }
     let mut reminted = false;
+    let mut pre_read_retried = false;
     let mut sent_steps = Vec::new();
     loop {
         let mut reply = match exchange.send(body).await {
@@ -1214,8 +1215,22 @@ async fn exchange(
             }
         }
         let retry_same_nonce = match &reply {
-            Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } => {
-                facts.retry_same_nonce
+            Reply::Refused { code, facts, .. } | Reply::ModuleRefused { code, facts } => {
+                if facts.not_sent {
+                    // Safe to resend does not mean useful to resend: deterministic
+                    // read refusals (including 404/422) will just refuse again.
+                    Some(
+                        facts.retry_same_nonce == Some(true)
+                            && code_prefix(code) == "pre_dispatch_read_incomplete"
+                            && matches!(
+                                detail_field(code_detail(code), "reason").as_deref(),
+                                Some("transport_unknown" | "lease_expired")
+                            )
+                            && !pre_read_retried,
+                    )
+                } else {
+                    facts.retry_same_nonce
+                }
             }
             _ => None,
         };
@@ -1224,11 +1239,15 @@ async fn exchange(
             if let Some(outcome) = mismatch {
                 return outcome;
             }
-            // Keep using the final backoff after the first two retries. The
-            // shared deadline, not the legacy attempt cap, bounds explicit retries.
+            // Pre-read retries have their own one-retry cap. Other explicit
+            // retries keep the final backoff and stop at the shared deadline.
             let delay = transient_delays[transient_retries.min(transient_delays.len() - 1)];
             if exchange.io.now() + delay < exchange.deadline() {
                 exchange.io.sleep(delay).await;
+                if matches!(&reply, Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } if facts.not_sent)
+                {
+                    pre_read_retried = true;
+                }
                 transient_retries += 1;
                 continue;
             }
@@ -1280,6 +1299,12 @@ async fn exchange(
                 )));
             }
             Reply::ModuleRefused { code, facts } => {
+                if facts.not_sent && facts.legs_sent.is_empty() {
+                    return RouteOutcome::RelayRefusal {
+                        text: refusal_text("Plexus", &code, &facts, retry_budget_ms),
+                        code,
+                    };
+                }
                 return RouteOutcome::OutcomeUndetermined(refusal_text(
                     "Plexus",
                     &code,
@@ -1319,7 +1344,7 @@ async fn exchange(
                         transient_retries += 1;
                     }
                     (None, CodeClass::Remint) if !reminted => reminted = true,
-                    (_, CodeClass::OutcomeUnknown) => {
+                    (_, CodeClass::OutcomeUnknown) if !facts.not_sent => {
                         return RouteOutcome::OutcomeUndetermined(refusal_text(
                             "Plexus",
                             &code,

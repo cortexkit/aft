@@ -24,8 +24,9 @@
     "repo_binding_generation": 1,
     "result": {
       "refusal_code": "vendor_rejected{status: 422}",
-      "retry_same_nonce": false,
-      "status": "refused"
+      "retry_same_nonce": true,
+      "status": "refused",
+      "transmission": "not_sent"
     }
   },
   "request": {
