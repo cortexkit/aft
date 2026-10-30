@@ -6409,6 +6409,10 @@ fn launcher_argv(
             OsString::from("--"),
             program.to_os_string(),
         ];
+        #[cfg(feature = "test-timing-hooks")]
+        if let Some(gate) = std::env::var_os("AFT_TEST_SANDBOX_START_GATE") {
+            wrapped.splice(1..1, [OsString::from("--test-start-gate"), gate]);
+        }
         wrapped.extend_from_slice(args);
         return Ok((launcher_path.as_os_str().to_os_string(), wrapped, None));
     };
@@ -6421,7 +6425,7 @@ profile_json=$2
 exit_fd=$3
 failure_fd=$4
 shift 4
-"$launcher" sandbox-launch --profile-json "$profile_json" --failure-fd "$failure_fd" -- "$@"
+"$launcher" sandbox-launch --profile-json "$profile_json" --failure-fd "$failure_fd" "$@"
 code=$?
 if [ "$code" -eq 78 ] && [ -s "/dev/fd/$failure_fd" ]; then
   if [ ! -s "/dev/fd/$exit_fd" ]; then
@@ -6435,8 +6439,12 @@ exit "$code""#,
         OsString::from(profile_json),
         OsString::from(exit_fd.to_string()),
         OsString::from(failure_fd.to_string()),
-        program.to_os_string(),
     ];
+    #[cfg(feature = "test-timing-hooks")]
+    if let Some(gate) = std::env::var_os("AFT_TEST_SANDBOX_START_GATE") {
+        wrapped.extend([OsString::from("--test-start-gate"), gate]);
+    }
+    wrapped.extend([OsString::from("--"), program.to_os_string()]);
     wrapped.extend_from_slice(args);
     Ok((OsString::from("/bin/sh"), wrapped, None))
 }
