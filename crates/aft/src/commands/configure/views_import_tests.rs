@@ -298,6 +298,7 @@ fn benchmark_paths() -> (PathBuf, PathBuf, String) {
     let storage =
         PathBuf::from(std::env::var_os("AFT_IMPORT_BENCH_STORAGE").expect("benchmark storage"));
     let plane = std::env::var("AFT_IMPORT_BENCH_PLANE").expect("benchmark plane");
+    crate::root_cache::configure_artifact_access(&root, KEY, false);
     (root, storage, plane)
 }
 
