@@ -8,9 +8,14 @@ fn repeat_to_size(seed: &str) -> String {
 }
 
 fn fixtures() -> Vec<(&'static str, String)> {
-    let normal = repeat_to_size(include_str!(
-        "../../../benchmarks/compression-tokens/fixtures/deploy-container/journalctl.txt"
-    ));
+    // Windows checkouts may convert this fixture to CRLF; normalize so the
+    // pinned token count below is the same on every platform.
+    let normal = repeat_to_size(
+        &include_str!(
+            "../../../benchmarks/compression-tokens/fixtures/deploy-container/journalctl.txt"
+        )
+        .replace("\r\n", "\n"),
+    );
     let unbroken = repeat_to_size("abcdefghijklmnopqrstuvwxyz0123456789");
     // Deterministic, varied base64 characters without line wrapping.
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -43,8 +48,11 @@ fn long_run_count_timings() {
             eprintln!("{name}: {bytes} bytes, {count} tokens, {elapsed:?}");
             assert!(count > 0);
             if bytes == INPUT_BYTES {
+                // Exact counting of 128 KiB takes under ~250 ms in a debug
+                // build; the ceiling leaves room for loaded CI runners while
+                // still catching the multi-second pathology it guards against.
                 assert!(
-                    elapsed < Duration::from_millis(500),
+                    elapsed < Duration::from_secs(2),
                     "{name}: counting {bytes} bytes took {elapsed:?}"
                 );
                 if name == "normal" {
