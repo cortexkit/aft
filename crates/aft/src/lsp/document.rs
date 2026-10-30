@@ -26,6 +26,9 @@ pub struct DocumentEntry {
     /// BLAKE3 hash of the synchronized text. Metadata alone cannot prove that
     /// diagnostics describe the current content, even for a large document.
     pub content_hash: Option<[u8; 32]>,
+    /// FIFO dispatch order of the acknowledged didOpen/didChange carrying this
+    /// text. Absent for synthetic state and failed or unconfirmed writes.
+    pub sync_order: Option<u64>,
 }
 
 /// Tracks document state for LSP synchronization.
@@ -86,6 +89,7 @@ impl DocumentStore {
             mtime: snapshot.mtime,
             size: snapshot.size,
             content_hash: snapshot.content_hash(&path),
+            sync_order: snapshot.sync_order,
         };
         self.entries.insert(path, entry);
         version
@@ -113,6 +117,7 @@ impl DocumentStore {
         entry.mtime = snapshot.mtime;
         entry.size = snapshot.size;
         entry.content_hash = content_hash;
+        entry.sync_order = snapshot.sync_order;
         Some(entry.version)
     }
 
@@ -202,14 +207,19 @@ impl DocumentStore {
 /// Metadata fields are `None` if the path cannot be statted or if the
 /// platform doesn't support the queried metadata (rare). The hash is `None`
 /// for unreadable files.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DiskSnapshot {
     mtime: Option<SystemTime>,
     size: Option<u64>,
     content_hash: std::cell::OnceCell<Option<[u8; 32]>>,
+    sync_order: Option<u64>,
 }
 
 impl DiskSnapshot {
+    pub(crate) fn with_sync_order(mut self, order: Option<u64>) -> Self {
+        self.sync_order = order;
+        self
+    }
     /// Use the text actually sent, not a second disk read that could observe a
     /// concurrent write and incorrectly certify text the server never received.
     pub(crate) fn for_content(path: &Path, content: &str) -> Self {
@@ -225,6 +235,7 @@ impl DiskSnapshot {
                 mtime: meta.modified().ok(),
                 size: Some(meta.len()),
                 content_hash: std::cell::OnceCell::new(),
+                sync_order: None,
             },
             Err(_) => Self::default(),
         }

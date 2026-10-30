@@ -304,6 +304,134 @@ fn current_reader_events_still_apply() {
 }
 
 #[test]
+fn unversioned_push_queued_before_the_latest_text_sync_is_not_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.ts");
+    std::fs::write(&file, "const value = 1;\n").unwrap();
+    let mut manager = LspManager::new();
+    let instance = ServerInstanceId::next();
+    let pause = Pause::install(instance, Stage::Reader);
+    let mut message = diagnostics(&file, "queued before edit");
+    message["params"].as_object_mut().unwrap().remove("version");
+    let command = format!("printf '%s' {}; exec cat", quote(&frame(message)));
+    let mut client = spawn(&manager, dir.path(), instance, &command);
+    client.set_diagnostic_capabilities_for_test(Default::default());
+    manager.clients.insert(key(dir.path()), client);
+    // The reader stamps the receipt before this pause, not when the manager
+    // eventually drains it after both text notifications.
+    pause.wait();
+    manager
+        .notify_file_changed_for_server_keys(
+            file.clone(),
+            "const value = 1;\n",
+            vec![key(dir.path())],
+        )
+        .unwrap();
+    std::fs::write(&file, "const value = 2;\n").unwrap();
+    manager
+        .notify_file_changed_for_server_keys(
+            file.clone(),
+            "const value = 2;\n",
+            vec![key(dir.path())],
+        )
+        .unwrap();
+    let sync_order = manager.documents[&key(dir.path())]
+        .entry(&file)
+        .unwrap()
+        .sync_order
+        .unwrap();
+    assert_eq!(
+        manager.version_for_unversioned_push(&key(dir.path()), &file, Some(sync_order + 1)),
+        Some(1),
+        "control: a later receipt with matching content can certify this push-only file"
+    );
+    drop(pause);
+    let receipt = next(&manager);
+    assert!(receipt.receive_order.unwrap() < sync_order);
+    manager.handle_waited_event(Some(receipt));
+    assert!(!manager.has_authoritative_report_for_file(&file));
+    assert!(manager.diagnostics.entries_for_file(&file)[0].1.stale);
+}
+
+#[test]
+fn unversioned_push_authority_tracks_disk_content_and_dynamic_pull_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.ts");
+    let text = "const value = 1;\n";
+    std::fs::write(&file, text).unwrap();
+    let mut manager = LspManager::new();
+    let instance = ServerInstanceId::next();
+    let mut client = spawn(&manager, dir.path(), instance, "exec cat");
+    client.set_diagnostic_capabilities_for_test(Default::default());
+    let key = key(dir.path());
+    manager.clients.insert(key.clone(), client);
+    manager
+        .notify_file_changed_for_server_keys(file.clone(), text, vec![key.clone()])
+        .unwrap();
+    let order = manager.documents[&key]
+        .entry(&file)
+        .unwrap()
+        .sync_order
+        .unwrap()
+        + 1;
+    let mut message = diagnostics(&file, "fresh unversioned report");
+    message["params"].as_object_mut().unwrap().remove("version");
+    manager.handle_publish_diagnostics_ordered(
+        key.kind.clone(),
+        key.root.clone(),
+        &message["params"],
+        Some(order),
+    );
+    assert!(manager.has_authoritative_report_for_file(&file));
+    assert!(
+        manager.diagnostics.entries_for_file(&file)[0]
+            .1
+            .from_receive_order
+    );
+
+    std::fs::write(&file, "different disk content\n").unwrap();
+    manager.handle_publish_diagnostics_ordered(
+        key.kind.clone(),
+        key.root.clone(),
+        &message["params"],
+        Some(order + 1),
+    );
+    assert!(!manager.has_authoritative_report_for_file(&file));
+    std::fs::write(&file, text).unwrap();
+    manager.handle_publish_diagnostics_ordered(
+        key.kind.clone(),
+        key.root.clone(),
+        &message["params"],
+        Some(order + 2),
+    );
+    assert!(manager.has_authoritative_report_for_file(&file));
+
+    manager
+        .clients
+        .get_mut(&key)
+        .unwrap()
+        .register_diagnostics_for_test(&json!({"registrations":[{
+            "id":"late-diagnostics", "method":"textDocument/diagnostic", "registerOptions":{}
+        }]}));
+    assert!(manager.server_supports_pull_for_file(&key, &file));
+    assert!(!manager.has_authoritative_report_for_file(&file));
+    assert!(!manager.has_report_for_open_document(&key, &file));
+    manager.ingest_document_report(
+        &key,
+        &file,
+        Some(0),
+        None,
+        serde_json::from_value(json!({"kind":"full", "items":[]})).unwrap(),
+    );
+    assert!(manager.has_authoritative_report_for_file(&file));
+    assert!(
+        !manager.diagnostics.entries_for_file(&file)[0]
+            .1
+            .from_receive_order
+    );
+}
+
+#[test]
 fn drain_dispatch_rechecks_instance_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Arc::new(AppContext::new(
@@ -456,6 +584,7 @@ fn pull_preservation_drops_retired_receipts_before_requeue() {
         manager
             .event_tx
             .send(ReceivedLspEvent {
+                receive_order: None,
                 instance: Some(instance),
                 event: LspEvent::DocumentDiagnosticsPulled {
                     server_kind: ServerKind::TypeScript,
@@ -587,6 +716,7 @@ fn retired_exit_cleanup_preserves_a_replacement_report_with_the_same_pid() {
     manager.remember_exit_report(current, replacement_report.clone());
     assert_eq!(manager.pending_exit_reports.len(), 2);
     let receipt = ReceivedLspEvent {
+        receive_order: None,
         instance: Some(retired),
         event: LspEvent::ServerExited {
             server_kind: ServerKind::TypeScript,

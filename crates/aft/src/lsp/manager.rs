@@ -507,12 +507,12 @@ impl EnsureServerOutcomes {
 /// `diagnostics` only contains entries from servers that proved freshness.
 /// `accepted_snapshots` preserves that same result per producer and document
 /// version so alert consumers never infer a partition from flattened output.
-/// Pre-edit cached entries and unversioned reports are NEVER included.
+/// Pre-edit cached entries and reports without a current-content proof are never included.
 #[derive(Debug, Clone, Default)]
 pub struct PostEditWaitOutcome {
     /// Complete, per-producer accepted snapshots. This includes a snapshot
     /// with an empty diagnostics list when a live server authoritatively found
-    /// the edited document clean; pending, exited, warming, and unversioned
+    /// the edited document clean; pending, exited, warming, and uncertified
     /// producers do not appear here.
     pub accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
     /// Authoritative diagnostics flattened only for the legacy response body.
@@ -556,10 +556,9 @@ pub fn post_edit_entry_is_fresh(
 
     match entry.version {
         Some(version) => version >= target_version,
-        // Unversioned publishDiagnostics payloads cannot prove which document
-        // state they describe. Epoch advancement only proves arrival order; an
-        // old analysis result can still arrive after our pre-snapshot. Treat as
-        // pending/partial rather than fresh.
+        // Ingestion has not bound this report to a synchronized version.
+        // Advancing a store epoch while draining a queued publication cannot
+        // substitute for a reader-ordered content proof.
         None => false,
     }
 }
@@ -1509,6 +1508,7 @@ impl LspManager {
         }
         let _ = self.event_tx.send(ReceivedLspEvent {
             instance: self.clients.get(key).map(|client| client.instance),
+            receive_order: None,
             event: LspEvent::DocumentDiagnosticsPulled {
                 server_kind: key.kind.clone(),
                 root: key.root.clone(),
@@ -2647,21 +2647,24 @@ impl LspManager {
                     .expect("content is loaded when any server needs didOpen");
                 let (send_result, sent) = if let Some(client) = self.clients.get_mut(key) {
                     (
-                        client.send_notification::<DidOpenTextDocument>(
-                            DidOpenTextDocumentParams {
-                                text_document: TextDocumentItem::new(
-                                    uri.clone(),
-                                    language_id.clone(),
-                                    version,
-                                    content.clone(),
-                                ),
-                            },
-                        ),
+                        client
+                            .send_notification_ordered::<DidOpenTextDocument>(
+                                DidOpenTextDocumentParams {
+                                    text_document: TextDocumentItem::new(
+                                        uri.clone(),
+                                        language_id.clone(),
+                                        version,
+                                        content.clone(),
+                                    ),
+                                },
+                            )
+                            .map(Some),
                         true,
                     )
                 } else {
-                    (Ok(()), false)
+                    (Ok(None), false)
                 };
+                let sync_order = send_result.as_ref().ok().copied().flatten();
                 if let Err(err) = send_result {
                     if matches!(err, LspError::Timeout(_)) {
                         // The writer owns the queued frame and can finish it
@@ -2679,7 +2682,8 @@ impl LspManager {
                 }
                 self.documents.entry(key.clone()).or_default().open_with(
                     canonical_path.clone(),
-                    &DiskSnapshot::for_content(&canonical_path, content),
+                    &DiskSnapshot::for_content(&canonical_path, content)
+                        .with_sync_order(sync_order),
                 );
                 newly_opened.push(key.clone());
                 continue;
@@ -2722,11 +2726,14 @@ impl LspManager {
                     // `didSave`, so without it the compiler errors it
                     // reports keep describing the old contents.
                     client
-                        .send_full_did_change(&uri, next_version, content)
-                        .and_then(|()| send_did_save(client, &uri, content))
+                        .send_full_did_change_ordered(&uri, next_version, content)
+                        .and_then(|order| {
+                            send_did_save(client, &uri, content).map(|()| Some(order))
+                        })
                 } else {
-                    Ok(())
+                    Ok(None)
                 };
+                let sync_order = send_result.as_ref().ok().copied().flatten();
                 if let Err(err) = send_result {
                     if let Some(store) = self.documents.get_mut(key) {
                         // A timed-out write may arrive later. Reserve its
@@ -2739,7 +2746,8 @@ impl LspManager {
                 if let Some(store) = self.documents.get_mut(key) {
                     store.bump_version_with(
                         &canonical_path,
-                        &DiskSnapshot::for_content(&canonical_path, content),
+                        &DiskSnapshot::for_content(&canonical_path, content)
+                            .with_sync_order(sync_order),
                     );
                 }
             }
@@ -2876,13 +2884,15 @@ impl LspManager {
 
             if let Some(version) = current_version {
                 let next_version = version + 1;
+                let mut sync_order = None;
                 if let Some(client) = self.clients.get_mut(&key) {
-                    let send = client.send_full_did_change(&uri, next_version, content)
+                    let send = client.send_full_did_change_ordered(&uri, next_version, content)
                     // AFT has written this content to disk: tell the server
                     // it was saved. rust-analyzer re-runs `cargo check` only
                     // on `didSave`, so without it the compiler errors it
                     // reports keep describing the file before the edit.
-                        .and_then(|()| send_did_save(client, &uri, content));
+                        .and_then(|order| send_did_save(client, &uri, content).map(|()| order));
+                    sync_order = send.as_ref().ok().copied();
                     if let Err(err) = send {
                         if let Some(store) = self.documents.get_mut(&key) {
                             store.bump_version_with(&canonical_path, &DiskSnapshot::default());
@@ -2891,7 +2901,10 @@ impl LspManager {
                     }
                 }
                 if let Some(store) = self.documents.get_mut(&key) {
-                    store.bump_version_with(&canonical_path, &disk);
+                    store.bump_version_with(
+                        &canonical_path,
+                        &disk.clone().with_sync_order(sync_order),
+                    );
                 }
                 self.queue_background_document_pull(&key, &canonical_path);
                 versions.push((key, next_version));
@@ -2902,16 +2915,19 @@ impl LspManager {
                 .documents
                 .get(&key)
                 .map_or(0, DocumentStore::next_open_version);
+            let mut sync_order = None;
             if let Some(client) = self.clients.get_mut(&key) {
-                let send =
-                    client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                let send = client.send_notification_ordered::<DidOpenTextDocument>(
+                    DidOpenTextDocumentParams {
                         text_document: TextDocumentItem::new(
                             uri.clone(),
                             language_id.clone(),
                             version,
                             content.to_string(),
                         ),
-                    });
+                    },
+                );
+                sync_order = send.as_ref().ok().copied();
                 if let Err(err) = send {
                     if matches!(err, LspError::Timeout(_)) {
                         self.documents
@@ -2932,10 +2948,10 @@ impl LspManager {
                     return Err(err);
                 }
             }
-            self.documents
-                .entry(key.clone())
-                .or_default()
-                .open_with(canonical_path.clone(), &disk);
+            self.documents.entry(key.clone()).or_default().open_with(
+                canonical_path.clone(),
+                &disk.clone().with_sync_order(sync_order),
+            );
             self.queue_background_document_pull(&key, &canonical_path);
             versions.push((key, version));
         }
@@ -3705,14 +3721,17 @@ impl LspManager {
             let Some(client) = self.clients.get_mut(&key) else {
                 continue;
             };
-            let sent = client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem::new(
-                    uri.clone(),
-                    language_id.clone(),
-                    version,
-                    content.clone(),
-                ),
-            });
+            let sent = client.send_notification_ordered::<DidOpenTextDocument>(
+                DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem::new(
+                        uri.clone(),
+                        language_id.clone(),
+                        version,
+                        content.clone(),
+                    ),
+                },
+            );
+            let sync_order = sent.as_ref().ok().copied();
             if let Err(err) = sent {
                 // Leave no half-opened set behind: the caller only closes what
                 // this call reports as opened.
@@ -3722,7 +3741,7 @@ impl LspManager {
             log_did_open_sent(&key, &canonical_path, &language_id, version);
             self.documents.entry(key.clone()).or_default().open_with(
                 canonical_path.clone(),
-                &DiskSnapshot::for_content(&canonical_path, &content),
+                &DiskSnapshot::for_content(&canonical_path, &content).with_sync_order(sync_order),
             );
             self.reopen_inspect_closed_document(&key, &canonical_path);
             opened.push(key);
@@ -4552,8 +4571,9 @@ impl LspManager {
     ///
     /// File-mode `lsp_diagnostics` uses this for push-only fallback after it
     /// has synced/opened the document. Versioned publishes are accepted when
-    /// they match the current document version; unversioned publishes are not
-    /// accepted as fresh because epoch/wall-clock ordering alone is racy.
+    /// they match the current document version. Unversioned pushes need the
+    /// reader-order and content-hash proof established at ingestion; store
+    /// epochs and wall-clock ordering alone are insufficient.
     pub fn diagnostic_entry_is_fresh_for_document(
         &self,
         file_path: &Path,
@@ -6106,6 +6126,7 @@ impl LspManager {
         entry: &DiagnosticEntry,
     ) -> bool {
         !entry.stale
+            && (!entry.from_receive_order || !self.server_supports_pull_for_file(key, file))
             && entry.content_hash.is_some()
             && entry.content_hash == file_content_hash(file)
             && self
@@ -6136,6 +6157,32 @@ impl LspManager {
             .and_then(|store| store.entry(file))
             .filter(|document| Some(document.version) == version)
             .and_then(|document| document.content_hash)
+    }
+
+    fn version_for_unversioned_push(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        receive_order: Option<u64>,
+    ) -> Option<i32> {
+        let client = self.clients.get(key)?;
+        // Pull-capable files retain the stronger diagnostic-request barrier.
+        // This is capability-based, including dynamic registrations and pull
+        // disabled by configuration, rather than a language-server allowlist.
+        if client
+            .diagnostic_capabilities_for_file(file)?
+            .pull_diagnostics
+        {
+            return None;
+        }
+        let document = self.documents.get(key)?.entry(file)?;
+        if receive_order? <= document.sync_order?
+            || document.content_hash.is_none()
+            || document.content_hash != file_content_hash(file)
+        {
+            return None;
+        }
+        Some(document.version)
     }
 
     fn certify_report_content(&mut self, key: &ServerKey, file: &Path, version: Option<i32>) {
@@ -6220,10 +6267,9 @@ impl LspManager {
     }
 
     /// True if this server/file pair has a current report that describes the
-    /// text the server now holds for the open document: a document pull
-    /// produced it, or a push carried the open document's version. An
-    /// unversioned push (a late clearing reply to an earlier close, for
-    /// example) proves neither.
+    /// text the server now holds for the open document. Pull-capable pairs
+    /// require a pulled or versioned report. Push-only pairs can instead use
+    /// the reader-order/hash proof for an unversioned publication.
     pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
         self.has_diagnostic_report_for_server_file(server, file)
     }
@@ -6664,9 +6710,13 @@ impl LspManager {
                 root,
                 method,
                 params: Some(params),
-            } if method == "textDocument/publishDiagnostics" => {
-                self.handle_publish_diagnostics(server_kind.clone(), root.clone(), params)
-            }
+            } if method == "textDocument/publishDiagnostics" => self
+                .handle_publish_diagnostics_ordered(
+                    server_kind.clone(),
+                    root.clone(),
+                    params,
+                    receipt.receive_order,
+                ),
             LspEvent::Notification {
                 server_kind,
                 root,
@@ -6772,11 +6822,22 @@ impl LspManager {
         });
     }
 
+    #[cfg(test)]
     fn handle_publish_diagnostics(
         &mut self,
         server: ServerKind,
         root: PathBuf,
         params: &serde_json::Value,
+    ) -> Option<PathBuf> {
+        self.handle_publish_diagnostics_ordered(server, root, params, None)
+    }
+
+    fn handle_publish_diagnostics_ordered(
+        &mut self,
+        server: ServerKind,
+        root: PathBuf,
+        params: &serde_json::Value,
+        receive_order: Option<u64>,
     ) -> Option<PathBuf> {
         #[cfg(test)]
         PUBLISH_DIAGNOSTICS_PARSES.with(|count| count.set(count.get() + 1));
@@ -6818,6 +6879,9 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        let from_receive_order = version.is_none();
+        let proven_version =
+            version.or_else(|| self.version_for_unversioned_push(&key, &file, receive_order));
         // Preserve the full compiler result independently of the working-set
         // LRU and document-close exceptions, which must not turn errors clean.
         if let Some(cache) = self
@@ -6887,10 +6951,13 @@ impl LspManager {
             file.clone(),
             stored,
             None,
-            version,
+            proven_version,
             provisional,
         );
-        self.certify_report_content(&key, &file, version);
+        self.certify_report_content(&key, &file, proven_version);
+        if from_receive_order && proven_version.is_some() {
+            self.diagnostics.mark_receive_order(&key, &file);
+        }
         let epoch = self.diagnostics.current_epoch();
         let published_at = self.diagnostics.publication_time(&key, &file);
         if let Some(client) = self.clients.get_mut(&key) {
@@ -8499,7 +8566,7 @@ fn replay_startup_notifications(
                 super::client::full_did_change_message(&uri, version, &content)?
             };
             write_attempted = true;
-            writer.send(payload)?;
+            let sync_order = writer.send_ordered(payload)?;
             document_written = true;
             let saved = if let Some(save) = save {
                 writer.send(super::client::did_save_message(
@@ -8513,7 +8580,7 @@ fn replay_startup_notifications(
             } else {
                 None
             };
-            Ok((disk, saved))
+            Ok((disk.with_sync_order(Some(sync_order)), saved))
         })();
         match sent {
             Ok((disk, saved)) => result.documents.push(StartupReplayDocument {

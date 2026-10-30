@@ -452,6 +452,9 @@ impl ServerInstanceId {
 pub(crate) struct ReceivedLspEvent {
     pub(crate) event: LspEvent,
     pub(crate) instance: Option<ServerInstanceId>,
+    /// Stamped by the reader before enqueueing or startup deferral, on the
+    /// same clock as the FIFO writer's dispatch fences.
+    pub(crate) receive_order: Option<u64>,
 }
 
 impl From<LspEvent> for ReceivedLspEvent {
@@ -459,6 +462,7 @@ impl From<LspEvent> for ReceivedLspEvent {
         Self {
             event,
             instance: None,
+            receive_order: None,
         }
     }
 }
@@ -473,6 +477,10 @@ pub(crate) enum LspEventSender {
 
 impl LspEventSender {
     fn send(&self, event: LspEvent) -> Result<(), ()> {
+        self.send_ordered(event, None)
+    }
+
+    fn send_ordered(&self, event: LspEvent, receive_order: Option<u64>) -> Result<(), ()> {
         match self {
             Self::Standalone(sender) => sender.send(event).map_err(|_| ()),
             Self::Managed { sender, instance } => {
@@ -482,6 +490,7 @@ impl LspEventSender {
                     .send(ReceivedLspEvent {
                         event,
                         instance: Some(*instance),
+                        receive_order,
                     })
                     .map_err(|_| ())
             }
@@ -1317,22 +1326,25 @@ impl LspClient {
                         }
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
-                        reader_writer.note_received();
+                        let receive_order = reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
                             if let Ok(mut times) = reader_check_begin_times.lock() {
                                 times.insert(ordinal, SystemTime::now());
                             }
                         }
-                        let _ = event_tx.send(LspEvent::Notification {
-                            server_kind: reader_kind.clone(),
-                            root: reader_root.clone(),
-                            method,
-                            params,
-                        });
+                        let _ = event_tx.send_ordered(
+                            LspEvent::Notification {
+                                server_kind: reader_kind.clone(),
+                                root: reader_root.clone(),
+                                method,
+                                params,
+                            },
+                            Some(receive_order),
+                        );
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
-                        reader_writer.note_received();
+                        let receive_order = reader_writer.note_received();
                         record_watched_file_registration(
                             &reader_watched_file_registrations,
                             &method,
@@ -1371,13 +1383,16 @@ impl LspClient {
                             }
                         }
                         // Also forward as event for any interested handlers
-                        let _ = event_tx.send(LspEvent::ServerRequest {
-                            server_kind: reader_kind.clone(),
-                            root: reader_root.clone(),
-                            id,
-                            method,
-                            params,
-                        });
+                        let _ = event_tx.send_ordered(
+                            LspEvent::ServerRequest {
+                                server_kind: reader_kind.clone(),
+                                root: reader_root.clone(),
+                                id,
+                                method,
+                                params,
+                            },
+                            Some(receive_order),
+                        );
                     }
                     Err(error) if transport::is_message_parse_error(&error) => {
                         // The complete body was consumed, so the next frame is
@@ -1645,6 +1660,22 @@ impl LspClient {
     pub(crate) fn uses_document_pull(&self, file: Option<&Path>) -> bool {
         self.diagnostic_capabilities_inner(file)
             .is_some_and(|caps| caps.pull_diagnostics)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_diagnostic_capabilities_for_test(
+        &mut self,
+        caps: ServerDiagnosticCapabilities,
+    ) {
+        self.diagnostic_caps = Some(caps);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn register_diagnostics_for_test(&mut self, params: &Value) {
+        self.diagnostic_registrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record("client/registerCapability", Some(params));
     }
 
     pub(crate) fn start_document_diagnostic_request(
@@ -2343,12 +2374,25 @@ impl LspClient {
         N: lsp_types::notification::Notification,
         N::Params: serde::Serialize,
     {
+        self.send_notification_ordered::<N>(params).map(|_| ())
+    }
+
+    pub(crate) fn send_notification_ordered<N>(
+        &mut self,
+        params: N::Params,
+    ) -> Result<u64, LspError>
+    where
+        N: lsp_types::notification::Notification,
+        N::Params: serde::Serialize,
+    {
         self.ensure_can_send()?;
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, Some(params));
-        self.writer.send(serde_json::to_string(&notification)?)?;
+        let order = self
+            .writer
+            .send_ordered(serde_json::to_string(&notification)?)?;
         self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
-        Ok(())
+        Ok(order)
     }
 
     /// Write an already serialized notification.
@@ -2359,20 +2403,20 @@ impl LspClient {
 
     /// Send `textDocument/didChange` carrying the whole document (see
     /// [`full_did_change_message`]).
-    pub(crate) fn send_full_did_change(
+    pub(crate) fn send_full_did_change_ordered(
         &mut self,
         uri: &lsp_types::Uri,
         version: i32,
         text: &str,
-    ) -> Result<(), LspError> {
+    ) -> Result<u64, LspError> {
         self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
-        self.send_serialized_notification(&json)?;
+        let order = self.writer.send_ordered(json)?;
         self.note_analysis_document(
             "textDocument/didChange",
             &json!({"textDocument": {"uri": uri.as_str()}}),
         );
-        Ok(())
+        Ok(order)
     }
 
     /// Send `textDocument/didSave`, with the borrowed text when given (see

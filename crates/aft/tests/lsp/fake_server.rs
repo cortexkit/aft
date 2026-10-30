@@ -155,7 +155,11 @@ fn write_publish_diagnostics_versioned(
     diagnostics: Value,
     version: Value,
 ) -> io::Result<()> {
-    let effective_version = if std::env::var("AFT_FAKE_LSP_STALE_VERSION").is_ok() {
+    let effective_version = if std::env::var_os("AFT_FAKE_LSP_UNVERSIONED_PUSH").is_some() {
+        // Model push-only servers such as kotlin-language-server, whose
+        // PublishDiagnosticsParams(uri, diagnostics) omits the version.
+        Value::Null
+    } else if std::env::var("AFT_FAKE_LSP_STALE_VERSION").is_ok() {
         match &version {
             Value::Number(n) if n.is_i64() => Value::Number((n.as_i64().unwrap() - 1).into()),
             _ => version.clone(),

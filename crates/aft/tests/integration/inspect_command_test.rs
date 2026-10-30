@@ -4682,6 +4682,55 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
     );
 }
 
+#[test]
+fn scoped_kotlin_inspect_certifies_unversioned_pushes_after_open_and_edit() {
+    let (_temp, root) = fixture_project();
+    write_file(
+        &root,
+        "settings.gradle",
+        "rootProject.name = 'diagnostics-fixture'\n",
+    );
+    let text = "fun main() { val n = 1 }\n";
+    let file = crate::helpers::canonicalize_like_product(&write_file(&root, "main.kt", text));
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .override_binary(ServerKind::KotlinLs, fake_server_path());
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_UNVERSIONED_PUSH", "1");
+    // kotlin-language-server constructs PublishDiagnosticsParams(uri,
+    // diagnostics) without a version and advertises no diagnostic provider.
+    // Keep the document open so this test isolates text sync, not close replies.
+    open_with_lsp(&ctx, &file, text);
+    let before = scoped_diagnostics_inspect(&ctx, "kotlin-unversioned-open", "main.kt");
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+
+    edit_match_as_opencode(&ctx, "kotlin-unversioned-edit", &file, "n = 1", "n = 2");
+    let after = scoped_diagnostics_inspect(&ctx, "kotlin-unversioned-after", "main.kt");
+    assert_eq!(after["complete"], true, "{after:#}");
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+    assert!(ctx
+        .lsp()
+        .diagnostics_store_for_test()
+        .entries_for_file(&file)
+        .iter()
+        .any(|(key, entry)| key.kind == ServerKind::KotlinLs
+            && entry.from_receive_order
+            && !entry.from_document_pull));
+    assert!(
+        diagnostic_messages_for(&after, "main.kt")
+            .iter()
+            .any(|message| message == "test diagnostic after change"),
+        "{after:#}"
+    );
+
+    fs::write(&file, "fun main() { val n = 3 }\n").unwrap();
+    assert!(
+        !ctx.lsp().has_authoritative_report_for_file(&file),
+        "a later outside write invalidates even a receive-ordered certificate"
+    );
+}
+
 fn python_progress_fixture(mode: Option<&str>) -> (tempfile::TempDir, AppContext) {
     python_progress_fixture_with_timeout(mode, 3000)
 }
