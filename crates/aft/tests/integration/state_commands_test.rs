@@ -22,6 +22,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, harness: &str
         .to_string(),
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn configured_aft(project: &Path, storage: &Path, harness: &str) -> AftProcess {
@@ -602,7 +603,7 @@ fn assert_no_artifact_state(storage: &Path) {
 #[cfg(unix)]
 #[test]
 fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().unwrap();
     let tools = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(project.path()).unwrap();
@@ -664,6 +665,7 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
         response["success"], true,
         "unreadable Git must not prevent binding: {response}"
     );
+    aft.wait_for_folder_admission();
     let reasons = degraded_reasons(&mut aft).join("; ");
     assert!(reasons.contains("git_identity_unavailable"), "{reasons}");
     assert!(reasons.contains("dubious ownership"), "{reasons}");
@@ -708,6 +710,7 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     fs::remove_file(blocked).unwrap();
     let response = aft.send(&bind.to_string());
     assert_eq!(response["success"], true, "{response}");
+    aft.wait_for_folder_admission();
     assert!(!degraded_reasons(&mut aft)
         .join("; ")
         .contains("git_identity_unavailable"));

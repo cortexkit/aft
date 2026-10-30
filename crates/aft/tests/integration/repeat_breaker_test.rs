@@ -272,7 +272,7 @@ fn repeat_breaker_ndjson_carries_the_worker_role_on_tool_call_and_raw_bash() {
         "AFT_TEST_FOREGROUND_WAIT_MS",
         std::ffi::OsStr::new(&wait_ms),
     )]);
-    aft.configure(project.path());
+    aft.configure_project(project.path());
     let mut tool_texts = Vec::new();
     let mut bash_texts = Vec::new();
 
@@ -985,7 +985,7 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
     std::fs::write(project.path().join("stable.repeat-fixture"), "stable")
         .expect("write repeat fixture");
     let mut aft = AftProcess::spawn();
-    aft.configure(project.path());
+    aft.configure_project(project.path());
     let mut texts = Vec::new();
 
     for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
@@ -1093,7 +1093,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
     // The Pi plugin and the OpenCode plugin in standalone mode send each model
     // bash call as a top-level `bash` request, arguments nested under `params`,
     // and show the model the response's `output`.
-    let project = tempfile::tempdir().expect("raw bash repeat project");
+    let project = crate::test_helpers::project::project_tempdir();
     write_rewritten_grep_fixture(project.path());
     let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
     let mut aft = AftProcess::spawn_with_env(&[(
@@ -1114,6 +1114,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
         .to_string(),
     );
     assert_eq!(configured["success"], true, "configure: {configured:?}");
+    aft.wait_for_folder_admission();
     let mut rewritten = Vec::new();
     let mut finished = Vec::new();
     let mut promoted = Vec::new();
@@ -1183,7 +1184,7 @@ fn repeat_breaker_never_steers_previewed_mutations() {
     let project = tempfile::tempdir().expect("preview repeat project");
     let target = project.path().join("notes.txt");
     let mut aft = AftProcess::spawn();
-    aft.configure(project.path());
+    aft.configure_project(project.path());
     let mut texts = Vec::new();
 
     for cycle in 0..3 {

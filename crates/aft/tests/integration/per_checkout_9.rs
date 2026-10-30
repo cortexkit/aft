@@ -373,7 +373,7 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
         &ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -662,6 +662,7 @@ fn parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
 /// for a missing session fails at once, and so does a retry that never lands
 /// within the deadline.
 fn started_parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
+    crate::test_helpers::admission::settle(ctx);
     let started = Instant::now();
     let mut retried = false;
     let session = loop {
@@ -1619,7 +1620,9 @@ fn slow_discovery_never_delays_the_bind() {
     let root = base.join("projects");
     let storage = base.join("storage");
     for index in 0..20 {
-        std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
+        let child = root.join(format!("repo-{index:02}"));
+        std::fs::create_dir_all(child.join(".git")).unwrap();
+        crate::test_helpers::project::mark_project(&child).unwrap();
     }
     let discovery = aft::views::parent::hold_discovery_for_test(&root);
     let ctx = Arc::new(
