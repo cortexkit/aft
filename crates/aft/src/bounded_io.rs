@@ -1100,6 +1100,21 @@ impl IsolatedPool {
     }
 }
 
+/// Reserves time for a bounded walk to return partial results before the bounded I/O helper's
+/// deadline; a helper still stuck in one OS call remains a `read_blocked`.
+pub(crate) fn deadline_before_io_timeout(
+    path: &Path,
+    budget: Duration,
+    return_margin: Duration,
+) -> Instant {
+    let now = Instant::now();
+    let access_deadline = now + access_budget(path);
+    let hard_deadline =
+        request_deadline(None).map_or(access_deadline, |request| request.min(access_deadline));
+    let walk_deadline = now + budget;
+    let return_deadline = hard_deadline.checked_sub(return_margin).unwrap_or(now);
+    walk_deadline.min(return_deadline)
+}
 fn run_with_limiter<T: Send + 'static>(
     path: &Path,
     at: Option<Instant>,
