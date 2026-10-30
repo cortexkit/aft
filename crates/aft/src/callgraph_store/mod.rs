@@ -6276,9 +6276,13 @@ impl DiskProjectIndex<'_> {
         for (id, name, scoped_name, kind, exported, is_default_export) in node_rows {
             index.note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
         }
+        let disk = self
+            .module_resolution_memo
+            .map(|memo| memo.disk_facts(self.project_root))
+            .unwrap_or_else(|| DiskFacts::new(self.project_root));
         let facts = FactPaths {
             root: self.project_root,
-            facts: &DiskFacts::new(self.project_root),
+            facts: &disk,
         };
         for raw in ref_rows {
             index.note_module_ref(
@@ -14985,7 +14989,7 @@ fn build_file_extract_with_memo(
         .iter()
         .map(|node| (node.scoped_name.clone(), node.id.clone()))
         .collect();
-    let disk = DiskFacts::new(project_root);
+    let disk = memo.disk_facts(project_root);
     let facts = FactPaths {
         root: project_root,
         facts: &disk,
@@ -24002,9 +24006,8 @@ fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
 /// one. This keeps watcher deletion events in the same identity domain as the
 /// files indexed before the deletion.
 ///
-/// The resolver also calls this for every candidate it probes (`tsconfig.json`
-/// in each ancestor directory, `index.ts` beside each import), and most probes
-/// name a file that does not exist.
+/// Uncached resolver probes also call this (`tsconfig.json` in each ancestor
+/// directory, `index.ts` beside each import), and most name a missing file.
 fn canonicalize_path(path: &Path) -> PathBuf {
     #[cfg(test)]
     work_counts::note_canonical_path(path);

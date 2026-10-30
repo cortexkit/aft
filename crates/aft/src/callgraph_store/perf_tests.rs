@@ -1017,6 +1017,80 @@ fn cold_callgraph_filesystem_real_repo() {
     eprintln!("cold filesystem: files={} edges={} canonicalize_path={canonical} unique_paths={unique} repeated_paths={} realpaths={realpaths} workspace_directory_visits={workspace_dirs} all_directory_reads={all_dirs} wall_ms={}", files.len(), edges.len(), canonical - unique, counts.wall.as_millis());
 }
 
+#[test]
+fn cold_callgraph_probe_identities_are_shared_across_files_not_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    write(&root, "package.json", "{}");
+    let memo = callgraph::ModuleResolutionMemo::default();
+    work_counts::reset_under(&root);
+    for _ in 0..12 {
+        let disk = memo.disk_facts(&root);
+        let facts = FactPaths {
+            root: &root,
+            facts: &disk,
+        };
+        assert!(facts.is_file(&root.join("package.json")));
+        assert!(!facts.is_file(&root.join("tsconfig.json")));
+    }
+    let (calls, unique, _, _) = work_counts::filesystem_counts(&root);
+    assert_eq!(
+        (calls, unique),
+        (2, 2),
+        "positive and negative probes must each resolve once across file-local DiskFacts"
+    );
+    assert_eq!(work_counts::realpaths_under(&root), 3);
+
+    let next_build = callgraph::ModuleResolutionMemo::default();
+    let disk = next_build.disk_facts(&root);
+    let facts = FactPaths {
+        root: &root,
+        facts: &disk,
+    };
+    assert!(facts.is_file(&root.join("package.json")));
+    assert_eq!(
+        work_counts::filesystem_counts(&root).0,
+        3,
+        "a new build must not inherit the old snapshot's canonical identities"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cold_callgraph_probe_memo_revalidates_existing_and_dangling_symlinks() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let first = write(&root, "first/package.json", "{}");
+    fs::create_dir(root.join("second")).unwrap();
+    symlink("first", root.join("alias")).unwrap();
+    symlink("missing", root.join("dangling")).unwrap();
+    let memo = callgraph::ModuleResolutionMemo::default();
+    let disk = memo.disk_facts(&root);
+    let facts = FactPaths {
+        root: &root,
+        facts: &disk,
+    };
+    assert!(facts.is_file(&root.join("alias/package.json")));
+    assert_eq!(
+        facts.canonical(&root.join("alias/package.json")),
+        Some(first)
+    );
+    assert!(!facts.is_file(&root.join("dangling/package.json")));
+    assert!(!facts.is_file(&root.join("dangling")));
+    fs::remove_file(root.join("alias")).unwrap();
+    symlink("second", root.join("alias")).unwrap();
+    fs::remove_file(root.join("dangling")).unwrap();
+    symlink("first", root.join("dangling")).unwrap();
+    assert!(!facts.is_file(&root.join("alias/package.json")));
+    assert_eq!(
+        facts.canonical(&root.join("alias")),
+        Some(root.join("second"))
+    );
+    assert!(facts.is_file(&root.join("dangling/package.json")));
+    assert!(facts.is_dir(&root.join("dangling")));
+}
+
 /// Frozen tracked inputs and sorted logical rows follow the extraction-work
 /// census, but include both storage paths and the dead-code consumer this time.
 #[test]
