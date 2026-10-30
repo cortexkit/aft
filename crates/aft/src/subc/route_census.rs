@@ -559,6 +559,8 @@ mod tests {
         let (dir, ctx, task) = wait_fixture(None);
         let root = ProjectRootId::from_path(dir.path()).unwrap();
         let registry = ctx.bash_background();
+        std::fs::write(&task.paths.stdout, "private task output").unwrap();
+        std::fs::write(&task.paths.stderr, "").unwrap();
         let watch = registry
             .register_watch(
                 task.task_id.clone(),
@@ -566,6 +568,8 @@ mod tests {
                 false,
             )
             .unwrap();
+        std::fs::remove_file(&task.paths.stdout).unwrap();
+        std::fs::remove_file(&task.paths.stderr).unwrap();
         let ctx = Arc::new(ctx);
         let executor = Executor::new();
         executor.register_actor(root.clone(), ctx.clone());
@@ -582,6 +586,7 @@ mod tests {
         }
         assert!(!value.to_string().contains("secret pattern"));
         assert!(!value.to_string().contains("fake running command"));
+        assert!(!value.to_string().contains("private task output"));
         let guard = task.state.lock().unwrap();
         let busy = fixture.snapshot(&executor, &metrics, now).render(&executor);
         assert!(busy["roots"][0]["routes"][0]["pins"]["running_bash"].is_null());
