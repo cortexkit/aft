@@ -518,7 +518,13 @@ The call returns `taskId`; inspect a snapshot with `bash_status({ "taskId": "...
 the next foreground tool call, and a completion reminder is delivered automatically (no polling
 needed). Output is buffered in memory up to 1MB and spills beyond that to AFT's bash-output cache
 (default `~/.cache/aft/bash-output/<taskId>.log`, or the harness storage directory when configured).
-Background tasks and undelivered completions are persisted to disk and survive AFT restarts.
+
+AFT saves background task records and pending notices on disk.
+On Linux, daemon tasks in user scopes can continue to run through an AFT module restart.
+The same systemd user manager must stay active. Standalone and PTY tasks do not get this containment.
+If the exit marker is missing and AFT cannot find the recorded process, it reports an unknown outcome (`FateUnknown`).
+See [scope settings and limits](config.md) for the fallback conditions and the operator stop command.
+
 Once a task has finished for 24 hours and its completion has been delivered, its output files are
 deleted; copy evidence you need into your report or a shared file. With project-root restrictions,
 only the starting session gets an ownership exception for output outside the project; another
@@ -583,6 +589,9 @@ call is aborted. Async mode (`background: true`)
 registers a pattern watcher that fires a notification when matched and suppresses the default
 completion reminder. (Wait/watch semantics moved here from `bash_status` — `bash_status` is
 snapshot-only.)
+
+Worker waits do not extend Linux daemon scope ceilings.
+See `bash.linux_scope_max_runtime_secs` in [configuration](config.md).
 
 **`bash_write`** — send input to a running PTY task. `input` is either a literal string or an
 array mixing literal strings and `{ key: "..." }` objects for control keys, e.g.

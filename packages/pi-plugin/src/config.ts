@@ -374,8 +374,10 @@ export interface BashConfig {
    */
   worker_wait_max_ms?: number;
   memory_limit_mib?: number;
-  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  /** Linux daemon scopes are on by default. Projects cannot change this containment. */
   linux_scope?: boolean;
+  /** User-only scope ceiling without an explicit timeout, in seconds. Default 86400. */
+  linux_scope_max_runtime_secs?: number;
   /** macOS agent commands do not inherit the supervisor's privacy grants. Default false. */
   disclaim_privacy?: boolean;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
@@ -937,9 +939,11 @@ const BashFeaturesSchema = z.object({
       message: `bash.worker_wait_max_ms must be at least ${MIN_WORKER_WAIT_MAX_MS}`,
     })
     .optional(),
-  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   memory_limit_mib: z.number().int().min(1).max(4_294_967_295).optional(),
+  /** Linux daemon scopes are on by default. Projects cannot change this containment. */
   linux_scope: z.boolean().optional(),
+  /** User-only scope ceiling without an explicit timeout, in seconds. Default 86400. */
+  linux_scope_max_runtime_secs: z.number().int().min(1).max(4_294_967_295).optional(),
   disclaim_privacy: z.boolean().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.

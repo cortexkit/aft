@@ -477,9 +477,17 @@ function buildSchema(): Record<string, unknown> {
               },
               linux_scope: {
                 type: "boolean",
-                default: false,
+                default: true,
                 description:
-                  "Linux-only, user-tier opt-in. Run tool shells in transient systemd user scopes when systemd-run and the user manager are available; otherwise fall back to the normal spawn.",
+                  "Linux daemon scopes are on by default. User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
+              },
+              linux_scope_max_runtime_secs: {
+                type: "integer",
+                minimum: 1,
+                maximum: 4294967295,
+                default: 86400,
+                description:
+                  "User-only Linux daemon scope ceiling in seconds. Worker waits do not extend it. An explicit timeout uses its own limit plus 60 seconds.",
               },
               disclaim_privacy: {
                 type: "boolean",
