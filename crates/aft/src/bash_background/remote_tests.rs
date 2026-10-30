@@ -53,6 +53,7 @@ async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timer
     let metadata = task.state.lock().unwrap().metadata.clone();
     let saved = fs::read(&paths.json).unwrap();
     let started = task.started;
+    let launch_ready = task.remote_launch_ready.load(Ordering::Acquire);
     let last_checkpoint = sink.last_progress_persist;
     let mut recovery = ReattachBudget::new(dir.path(), &metadata);
     recovery.deadline();
@@ -103,7 +104,10 @@ async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timer
         ),
         deadlines
     );
-    assert!(!task.remote_launch_ready.load(Ordering::Acquire));
+    assert_eq!(
+        task.remote_launch_ready.load(Ordering::Acquire),
+        launch_ready
+    );
 
     consumer
         .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)

@@ -877,11 +877,16 @@ impl WatchJob {
 }
 
 /// Turns `note` (from `remote_phase_note`) into a sentence: first character
-/// upper-cased, a period appended. An empty note gives an empty string.
+/// upper-cased, a period added if missing. An empty note gives an empty string.
 fn remote_phase_sentence(note: &str) -> String {
     let mut chars = note.chars();
     match chars.next() {
-        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        Some(first) => format!(
+            "{}{}{}",
+            first.to_uppercase(),
+            chars.as_str(),
+            if note.ends_with('.') { "" } else { "." }
+        ),
         None => String::new(),
     }
 }
@@ -903,6 +908,21 @@ fn output_tail(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_progress_sentences_keep_the_approved_final_period() {
+        assert_eq!(
+            super::remote_phase_sentence("queued on the runner (12 s)"),
+            "Queued on the runner (12 s)."
+        );
+        for note in [
+            "The remote job is uploading its files (14s so far).",
+            "The remote job is waiting for a free build host (2m 10s so far): room available.",
+            "The remote job is connecting to its build host (3s so far).",
+            "The remote job is in step future_phase (40s so far).",
+        ] {
+            assert_eq!(super::remote_phase_sentence(note), note);
+        }
+    }
     use super::*;
     #[test]
     fn each_line_sync_watch_refuses_delivery() {
