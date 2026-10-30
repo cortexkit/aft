@@ -230,6 +230,8 @@ impl PhaseTimer {
     }
 
     pub(crate) fn finish(&mut self, phase: &str) {
+        #[cfg(test)]
+        crate::test_allocations::heap_marker(self.prefix, phase);
         let elapsed = self.start.elapsed();
         let elapsed_ms = elapsed.as_millis();
         ACTIVE_MATERIALIZATION.with(|active| {
@@ -305,6 +307,8 @@ impl StageTimer {
     }
 
     pub(crate) fn finish(&mut self, stage: &str, detail: std::fmt::Arguments<'_>) {
+        #[cfg(test)]
+        crate::test_allocations::heap_marker(self.prefix, stage);
         if self.enabled {
             eprintln!(
                 "view_profile {}.{stage} ms={:.3} {detail}",

@@ -63,29 +63,58 @@ pub(super) fn is_request(body: &Value) -> bool {
         == Some(OPERATION)
 }
 
-fn admit(scope: Option<&ScopeStamp>, now_ms: u64) -> Result<(), ErrorBody> {
-    let refused = || {
-        ErrorBody::new(
-            "permission_denied",
-            "diagnostics.findings requires an authorized agent head or daemon-stamped flow route",
-        )
-    };
-    let scope = scope.ok_or_else(refused)?;
-    if !scope.owner_authorized
-        || scope.scope_epoch == 0
-        || scope.expires_at_ms.is_some_and(|at| at <= now_ms)
-        || scope.kind == ScopeKind::Worker
-        || scope.attributes.on_behalf_of_agent.is_some()
-        || scope.attributes.run_id.is_some()
-    {
-        return Err(refused());
-    }
-    if scope
+fn admission_refusal() -> ErrorBody {
+    ErrorBody::new(
+        "permission_denied",
+        "diagnostics.findings requires an authorized agent head or daemon-stamped flow route",
+    )
+}
+
+pub(super) fn is_flow_scope(scope: &ScopeStamp) -> bool {
+    scope
         .attributes
         .flow_id
         .as_ref()
         .is_some_and(|id| !id.is_empty())
-        || (scope.kind == ScopeKind::Head
+}
+
+fn authorized_scope(scope: &ScopeStamp, now_ms: u64) -> bool {
+    scope.owner_authorized
+        && scope.scope_epoch != 0
+        && scope.expires_at_ms.is_none_or(|at| at > now_ms)
+        && scope.kind != ScopeKind::Worker
+        && scope.attributes.on_behalf_of_agent.is_none()
+        && scope.attributes.run_id.is_none()
+}
+
+fn authorized_flow(scope: &ScopeStamp, now_ms: u64) -> bool {
+    is_flow_scope(scope) && authorized_scope(scope, now_ms)
+}
+
+// The daemon owns scope authority: do not duplicate its owner or carrier list.
+// This admits only manifest-declared read-only flow operations; adding a more
+// privileged flow operation requires reviewing this admission boundary.
+pub(super) fn admit_flow(scope: Option<&ScopeStamp>) -> Result<(), ErrorBody> {
+    let now = now_ms()?;
+    if scope.is_some_and(|scope| authorized_flow(scope, now)) {
+        Ok(())
+    } else {
+        Err(admission_refusal())
+    }
+}
+
+fn now_ms() -> Result<u64, ErrorBody> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|_| ErrorBody::new("clock_unavailable", "Unix-epoch clock unavailable"))
+}
+
+fn admit(scope: Option<&ScopeStamp>, now_ms: u64) -> Result<(), ErrorBody> {
+    let scope = scope.ok_or_else(admission_refusal)?;
+    if authorized_flow(scope, now_ms)
+        || (authorized_scope(scope, now_ms)
+            && scope.kind == ScopeKind::Head
             && scope
                 .attributes
                 .agent_id
@@ -94,7 +123,7 @@ fn admit(scope: Option<&ScopeStamp>, now_ms: u64) -> Result<(), ErrorBody> {
     {
         Ok(())
     } else {
-        Err(refused())
+        Err(admission_refusal())
     }
 }
 
@@ -131,10 +160,7 @@ fn reply(
     cache: &super::HealthRollupCache,
     executor: &crate::executor::Executor,
 ) -> Result<Value, ErrorBody> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ErrorBody::new("clock_unavailable", "Unix-epoch clock unavailable"))?
-        .as_millis() as u64;
+    let now = now_ms()?;
     admit(scope, now)?;
     let window = window_ms(&envelope["params"])
         .map_err(|message| ErrorBody::new("invalid_params", message))?;
@@ -783,6 +809,46 @@ mod tests {
             .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == OPERATION))));
     }
 
+    #[test]
+    fn flow_management_requests_keep_bind_admission_and_recheck_authority() {
+        use super::super::*;
+
+        let mut identity = ManagementIdentity {
+            admission: ManagementAdmission::FlowOnly,
+            ..Default::default()
+        };
+        let forged = json!({"op": "memory.census", "scope": {"kind": "head"}});
+        assert_eq!(
+            admit_management_flow_request(&identity, Some(&forged))
+                .unwrap_err()
+                .code,
+            "flow_scope_not_supported"
+        );
+        let findings = json!({"method": OPERATION});
+        let mut flow = scope(ScopeKind::Ephemeral);
+        flow.attributes.flow_id = Some("alf-self-diagnosis".into());
+        for stamp in [
+            None,
+            Some({
+                let mut expired = flow.clone();
+                expired.expires_at_ms = Some(1);
+                expired
+            }),
+            Some({
+                flow.owner_authorized = false;
+                flow
+            }),
+        ] {
+            identity.scope = stamp;
+            assert_eq!(
+                admit_management_flow_request(&identity, Some(&findings))
+                    .unwrap_err()
+                    .code,
+                "permission_denied"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn flow_scoped_route_serves_only_diagnostics_findings() {
         use super::super::*;
@@ -824,6 +890,10 @@ mod tests {
         // Module startup opens shared storage for the GitHub speech service before
         // any route binds. Keep it outside the project whose setup we forbid.
         let storage = dir.path().join("module-storage");
+        let app = App::default_shared();
+        let executor = Arc::new(Executor::new());
+        let module_app = app.clone();
+        let module_executor = executor.clone();
         let (mut daemon, module) = tokio::io::duplex(64 * 1024);
         let module_thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -835,8 +905,8 @@ mod tests {
                 read,
                 write,
                 &storage.join("absent-connection.json"),
-                App::default_shared(),
-                Arc::new(Executor::new()),
+                module_app,
+                module_executor,
                 |_, _| panic!("flow scope must not execute commands"),
                 None,
                 false,
@@ -872,34 +942,84 @@ mod tests {
         );
 
         let mut flow = scope(ScopeKind::Ephemeral);
-        flow.attributes.agent_id = None;
-        flow.attributes.flow_id = Some("fleet-self-diagnosis".into());
-        let bind = |channel, target, role_versions| ModuleControlRequest::RouteBind {
+        flow.scope_ref = "flow:alf-self-diagnosis".into();
+        flow.attributes.flow_id = Some("alf-self-diagnosis".into());
+        let basal = Some(Principal::Reserved {
+            module_id: "basal".into(),
+        });
+        assert_eq!(trust_for_bind("basal", &basal), BindTrust::Untrusted);
+        let bind = |channel, principal, scope| ModuleControlRequest::RouteBind {
             route_channel: channel,
             epoch: 1,
-            target,
-            identity: subc_protocol::BindIdentity::new(&root, "alfonso", "flow-diagnostics"),
-            principal: Some(Principal::Reserved {
-                module_id: "prefrontal-core".into(),
-            }),
+            target: RouteTarget::ManagementSurface {
+                module_id: "aft".into(),
+            },
+            identity: subc_protocol::BindIdentity::new(&root, "basal", "flow-diagnostics"),
+            principal,
             consumer_capabilities: None,
             admission_facts: Default::default(),
-            scope: Some(flow.clone()),
-            role_versions,
+            scope,
+            role_versions: None,
             call_mode: Some(subc_protocol::call_mode::CallMode::Flow),
         };
+
+        let mut invalid_scopes = vec![None, Some(scope(ScopeKind::Head))];
+        for mutation in [
+            |s: &mut ScopeStamp| s.owner_authorized = false,
+            |s: &mut ScopeStamp| s.attributes.flow_id = Some(String::new()),
+            |s: &mut ScopeStamp| s.scope_epoch = 0,
+            |s: &mut ScopeStamp| s.expires_at_ms = Some(1),
+            |s: &mut ScopeStamp| s.kind = ScopeKind::Worker,
+            |s: &mut ScopeStamp| s.attributes.run_id = Some("worker-run".into()),
+            |s: &mut ScopeStamp| s.attributes.on_behalf_of_agent = Some("alf".into()),
+        ] {
+            let mut invalid = flow.clone();
+            mutation(&mut invalid);
+            invalid_scopes.push(Some(invalid));
+        }
+        for (index, stamp) in invalid_scopes.into_iter().enumerate() {
+            let channel = 50 + index as u16;
+            let answer = request(
+                &mut daemon,
+                0,
+                u64::from(channel),
+                serde_json::to_value(bind(channel, basal.clone(), stamp)).unwrap(),
+            )
+            .await;
+            assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
+            let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
+            assert_eq!(error.code, "route_refused");
+            assert_eq!(
+                error.message,
+                "AFT management routes require a first-party principal"
+            );
+            assert_eq!(error.detail, None);
+            assert!(!root.exists(), "refused bind must not initialize storage");
+            assert_eq!(executor.actor_count(), 0);
+            assert_eq!(app.watcher_count(), 0);
+        }
+
+        let mut flow_read = flow.clone();
+        flow_read.scope_ref = "flow-read/call".into();
+        let answer = request(
+            &mut daemon,
+            0,
+            60,
+            serde_json::to_value(bind(60, basal.clone(), Some(flow_read.clone()))).unwrap(),
+        )
+        .await;
+        assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&answer.body).unwrap(),
+            serde_json::to_value(flow_read::admit_management(Some(&flow_read)).unwrap_err())
+                .unwrap(),
+        );
+
         let ack = request(
             &mut daemon,
             0,
             41,
-            serde_json::to_value(bind(
-                41,
-                RouteTarget::ManagementSurface {
-                    module_id: "aft".into(),
-                },
-                None,
-            ))
-            .unwrap(),
+            serde_json::to_value(bind(41, basal.clone(), Some(flow.clone()))).unwrap(),
         )
         .await;
         assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
@@ -922,6 +1042,8 @@ mod tests {
         assert_eq!(findings.header.ty, FrameType::Response, "{findings:?}");
         let findings: Value = serde_json::from_slice(&findings.body).unwrap();
         assert!(findings["result"]["findings"].is_array(), "{findings}");
+        assert!(findings["result"]["generated_at_ms"].is_u64(), "{findings}");
+        assert_eq!(findings["result"]["window_ms"], DEFAULT_WINDOW_MS);
         assert!(
             !root.exists(),
             "diagnostics.findings must not initialize project storage"
@@ -929,24 +1051,102 @@ mod tests {
 
         // Include provider reads and unknown operations: none may fall through
         // to a database read or a general tool just because it lacks a method.
-        for body in [
+        let mut refused_requests = vec![
+            json!({"method": "health", "params": {}}),
+            json!({"op": "health"}),
+            json!({"method": "configure", "params": {"project_root": root}}),
+            json!({"op": "configure", "project_root": root}),
             json!({"method": "memory.census", "params": {}}),
             json!({"method": "writes.census", "params": {}}),
             json!({"method": "backups.purge", "params": {}}),
             json!({"op": "tool.call", "name": "read", "arguments": {"path": "secret"}}),
             json!({"name": "read", "arguments": {"path": "secret"}}),
             json!({"op": "tool.list"}),
+            json!({"method": "configure", "op": OPERATION}),
+            json!({"op": "memory.census", "scope": {"kind": "head"}}),
             json!({"method": "unknown.operation"}),
             Value::Null,
-        ] {
+        ];
+        let manifest = serde_json::to_value(manifest::build_manifest()).unwrap();
+        for provider in manifest["provides"].as_array().unwrap() {
+            if let Some(operations) = provider["operations"].as_array() {
+                for operation in operations {
+                    if operation["name"] != OPERATION {
+                        refused_requests.push(json!({"op": operation["name"], "params": {}}));
+                    }
+                }
+            }
+        }
+        for body in refused_requests {
             let answer = request(&mut daemon, 41, 43, body).await;
             assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
             let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
             assert_eq!(error.code, "flow_scope_not_supported");
+            assert_eq!(
+                error.message,
+                "a flow may call only diagnostics.findings on an AFT management route"
+            );
             assert!(
                 !root.exists(),
                 "refused flow request must not initialize project storage"
             );
+            assert_eq!(executor.actor_count(), 0);
+            assert_eq!(app.watcher_count(), 0);
+        }
+
+        // Authority comes from the daemon stamp, not a local owner/carrier list.
+        let mut other_owner = flow.clone();
+        other_owner.owner = Principal::Reserved {
+            module_id: "another-scope-authority".into(),
+        };
+        let ack = request(
+            &mut daemon,
+            0,
+            61,
+            serde_json::to_value(bind(61, Some(Principal::Unverified), Some(other_owner))).unwrap(),
+        )
+        .await;
+        assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+        let findings = request(&mut daemon, 61, 62, json!({"op": OPERATION})).await;
+        assert_eq!(findings.header.ty, FrameType::Response, "{findings:?}");
+
+        // Unscoped first-party management still serves the census; heads can
+        // still read findings with or without a flow identity of their own.
+        for (channel, stamp) in [
+            (70, None),
+            (71, Some(scope(ScopeKind::Head))),
+            (
+                72,
+                Some({
+                    let mut head = flow.clone();
+                    head.kind = ScopeKind::Head;
+                    head
+                }),
+            ),
+        ] {
+            let ack = request(
+                &mut daemon,
+                0,
+                u64::from(channel),
+                serde_json::to_value(bind(channel, Some(Principal::Direct), stamp)).unwrap(),
+            )
+            .await;
+            assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+            let body = if channel == 70 {
+                json!({"op": "memory.census"})
+            } else {
+                json!({"method": OPERATION})
+            };
+            let answer = request(&mut daemon, channel, 73, body).await;
+            assert_eq!(answer.header.ty, FrameType::Response, "{answer:?}");
+            let body: Value = serde_json::from_slice(&answer.body).unwrap();
+            if channel == 70 {
+                assert_eq!(body["op"], "memory.census");
+                assert_eq!(body["status"], "ok");
+                assert!(body["data"]["process"].is_object(), "{body}");
+            } else {
+                assert!(body["result"]["findings"].is_array(), "{body}");
+            }
         }
 
         // Flow-scoped tool-provider binds follow the call-mode contract
@@ -957,6 +1157,8 @@ mod tests {
             !root.exists(),
             "flow admission must not initialize a project or database"
         );
+        assert_eq!(executor.actor_count(), 0);
+        assert_eq!(app.watcher_count(), 0);
     }
 
     #[test]

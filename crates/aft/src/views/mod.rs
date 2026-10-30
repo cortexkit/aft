@@ -60,6 +60,7 @@ pub mod parent;
 pub mod query_wait;
 pub mod semantic;
 pub mod semantic_arena;
+pub(crate) mod semantic_batch_lease;
 pub mod semantic_runtime;
 mod tree_base;
 pub mod trigram;

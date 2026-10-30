@@ -4,6 +4,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "first_load_memory.rs"]
+mod memory;
+
 use crate::blob_store::v2::FamilyPlane;
 pub use crate::watcher_backend::cookie::{CookieObservation, CookieTicket};
 
@@ -2514,6 +2518,22 @@ impl FirstLoadDriver for CheckoutDriver {
             None
         };
         let mut v3_readers = V3PlaneReaders::new(&route);
+        let v2_graph_reader = if !v3
+            && self
+                .planes
+                .iter()
+                .any(|p| p.plane() == FamilyPlane::Callgraph)
+        {
+            crate::blob_store::v2::FamilyStoreReader::open_existing(
+                self.owner.registry().storage(),
+                self.owner.family(),
+                FamilyPlane::Callgraph,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
         let persisted = durable
             .as_ref()
             .and_then(|generation| {
@@ -2653,6 +2673,17 @@ impl FirstLoadDriver for CheckoutDriver {
                     let keys_present = old.attachments.values().all(|a| {
                         a.downcast_ref::<CachedAttachment>()
                             .is_none_or(|cached| v3_readers.contains(&cached.0))
+                            && a.downcast_ref::<super::callgraph::CallgraphAttachment>()
+                                .is_none_or(|attachment| {
+                                    attachment.payload().is_some()
+                                        || if v3 {
+                                            v3_readers.contains(&attachment.key)
+                                        } else {
+                                            v2_graph_reader.as_ref().is_some_and(|reader| {
+                                                reader.contains(&attachment.key).unwrap_or(false)
+                                            })
+                                        }
+                                })
                     });
                     if cached.reusable(current)
                         && delivered <= cached.delivery_seq
@@ -2803,6 +2834,8 @@ impl FirstLoadDriver for CheckoutDriver {
             guard: guard.clone(),
             subscription,
         };
+        #[cfg(test)]
+        crate::test_allocations::heap_marker("first_load", "reconcile");
         let mut cut = installed.install_cut().cloned();
         if let Some(cut) = &mut cut {
             cut.verification = guard;
@@ -2960,6 +2993,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         progress = PublicationProgress::Published;
                         unpublished.complete();
                         published = true;
+                        super::callgraph::retire_attachments(&observed, &generation);
                         self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
                         for adapter in &self.adapters {
                             adapter.generation_published(access, &generation, &|| self.installed_cut().0)?;
@@ -3268,6 +3302,7 @@ impl CheckoutDriver {
                         },
                     );
                 drop(retired);
+                super::callgraph::retire_attachments(&observed, &composed);
                 Ok(composed)
             }
             Ok(super::base_refs::WorkerOutcome::Lost {
@@ -4688,13 +4723,9 @@ impl CompositePlane for CallgraphBridge {
                 attachment.downcast_ref::<super::callgraph::CallgraphAttachment>()
             {
                 keys.push((path.clone(), attachment.key));
-                payloads.push((
-                    attachment.key,
-                    attachment
-                        .blob
-                        .to_bytes()
-                        .map_err(|e| error(e.to_string()))?,
-                ));
+                if let Some(payload) = attachment.payload() {
+                    payloads.push((attachment.key, payload));
+                }
             } else {
                 return Err(error(format!("{path:?}: callgraph attachment missing")));
             }
@@ -4728,6 +4759,21 @@ impl CompositePlane for CallgraphBridge {
                 ));
             }
         }
+        for (path, key) in &keys {
+            if let Some(attachment) = observed
+                .get(path)
+                .and_then(|entry| entry.attachments.get(&FamilyPlane::Callgraph))
+                .and_then(|a| a.downcast_ref::<super::callgraph::CallgraphAttachment>())
+                .filter(|a| a.key == *key)
+            {
+                attachment.retire();
+            }
+        }
+        drop(payloads);
+        // Successor publication builds the derived graph before returning. The
+        // protected blob rows, not reconciliation buffers, are its inputs.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         super::base_builder::publish_successor(
             claim,
             |manifest| {
@@ -4851,13 +4897,20 @@ impl CompositePlane for CallgraphBridge {
             .collect();
         live.protect(&keys).map_err(|e| error(e.to_string()))?;
         for (path, attachment) in attachments {
-            let bytes = attachment
-                .blob
-                .to_bytes()
-                .map_err(|e| error(e.to_string()))?;
+            let bytes = match attachment.payload() {
+                Some(bytes) => bytes,
+                None => store
+                    .get(&attachment.key)
+                    .map_err(|e| error(e.to_string()))?
+                    .ok_or_else(|| error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: retired callgraph payload missing from store; revalidate")))?
+                    .into(),
+            };
             store
                 .put_or_touch(&attachment.key, &bytes)
                 .map_err(|e| error(e.to_string()))?;
+            // The live pin protects the durable row through graph construction.
+            // Retries can read it under a new pin; a missing row forces revalidation.
+            attachment.retire();
             if let Some(super::manifest_v2::EntryV2::Regular {
                 planes,
                 resolution_input,
@@ -4868,6 +4921,9 @@ impl CompositePlane for CallgraphBridge {
                 *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
             }
         }
+        // Return freed extraction buffers before the resolver grows its indices.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         // Joining uses only protected immutable blobs and the projected manifest,
         // not a source root or a sibling's derived database.
         let reader = super::callgraph::BlobReader(
@@ -4995,14 +5051,20 @@ impl CompositePlane for CallgraphBridge {
             .map_err(|e| error(e.to_string()))?;
         let mut payloads = Vec::new();
         for (path, attachment) in &attachments {
-            payloads.push((
-                path.clone(),
-                attachment.key,
-                attachment
-                    .blob
-                    .to_bytes()
-                    .map_err(|e| error(e.to_string()))?,
-            ));
+            let bytes = match attachment.payload() {
+                Some(bytes) => bytes,
+                None => crate::blob_store::v3::PlaneReader::open_existing(
+                    &route.storage,
+                    &route.family,
+                    FamilyPlane::Callgraph,
+                )
+                .map_err(super::callgraph::v3_error)?
+                .get(&attachment.key)
+                .map_err(super::callgraph::v3_error)?
+                .ok_or_else(|| error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: retired callgraph payload missing from store; revalidate")))?
+                .into(),
+            };
+            payloads.push((path.clone(), attachment.key, bytes));
         }
         if !payloads.is_empty() {
             let request = payloads
@@ -5031,6 +5093,13 @@ impl CompositePlane for CallgraphBridge {
                 *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
             }
         }
+        for (_, attachment) in &attachments {
+            attachment.retire();
+        }
+        drop((payloads, attachments));
+        // Serialization and parsing buffers no longer belong to this phase.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         // The derived graph covers the composed generation. While the base's
         // graph is still pending the projection refuses, and the worker's
         // graph stays building until a later publication; nothing is copied.
@@ -5039,7 +5108,7 @@ impl CompositePlane for CallgraphBridge {
         if super::callgraph::project_manifest(&composed).is_err() {
             return Ok(());
         }
-        let reader = super::callgraph::V3BlobReader(
+        let reader = super::callgraph::V3BlobReader::new(
             crate::blob_store::v3::PlaneReader::open_existing(
                 &route.storage,
                 &route.family,
@@ -5149,6 +5218,64 @@ impl CompositePlane for CallgraphBridge {
 mod callgraph_bridge_tests {
     use super::super::contracts::{PlaneAdapter, PlaneLoader};
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_v2_attachment_reuses_present_key_and_reextracts_a_missing_row() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("file.rs"),
+            b"fn target() {} fn caller() { target(); }",
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join("file.rs"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, bridge.clone());
+        SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])
+            .load(&access)
+            .unwrap();
+        let count = bridge.extraction_count();
+        let observed = driver.observed.lock().unwrap().clone();
+        let attachment = observed.entries[&RelPath::new(b"file.rs".to_vec()).unwrap()].attachments
+            [&FamilyPlane::Callgraph]
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap();
+        assert!(attachment.payload().is_none());
+        driver.reconcile(&access).unwrap();
+        assert_eq!(
+            bridge.extraction_count(),
+            count,
+            "a durable key replaces the consumed payload"
+        );
+        let store = driver.owner.open_store(FamilyPlane::Callgraph).unwrap();
+        let deleted = rusqlite::Connection::open(store.path())
+            .unwrap()
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key=?1",
+                rusqlite::params![attachment.key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let next = driver.reconcile(&access).unwrap();
+        assert_eq!(bridge.extraction_count(), count + 1);
+        assert!(
+            next.entries[&RelPath::new(b"file.rs".to_vec()).unwrap()].attachments
+                [&FamilyPlane::Callgraph]
+                .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+                .unwrap()
+                .payload()
+                .is_some()
+        );
+    }
 
     struct Walker;
     impl MembershipWalker for Walker {
@@ -6899,7 +7026,7 @@ mod v3_bootstrap_tests {
         assert_eq!(graph.key(&path, content), Some(extracted.key));
         let trigram_key = crate::blob_store::v2::TrigramKey { content, policy }.family_key();
         let trigram = super::super::segment_store::TrigramPayload::extract(bytes, &policy).encode();
-        let graph_payload = extracted.blob.to_bytes().unwrap();
+        let graph_payload = extracted.payload().unwrap();
         crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
             p.put(
                 &trigram_key,
@@ -6981,7 +7108,7 @@ mod v3_bootstrap_tests {
         crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
             p.put(
                 &key,
-                &attachment.blob.to_bytes().unwrap(),
+                &attachment.payload().unwrap(),
                 FamilyPlane::Callgraph.payload_schema(),
             )?;
             Ok(())

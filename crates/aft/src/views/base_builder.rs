@@ -401,7 +401,7 @@ impl BuildClaim {
         // `derived_name` is `derived-<owner>.sqlite`: the name the
         // reference file below resolves to.
         let database = store.view_dir().join(self.derived_name(generation));
-        let reader = super::callgraph::V3BlobReader(v3::PlaneReader::open_existing(
+        let reader = super::callgraph::V3BlobReader::new(v3::PlaneReader::open_existing(
             &self.storage,
             &self.family,
             FamilyPlane::Callgraph,
