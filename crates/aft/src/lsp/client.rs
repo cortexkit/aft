@@ -2434,7 +2434,10 @@ impl LspClient {
     }
 
     /// Send `textDocument/didChange` carrying the whole document (see
-    /// [`full_did_change_message`]).
+    /// [`full_did_change_message`]). Production senders need the order and
+    /// call [`Self::send_full_did_change_ordered`]; tests that only need the
+    /// send use this.
+    #[cfg(test)]
     pub(crate) fn send_full_did_change(
         &mut self,
         uri: &lsp_types::Uri,
