@@ -2439,11 +2439,10 @@ impl LspManager {
         key: &ServerKey,
         failure: StartFailure,
     ) -> ServerAttemptResult {
-        slog_error!("failed to spawn {}: {}", def.name, failure.error);
+        log_spawn_failure(def, key, &failure.error, self.retry_clock.now());
         let result = classify_spawn_error(&def.binary, &failure.error);
-        // Remember the failure so subsequent file events skip this
-        // (kind, root) pair instead of producing a fresh spawn attempt +
-        // ERROR log per request.
+        // Remember executable failures so subsequent file events skip this
+        // (kind, root) pair. Capacity refusals remain eligible on the next request.
         self.record_failed_spawn(key, result, failure.durability)
     }
 
@@ -9771,6 +9770,37 @@ fn process_start_durability(error: &LspError) -> FailureDurability {
     }
 }
 
+fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: Instant) {
+    let capacity = match error {
+        LspError::Io(io) => io
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<super::client::RustAnalyzerCapacityExhausted>()),
+        _ => None,
+    };
+    if let Some(capacity) = capacity {
+        // Admission is daemon-wide, so separate managers for the same root
+        // must share the log limit. Expire quiet roots instead of retaining
+        // every checkout the daemon has ever seen.
+        static LAST_LOG: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, Instant>>> =
+            std::sync::OnceLock::new();
+        let mut last_log = LAST_LOG.get_or_init(Default::default).lock();
+        last_log.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(3600));
+        if last_log.contains_key(&key.root) {
+            return;
+        }
+        last_log.insert(key.root.clone(), now);
+        drop(last_log);
+        slog_info!(
+            "rust-analyzer admission deferred root={} cap={} current={}; retry after another worker analyzer stops",
+            key.root.display(),
+            capacity.cap,
+            capacity.current
+        );
+    } else {
+        slog_error!("failed to spawn {}: {}", def.name, error);
+    }
+}
+
 /// Classify a server that died or failed during or after `initialize` from
 /// its failure text and stderr. Only configuration errors AFT recognises are
 /// permanent: typescript-language-server finding no usable TypeScript SDK,
@@ -10289,6 +10319,68 @@ mod transient_retry_tests {
         assert_eq!(format_retry_delay(Duration::from_secs(45)), "45s");
         assert_eq!(format_retry_delay(Duration::from_secs(120)), "2m");
         assert_eq!(format_retry_delay(Duration::from_secs(270)), "4m 30s");
+    }
+
+    #[test]
+    fn rust_capacity_logs_info_once_per_root_per_hour_across_managers() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: dir.path().join("first"),
+        };
+        let other = ServerKey {
+            root: dir.path().join("second"),
+            ..key.clone()
+        };
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == ServerKind::Rust)
+            .unwrap();
+        let failure = || {
+            let error = LspError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 3 },
+            ));
+            let durability = process_start_durability(&error);
+            assert_eq!(durability, FailureDurability::Capacity);
+            StartFailure { error, durability }
+        };
+        let (mut first, offset) = manager_with_clock();
+        let mut second = LspManager::new();
+        second.set_retry_clock(first.retry_clock.clone());
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &key, failure());
+            offset.store(3_599_999, Ordering::SeqCst);
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &other, failure());
+            offset.store(3_600_000, Ordering::SeqCst);
+            second.record_file_start_failure(&def, &key, failure());
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(line.starts_with("INFO "), "{line}");
+            assert!(line.contains("cap=2 current=3"), "{line}");
+        }
+        assert!(lines[0].contains(&key.root.display().to_string()));
+        assert!(lines[1].contains(&other.root.display().to_string()));
+        assert!(lines[2].contains(&key.root.display().to_string()));
+
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::NotFound] {
+                let error = LspError::Io(std::io::Error::from(kind));
+                let durability = process_start_durability(&error);
+                first.record_file_start_failure(&def, &key, StartFailure { error, durability });
+            }
+        });
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ERROR "))
+                .count(),
+            2,
+            "real spawn failures must still log ERROR: {lines:?}"
+        );
     }
 
     #[test]
