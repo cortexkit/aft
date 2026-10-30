@@ -272,8 +272,20 @@ impl Drop for DeferredInspectRootPermit {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct InspectRootStatSnapshot(Vec<(PathBuf, u64, SystemTime)>);
+#[derive(Debug)]
+struct InspectRootStatSnapshot(
+    Vec<(PathBuf, u64, SystemTime)>,
+    Arc<crate::inspect::inventory::InspectInventory>,
+    Vec<(PathBuf, blake3::Hash)>,
+);
+
+impl PartialEq for InspectRootStatSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.2 == other.2
+    }
+}
+
+impl Eq for InspectRootStatSnapshot {}
 
 fn capture_inspect_root_stats_until(
     root: &Path,
@@ -295,10 +307,16 @@ fn capture_inspect_root_stats_while(
     has_work_budget: impl Fn() -> bool + Send + Sync + 'static,
     timeout_detail: impl Fn() -> String,
 ) -> Result<InspectRootStatSnapshot, String> {
+    #[cfg(test)]
+    let _profile = crate::inspect::walk_profile::Walk::start("freshness_listing");
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
-    for file in crate::callgraph::walk_project_files_while(root, move || walk_budget()) {
+    let inventory = Arc::new(crate::inspect::inventory::InspectInventory::collect(
+        root,
+        move || walk_budget(),
+    ));
+    for file in &inventory.sources {
         if !has_work_budget() {
             return Err(timeout_detail());
         }
@@ -306,7 +324,7 @@ fn capture_inspect_root_stats_while(
         INSPECT_STAT_CALLS.with(|count| count.set(count.get() + 1));
         match std::fs::metadata(&file) {
             Ok(metadata) => files.push((
-                file,
+                file.clone(),
                 metadata.len(),
                 metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             )),
@@ -327,7 +345,25 @@ fn capture_inspect_root_stats_while(
         return Err(timeout_detail());
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(InspectRootStatSnapshot(files))
+    // Manifest membership is shared with hash calculations during the request.
+    // Fence it too, so an added manifest cannot make a snapshot appear current.
+    let mut manifests = Vec::new();
+    for manifest in &inventory.manifests {
+        if !has_work_budget() {
+            return Err(timeout_detail());
+        }
+        let contents = std::fs::read(manifest).map_err(|error| {
+            format!(
+                "failed to stat {} during inspect verification: {error}",
+                manifest.display()
+            )
+        })?;
+        manifests.push((manifest.clone(), blake3::hash(&contents)));
+    }
+    if !has_work_budget() {
+        return Err(timeout_detail());
+    }
+    Ok(InspectRootStatSnapshot(files, inventory, manifests))
 }
 
 #[cfg(test)]
@@ -641,6 +677,7 @@ fn handle_inspect_payload(
     observed_stats: Option<&InspectRootStatSnapshot>,
     rust_checks: Vec<InspectRustCheck>,
 ) -> Response {
+    let _inventory = observed_stats.map(|stats| stats.1.install());
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
         Err(message) => return invalid_request(&req.id, message),
@@ -901,7 +938,9 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         let grant_scope = crate::access_policy::current_scope();
         let ask_route = crate::access_policy::capture_ask_route();
+        let inventory = crate::inspect::inventory::current(&snapshot.project_root);
         std::thread::spawn(move || {
+            let _inventory = inventory.as_ref().map(|inventory| inventory.install());
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
@@ -7798,6 +7837,160 @@ mod fresh_payload_tests {
 #[cfg(test)]
 mod deferred_terminal_tests {
     #[test]
+    #[ignore = "real-checkout inspect walk and output measurement; requires AFT_INSPECT_WALK_PROFILE_ROOT"]
+    fn inspect_checkout_walk_profile() {
+        use crate::inspect::walk_profile;
+        let root =
+            std::fs::canonicalize(std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").unwrap())
+                .unwrap();
+        let output =
+            std::path::PathBuf::from(std::env::var_os("AFT_INSPECT_WALK_PROFILE_OUTPUT").unwrap());
+        let requested_scope = std::env::var("AFT_INSPECT_WALK_PROFILE_SCOPE")
+            .unwrap_or_else(|_| "crates/aft/src/inspect".to_string());
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(storage.path().to_path_buf());
+        config.views.enabled = false;
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.inspect.tier2_pass_timeout_ms = 600_000;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let configure = RawRequest {
+            id: "inspect-profile-configure".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: serde_json::json!({
+                "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
+                "config": {
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": true},
+                    "views": {"enabled": false},
+                },
+            }),
+        };
+        let configured = crate::commands::configure::handle_configure(&configure, &ctx);
+        assert!(configured.success, "{}", configured.data);
+        ctx.inspect_manager()
+            .set_automatic_tier2_refresh_allowed(false);
+        // Seed heavy analyzers outside the command's per-phase deadline, so a
+        // large checkout measures cache reuse rather than timeout handling.
+        let snapshot = build_snapshot(&ctx).unwrap();
+        assert_eq!(
+            snapshot.project_root,
+            crate::inspect::job::canonicalize_normalized(&root)
+        );
+        assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
+        start_on_demand_callgraph_for_inspect(&ctx, snapshot.config.as_ref());
+        let _ = ctx.callgraph_store_for_query_without_wait();
+        let scope = JobScope::for_project(root.clone());
+        for category in InspectCategory::active().iter().copied() {
+            eprintln!("inspect profile seed starting: {category}");
+            let outcome = if category.is_tier2() {
+                ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
+                    snapshot.clone(),
+                    category,
+                    scope.clone(),
+                )
+            } else if matches!(category, InspectCategory::Metrics | InspectCategory::Todos) {
+                ctx.inspect_manager().submit_category_until(
+                    snapshot.clone(),
+                    category,
+                    scope.clone(),
+                    Instant::now() + Duration::from_secs(900),
+                )
+            } else {
+                continue;
+            };
+            assert!(
+                matches!(outcome, JobOutcome::Fresh { .. }),
+                "{category}: {outcome:?}"
+            );
+            eprintln!("inspect profile seed completed: {category}");
+        }
+        let mut measurements = Vec::new();
+        for (name, scope) in [
+            ("unscoped", None),
+            ("scoped", Some(requested_scope.as_str())),
+        ] {
+            walk_profile::take();
+            let req = RawRequest {
+                id: name.to_string(),
+                command: "inspect".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: serde_json::json!({
+                    "sections": ["dead_code", "unused_exports", "duplicates", "cycles"],
+                    "scope": scope, "top_k": 100,
+                }),
+            };
+            let started = Instant::now();
+            let cpu = walk_profile::cpu_ms();
+            let response = run_blocking_inspect_body(
+                &req,
+                &ctx,
+                ApplicableServerSnapshot::default(),
+                false,
+                InspectPhaseLog::for_request(name.to_string()),
+                InspectRequestDeadline::new(Duration::from_secs(900), Duration::from_secs(1)),
+            );
+            let measurement = serde_json::json!({
+                "case": name, "ms": started.elapsed().as_secs_f64() * 1000.0,
+                "cpu_ms": walk_profile::cpu_ms() - cpu, "walks": walk_profile::take(),
+                "response": response.data,
+            });
+            eprintln!("inspect checkout profile {}", serde_json::to_string(&serde_json::json!({
+                "case": name, "ms": measurement["ms"], "cpu_ms": measurement["cpu_ms"], "walks": measurement["walks"],
+            })).unwrap());
+            assert!(response.success, "{measurement:#}");
+            let snapshot = build_snapshot(&ctx).unwrap();
+            let cache = ctx.inspect_manager().cache_for_snapshot(&snapshot).unwrap();
+            let mut measurement = measurement;
+            let caller_scope = scope.map_or_else(
+                || JobScope::for_project(root.clone()),
+                |relative| JobScope::from_roots(root.clone(), vec![root.join(relative)]),
+            );
+            for category in [
+                InspectCategory::DeadCode,
+                InspectCategory::UnusedExports,
+                InspectCategory::Duplicates,
+                InspectCategory::Cycles,
+            ] {
+                let aggregate = cache
+                    .latest_aggregate_any_hash(category)
+                    .unwrap()
+                    .expect("persisted category aggregate");
+                if category == InspectCategory::DeadCode {
+                    assert_eq!(
+                        aggregate["callgraph_available"], true,
+                        "dead-code comparison requires a real call graph"
+                    );
+                }
+                measurement["full_aggregates"][category.as_str()] = aggregate;
+                let outcome = ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
+                    snapshot.clone(),
+                    category,
+                    caller_scope.clone(),
+                );
+                let JobOutcome::Fresh { payload } = outcome else {
+                    panic!("{category}: {outcome:?}");
+                };
+                measurement["job_aggregates"][category.as_str()] = payload;
+                assert!(
+                    measurement["response"]["summary"]
+                        .get(category.as_str())
+                        .is_some(),
+                    "{measurement:#}"
+                );
+            }
+            measurements.push(measurement);
+        }
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
+    }
+    #[test]
     fn root_too_broad_inspect_refuses_snapshot() {
         let ctx = crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -8255,6 +8448,30 @@ mod deferred_terminal_tests {
             .is_some_and(|phases| phases
                 .iter()
                 .all(|phase| phase["id"] != "stat_verification")));
+    }
+
+    #[test]
+    fn inspect_final_stat_verification_fences_shared_manifest_membership_and_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        let manifest = root.path().join("package.json");
+        std::fs::write(&manifest, "{\"main\":\"one.js\"}").unwrap();
+        let added = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_ne!(initial, added);
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&manifest).unwrap());
+        std::fs::write(&manifest, "{\"main\":\"two.js\"}").unwrap();
+        filetime::set_file_mtime(&manifest, mtime).unwrap();
+        let changed = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_ne!(
+            added, changed,
+            "same-size, same-mtime manifest edits are fenced"
+        );
+        std::fs::remove_file(&manifest).unwrap();
+        assert_eq!(
+            initial,
+            capture_inspect_root_stats_until(root.path(), None).unwrap()
+        );
     }
 
     #[test]
