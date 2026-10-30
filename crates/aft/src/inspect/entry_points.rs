@@ -157,9 +157,6 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
 }
 
 fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
-    if let Some(inventory) = super::inventory::current(project_root) {
-        return inventory.entry_point_files.clone();
-    }
     uncached_entry_point_files_while(project_root, || true)
 }
 
@@ -226,12 +223,7 @@ pub(super) fn is_entry_point_manifest(path: &Path) -> bool {
     )
 }
 
-#[cfg(test)]
-pub(super) fn uncached_entry_point_files(project_root: &Path) -> Vec<PathBuf> {
-    uncached_entry_point_files_while(project_root, || true)
-}
-
-fn should_skip_manifest_dir(path: &Path) -> bool {
+pub(super) fn should_skip_manifest_dir(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
         Some(

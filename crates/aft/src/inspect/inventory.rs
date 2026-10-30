@@ -12,7 +12,6 @@ use super::job::canonicalize_normalized;
 pub(crate) struct InspectInventory {
     root: PathBuf,
     pub(crate) sources: Vec<PathBuf>,
-    pub(super) entry_point_files: Vec<PathBuf>,
     pub(crate) manifests: Vec<PathBuf>,
 }
 
@@ -52,11 +51,9 @@ mod tests {
         crate::project_content::register_storage_root(&root.join("storage"));
         let mut sources = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         sources.sort();
-        let entries = entry_points::uncached_entry_point_files(&root);
         let manifests = entry_points::collect_entry_point_manifests(&root);
         let inventory = Arc::new(InspectInventory::collect(&root, || true));
         assert_eq!(inventory.sources, sources);
-        assert_eq!(inventory.entry_point_files, entries);
         assert_eq!(inventory.manifests, manifests);
         assert!(inventory
             .manifests
@@ -165,9 +162,7 @@ impl InspectInventory {
         // settings. Keep the independent walkers rather than broaden either set.
         let jj_only = root.ancestors().any(|path| path.join(".jj").exists())
             && !root.ancestors().any(|path| path.join(".git").exists());
-        let (mut sources, mut entry_point_files) = if crate::context::confinement::active()
-            || jj_only
-        {
+        let (mut sources, mut manifests) = if crate::context::confinement::active() || jj_only {
             let walk_budget = Arc::clone(&budget);
             let sources =
                 crate::callgraph::walk_project_files_while(root, move || walk_budget()).collect();
@@ -176,7 +171,13 @@ impl InspectInventory {
                 entry_points::uncached_entry_point_files_while(&normalized_root, move || {
                     entry_budget()
                 });
-            (sources, entries)
+            (
+                sources,
+                entries
+                    .into_iter()
+                    .filter(|path| entry_points::is_entry_point_manifest(path))
+                    .collect(),
+            )
         } else {
             #[derive(Default)]
             struct Census {
@@ -184,7 +185,9 @@ impl InspectInventory {
                 // inherit each policy's decision even when the union descends.
                 directories: HashMap<PathBuf, (bool, bool)>,
                 sources: Vec<PathBuf>,
-                entries: Vec<PathBuf>,
+                // Retaining other files would sort the whole checkout again for
+                // each before/after file listing, but the hash only needs manifests.
+                manifests: Vec<PathBuf>,
             }
             let census = Arc::new(Mutex::new(Census::default()));
             let collected = Arc::clone(&census);
@@ -210,8 +213,15 @@ impl InspectInventory {
                     .unwrap_or((true, true));
                 let source = source_parent
                     && crate::callgraph::project_walk_entry_is_included(entry, &worktrees);
+                // A source-admitted directory already passed the shared worktree
+                // boundary check; manifest-only directories still need that check.
                 let manifest = manifest_parent
-                    && entry_points::manifest_walk_entry_is_included(entry, &worktrees);
+                    && (!entry.file_type().is_some_and(|kind| kind.is_dir())
+                        || (!entry_points::should_skip_manifest_dir(entry.path())
+                            && (source
+                                || !crate::search_index::is_nested_worktree_entry(
+                                    entry, &worktrees,
+                                ))));
                 if entry.file_type().is_some_and(|kind| kind.is_dir()) {
                     state
                         .directories
@@ -220,12 +230,12 @@ impl InspectInventory {
                     if source && crate::parser::detect_language(entry.path()).is_some() {
                         state.sources.push(entry.path().to_path_buf());
                     }
-                    if manifest {
+                    if manifest && entry_points::is_entry_point_manifest(entry.path()) {
                         let relative = entry
                             .path()
                             .strip_prefix(&walk_root)
                             .expect("walk entry under root");
-                        state.entries.push(entry_root.join(relative));
+                        state.manifests.push(entry_root.join(relative));
                     }
                 }
                 source || manifest
@@ -236,20 +246,15 @@ impl InspectInventory {
             let mut state = census.lock().unwrap();
             (
                 std::mem::take(&mut state.sources),
-                std::mem::take(&mut state.entries),
+                std::mem::take(&mut state.manifests),
             )
         };
         sources.sort();
-        entry_point_files.sort();
-        let manifests = entry_point_files
-            .iter()
-            .filter(|path| entry_points::is_entry_point_manifest(path))
-            .cloned()
-            .collect();
+        manifests.sort();
+        manifests.dedup();
         Self {
             root: normalized_root,
             sources,
-            entry_point_files,
             manifests,
         }
     }

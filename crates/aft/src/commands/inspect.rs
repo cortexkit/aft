@@ -7852,20 +7852,25 @@ mod deferred_terminal_tests {
         config.project_root = Some(root.clone());
         config.storage_dir = Some(storage.path().to_path_buf());
         config.views.enabled = false;
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
         config.inspect.tier2_pass_timeout_ms = 600_000;
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.isolate_cold_build_limiter_for_test(2);
-        let configure: RawRequest = serde_json::from_value(serde_json::json!({
-            "id": "inspect-profile-configure", "command": "configure", "params": {
+        let configure = RawRequest {
+            id: "inspect-profile-configure".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: serde_json::json!({
                 "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
                 "config": {
                     "indexes": {"trigram": false, "semantic": false, "callgraph": true},
                     "views": {"enabled": false},
                 },
-            },
-        }))
-        .unwrap();
+            }),
+        };
         let configured = crate::commands::configure::handle_configure(&configure, &ctx);
         assert!(configured.success, "{}", configured.data);
         ctx.inspect_manager()
@@ -7873,7 +7878,13 @@ mod deferred_terminal_tests {
         // Seed heavy analyzers outside the command's per-phase deadline, so a
         // large checkout measures cache reuse rather than timeout handling.
         let snapshot = build_snapshot(&ctx).unwrap();
+        assert_eq!(
+            snapshot.project_root,
+            crate::inspect::job::canonicalize_normalized(&root)
+        );
+        assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
         start_on_demand_callgraph_for_inspect(&ctx, snapshot.config.as_ref());
+        let _ = ctx.callgraph_store_for_query_without_wait();
         let scope = JobScope::for_project(root.clone());
         for category in InspectCategory::active().iter().copied() {
             eprintln!("inspect profile seed starting: {category}");
@@ -7905,13 +7916,16 @@ mod deferred_terminal_tests {
             ("scoped", Some(requested_scope.as_str())),
         ] {
             walk_profile::take();
-            let req: RawRequest = serde_json::from_value(serde_json::json!({
-                "id": name, "command": "inspect", "params": {
+            let req = RawRequest {
+                id: name.to_string(),
+                command: "inspect".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: serde_json::json!({
                     "sections": ["dead_code", "unused_exports", "duplicates", "cycles"],
                     "scope": scope, "top_k": 100,
-                }
-            }))
-            .unwrap();
+                }),
+            };
             let started = Instant::now();
             let cpu = walk_profile::cpu_ms();
             let response = run_blocking_inspect_body(
