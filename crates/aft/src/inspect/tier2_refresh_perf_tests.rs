@@ -144,6 +144,117 @@ fn completed_scoped_waiter(
     }
 }
 
+thread_local! {
+    static CALLGRAPH_READ_RETRY_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+pub(super) fn notify_callgraph_read_retry_for_test() {
+    let observer = CALLGRAPH_READ_RETRY_OBSERVER.with(|slot| slot.borrow_mut().take());
+    if let Some(observer) = observer {
+        observer();
+    }
+}
+
+struct CallgraphReadRetryObserverReset;
+
+impl Drop for CallgraphReadRetryObserverReset {
+    fn drop(&mut self) {
+        CALLGRAPH_READ_RETRY_OBSERVER.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+fn assert_completed_scoped_dead_code_retries_transient_lock(wait_for_completion: bool) {
+    let (_dir, root, inspect_dir, mut job) = published_projection_fixture();
+    job.scope_files = crate::callgraph::walk_project_files(&root).collect();
+    let manager = InspectManager::new();
+    let cache = manager
+        .cache_for_paths(inspect_dir.clone(), root.clone())
+        .unwrap();
+    let project = manager
+        .tier2_run_with_reuse_job(&job, &cache, &Tier2ReuseOptions::default())
+        .unwrap();
+    let snapshot = InspectSnapshot::new(
+        root.clone(),
+        inspect_dir,
+        Arc::clone(&job.config),
+        Arc::clone(&job.symbol_cache),
+    );
+    let scope = JobScope::from_roots(root.clone(), vec![root.join("src/target.ts")]);
+    let expected = scoped_tier2_payload_from_contributions(
+        None,
+        &snapshot,
+        job.category,
+        cache.as_ref(),
+        project.aggregate.clone(),
+        &scope,
+    )
+    .unwrap();
+    assert_eq!(expected["callgraph_available"], true);
+    let rollup = manager.previous_dead_code_rollup_state(&root).unwrap();
+
+    let graph_dir = callgraph_store_dir_from_inspect_dir(&job.inspect_dir, &root).unwrap();
+    let store = CallGraphStore::open_ready_no_rebuild(graph_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
+    let blocker = store.lock_readiness_for_test();
+    drop(store);
+    assert!(callgraph_store_ready_for_dead_code(graph_dir, root.clone())
+        .unwrap_err()
+        .is_transient_lock_contention());
+
+    // Release a real SQLite lock only after the read observes contention. This
+    // forces the readiness window without depending on a thread winning a race.
+    let released = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&released);
+    CALLGRAPH_READ_RETRY_OBSERVER.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            blocker.execute_batch("ROLLBACK").unwrap();
+            observed.store(true, Ordering::SeqCst);
+        }));
+    });
+    let _reset = CallgraphReadRetryObserverReset;
+    crate::callgraph_store::take_projection_work();
+    let payload = if wait_for_completion {
+        completed_scoped_waiter(
+            &manager,
+            &snapshot,
+            &cache,
+            job.category,
+            &scope,
+            project.aggregate,
+        )
+    } else {
+        // Exercise the second open after completion's separate readiness probe.
+        scoped_tier2_payload_from_contributions(
+            Some(&manager),
+            &snapshot,
+            job.category,
+            cache.as_ref(),
+            project.aggregate,
+            &scope,
+        )
+        .unwrap()
+    };
+    assert_eq!(payload, expected, "a short lock must not downgrade a ready graph");
+    assert!(released.load(Ordering::SeqCst), "the read must observe the lock");
+    assert_eq!(crate::callgraph_store::take_projection_work(), (0, 0));
+    assert!(Arc::ptr_eq(
+        &rollup,
+        &manager.previous_dead_code_rollup_state(&root).unwrap()
+    ));
+}
+
+#[test]
+fn completed_scoped_dead_code_retries_transient_readiness_lock() {
+    assert_completed_scoped_dead_code_retries_transient_lock(true);
+}
+
+#[test]
+fn completed_scoped_dead_code_retries_transient_projection_open_lock() {
+    assert_completed_scoped_dead_code_retries_transient_lock(false);
+}
+
 #[test]
 fn completed_scoped_dead_code_waiters_share_projection_and_rollup() {
     let (_dir, root, inspect_dir, mut job) = published_projection_fixture();
