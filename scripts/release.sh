@@ -21,7 +21,7 @@ fi
 #   3. Syncs version across all 7 package files
 #   4. Commits the version bump
 #   5. Opens the release PR and waits for queue integration
-#   6. Checks the exact final merge OID's queue or main push run, then tags it
+#   6. Checks the merge-queue or main push run for the exact final merge commit, then tags it
 #   7. CI takes over: gate on that green tests.yml run → build → publish npm +
 #      GitHub release (release.yml does not rerun the tests)
 
