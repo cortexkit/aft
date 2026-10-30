@@ -145,6 +145,54 @@ pub(super) fn measurement_recheck_hook() -> Result<()> {
     })
 }
 
+pub(super) fn with_changing_namespace<T>(
+    storage: &Path,
+    family: &str,
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Restore(Option<RecheckHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECHECK_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let dir = view_dir(storage, family, "measurement-writer").unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    std::thread::scope(|scope| {
+        let (write, requests) = crossbeam_channel::bounded(0);
+        let (done, writes) = crossbeam_channel::bounded(0);
+        let writer = scope.spawn(move || {
+            let mut count = 0;
+            while requests.recv().is_ok() {
+                let result = (|| {
+                    let derived = IdentityConnection::open(
+                        dir.join(format!("derived-{count}.sqlite")),
+                        "view-load-measurement-writer",
+                    )?;
+                    derived.execute_batch(
+                        "CREATE TABLE growing(payload BLOB); INSERT INTO growing VALUES(zeroblob(16384));",
+                    )?;
+                    Ok(())
+                })();
+                count += 1;
+                if done.send(result).is_err() {
+                    break;
+                }
+            }
+            count
+        });
+        let restore = Restore(RECHECK_HOOK.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                write.send(()).unwrap();
+                writes.recv().unwrap()
+            })))
+        }));
+        let result = run();
+        drop(restore);
+        (result, writer.join().unwrap())
+    })
+}
+
 #[test]
 fn path_context_keeps_io_contention_classifiable() {
     let path = Path::new("busy-ledger/members.sqlite");

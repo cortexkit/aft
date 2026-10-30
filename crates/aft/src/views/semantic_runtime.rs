@@ -1513,6 +1513,7 @@ fn retry_activation<T>(
                 return Ok(value);
             }
             Err(RefreshError::Transient(reason)) => {
+                let store_busy = super::trigram::bind_is_busy(&reason);
                 let reason = schedule_retry(
                     slot,
                     epoch,
@@ -1521,15 +1522,26 @@ fn retry_activation<T>(
                     config.schedule.retry_initial,
                 );
                 if let Some(slot) = slot.upgrade() {
-                    slot.fail(epoch, reason.clone());
+                    if store_busy {
+                        slot.set(epoch, CheckoutSemanticState::Loading);
+                    } else {
+                        slot.fail(epoch, reason.clone());
+                    }
                 }
                 set_status(
                     slot,
                     epoch,
                     &config.status,
-                    crate::context::SemanticIndexStatus::Failed(format!(
-                        "semantic: unavailable: {reason}"
-                    )),
+                    if store_busy {
+                        crate::context::SemanticIndexStatus::Building {
+                            started_at: Instant::now(),
+                            stage: CHECKOUT_VIEW_LOADING_STAGE.into(),
+                        }
+                    } else {
+                        crate::context::SemanticIndexStatus::Failed(format!(
+                            "semantic: unavailable: {reason}"
+                        ))
+                    },
                 );
                 crate::slog_warn!(
                     "semantic view unavailable root={} reason={}",
@@ -1659,16 +1671,22 @@ pub(crate) fn run_worker(
     if !is_current(&slot, epoch) {
         return;
     }
-    let runtime = match CheckoutSemantic::with_trigram_policy(
-        &config.storage,
-        &config.family,
-        &config.scope,
-        &config.root,
-        producer,
-        config.trigram_policy,
-        slot.clone(),
-    ) {
+    let runtime = match retry_activation(&slot, epoch, &wake, &config, "view registration", || {
+        CheckoutSemantic::with_trigram_policy(
+            &config.storage,
+            &config.family,
+            &config.scope,
+            &config.root,
+            producer.clone(),
+            config.trigram_policy,
+            slot.clone(),
+        )
+    }) {
         Ok(runtime) => Arc::new(runtime),
+        Err(RefreshError::Superseded) => {
+            release_lane(&slot, epoch);
+            return;
+        }
         Err(error) => return fail(format!("view registration: {error}")),
     };
     if !is_current(&slot, epoch) {
@@ -2380,14 +2398,14 @@ impl std::fmt::Display for RefreshError {
 }
 
 /// Whether a model, load or store failure clears by itself. Embedding errors
-/// carry the backend's authoritative transient marker. The only store failure
-/// retried is SQLite's busy/locked
-/// (another connection holds the database for a moment); every other store
-/// error is surfaced as the checkout's named gap.
+/// carry the backend's authoritative transient marker. Store contention includes
+/// SQLite's busy/locked and a namespace inventory changed by another writer;
+/// every other store error is surfaced as the checkout's named gap.
 /// A publication or installation that may already have committed carries the
 /// checkout-change marker so the worker revalidates a fresh job before serving it.
 pub fn is_transient_reason(reason: &str) -> bool {
     crate::semantic_index::embedding_failure_is_transient(reason)
+        || super::trigram::bind_is_busy(reason)
         || [
             super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
             super::first_load::CHECKOUT_WRITE_ACTIVE,

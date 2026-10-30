@@ -380,9 +380,9 @@ pub(crate) struct CallgraphViewError {
 impl From<String> for CallgraphViewError {
     fn from(reason: String) -> Self {
         Self {
+            busy: super::trigram::bind_is_busy(&reason),
+            completion_busy: reason.contains(&format!("{V3_BASE_COMPLETION_BUSY}: Busy {{")),
             reason,
-            busy: false,
-            completion_busy: false,
         }
     }
 }
@@ -404,7 +404,7 @@ impl From<PlaneError> for CallgraphViewError {
         Self {
             busy: reason.starts_with(DERIVED_STORE_BUSY)
                 || reason.starts_with(V3_STORE_BUSY)
-                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX)
+                || super::trigram::bind_is_busy(reason)
                 || completion_busy,
             completion_busy,
             reason: error.to_string(),
@@ -600,14 +600,8 @@ pub(crate) struct CallgraphView {
     family: String,
     policy: crate::blob_store::v2::TrigramPolicy,
     source: Arc<dyn CallgraphReaderSource>,
-    query: std::sync::Mutex<CompletionRetry>,
+    query: std::sync::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
     ready: std::sync::atomic::AtomicBool,
-}
-
-#[derive(Default)]
-struct CompletionRetry {
-    pending: Option<(std::time::Instant, CallgraphViewError)>,
-    delay: std::time::Duration,
 }
 
 /// The v3 member scope of a checkout's call-graph view.
@@ -689,7 +683,7 @@ impl CallgraphView {
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(CompletionRetry::default()),
+            query: std::sync::Mutex::new(super::contracts::LoadRetry::default()),
             ready: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -719,6 +713,13 @@ impl CallgraphView {
         self.source.extraction_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retry_due_for_test(&self) {
+        if let Some((deadline, _)) = &mut self.query.lock().unwrap().pending {
+            *deadline = std::time::Instant::now();
+        }
+    }
+
     /// Acquires a reader pinned to one verified generation. Acquisitions are
     /// serialized so an installed membership and its graph come from the
     /// same reconciliation.
@@ -734,25 +735,7 @@ impl CallgraphView {
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((deadline, error)) = &retry.pending {
-            if now() < *deadline {
-                return Err(error.clone());
-            }
-        }
-        let result = self.source.acquire();
-        match &result {
-            Err(error) if error.completion_busy => {
-                // Match configure's lexical ViewLoad retry backoff (1 to 30
-                // seconds) without blocking a request behind a live base owner.
-                retry.delay = if retry.delay.is_zero() {
-                    std::time::Duration::from_secs(1)
-                } else {
-                    (retry.delay * 2).min(std::time::Duration::from_secs(30))
-                };
-                retry.pending = Some((now() + retry.delay, error.clone()));
-            }
-            _ => *retry = CompletionRetry::default(),
-        }
+        let result = retry.run(now, |error| error.busy, || self.source.acquire());
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
         result
@@ -869,6 +852,7 @@ mod tests {
         );
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
+        graph.retry_due_for_test();
         assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
     }
 

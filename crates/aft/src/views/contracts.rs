@@ -273,6 +273,50 @@ impl std::fmt::Display for PlaneError {
 
 impl std::error::Error for PlaneError {}
 
+/// A busy load keeps its cause until the next bounded retry. Sharing the
+/// backoff prevents query traffic from repeatedly contending with a writer.
+pub(crate) struct LoadRetry<E> {
+    pub(crate) pending: Option<(std::time::Instant, E)>,
+    pub(crate) delay: std::time::Duration,
+}
+
+impl<E> Default for LoadRetry<E> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            delay: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl<E: Clone> LoadRetry<E> {
+    pub(crate) fn run<T>(
+        &mut self,
+        now: impl Fn() -> std::time::Instant,
+        busy: impl Fn(&E) -> bool,
+        attempt: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        if let Some((deadline, error)) = &self.pending {
+            if now() < *deadline {
+                return Err(error.clone());
+            }
+        }
+        let result = attempt();
+        match &result {
+            Err(error) if busy(error) => {
+                self.delay = if self.delay.is_zero() {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    (self.delay * 2).min(std::time::Duration::from_secs(30))
+                };
+                self.pending = Some((now() + self.delay, error.clone()));
+            }
+            _ => *self = Self::default(),
+        }
+        result
+    }
+}
+
 /// Loader work is not an artifact plane; name its stage instead of blaming an index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoaderStage {
