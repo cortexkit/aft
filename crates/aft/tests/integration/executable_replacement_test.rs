@@ -141,10 +141,24 @@ fn pin_directories(storage: &Path) -> Vec<PathBuf> {
 
 fn copy_and_warm_aft(destination: &Path) {
     std::fs::copy(crate::test_helpers::aft_binary::aft_binary(), destination).unwrap();
-    let probe = Command::new(destination)
-        .args(["gh-shim", "--shim-version"])
-        .output()
-        .unwrap();
+    // On Linux, a sibling test forking while `fs::copy` still had the new file
+    // open for writing hands that descriptor to its child until the child
+    // execs, and executing the copy meanwhile fails with ETXTBSY. The window is
+    // short and owned by another test's fork, so retry only that error.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let probe = loop {
+        match Command::new(destination)
+            .args(["gh-shim", "--shim-version"])
+            .output()
+        {
+            Err(error)
+                if error.raw_os_error() == Some(26) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => break result.unwrap(),
+        }
+    };
     assert!(probe.status.success(), "{probe:?}");
     assert!(
         String::from_utf8_lossy(&probe.stdout).contains("\"shim_version\""),
