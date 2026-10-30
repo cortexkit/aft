@@ -548,6 +548,14 @@ pub(super) mod tests {
 
     pub(crate) fn session(root: &Path, storage: &Path) -> ParentSession {
         ParentSession {
+            lifecycle_bound: false,
+            classified: Discovery {
+                root: root.to_path_buf(),
+                children: Vec::new(),
+                skipped: Vec::new(),
+                outside: Vec::new(),
+            },
+            project_detection: Default::default(),
             root: root.to_path_buf(),
             storage: storage.to_path_buf(),
             planes: RequestedPlanes {

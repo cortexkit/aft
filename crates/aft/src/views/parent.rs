@@ -870,6 +870,7 @@ pub(crate) struct ParentSemantic {
 
 /// A parent folder's session state, shared by every context bound to it.
 pub struct ParentSession {
+    lifecycle_bound: bool,
     classified: Discovery,
     project_detection: crate::folder_admission::ProjectDetectionConfig,
     root: PathBuf,
@@ -910,6 +911,7 @@ impl ParentSession {
     ) -> Arc<Self> {
         let root_for_backstop = root.clone();
         let session = Arc::new(Self {
+            lifecycle_bound: true,
             classified,
             project_detection,
             root,
@@ -993,7 +995,7 @@ impl ParentSession {
     /// True once the session stopped: no context holds it any more, or it was
     /// replaced or deactivated.
     pub fn stopped(&self) -> bool {
-        self.stop.load(Ordering::SeqCst) || !self.held()
+        self.stop.load(Ordering::SeqCst) || (self.lifecycle_bound && !self.held())
     }
 
     /// Holds (or releases) the worker's rounds. Queries keep being answered
