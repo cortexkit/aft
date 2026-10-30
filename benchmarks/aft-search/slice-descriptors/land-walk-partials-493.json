@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "walk-partials-493"
+  ],
+  "note": "A folder walk that runs out of its time budget keeps the paths it already found and reports complete:false with the approved sentence; a blocked folder keeps its own named gap. Affects grep fallback walks and outline/glob directory walks, not ranking. No changed path matches RANKING_FENCE_PREFIXES."
+}

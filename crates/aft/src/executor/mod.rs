@@ -2033,6 +2033,21 @@ impl Executor {
         Some(self.inner.dispatch_liveness.snapshot(&self.inner.config))
     }
 
+    /// In-memory read-job identities for management attribution; contention stays unknown.
+    pub(crate) fn try_running_read_requests(&self) -> Option<HashSet<String>> {
+        self.inner.state.try_lock().map(|state| {
+            state
+                .running_jobs
+                .values()
+                .filter(|job| {
+                    matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+                        && job.execution_started.load(Ordering::Acquire)
+                })
+                .map(|job| job.request_id.clone())
+                .collect()
+        })
+    }
+
     pub fn try_mutating_lane_snapshots(&self) -> Option<Vec<MutatingLaneSnapshot>> {
         self.inner
             .state
