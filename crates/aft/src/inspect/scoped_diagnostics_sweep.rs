@@ -79,6 +79,7 @@ pub(crate) fn producer_keys_for_file(
 /// cause and the summary can say how many files were examined.
 #[derive(Debug, Default)]
 pub(crate) struct ScopedSweep {
+    requested_content: HashMap<(PathBuf, ServerKey), [u8; 32]>,
     /// Explicit per-file results take precedence over that server's previously
     /// published diagnostics, even if the request failed. TypeScript results
     /// are used only for this sweep; Python pulls also update the diagnostics
@@ -107,6 +108,18 @@ pub(crate) struct ScopedSweep {
 }
 
 impl ScopedSweep {
+    pub(crate) fn revalidate_requested_reports(&mut self) {
+        for (key, result) in &mut self.requested_reports {
+            if result.is_ok()
+                && self.requested_content.get(key).is_none_or(|hash| {
+                    Some(*hash) != crate::lsp::document::file_content_hash(&key.0)
+                })
+            {
+                *result =
+                    Err(super::diagnostics_category::CURRENT_CONTENT_UNVERIFIED_REASON.into());
+            }
+        }
+    }
     /// Close every document the sweep opened. Runs after the diagnostics
     /// payload is built: the collected reports stay in the store.
     pub(crate) fn close_opened(&mut self, ctx: &AppContext) {
@@ -399,7 +412,15 @@ pub(crate) fn sweep_scoped_files(
         }
         for (file, key, request) in typescript_in_flight {
             let reply = request.wait();
-            let result = ctx.lsp().finish_scoped_typescript_diagnostics(reply);
+            let result =
+                ctx.lsp()
+                    .finish_scoped_typescript_diagnostics(reply)
+                    .map(|(hash, diagnostics)| {
+                        sweep
+                            .requested_content
+                            .insert((file.clone(), key.clone()), hash);
+                        diagnostics
+                    });
             sweep
                 .requested_reports
                 .insert((file, key), result.map_err(|error| error.to_string()));
@@ -603,6 +624,11 @@ pub(crate) fn sweep_scoped_files(
                 .requested_reports
                 .contains_key(&(file.clone(), key.clone()))
             {
+                if let Some(hash) = lsp.report_content_hash(&key, &file) {
+                    sweep
+                        .requested_content
+                        .insert((file.clone(), key.clone()), hash);
+                }
                 sweep.requested_reports.insert((file, key), Ok(diagnostics));
             }
         }

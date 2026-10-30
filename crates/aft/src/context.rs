@@ -22226,6 +22226,9 @@ mod status_emitter_tests {
 
     #[test]
     fn status_counts_do_not_acquire_a_held_lsp_manager() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
@@ -22240,9 +22243,10 @@ mod status_emitter_tests {
                 kind: crate::lsp::registry::ServerKind::Rust,
                 root: PathBuf::from("/proj"),
             },
-            PathBuf::from("/proj/main.rs"),
+            file.clone(),
             vec![],
         );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
         let (client, mut fleet_rx) = crate::fleet_status::FleetStatusClient::dial_channel(2);
         ctx.install_fleet_status_client(Some(client));
         let mut first = String::from("first");
@@ -23092,14 +23096,18 @@ mod status_bar_tests {
 
     #[test]
     fn diagnostics_counts_are_unknown_until_project_applicability_exists() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         ctx.lsp()
             .diagnostics_store_mut_for_test()
             .publish_with_kind(
                 crate::lsp::registry::ServerKind::Rust,
-                PathBuf::from("/fixture/main.rs"),
+                file.clone(),
                 Vec::new(),
             );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
         assert_eq!(
             (
                 ctx.status_bar_count_values().errors,
@@ -23305,7 +23313,9 @@ mod status_bar_tests {
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false); // populate so the bar surfaces
 
-        let file = std::path::PathBuf::from("/proj/gone.ts");
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("gone.ts");
+        std::fs::write(&file, "const value = 1;\n").unwrap();
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test().publish(
@@ -23326,6 +23336,7 @@ mod status_bar_tests {
                     source: None,
                 }],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
 
         // Bar reflects the live warm-set error.
@@ -23345,8 +23356,11 @@ mod status_bar_tests {
 
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
-        let root = std::path::PathBuf::from("/proj");
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         let file = root.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::Rust,
             root,
@@ -23370,6 +23384,7 @@ mod status_bar_tests {
                 file.clone(),
                 vec![diagnostic(DiagnosticSeverity::Error, "settled error")],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!((counts.errors, counts.warnings), (1, 0));
@@ -23388,6 +23403,7 @@ mod status_bar_tests {
                     None,
                     true,
                 );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(
@@ -23417,15 +23433,13 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        let root = if cfg!(windows) {
-            std::path::PathBuf::from(r"C:\proj")
-        } else {
-            std::path::PathBuf::from("/proj")
-        };
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         ctx.set_canonical_cache_root(root.clone());
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
 
         let file = root.join("aft.jsonc");
+        std::fs::write(&file, "{}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::TypeScript,
             root: root.clone(),
@@ -23448,6 +23462,7 @@ mod status_bar_tests {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
                 .publish(key.clone(), file.clone(), vec![env]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,
@@ -23458,7 +23473,8 @@ mod status_bar_tests {
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
-                .publish(key, file, vec![]);
+                .publish(key, file.clone(), vec![]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,

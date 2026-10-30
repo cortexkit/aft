@@ -23,7 +23,7 @@ use crate::lsp::client::{
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
-use crate::lsp::document::{DiskSnapshot, DocumentEntry, DocumentStore};
+use crate::lsp::document::{file_content_hash, DiskSnapshot, DocumentEntry, DocumentStore};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams, AftWorkspaceDiagnosticRequest,
@@ -509,12 +509,12 @@ impl EnsureServerOutcomes {
 /// `diagnostics` only contains entries from servers that proved freshness.
 /// `accepted_snapshots` preserves that same result per producer and document
 /// version so alert consumers never infer a partition from flattened output.
-/// Pre-edit cached entries and unversioned reports are NEVER included.
+/// Pre-edit cached entries and reports without a current-content proof are never included.
 #[derive(Debug, Clone, Default)]
 pub struct PostEditWaitOutcome {
     /// Complete, per-producer accepted snapshots. This includes a snapshot
     /// with an empty diagnostics list when a live server authoritatively found
-    /// the edited document clean; pending, exited, warming, and unversioned
+    /// the edited document clean; pending, exited, warming, and uncertified
     /// producers do not appear here.
     pub accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
     /// Authoritative diagnostics flattened only for the legacy response body.
@@ -558,10 +558,9 @@ pub fn post_edit_entry_is_fresh(
 
     match entry.version {
         Some(version) => version >= target_version,
-        // Unversioned publishDiagnostics payloads cannot prove which document
-        // state they describe. Epoch advancement only proves arrival order; an
-        // old analysis result can still arrive after our pre-snapshot. Treat as
-        // pending/partial rather than fresh.
+        // Ingestion has not bound this report to a synchronized version.
+        // Advancing a store epoch while draining a queued publication cannot
+        // substitute for a reader-ordered content proof.
         None => false,
     }
 }
@@ -1534,6 +1533,7 @@ impl LspManager {
         }
         let _ = self.event_tx.send(ReceivedLspEvent {
             instance: self.clients.get(key).map(|client| client.instance),
+            receive_order: None,
             event: LspEvent::DocumentDiagnosticsPulled {
                 server_kind: key.kind.clone(),
                 root: key.root.clone(),
@@ -2238,7 +2238,7 @@ impl LspManager {
         key: &ServerKey,
         path: &Path,
     ) -> Result<i32, LspError> {
-        self.mark_pulled_report_stale(key, path);
+        self.invalidate_diagnostic_content(key, path);
         let reservation = self
             .starting
             .get_mut(key)
@@ -2661,26 +2661,34 @@ impl LspManager {
                 .is_some_and(|store| store.is_open(&canonical_path));
 
             if !already_open {
+                self.invalidate_diagnostic_content(key, &canonical_path);
+                let version = self
+                    .documents
+                    .get(key)
+                    .map_or(0, DocumentStore::next_open_version);
                 let content = initial_content
                     .as_ref()
                     .expect("content is loaded when any server needs didOpen");
                 let (send_result, sent) = if let Some(client) = self.clients.get_mut(key) {
                     (
-                        client.send_notification::<DidOpenTextDocument>(
-                            DidOpenTextDocumentParams {
-                                text_document: TextDocumentItem::new(
-                                    uri.clone(),
-                                    language_id.clone(),
-                                    0,
-                                    content.clone(),
-                                ),
-                            },
-                        ),
+                        client
+                            .send_notification_ordered::<DidOpenTextDocument>(
+                                DidOpenTextDocumentParams {
+                                    text_document: TextDocumentItem::new(
+                                        uri.clone(),
+                                        language_id.clone(),
+                                        version,
+                                        content.clone(),
+                                    ),
+                                },
+                            )
+                            .map(Some),
                         true,
                     )
                 } else {
-                    (Ok(()), false)
+                    (Ok(None), false)
                 };
+                let sync_order = send_result.as_ref().ok().copied().flatten();
                 if let Err(err) = send_result {
                     if matches!(err, LspError::Timeout(_)) {
                         // The writer owns the queued frame and can finish it
@@ -2694,12 +2702,13 @@ impl LspManager {
                     return Err(err);
                 }
                 if sent {
-                    log_did_open_sent(key, &canonical_path, &language_id);
+                    log_did_open_sent(key, &canonical_path, &language_id, version);
                 }
-                self.documents
-                    .entry(key.clone())
-                    .or_default()
-                    .open_with(canonical_path.clone(), &disk);
+                self.documents.entry(key.clone()).or_default().open_with(
+                    canonical_path.clone(),
+                    &DiskSnapshot::for_content(&canonical_path, content)
+                        .with_sync_order(sync_order),
+                );
                 newly_opened.push(key.clone());
                 continue;
             }
@@ -2718,6 +2727,7 @@ impl LspManager {
                 .get(key)
                 .is_some_and(|store| store.is_stale_against(&canonical_path, &disk));
             if drifted {
+                self.invalidate_diagnostic_content(key, &canonical_path);
                 if drift_content.is_none() {
                     match std::fs::read_to_string(&canonical_path) {
                         Ok(content) => drift_content = Some(content),
@@ -2740,11 +2750,14 @@ impl LspManager {
                     // `didSave`, so without it the compiler errors it
                     // reports keep describing the old contents.
                     client
-                        .send_full_did_change(&uri, next_version, content)
-                        .and_then(|()| send_did_save(client, &uri, content))
+                        .send_full_did_change_ordered(&uri, next_version, content)
+                        .and_then(|order| {
+                            send_did_save(client, &uri, content).map(|()| Some(order))
+                        })
                 } else {
-                    Ok(())
+                    Ok(None)
                 };
+                let sync_order = send_result.as_ref().ok().copied().flatten();
                 if let Err(err) = send_result {
                     if let Some(store) = self.documents.get_mut(key) {
                         // A timed-out write may arrive later. Reserve its
@@ -2755,7 +2768,11 @@ impl LspManager {
                     return Err(err);
                 }
                 if let Some(store) = self.documents.get_mut(key) {
-                    store.bump_version_with(&canonical_path, &disk);
+                    store.bump_version_with(
+                        &canonical_path,
+                        &DiskSnapshot::for_content(&canonical_path, content)
+                            .with_sync_order(sync_order),
+                    );
                 }
             }
         }
@@ -2874,7 +2891,7 @@ impl LspManager {
 
         let mut versions: Vec<(ServerKey, i32)> = Vec::with_capacity(server_keys.len());
         // Read once for every server's store (see `ensure_file_open`).
-        let disk = DiskSnapshot::read(&canonical_path);
+        let disk = DiskSnapshot::for_content(&canonical_path, content);
 
         for key in server_keys {
             if self.starting.contains_key(&key) {
@@ -2882,12 +2899,8 @@ impl LspManager {
                 versions.push((key, version));
                 continue;
             }
-            // The server is about to hold text its pulled report may not
-            // describe. A pull-only server publishes nothing after the
-            // change, so without this a scoped inspect would keep certifying
-            // the old report for a document that is open (see
-            // `sweep_scoped_files`).
-            self.mark_pulled_report_stale(&key, &canonical_path);
+            // Both pushed and pulled reports lose authority before text sync.
+            self.invalidate_diagnostic_content(&key, &canonical_path);
             let current_version = self
                 .documents
                 .get(&key)
@@ -2895,13 +2908,15 @@ impl LspManager {
 
             if let Some(version) = current_version {
                 let next_version = version + 1;
+                let mut sync_order = None;
                 if let Some(client) = self.clients.get_mut(&key) {
-                    let send = client.send_full_did_change(&uri, next_version, content)
+                    let send = client.send_full_did_change_ordered(&uri, next_version, content)
                     // AFT has written this content to disk: tell the server
                     // it was saved. rust-analyzer re-runs `cargo check` only
                     // on `didSave`, so without it the compiler errors it
                     // reports keep describing the file before the edit.
-                        .and_then(|()| send_did_save(client, &uri, content));
+                        .and_then(|order| send_did_save(client, &uri, content).map(|()| order));
+                    sync_order = send.as_ref().ok().copied();
                     if let Err(err) = send {
                         if let Some(store) = self.documents.get_mut(&key) {
                             store.bump_version_with(&canonical_path, &DiskSnapshot::default());
@@ -2910,23 +2925,33 @@ impl LspManager {
                     }
                 }
                 if let Some(store) = self.documents.get_mut(&key) {
-                    store.bump_version_with(&canonical_path, &disk);
+                    store.bump_version_with(
+                        &canonical_path,
+                        &disk.clone().with_sync_order(sync_order),
+                    );
                 }
                 self.queue_background_document_pull(&key, &canonical_path);
                 versions.push((key, next_version));
                 continue;
             }
 
+            let version = self
+                .documents
+                .get(&key)
+                .map_or(0, DocumentStore::next_open_version);
+            let mut sync_order = None;
             if let Some(client) = self.clients.get_mut(&key) {
-                let send =
-                    client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                let send = client.send_notification_ordered::<DidOpenTextDocument>(
+                    DidOpenTextDocumentParams {
                         text_document: TextDocumentItem::new(
                             uri.clone(),
                             language_id.clone(),
-                            0,
+                            version,
                             content.to_string(),
                         ),
-                    });
+                    },
+                );
+                sync_order = send.as_ref().ok().copied();
                 if let Err(err) = send {
                     if matches!(err, LspError::Timeout(_)) {
                         self.documents
@@ -2936,7 +2961,7 @@ impl LspManager {
                     }
                     return Err(err);
                 }
-                log_did_open_sent(&key, &canonical_path, &language_id);
+                log_did_open_sent(&key, &canonical_path, &language_id, version);
                 // The content was just written to disk: tell the server it
                 // was saved, so rust-analyzer re-runs `cargo check`.
                 if let Err(err) = send_did_save(client, &uri, content) {
@@ -2947,31 +2972,15 @@ impl LspManager {
                     return Err(err);
                 }
             }
-            self.documents
-                .entry(key.clone())
-                .or_default()
-                .open_with(canonical_path.clone(), &disk);
-            // didOpen carries version 0 — that's the version the server
-            // will echo on its first publishDiagnostics for this document.
+            self.documents.entry(key.clone()).or_default().open_with(
+                canonical_path.clone(),
+                &disk.clone().with_sync_order(sync_order),
+            );
             self.queue_background_document_pull(&key, &canonical_path);
-            versions.push((key, 0));
+            versions.push((key, version));
         }
 
         Ok(versions)
-    }
-
-    /// Mark `key`'s stored report for `file` stale when it came from a
-    /// document pull. Pushed reports are left alone: their server publishes
-    /// again after the change and replaces them.
-    fn mark_pulled_report_stale(&mut self, key: &ServerKey, file: &Path) {
-        let pulled = self
-            .diagnostics
-            .entries_for_file(file)
-            .into_iter()
-            .any(|(stored_key, entry)| stored_key == key && entry.from_document_pull);
-        if pulled {
-            self.diagnostics.mark_stale_for_server_file(key, file);
-        }
     }
 
     /// Bring a document that is open in `server_keys` up to date with the file
@@ -3011,8 +3020,7 @@ impl LspManager {
         // (`mark_diagnostics_stale_for_file`). A push server publishes again
         // after the change below; a pull server is asked again.
         for key in &drifted {
-            self.diagnostics
-                .mark_stale_for_server_file(key, &canonical_path);
+            self.invalidate_diagnostic_content(key, &canonical_path);
         }
         std::fs::read_to_string(&canonical_path)
             .map_err(LspError::Io)
@@ -3826,28 +3834,36 @@ impl LspManager {
         let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
+            self.invalidate_diagnostic_content(&key, &canonical_path);
+            let version = self
+                .documents
+                .get(&key)
+                .map_or(0, DocumentStore::next_open_version);
             let Some(client) = self.clients.get_mut(&key) else {
                 continue;
             };
-            let sent = client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem::new(
-                    uri.clone(),
-                    language_id.clone(),
-                    0,
-                    content.clone(),
-                ),
-            });
+            let sent = client.send_notification_ordered::<DidOpenTextDocument>(
+                DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem::new(
+                        uri.clone(),
+                        language_id.clone(),
+                        version,
+                        content.clone(),
+                    ),
+                },
+            );
+            let sync_order = sent.as_ref().ok().copied();
             if let Err(err) = sent {
                 // Leave no half-opened set behind: the caller only closes what
                 // this call reports as opened.
                 let _ = self.close_inspect_documents(&canonical_path, &opened);
                 return Err(err);
             }
-            log_did_open_sent(&key, &canonical_path, &language_id);
-            self.documents
-                .entry(key.clone())
-                .or_default()
-                .open(canonical_path.clone());
+            log_did_open_sent(&key, &canonical_path, &language_id, version);
+            self.documents.entry(key.clone()).or_default().open_with(
+                canonical_path.clone(),
+                &DiskSnapshot::for_content(&canonical_path, &content).with_sync_order(sync_order),
+            );
             self.reopen_inspect_closed_document(&key, &canonical_path);
             opened.push(key);
         }
@@ -3987,14 +4003,15 @@ impl LspManager {
             .get(&(server_key.clone(), lookup_path.clone()))
             .cloned()
             .unwrap_or_default();
-        let (result_id, version) = self
+        let (result_id, version, content_hash) = self
             .diagnostics
             .entries_for_file(&lookup_path)
             .into_iter()
             .find_map(|(key, entry)| {
-                (key == server_key).then(|| (entry.result_id.clone(), entry.version))
+                (key == server_key)
+                    .then(|| (entry.result_id.clone(), entry.version, entry.content_hash))
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
         let merged = union_of_diagnostics(pulled.clone(), pushed);
         self.latest_pull_for_rust
             .insert((server_key.clone(), lookup_path.clone()), pulled);
@@ -4004,12 +4021,20 @@ impl LspManager {
             .is_some_and(|client| client.diagnostics_are_provisional());
         self.diagnostics.publish_full_with_provisional(
             server_key.clone(),
-            lookup_path,
+            lookup_path.clone(),
             merged,
             result_id,
             version,
             provisional,
         );
+        self.diagnostics
+            .certify_content(server_key, &lookup_path, content_hash);
+        self.diagnostics
+            .mark_document_pull(server_key, &lookup_path);
+        if content_hash.is_none() {
+            self.diagnostics
+                .mark_stale_for_server_file(server_key, &lookup_path);
+        }
     }
 
     /// Whether a document is open in this server's document store.
@@ -4462,6 +4487,35 @@ impl LspManager {
         &mut self.diagnostics
     }
 
+    #[cfg(test)]
+    pub(crate) fn sync_document_version_for_test(
+        &mut self,
+        key: &ServerKey,
+        file: &Path,
+        version: i32,
+    ) {
+        self.documents
+            .entry(key.clone())
+            .or_default()
+            .sync_at_version(file.to_path_buf(), version, &DiskSnapshot::read(file));
+    }
+
+    /// Certify a synthetic test report against fixture content. Real reports
+    /// must instead prove their synchronized version at ingestion.
+    #[doc(hidden)]
+    pub fn certify_diagnostic_content_for_test(&mut self, file: &Path) {
+        let keys = self
+            .diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.diagnostics
+                .certify_content(&key, file, file_content_hash(file));
+        }
+    }
+
     /// Test-only: record that server discovery found no applicable language
     /// servers for the project. Fixtures that publish reports straight into the
     /// diagnostics store, without configure's discovery walk, use this so their
@@ -4642,8 +4696,9 @@ impl LspManager {
     ///
     /// File-mode `lsp_diagnostics` uses this for push-only fallback after it
     /// has synced/opened the document. Versioned publishes are accepted when
-    /// they match the current document version; unversioned publishes are not
-    /// accepted as fresh because epoch/wall-clock ordering alone is racy.
+    /// they match the current document version. Unversioned pushes need the
+    /// reader-order and content-hash proof established at ingestion; store
+    /// epochs and wall-clock ordering alone are insufficient.
     pub fn diagnostic_entry_is_fresh_for_document(
         &self,
         file_path: &Path,
@@ -4660,7 +4715,7 @@ impl LspManager {
             return false;
         };
 
-        if entry.stale {
+        if !self.report_matches_current_content(server_key, &lookup_path, entry) {
             return false;
         }
 
@@ -4726,9 +4781,10 @@ impl LspManager {
         }
 
         for (key, target_version) in &wait.expected_versions {
-            if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+            if wait.exited.contains(key) {
                 continue;
             }
+            wait.fresh.remove(key);
             if !self.clients.contains_key(key) {
                 // A start still in flight has no client yet. It is pending,
                 // not exited; releasing its reservation wakes this waiter.
@@ -4751,6 +4807,9 @@ impl LspManager {
                 .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
             {
                 let pre = wait.pre_snapshot.get(key).copied().unwrap_or_default();
+                if !self.report_matches_current_content(key, &wait.lookup_path, entry) {
+                    continue;
+                }
                 if let Some(diagnostics) =
                     Self::authoritative_post_edit_diagnostics(entry, *target_version, pre)
                 {
@@ -4778,9 +4837,19 @@ impl LspManager {
 
     pub(crate) fn finish_post_edit_diagnostics_wait(
         &mut self,
-        wait: PostEditDiagnosticsWait,
+        mut wait: PostEditDiagnosticsWait,
     ) -> PostEditWaitOutcome {
         self.post_edit_waiters.remove(&wait.waiter_id);
+        wait.fresh.retain(|key, diagnostics| {
+            self.diagnostics
+                .entries_for_file(&wait.lookup_path)
+                .into_iter()
+                .any(|(stored, entry)| {
+                    stored == key
+                        && self.report_matches_current_content(key, &wait.lookup_path, entry)
+                        && entry.diagnostics == *diagnostics
+                })
+        });
         for (key, _) in &wait.expected_versions {
             if wait.fresh.contains_key(key) || wait.exited.contains(key) {
                 continue;
@@ -5264,7 +5333,10 @@ impl LspManager {
     pub(crate) fn finish_scoped_typescript_diagnostics(
         &self,
         reply: super::typescript_diagnostics::TypescriptDiagnosticsReply,
-    ) -> Result<Vec<StoredDiagnostic>, super::typescript_diagnostics::CertificationFailure> {
+    ) -> Result<
+        ([u8; 32], Vec<StoredDiagnostic>),
+        super::typescript_diagnostics::CertificationFailure,
+    > {
         let current = self.documents.get(&reply.key).is_some_and(|store| {
             reply.version.is_some()
                 && store.version(&reply.file) == reply.version
@@ -5273,7 +5345,13 @@ impl LspManager {
         if !current {
             return Err(super::typescript_diagnostics::CertificationFailure::DocumentChanged);
         }
-        reply.result
+        let hash = self
+            .documents
+            .get(&reply.key)
+            .and_then(|store| store.entry(&reply.file))
+            .and_then(|entry| entry.content_hash)
+            .ok_or(super::typescript_diagnostics::CertificationFailure::DocumentChanged)?;
+        reply.result.map(|diagnostics| (hash, diagnostics))
     }
 
     /// Store the reply of a pull started by [`Self::begin_file_pulls`] or
@@ -5302,6 +5380,14 @@ impl LspManager {
                 .get(&key)
                 .and_then(|store| store.entry(&canonical_path))
                 != document_snapshot.as_ref()
+            || document_snapshot
+                .as_ref()
+                .and_then(|document| document.content_hash)
+                .is_none()
+            || document_snapshot
+                .as_ref()
+                .and_then(|document| document.content_hash)
+                != file_content_hash(&canonical_path)
         {
             return PullFileOutcome::RequestFailed {
                 reason: "document_changed_while_pulling".into(),
@@ -5686,6 +5772,7 @@ impl LspManager {
                     self.diagnostics.mark_document_pull(key, canonical_path);
                     self.note_document_pull_completed(key, canonical_path);
                 }
+                self.certify_report_content(key, canonical_path, document_version);
                 PullFileOutcome::Full {
                     diagnostic_count: count,
                 }
@@ -5713,6 +5800,7 @@ impl LspManager {
                         self.diagnostics.mark_document_pull(key, canonical_path);
                         self.note_document_pull_completed(key, canonical_path);
                     }
+                    self.certify_report_content(key, canonical_path, document_version);
                     PullFileOutcome::Unchanged
                 } else {
                     PullFileOutcome::RequestFailed {
@@ -6184,7 +6272,9 @@ impl LspManager {
     pub(crate) fn authoritative_diagnostic_reports(
         &self,
     ) -> impl Iterator<Item = (&ServerKey, &Path, &[StoredDiagnostic])> {
-        self.diagnostics.authoritative_reports()
+        self.current_diagnostic_reports()
+            .filter(|(_, _, entry)| !entry.provisional)
+            .map(|(key, file, entry)| (key, file, entry.diagnostics.as_slice()))
     }
 
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
@@ -6198,7 +6288,124 @@ impl LspManager {
     pub(crate) fn current_diagnostic_reports(
         &self,
     ) -> impl Iterator<Item = (&ServerKey, &Path, &DiagnosticEntry)> {
-        self.diagnostics.current_reports()
+        self.diagnostics
+            .current_reports()
+            .filter(|(key, file, entry)| self.report_matches_current_content(key, file, entry))
+    }
+
+    fn report_matches_current_content(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        entry: &DiagnosticEntry,
+    ) -> bool {
+        !entry.stale
+            && (!entry.from_receive_order || !self.server_supports_pull_for_file(key, file))
+            && entry.content_hash.is_some()
+            && entry.content_hash == file_content_hash(file)
+            && self
+                .documents
+                .get(key)
+                .and_then(|store| store.version(file))
+                .is_none_or(|version| entry.version == Some(version))
+    }
+
+    fn invalidate_diagnostic_content(&mut self, key: &ServerKey, file: &Path) {
+        self.diagnostics.mark_stale_for_server_file(key, file);
+        // A later pull must not lend its content proof to cached rows from
+        // before the change when Rust's pushed and pulled results are merged.
+        self.latest_pull_for_rust
+            .remove(&(key.clone(), file.to_path_buf()));
+        self.latest_push_for_pull_servers
+            .remove(&(key.clone(), file.to_path_buf()));
+    }
+
+    fn confirmed_document_hash(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        version: Option<i32>,
+    ) -> Option<[u8; 32]> {
+        self.documents
+            .get(key)
+            .and_then(|store| store.entry(file))
+            .filter(|document| Some(document.version) == version)
+            .and_then(|document| document.content_hash)
+    }
+
+    fn version_for_unversioned_push(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        receive_order: Option<u64>,
+    ) -> Option<i32> {
+        let client = self.clients.get(key)?;
+        // Pull-capable files retain the stronger diagnostic-request barrier.
+        // This is capability-based, including dynamic registrations and pull
+        // disabled by configuration, rather than a language-server allowlist.
+        if client
+            .diagnostic_capabilities_for_file(file)?
+            .pull_diagnostics
+        {
+            return None;
+        }
+        let document = self.documents.get(key)?.entry(file)?;
+        if receive_order? <= document.sync_order?
+            || document.content_hash.is_none()
+            || document.content_hash != file_content_hash(file)
+        {
+            return None;
+        }
+        Some(document.version)
+    }
+
+    fn certify_report_content(&mut self, key: &ServerKey, file: &Path, version: Option<i32>) {
+        let hash = self.confirmed_document_hash(key, file, version);
+        self.diagnostics.certify_content(key, file, hash);
+        if hash.is_none() {
+            self.diagnostics.mark_stale_for_server_file(key, file);
+        }
+    }
+
+    pub(crate) fn report_content_hash(&self, key: &ServerKey, file: &Path) -> Option<[u8; 32]> {
+        self.diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .find(|(stored, entry)| {
+                *stored == key && self.report_matches_current_content(stored, file, entry)
+            })
+            .and_then(|(_, entry)| entry.content_hash)
+    }
+
+    /// Include stale and empty reports: neither means a changed file is clean.
+    pub(crate) fn diagnostic_working_files(&self) -> Vec<PathBuf> {
+        self.diagnostics
+            .reports()
+            .map(|(_, file, _)| file.to_path_buf())
+            .chain(
+                self.documents
+                    .values()
+                    .flat_map(|store| store.open_documents().into_iter().cloned()),
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn unverified_diagnostic_files(&self) -> Vec<(ServerKey, PathBuf)> {
+        self.diagnostics
+            .reports()
+            .filter(|(key, file, entry)| !self.report_matches_current_content(key, file, entry))
+            .map(|(key, file, _)| (key.clone(), file.to_path_buf()))
+            .collect()
+    }
+
+    pub(crate) fn unverified_diagnostic_file(&self, file: &Path) -> Option<ServerKey> {
+        self.diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .find(|(key, entry)| !self.report_matches_current_content(key, file, entry))
+            .map(|(key, _)| key.clone())
     }
 
     /// True if any LSP server has a current diagnostic report, including an
@@ -6206,7 +6413,7 @@ impl LspManager {
     /// treating an empty flattened diagnostic list as trustworthy when no server
     /// has actually run or every report was marked stale after an external edit.
     pub fn has_any_diagnostic_reports(&self) -> bool {
-        self.diagnostics.has_any_fresh_report()
+        self.current_diagnostic_reports().next().is_some()
     }
 
     /// True if any server has a current report for this file, including an
@@ -6214,7 +6421,10 @@ impl LspManager {
     /// they predate an external edit.
     pub fn has_diagnostic_report_for_file(&self, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
-        self.diagnostics.has_any_fresh_report_for_file(&normalized)
+        self.diagnostics
+            .entries_for_file(&normalized)
+            .into_iter()
+            .any(|(key, entry)| self.report_matches_current_content(key, &normalized, entry))
     }
 
     /// True if this exact server/file pair has a current diagnostic report,
@@ -6223,29 +6433,19 @@ impl LspManager {
     pub fn has_diagnostic_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
         self.diagnostics
-            .has_fresh_report_for_server_file(server, &normalized)
-    }
-
-    /// True if this server/file pair has a current report that describes the
-    /// text the server now holds for the open document: a document pull
-    /// produced it, or a push carried the open document's version. An
-    /// unversioned push (a late clearing reply to an earlier close, for
-    /// example) proves neither.
-    pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
-        let normalized = normalize_lookup_path(file);
-        let open_version = self
-            .documents
-            .get(server)
-            .and_then(|documents| documents.version(&normalized));
-        self.diagnostics
             .entries_for_file(&normalized)
             .into_iter()
             .any(|(key, entry)| {
-                key == server
-                    && !entry.stale
-                    && (entry.from_document_pull
-                        || (entry.version.is_some() && entry.version == open_version))
+                key == server && self.report_matches_current_content(key, &normalized, entry)
             })
+    }
+
+    /// True if this server/file pair has a current report that describes the
+    /// text the server now holds for the open document. Pull-capable pairs
+    /// require a pulled or versioned report. Push-only pairs can instead use
+    /// the reader-order/hash proof for an unversioned publication.
+    pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
+        self.has_diagnostic_report_for_server_file(server, file)
     }
 
     /// True if any server has an authoritative report for this file: neither
@@ -6260,6 +6460,7 @@ impl LspManager {
             .any(|(key, entry)| {
                 !entry.stale
                     && !entry.provisional
+                    && self.report_matches_current_content(key, &normalized, entry)
                     && self.clients.get(key).is_none_or(|client| {
                         !client.uses_analysis_progress()
                             || ((if client.uses_document_pull(Some(&normalized)) {
@@ -6282,7 +6483,8 @@ impl LspManager {
     /// empty checked-clean report. Needed by the blocking quiescence wait, which
     /// settles per producer rather than per file.
     pub fn has_authoritative_report_for_server(&self, server: &ServerKey) -> bool {
-        self.diagnostics.has_authoritative_report_for_server(server)
+        self.authoritative_diagnostic_reports()
+            .any(|(key, _, _)| key == server)
     }
 
     /// True if this server instance is still warming: its reports stay
@@ -6304,6 +6506,9 @@ impl LspManager {
     }
 
     pub(crate) fn analysis_progress_certifies_file(&self, server: &ServerKey, file: &Path) -> bool {
+        if !self.has_diagnostic_report_for_server_file(server, file) {
+            return false;
+        }
         if self.clients.get(server).is_some_and(|client| {
             client.uses_analysis_progress() && client.uses_document_pull(Some(file))
         }) {
@@ -6512,6 +6717,9 @@ impl LspManager {
         if entry.provisional {
             return Some("report-provisional");
         }
+        if !self.report_matches_current_content(key, file, entry) {
+            return Some("current-content-unverified");
+        }
         match entry.version {
             None => Some("missing-version"),
             Some(version) if version != document_version => Some("version-mismatch"),
@@ -6676,9 +6884,13 @@ impl LspManager {
                 root,
                 method,
                 params: Some(params),
-            } if method == "textDocument/publishDiagnostics" => {
-                self.handle_publish_diagnostics(server_kind.clone(), root.clone(), params)
-            }
+            } if method == "textDocument/publishDiagnostics" => self
+                .handle_publish_diagnostics_ordered(
+                    server_kind.clone(),
+                    root.clone(),
+                    params,
+                    receipt.receive_order,
+                ),
             LspEvent::Notification {
                 server_kind,
                 root,
@@ -6784,11 +6996,22 @@ impl LspManager {
         });
     }
 
+    #[cfg(test)]
     fn handle_publish_diagnostics(
         &mut self,
         server: ServerKind,
         root: PathBuf,
         params: &serde_json::Value,
+    ) -> Option<PathBuf> {
+        self.handle_publish_diagnostics_ordered(server, root, params, None)
+    }
+
+    fn handle_publish_diagnostics_ordered(
+        &mut self,
+        server: ServerKind,
+        root: PathBuf,
+        params: &serde_json::Value,
+        receive_order: Option<u64>,
     ) -> Option<PathBuf> {
         #[cfg(test)]
         PUBLISH_DIAGNOSTICS_PARSES.with(|count| count.set(count.get() + 1));
@@ -6830,6 +7053,9 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        let from_receive_order = version.is_none();
+        let proven_version =
+            version.or_else(|| self.version_for_unversioned_push(&key, &file, receive_order));
         // Preserve the full compiler result independently of the working-set
         // LRU and document-close exceptions, which must not turn errors clean.
         if let Some(cache) = self
@@ -6846,7 +7072,10 @@ impl LspManager {
             // An empty push is kept as no entry: a missing entry already
             // reads as "no pushed diagnostics", and storing empty lists kept
             // one entry for every file rust-analyzer ever published.
-            if stored.is_empty() {
+            // Compiler-check results are stored separately. An unversioned push
+            // does not identify the document state it analyzed, so it cannot
+            // borrow a later document pull's content proof.
+            if stored.is_empty() || self.confirmed_document_hash(&key, &file, version).is_none() {
                 self.latest_push_for_pull_servers
                     .remove(&(key.clone(), file.clone()));
             } else {
@@ -6896,9 +7125,13 @@ impl LspManager {
             file.clone(),
             stored,
             None,
-            version,
+            proven_version,
             provisional,
         );
+        self.certify_report_content(&key, &file, proven_version);
+        if from_receive_order && proven_version.is_some() {
+            self.diagnostics.mark_receive_order(&key, &file);
+        }
         let epoch = self.diagnostics.current_epoch();
         let published_at = self.diagnostics.publication_time(&key, &file);
         if let Some(client) = self.clients.get_mut(&key) {
@@ -6914,7 +7147,7 @@ impl LspManager {
         self.queue_background_document_pull(&key, &file);
         if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
             slog_info!(
-                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-{} file={} version={}",
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=uncertified-because-{} file={} version={}",
                 key.kind.id_str(),
                 key.root.display(),
                 reason,
@@ -8072,13 +8305,14 @@ pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
     }
 }
 
-fn log_did_open_sent(key: &ServerKey, file: &Path, language_id: &str) {
+fn log_did_open_sent(key: &ServerKey, file: &Path, language_id: &str, version: i32) {
     slog_info!(
-        "lsp_protocol server={} root={} method=textDocument/didOpen event=sent file={} language_id={} version=0",
+        "lsp_protocol server={} root={} method=textDocument/didOpen event=sent file={} language_id={} version={}",
         key.kind.id_str(),
         key.root.display(),
         file.display(),
-        language_id
+        language_id,
+        version
     );
 }
 
@@ -8482,8 +8716,8 @@ fn replay_startup_notifications(
         let mut write_attempted = false;
         let mut document_written = false;
         let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
-            let disk = DiskSnapshot::read(&path);
             let content = std::fs::read_to_string(&path)?;
+            let disk = DiskSnapshot::for_content(&path, &content);
             let uri = uri_for_path(&path)?;
             #[cfg(test)]
             if let Some(hook) = signal.replay_hook.lock().clone() {
@@ -8506,7 +8740,7 @@ fn replay_startup_notifications(
                 super::client::full_did_change_message(&uri, version, &content)?
             };
             write_attempted = true;
-            writer.send(payload)?;
+            let sync_order = writer.send_ordered(payload)?;
             document_written = true;
             let saved = if let Some(save) = save {
                 writer.send(super::client::did_save_message(
@@ -8520,7 +8754,7 @@ fn replay_startup_notifications(
             } else {
                 None
             };
-            Ok((disk, saved))
+            Ok((disk.with_sync_order(Some(sync_order)), saved))
         })();
         match sent {
             Ok((disk, saved)) => result.documents.push(StartupReplayDocument {
@@ -9957,6 +10191,7 @@ mod project_applicability_tests {
         manager
             .diagnostics
             .publish(ts.clone(), root.join("main.ts"), Vec::new());
+        manager.certify_diagnostic_content_for_test(&root.join("main.ts"));
         (dir, manager, config, ts)
     }
 
@@ -10494,14 +10729,22 @@ mod diagnostic_capacity_tests {
                 keys.clone(),
             )
             .unwrap();
-        assert_eq!(reads() - before, 1, "opening in three stores");
+        assert_eq!(
+            reads() - before,
+            0,
+            "hash the sent text without rereading disk"
+        );
 
         std::fs::write(&file, "export const x = 2;\n").unwrap();
         let before = reads();
         manager
             .notify_file_changed_for_server_keys(file, "export const x = 2;\n", keys)
             .unwrap();
-        assert_eq!(reads() - before, 1, "changing in three stores");
+        assert_eq!(
+            reads() - before,
+            0,
+            "hash the sent text without rereading disk"
+        );
     }
 
     // Documents closed by scoped inspects are remembered only up to a cap,
@@ -10862,7 +11105,7 @@ mod clear_diagnostics_tests {
     #[test]
     fn drain_events_reports_publish_diagnostics_updates() {
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = super::canonicalize_for_lsp(dir.path()).unwrap();
         let file = root.join("main.ts");
         std::fs::write(&file, "const x: number = 'nope';").unwrap();
 
@@ -10893,6 +11136,14 @@ mod clear_diagnostics_tests {
             version: Some(1),
         })
         .unwrap();
+        manager.sync_document_version_for_test(
+            &ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            },
+            &file,
+            1,
+        );
         manager
             .event_tx
             .send(
@@ -11926,6 +12177,155 @@ mod document_pull_certificate_tests {
         let entry = manager.diagnostics.entries_for_file(&file)[0].1;
         assert!(entry.from_document_pull);
         assert_eq!(entry.diagnostics[0].message, "checked error");
+    }
+}
+
+#[cfg(test)]
+mod current_content_diagnostics_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture() -> (tempfile::TempDir, LspManager, ServerKey, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let file = canonicalize_for_lsp(temp.path()).unwrap().join("a.ts");
+        std::fs::write(&file, "broken\n").unwrap();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: file.parent().unwrap().to_path_buf(),
+        };
+        let mut manager = LspManager::new();
+        manager
+            .documents
+            .entry(key.clone())
+            .or_default()
+            .open(file.clone());
+        publish(&mut manager, &key, &file, Some(0));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+        (temp, manager, key, file)
+    }
+
+    fn publish(manager: &mut LspManager, key: &ServerKey, file: &Path, version: Option<i32>) {
+        manager.handle_publish_diagnostics(
+            key.kind.clone(),
+            key.root.clone(),
+            &json!({
+                "uri": uri_for_path(file).unwrap(), "version": version, "diagnostics": []
+            }),
+        );
+    }
+
+    #[test]
+    fn diagnostics_late_and_unversioned_reports_do_not_certify_current_content() {
+        for version in [Some(0), None] {
+            let (_temp, mut manager, key, file) = fixture();
+            std::fs::write(&file, "fixed!\n").unwrap();
+            manager.documents.get_mut(&key).unwrap().bump_version(&file);
+            publish(&mut manager, &key, &file, version);
+            assert_eq!(
+                manager.authoritative_diagnostic_reports().count(),
+                0,
+                "version={version:?}"
+            );
+            assert!(!manager.has_authoritative_report_for_file(&file));
+            assert_eq!(manager.unverified_diagnostic_files(), vec![(key, file)]);
+        }
+    }
+
+    #[test]
+    fn diagnostics_matching_version_and_content_remain_authoritative() {
+        let (_temp, mut manager, key, file) = fixture();
+        std::fs::write(&file, "fixed!\n").unwrap();
+        manager.documents.get_mut(&key).unwrap().bump_version(&file);
+        publish(&mut manager, &key, &file, Some(1));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+        assert!(manager.has_authoritative_report_for_file(&file));
+    }
+
+    #[test]
+    fn diagnostics_check_disk_content_even_before_a_watcher_event() {
+        let (_temp, manager, key, file) = fixture();
+        assert!(manager.diagnostic_entry_is_fresh_for_document(
+            &file,
+            &key,
+            PreEditSnapshot::default()
+        ));
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, "fixed!\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 0);
+        assert!(!manager.has_authoritative_report_for_file(&file));
+        assert!(!manager.diagnostic_entry_is_fresh_for_document(
+            &file,
+            &key,
+            PreEditSnapshot::default()
+        ));
+    }
+
+    #[test]
+    fn diagnostics_reopen_does_not_accept_an_earlier_open_version() {
+        let (_temp, mut manager, key, file) = fixture();
+        let store = manager.documents.get_mut(&key).unwrap();
+        store.close(&file);
+        assert_eq!(store.open(file.clone()), 1);
+        publish(&mut manager, &key, &file, Some(0));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 0);
+        publish(&mut manager, &key, &file, Some(1));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+    }
+
+    #[test]
+    fn diagnostics_text_sync_cannot_recertify_earlier_push_or_pull_rows() {
+        let (_temp, mut manager, previous, file) = fixture();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: previous.root,
+        };
+        manager.sync_document_version_for_test(&key, &file, 0);
+        let old = vec![StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: crate::lsp::diagnostics::DiagnosticSeverity::Error,
+            message: "earlier analysis".into(),
+            code: None,
+            source: None,
+        }];
+        manager
+            .latest_push_for_pull_servers
+            .insert((key.clone(), file.clone()), old.clone());
+        manager
+            .latest_pull_for_rust
+            .insert((key.clone(), file.clone()), old);
+        std::fs::write(&file, "fixed!\n").unwrap();
+        manager
+            .notify_file_changed_for_server_keys(file.clone(), "fixed!\n", vec![key.clone()])
+            .unwrap();
+        assert!(!manager
+            .latest_push_for_pull_servers
+            .contains_key(&(key.clone(), file.clone())));
+        assert!(!manager
+            .latest_pull_for_rust
+            .contains_key(&(key.clone(), file.clone())));
+        manager.ingest_document_report(
+            &key,
+            &file,
+            Some(1),
+            None,
+            serde_json::from_value(json!({"kind":"full", "items":[]})).unwrap(),
+        );
+        manager.store_pull_push_union(&key, &file, Vec::new());
+        assert!(manager.has_authoritative_report_for_file(&file));
+        assert!(manager
+            .server_file_diagnostics(&key, &file)
+            .unwrap()
+            .is_empty());
     }
 }
 
