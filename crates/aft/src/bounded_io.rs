@@ -336,23 +336,27 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
             .clone()
     });
     if response.success && current().is_some_and(|b| b.walk_partial.load(Ordering::Acquire)) {
-        let gap = error
-            .map(|error| error.message)
-            .or_else(|| {
-                current().and_then(|budget| {
-                    budget
-                        .walk_gap
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
+        let named_gap = error.map(|error| error.message).or_else(|| {
+            current().and_then(|budget| {
+                budget
+                    .walk_gap
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
             })
-            .unwrap_or_else(|| WALK_PARTIAL_GAP.to_string());
+        });
+        let mut gaps = vec![WALK_PARTIAL_GAP.to_string()];
+        if let Some(gap) = named_gap {
+            if gap != WALK_PARTIAL_GAP {
+                gaps.push(gap);
+            }
+        }
+        let gap = gaps.join("\n");
         response.data["complete"] = serde_json::json!(false);
-        if let Some(gaps) = response.data["gaps"].as_array_mut() {
-            gaps.push(serde_json::json!(gap));
+        if let Some(existing) = response.data["gaps"].as_array_mut() {
+            existing.extend(gaps.into_iter().map(serde_json::Value::String));
         } else {
-            response.data["gaps"] = serde_json::json!([gap]);
+            response.data["gaps"] = serde_json::json!(gaps);
         }
         let text = response.data["text"].as_str().unwrap_or_default();
         // Coverage details precede the shared trailer so the last line remains
