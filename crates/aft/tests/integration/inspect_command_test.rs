@@ -3863,6 +3863,55 @@ fn inspect_command_diagnostics_without_a_report_is_not_returned_as_a_zero_result
 }
 
 #[test]
+fn inspect_command_diagnostics_unverified_report_without_a_live_server_returns_partial() {
+    let (_temp_dir, root) = fixture_project();
+    let file = crate::helpers::canonicalize_like_product(&write_file(
+        &root,
+        "main.ts",
+        "export const n = 1;\n",
+    ));
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .diagnostics_store_mut_for_test()
+        .publish_with_kind(ServerKind::TypeScript, file.clone(), Vec::new());
+    ctx.lsp().certify_diagnostic_content_for_test(&file);
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+
+    // Retain a report for the previous content, with no live producer to
+    // refresh it. The file is unknown, not checked-clean or an unfinished job.
+    fs::write(&file, "export const n = 2;\n").unwrap();
+    assert!(ctx.lsp().active_server_keys().is_empty());
+    assert!(!ctx.lsp().has_authoritative_report_for_file(&file));
+    let response = inspect_warm_event_driven(
+        &ctx,
+        json!({
+            "id": "inspect-unverified-no-live-server",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert_eq!(
+        uncovered_files(&response),
+        vec![(
+            "main.ts".into(),
+            "no diagnostics for the current file content arrived in time; retry aft_inspect".into(),
+        )],
+        "{response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-clean\"\n");
