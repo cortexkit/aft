@@ -11216,6 +11216,37 @@ fn direct_call_site_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreC
     })
 }
 
+fn direct_callers_batch_sql(requested_values: &str) -> String {
+    // Joining the whole (nodes JOIN files) relation on the nullable side makes
+    // SQLite materialize every target node for each caller prefetch. Probe the
+    // target's primary key instead, but still hide nodes whose file is absent.
+    format!(
+        "WITH requested(target_file, target_symbol) AS (VALUES {requested_values})
+         SELECT e.target_file, e.target_symbol, e.line,
+                r.byte_start, r.byte_end, r.status, e.provenance,
+                src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
+                src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
+                src_file.lang,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang, e.kind, src.is_test
+         FROM requested requested
+         JOIN edges e
+           ON e.target_file = requested.target_file
+          AND e.target_symbol = requested.target_symbol
+          AND e.kind IN ('call', 'callback_ref')
+         JOIN refs r ON r.ref_id = e.ref_id
+         JOIN nodes src ON src.id = e.source_node
+         JOIN files src_file ON src_file.path = src.file_path
+         LEFT JOIN nodes tgt
+             ON tgt.id = e.target_node
+            AND tgt.file_path IN (SELECT path FROM files)
+         LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path
+         ORDER BY e.target_file, e.target_symbol, e.source_node,
+                  r.byte_start, r.line, r.ref_id"
+    )
+}
+
 fn direct_callers_for_tuples(
     conn: &Connection,
     targets: &[(String, String)],
@@ -11233,29 +11264,7 @@ fn direct_callers_for_tuples(
             .map(|_| "(?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "WITH requested(target_file, target_symbol) AS (VALUES {requested_values})
-             SELECT e.target_file, e.target_symbol, e.line,
-                    r.byte_start, r.byte_end, r.status, e.provenance,
-                    src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
-                    src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
-                    src_file.lang,
-                    tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
-                    tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
-                    tgt_file.lang, e.kind, src.is_test
-             FROM requested requested
-             JOIN edges e
-               ON e.target_file = requested.target_file
-              AND e.target_symbol = requested.target_symbol
-              AND e.kind IN ('call', 'callback_ref')
-             JOIN refs r ON r.ref_id = e.ref_id
-             JOIN nodes src ON src.id = e.source_node
-             JOIN files src_file ON src_file.path = src.file_path
-             LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
-                 ON tgt.id = e.target_node
-             ORDER BY e.target_file, e.target_symbol, e.source_node,
-                      r.byte_start, r.line, r.ref_id"
-        );
+        let sql = direct_callers_batch_sql(&requested_values);
         let bindings = chunk
             .iter()
             .flat_map(|(file, symbol)| [file.as_str(), symbol.as_str()]);
@@ -28357,6 +28366,166 @@ mod cold_build_insert_tests {
         assert_eq!(CALLER_QUERY_SELECTS.with(Cell::get), 3);
         assert_eq!(BOUNDARY_COUNT_SELECTS.with(Cell::get), 0);
         assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 4);
+    }
+
+    #[test]
+    fn direct_callers_batch_probes_targets_without_scanning_unrelated_nodes() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        let mut source =
+            String::from("export function target() {}\nexport function caller() { target(); }\n");
+        for i in 0..512 {
+            source.push_str(&format!("export function unrelated{i}() {{}}\n"));
+        }
+        fs::write(&file, source).expect("write fixture");
+        let store = CallGraphStore::open(dir.path().join("store"), dir.path().to_path_buf())
+            .expect("open store");
+        store.cold_build(&[file]).expect("cold build");
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = direct_callers_batch_sql("(?, ?)");
+        let mut stmt = conn.prepare(&sql).expect("prepare caller batch");
+        let calls = stmt
+            .query_map(params!["main.ts", "target"], direct_call_site_from_row)
+            .expect("query callers")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("caller rows");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].target.is_some());
+        assert!(
+            stmt.get_status(rusqlite::StatementStatus::FullscanStep) < 8,
+            "caller prefetch must not materialize the unrelated target nodes"
+        );
+    }
+
+    #[test]
+    fn direct_callers_batch_preserves_nullable_targets_and_order() {
+        let dir = tempdir().expect("temp dir");
+        let caller = dir.path().join("main.ts");
+        let target = dir.path().join("target.ts");
+        fs::write(
+            &caller,
+            "import { target } from './target';\nexport function caller() { target(); target(); }\n",
+        )
+        .expect("write caller");
+        fs::write(&target, "export function target() {}\n").expect("write target");
+        let store = CallGraphStore::open(dir.path().join("store"), dir.path().to_path_buf())
+            .expect("open store");
+        store.cold_build(&[caller, target]).expect("cold build");
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute(
+            "UPDATE edges SET kind = 'callback_ref' WHERE rowid = (SELECT MAX(rowid) FROM edges)",
+            [],
+        )
+        .expect("include callback reference");
+        let key = ("target.ts".to_owned(), "target".to_owned());
+        let absent = ("missing.ts".to_owned(), "missing".to_owned());
+        for missing in ["none", "file", "node", "null"] {
+            match missing {
+                "file" => {
+                    conn.execute("DELETE FROM files WHERE path = 'target.ts'", [])
+                        .expect("remove target file");
+                }
+                "node" => {
+                    conn.execute("UPDATE edges SET target_node = 'missing'", [])
+                        .expect("dangling target node");
+                }
+                "null" => {
+                    conn.execute("UPDATE edges SET target_node = NULL", [])
+                        .expect("null target node");
+                }
+                _ => {}
+            }
+            let expected = direct_callers_for_tuple(&conn, &key.0, &key.1)
+                .expect("original single-target join");
+            assert_eq!(expected.len(), 2);
+            assert_eq!(expected[0].target.is_some(), missing == "none");
+            let batch =
+                direct_callers_for_tuples(&conn, &[key.clone(), absent.clone(), key.clone()])
+                    .expect("caller batch");
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[&key], expected, "nullable target: {missing}");
+            assert!(batch[&absent].is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires AFT_CALLERS_PREFETCH_STORE from a fixed real-source export"]
+    fn direct_callers_real_store_query_plan() {
+        let path = std::env::var("AFT_CALLERS_PREFETCH_STORE").expect("real store path");
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open real store read-only");
+        let (file, symbol, edges) = conn
+            .query_row(
+                "SELECT target_file, target_symbol, COUNT(*) FROM edges
+                 WHERE kind IN ('call', 'callback_ref')
+                 GROUP BY target_file, target_symbol ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("widely called target");
+        let optimized = direct_callers_batch_sql("(?, ?)");
+        let original = optimized.replace(
+            "LEFT JOIN nodes tgt\n             ON tgt.id = e.target_node\n            AND tgt.file_path IN (SELECT path FROM files)\n         LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path",
+            "LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path) ON tgt.id = e.target_node",
+        );
+        assert_ne!(original, optimized, "reference must retain the old join");
+        let mut reports = Vec::new();
+        let mut reference = None;
+        for (variant, sql) in [("before", original), ("after", optimized)] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan")
+                .query_map(params![file, symbol], |row| row.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("plan rows");
+            let mut stmt = conn.prepare(&sql).expect("prepare real query");
+            let mut times = Vec::new();
+            let mut fullscan_steps = 0;
+            let mut vm_steps = 0;
+            let mut row_count = 0;
+            for run in 0..7 {
+                let started = Instant::now();
+                let calls = stmt
+                    .query_map(params![file, symbol], direct_call_site_from_row)
+                    .expect("query real callers")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("real callers");
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                if run == 0 {
+                    fullscan_steps = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+                    vm_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                }
+                row_count = calls.len();
+                if let Some(expected) = &reference {
+                    assert_eq!(&calls, expected, "real caller rows and order must match");
+                } else {
+                    reference = Some(calls);
+                }
+            }
+            reports.push(serde_json::json!({
+                "variant": variant, "sql": sql, "plan": plan, "rows": row_count,
+                "fullscan_steps": fullscan_steps, "vm_steps": vm_steps, "times_ms": times,
+            }));
+        }
+        let report = serde_json::json!({
+            "sqlite_version": rusqlite::version(), "file": file, "symbol": symbol,
+            "edges": edges, "queries": reports, "identical_rows": true,
+        });
+        println!("CALLER_PREFETCH_PLAN {report}");
+        if let Ok(path) = std::env::var("AFT_CALLERS_PREFETCH_REPORT") {
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&report).expect("serialize report"),
+            )
+            .expect("write real-store report");
+        }
     }
 
     #[test]
