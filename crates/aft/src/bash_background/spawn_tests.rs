@@ -70,6 +70,10 @@ fn linux_scope_preserves_shell_dollar_expressions() {
     if let Some(root) = std::env::var_os(FIXTURE) {
         let root = PathBuf::from(root);
         let registry = BgTaskRegistry::default();
+        registry
+            .inner
+            .task_scopes
+            .set_launcher_for_test(root.join("systemd-run"));
         registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
         let command = r#"test -z "${AFT_INTERNAL_LINUX_SCOPE+x}" || exit 99; X=inner; printf '%s' "$BASHPID" > shell-pid; printf 'braced=%s plain=%s pid=%s\n' "${X}" "$X" "$$"; cd child-dir ; echo "${PWD}""#;
         let id = super::super::task_scope::with_placement_reader_for_test(
@@ -127,7 +131,7 @@ fn linux_scope_preserves_shell_dollar_expressions() {
         return;
     }
 
-    // Isolate PATH changes from every other test, including launcher discovery.
+    // Use a subprocess to keep fixture environment changes local.
     for mode in ["modern", "legacy", "v253"] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("child-dir")).unwrap();
@@ -146,7 +150,7 @@ while [[ $1 == --* ]]; do
                 exit 1
             fi
             expand=no ;;
-        --user|--scope|--collect|--quiet|--unit=*|--slice=*|--property=*) ;;
+        --user|--scope|--collect|--quiet|--unit=*|--description=*|--slice=*|--property=*|--) ;;
         *) exit 2 ;;
     esac
     shift
@@ -225,6 +229,9 @@ fn task_scope_standalone_never_starts_systemd_run() {
     if let Some(root) = std::env::var_os(ROOT) {
         let root = PathBuf::from(root);
         let r = BgTaskRegistry::default();
+        r.inner
+            .task_scopes
+            .set_launcher_for_test(root.join("systemd-run"));
         r.configure_task_scope_runtime(false, Duration::from_secs(86400));
         let id = r
             .spawn_with_shell_in_slot_typed(
@@ -325,6 +332,10 @@ fn task_scope_creation_refusal_falls_back_without_payload_retry() {
         let root = PathBuf::from(root);
         let released = std::env::var("AFT_TEST_SCOPE_REFUSAL_MODE").unwrap() == "released";
         let registry = BgTaskRegistry::default();
+        registry
+            .inner
+            .task_scopes
+            .set_launcher_for_test(root.join("systemd-run"));
         registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
         let command = format!("test -z \"${{AFT_INTERNAL_LINUX_SCOPE+x}}\" || exit 99; printf x >> payload-count; exit {}", if released { 23 } else { 0 });
         let spawn = || {

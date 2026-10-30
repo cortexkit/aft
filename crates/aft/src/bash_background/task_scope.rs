@@ -33,6 +33,8 @@ mod linux {
         daemon_mode: AtomicBool,
         max_runtime: Mutex<Duration>,
         handles: Mutex<HashMap<String, ScopeHandle>>,
+        #[cfg(test)]
+        launcher_path: Mutex<Option<PathBuf>>,
     }
 
     impl Default for TaskScopes {
@@ -43,11 +45,33 @@ mod linux {
                     crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
                 )),
                 handles: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                launcher_path: Mutex::new(None),
             }
         }
     }
 
     impl TaskScopes {
+        #[cfg(test)]
+        pub(crate) fn set_launcher_for_test(&self, path: PathBuf) {
+            *self.launcher_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        }
+
+        fn launcher(&self) -> Option<SystemdScopeLauncher> {
+            #[cfg(test)]
+            {
+                let path = self
+                    .launcher_path
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(path) = path {
+                    return probe_launcher(path);
+                }
+            }
+            select_systemd_scope_launcher()
+        }
+
         pub(crate) fn is_daemon(&self) -> bool {
             self.daemon_mode.load(Ordering::Acquire)
         }
@@ -104,12 +128,8 @@ mod linux {
                 .cloned()
         }
 
-        pub(crate) fn kill(
-            &self,
-            task_id: &str,
-            identity: Option<(u32, u64)>,
-        ) -> Result<(), String> {
-            if let Some(handle) = self.resolve_handle(task_id, identity)? {
+        pub(crate) fn kill(&self, task_id: &str) -> Result<(), String> {
+            if let Some(handle) = self.resolve_handle(task_id)? {
                 handle
                     .kill()
                     .map_err(|_| "failed to confirm or kill task scope".to_string())?;
@@ -117,30 +137,30 @@ mod linux {
             Ok(())
         }
 
-        pub(crate) fn resolve_handle(
-            &self,
-            task_id: &str,
-            identity: Option<(u32, u64)>,
-        ) -> Result<Option<ScopeHandle>, String> {
+        fn resolve_handle(&self, task_id: &str) -> Result<Option<ScopeHandle>, String> {
+            let unit = scope_unit(task_id).map_err(|_| "failed to confirm or kill task scope")?;
             if let Some(handle) = self.get(task_id) {
                 return Ok(Some(handle));
             }
-            let answer = if let Some((pid, start)) = identity {
-                self.adopt(task_id, pid, start)
-            } else {
-                match lookup_state(task_id) {
-                    Ok(ScopeLookup::Present(_)) => Err("task scope identity is missing".into()),
-                    other => other,
-                }
+            let Some(current) = current_cgroup(std::process::id()) else {
+                return Ok(None);
             };
-            match answer {
-                Ok(ScopeLookup::Present(handle)) => Ok(Some(handle)),
-                Ok(ScopeLookup::Absent) => Ok(None),
-                _ => {
-                    log_unconfirmed_scope();
-                    Err("failed to confirm or kill task scope".into())
-                }
+            // A cgroup file does not use the user bus.
+            let Some(cgroup) = local_scope_path(&unit, &current, unsafe { libc::geteuid() }) else {
+                return Ok(None);
+            };
+            if !cgroup
+                .try_exists()
+                .map_err(|_| "failed to confirm or kill task scope")?
+            {
+                return Ok(None);
             }
+            Ok(Some(ScopeHandle {
+                task_id: task_id.into(),
+                unit,
+                cgroup,
+                description: String::new(),
+            }))
         }
 
         pub(crate) fn adopt(
@@ -173,7 +193,7 @@ mod linux {
             &self,
             records: &[ScopeRecord],
             terminal_only: bool,
-            mut recheck: impl FnMut(&str) -> bool,
+            mut recheck: impl FnMut(&str, &str) -> bool,
         ) -> Result<usize, String> {
             let units = list_units()?;
             let mut stopped = 0;
@@ -183,7 +203,7 @@ mod linux {
                     continue;
                 };
                 match lookup(id) {
-                    Ok(Some(scope)) if recheck(id) => {
+                    Ok(Some(scope)) if recheck(id, &scope.description) => {
                         scope.stop()?;
                         stopped += 1;
                     }
@@ -275,6 +295,20 @@ mod linux {
         Ok(ScopeLookup::Present(scope))
     }
 
+    fn local_scope_path(unit: &str, current: &Path, uid: u32) -> Option<PathBuf> {
+        let service = format!("user@{uid}.service");
+        let mut root = PathBuf::new();
+        for component in current.components() {
+            root.push(component.as_os_str());
+            if let Some(name) = component.as_os_str().to_str() {
+                if name.starts_with("user@") && name.ends_with(".service") {
+                    return (name == service).then(|| root.join(TASK_SLICE).join(unit));
+                }
+            }
+        }
+        None
+    }
+
     #[derive(Debug)]
     pub(crate) enum ScopeLookup {
         Absent,
@@ -287,6 +321,7 @@ mod linux {
         task_id: String,
         unit: String,
         cgroup: PathBuf,
+        description: String,
     }
 
     impl ScopeHandle {
@@ -327,6 +362,14 @@ mod linux {
         unit: String,
         runtime: Duration,
         memory_bytes: Option<u64>,
+        description: String,
+    }
+
+    pub(crate) fn scope_description(task_id: &str, storage_root: &Path) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::fs::canonicalize(storage_root).unwrap_or_else(|_| storage_root.to_owned());
+        let hash = blake3::hash(root.as_os_str().as_bytes()).to_hex();
+        format!("aft task {task_id} root={}", &hash[..16])
     }
 
     fn prefix(expand: bool) -> Vec<OsString> {
@@ -470,8 +513,23 @@ mod linux {
         None
     }
 
+    pub(crate) fn systemd_run_path_with(
+        mut exists: impl FnMut(&Path) -> bool,
+    ) -> Option<&'static Path> {
+        [
+            Path::new("/usr/bin/systemd-run"),
+            Path::new("/bin/systemd-run"),
+        ]
+        .into_iter()
+        .find(|path| exists(path))
+    }
+
     pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
-        let path = which::which("systemd-run").ok()?;
+        let path = systemd_run_path_with(Path::is_file)?.to_owned();
+        probe_launcher(path)
+    }
+
+    fn probe_launcher(path: PathBuf) -> Option<SystemdScopeLauncher> {
         let supports_expand_environment = probe_systemd_scope(&path, Duration::from_secs(1))?;
         let version = run(
             user_manager_command(&path).arg("--version"),
@@ -500,7 +558,7 @@ mod linux {
 
     #[cfg(test)]
     pub(crate) fn probe_user_manager(limit: Duration) -> Result<(), String> {
-        let launcher = which::which("systemd-run").map_err(|e| e.to_string())?;
+        let launcher = systemd_run_path_with(Path::is_file).ok_or("systemd-run is unavailable")?;
         successful(run(
             user_manager_command(&launcher).args(["--user", "--scope", "--quiet", "/bin/true"]),
             limit.min(Duration::from_secs(1)),
@@ -515,6 +573,7 @@ mod linux {
             task_id: &str,
             hard_kill: super::super::HardKill,
             memory_mib: Option<u64>,
+            storage_root: &Path,
         ) -> Result<Option<ScopeLaunch>, String> {
             static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if !*UNIFIED.get_or_init(|| current_cgroup(std::process::id()).is_some()) {
@@ -522,7 +581,7 @@ mod linux {
                 LOGGED.call_once(|| crate::slog_info!("bash.linux_scope: unified cgroup hierarchy is not visible; spawning without a scope"));
                 return Ok(None);
             }
-            let Some(launcher) = select_systemd_scope_launcher() else {
+            let Some(launcher) = self.launcher() else {
                 // If the manager probe cannot run a command, run the task without a scope.
                 static LOGGED: std::sync::Once = std::sync::Once::new();
                 LOGGED.call_once(|| {
@@ -530,7 +589,15 @@ mod linux {
                 });
                 return Ok(None);
             };
-            ScopeLaunch::new(launcher, policy, task_id, hard_kill, memory_mib).map(Some)
+            ScopeLaunch::new(
+                launcher,
+                policy,
+                task_id,
+                hard_kill,
+                memory_mib,
+                storage_root,
+            )
+            .map(Some)
         }
     }
 
@@ -541,6 +608,7 @@ mod linux {
             task_id: &str,
             hard_kill: HardKill,
             memory_mib: Option<u64>,
+            storage_root: &Path,
         ) -> Result<Self, String> {
             let unit = scope_unit(task_id).map_err(|e| e.to_string())?;
             let memory_bytes = memory_mib
@@ -560,6 +628,7 @@ mod linux {
                 unit,
                 runtime,
                 memory_bytes,
+                description: scope_description(task_id, storage_root),
             })
         }
         pub(crate) fn argv(
@@ -576,6 +645,8 @@ mod linux {
                         .expect("validated scope unit")
                 )
                 .into(),
+                // The user journal uses payload argv if no description is set.
+                format!("--description={}", self.description).into(),
                 format!("--slice={TASK_SLICE}").into(),
                 format!("--property=RuntimeMaxSec={}ms", self.runtime.as_millis()).into(),
                 "--property=TimeoutStopSec=2s".into(),
@@ -589,6 +660,7 @@ mod linux {
                     wrapped.push("--property=OOMPolicy=kill".into());
                 }
             }
+            wrapped.push("--".into());
             wrapped.push(executable.as_os_str().to_owned());
             wrapped.extend_from_slice(args);
             (self.launcher.path.clone(), wrapped)
@@ -607,6 +679,7 @@ mod linux {
                         task_id: self.task_id.clone(),
                         unit: self.unit.clone(),
                         cgroup: path,
+                        description: self.description.clone(),
                     });
                 }
                 if !super::super::process::is_process_alive(pid) {
@@ -715,6 +788,7 @@ mod linux {
                 "show",
                 "--property=ControlGroup",
                 "--property=LoadState",
+                "--property=Description",
                 &unit,
             ]),
             Duration::from_secs(1),
@@ -739,6 +813,7 @@ mod linux {
             task_id: task_id.into(),
             unit,
             cgroup,
+            description: property("Description=").unwrap_or_default().into(),
         }))
     }
 
@@ -933,6 +1008,7 @@ mod linux {
             task_id: task_id.into(),
             unit: scope_unit(task_id).unwrap(),
             cgroup,
+            description: scope_description(task_id, Path::new("/fixture")),
         }
     }
 
@@ -950,6 +1026,7 @@ mod linux {
             id,
             HardKill::Default,
             None,
+            Path::new("/fixture"),
         )
         .unwrap()
     }
@@ -975,6 +1052,7 @@ mod linux {
             unit: scope_unit(id).unwrap(),
             runtime,
             memory_bytes: cap.map(|mib| mib.checked_mul(1024 * 1024).unwrap()),
+            description: scope_description(id, Path::new("/fixture")),
         }
         .argv(executable, args)
     }
@@ -1023,6 +1101,24 @@ mod linux {
                 ScopeLookup::Unreachable
             ));
         }
+
+        #[test]
+        fn task_scope_local_path_requires_this_user_manager() {
+            let unit = scope_unit("bash-0123456789abcdef").unwrap();
+            let current = unified_cgroup_path(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/module.scope\n",
+            )
+            .unwrap();
+            let expected = unified_cgroup_path("0::/user.slice/user-1000.slice/user@1000.service/aft.slice/aft-task-bash-0123456789abcdef.scope\n").unwrap();
+            assert_eq!(local_scope_path(&unit, &current, 1000), Some(expected));
+            assert!(local_scope_path(&unit, &current, 1001).is_none());
+            assert!(local_scope_path(
+                &unit,
+                &unified_cgroup_path("0::/init.scope\n").unwrap(),
+                1000
+            )
+            .is_none());
+        }
         #[test]
         fn task_scope_control_group_validation() {
             let id = "bash-0123456789abcdef";
@@ -1070,6 +1166,35 @@ mod linux {
             assert_eq!(parse_version("systemd 253 (253.1)\n"), Some(253));
             assert_eq!(parse_version("unknown 262"), None);
             assert_eq!(parse_version("systemd unknown"), None);
+        }
+
+        #[test]
+        fn task_scope_launcher_ignores_process_path() {
+            const INNER: &str = "AFT_TEST_SCOPE_TRUSTED_LAUNCHER";
+            if std::env::var_os(INNER).is_some() {
+                let selected = select_systemd_scope_launcher().unwrap();
+                assert!(
+                    [
+                        Path::new("/usr/bin/systemd-run"),
+                        Path::new("/bin/systemd-run")
+                    ]
+                    .contains(&selected.path.as_path()),
+                    "scope launcher came from untrusted PATH"
+                );
+                return;
+            }
+            if let Err(error) = probe_user_manager(Duration::from_secs(1)) {
+                eprintln!("SKIP task scopes: user manager probe failed: {error}");
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            crate::executable_cache::write_executable(
+                &root.path().join("systemd-run"),
+                b"#!/bin/sh\nprintf 'systemd 262\\n'\nexit 0\n",
+            )
+            .unwrap();
+            let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::task_scope::linux::command_tests::task_scope_launcher_ignores_process_path", "--nocapture"]).env(INNER, "1").env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).status().unwrap();
+            assert!(status.success(), "trusted launcher subprocess failed");
         }
 
         #[test]
@@ -1141,6 +1266,7 @@ mod linux {
                     "bash-0123456789abcdef",
                     limit,
                     None,
+                    Path::new("/fixture"),
                 )
                 .unwrap();
                 assert!(launch
@@ -1202,6 +1328,7 @@ mod unsupported {
             _task_id: &str,
             _hard_kill: super::super::HardKill,
             _memory_mib: Option<u64>,
+            _storage_root: &std::path::Path,
         ) -> Result<Option<ScopeLaunch>, String> {
             Ok(None)
         }
@@ -1296,6 +1423,10 @@ mod tests {
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
+        let description = format!(
+            "--description={}",
+            scope_description(id, Path::new("/fixture"))
+        );
         assert_eq!(
             args,
             [
@@ -1305,12 +1436,14 @@ mod tests {
                 "--quiet",
                 "--expand-environment=no",
                 "--unit=aft-task-bash-0123456789abcdef",
+                description.as_str(),
                 "--slice=aft.slice",
                 "--property=RuntimeMaxSec=61500ms",
                 "--property=TimeoutStopSec=2s",
                 "--property=MemoryMax=67108864",
                 "--property=MemorySwapMax=0",
                 "--property=OOMPolicy=kill",
+                "--",
                 "/bin/sh",
                 "${X} $$"
             ]
@@ -1353,11 +1486,13 @@ mod tests {
                 "--collect",
                 "--quiet",
                 "--unit=aft-task-bash-0123456789abcdef",
+                description.as_str(),
                 "--slice=aft.slice",
                 "--property=RuntimeMaxSec=86400000ms",
                 "--property=TimeoutStopSec=2s",
                 "--property=MemoryMax=67108864",
                 "--property=MemorySwapMax=0",
+                "--",
                 "/bin/sh"
             ]
         );
@@ -1372,6 +1507,40 @@ mod tests {
         );
         assert!(v253.contains(&OsString::from("--property=OOMPolicy=kill")));
         assert!(!v253.contains(&OsString::from("--expand-environment=no")));
+    }
+
+    #[test]
+    fn task_scope_all_systemd_shapes_hide_payload_from_options() {
+        let id = "bash-0123456789abcdef";
+        for (expand, oom) in [(true, true), (false, true), (false, false)] {
+            let (_, args) = argv_for_test(
+                id,
+                expand,
+                oom,
+                Duration::from_secs(86400),
+                Some(64),
+                Path::new("/bin/sh"),
+                &["-c".into(), "echo fixture-private-command".into()],
+            );
+            let args = args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>();
+            assert!(
+                args.iter().any(
+                    |arg| arg.starts_with("--description=aft task bash-0123456789abcdef root=")
+                ),
+                "scope description is missing"
+            );
+            let fence = args
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("payload argv fence is missing");
+            assert_eq!(args[fence + 1], "/bin/sh");
+            assert!(args[..fence]
+                .iter()
+                .all(|arg| !arg.contains("fixture-private-command")));
+        }
     }
 
     #[test]

@@ -5372,9 +5372,17 @@ async fn task_scope_standalone_fallback_never_starts_systemd_run() {
                 7200,
             );
             original.configure_task_scope_runtime(false, Duration::from_secs(86400));
+            original
+                .inner
+                .task_scopes
+                .set_launcher_for_test(root.join("systemd-run"));
             if restarted {
                 drop(original);
                 let ctx = restarted_context(&dir);
+                ctx.bash_background()
+                    .inner
+                    .task_scopes
+                    .set_launcher_for_test(root.join("systemd-run"));
                 assert!(!ctx.is_daemon_mode());
                 ctx.bash_background()
                     .replay_session(&dir, "session")

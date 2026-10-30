@@ -2275,6 +2275,15 @@ pub(crate) fn is_harness_store_name(name: &str) -> bool {
         || name.starts_with("fed--")
 }
 
+#[cfg(unix)]
+pub(crate) fn task_store_root(session_dir: &Path) -> Option<&Path> {
+    let tasks = session_dir.parent()?;
+    if tasks.file_name()? != "bash-tasks" {
+        return None;
+    }
+    tasks.parent()
+}
+
 pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
     let session_hash = hash_session(session_id);
     let direct = storage_dir.join("bash-tasks").join(&session_hash);
@@ -2421,6 +2430,43 @@ mod scope_record_tests {
         assert!(
             entries >= 600 && calls >= 5,
             "invalid entries did not consume budget"
+        );
+    }
+
+    #[test]
+    fn task_scope_record_scan_skips_oversized_body() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "bash-0000000000000001";
+        record(root.path(), "oversized", id, true);
+        let task = resolve_task(root.path(), "oversized", id).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&task.paths.json)
+            .unwrap()
+            .write_all(&vec![b' '; 1_048_576])
+            .unwrap();
+        work_counts::reset();
+        let mut cursor = StorageTaskRecordCursor::new(root.path()).unwrap();
+        let mut rows = Vec::new();
+        let mut oversized = 0;
+        loop {
+            let batch = discover_storage_task_records(root.path(), &mut cursor).unwrap();
+            oversized += batch.skipped_oversized;
+            rows.extend(batch.records);
+            if batch.finished {
+                break;
+            }
+        }
+        assert!(
+            rows.is_empty(),
+            "oversized record body granted scope ownership"
+        );
+        assert_eq!(oversized, 1);
+        assert!(cursor.rejected_task_ids.contains(id));
+        assert_eq!(
+            work_counts::get().metadata_reads,
+            0,
+            "oversized record body was read"
         );
     }
 
@@ -2737,6 +2783,9 @@ pub fn discover_task_ids(session_dir: &Path) -> io::Result<(Vec<String>, Vec<OsS
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) const TASK_SCOPE_RECORD_MAX_BYTES: u64 = 1_048_576;
+
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub(crate) struct TaskRecordRef {
     pub task_id: String,
@@ -2755,7 +2804,7 @@ pub(crate) fn reread_storage_task_record(record: &TaskRecordRef) -> io::Result<P
         verify_scope_directory(directory)?;
     }
     let task = resolve_task_layout_from_session(Arc::clone(&record.session), &record.task_id)?;
-    let metadata = read_task_at(&task)?;
+    let metadata = read_task_at_limited(&task, Some(TASK_SCOPE_RECORD_MAX_BYTES))?;
     if metadata.task_id != record.task_id {
         return Err(io::Error::other("task record identity changed"));
     }
@@ -2800,6 +2849,7 @@ pub(crate) struct StorageTaskRecordBatch {
     pub records: Vec<TaskRecordRef>,
     pub finished: bool,
     pub entries_scanned: usize,
+    pub skipped_oversized: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -2835,6 +2885,7 @@ pub(crate) fn discover_storage_task_records(
         records: Vec::new(),
         finished: false,
         entries_scanned: 0,
+        skipped_oversized: 0,
     };
     // Only one entry can continue after the time limit. Each entry uses a constant number of filesystem operations.
     while batch.entries_scanned < super::gc_cursor::GC_ENTRY_BUDGET
@@ -2889,7 +2940,10 @@ pub(crate) fn discover_storage_task_records(
                     terminal: metadata.is_terminal(),
                     ..record
                 }),
-                Err(_) => {
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::FileTooLarge {
+                        batch.skipped_oversized += 1;
+                    }
                     cursor.rejected_task_ids.insert(id.into());
                 }
             }
@@ -3244,12 +3298,16 @@ pub(crate) fn task_temp_quiescent(metadata: &PersistedTask) -> bool {
 }
 
 pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
+    read_task_at_limited(task, None)
+}
+
+fn read_task_at_limited(task: &ResolvedTask, limit: Option<u64>) -> io::Result<PersistedTask> {
     let name = match task.paths.layout {
         TaskLayout::Directory => OsString::from(METADATA_FILE),
         TaskLayout::Flat => OsString::from(format!("{}.json", task.paths.task_id)),
     };
     let mut file = open_metadata_through_replacement(&task.dirs.control, &name)?;
-    let metadata = read_task_file(&mut file, &task.dirs.control.path().join(&name))?;
+    let metadata = read_task_file_limited(&mut file, &task.dirs.control.path().join(&name), limit)?;
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3260,11 +3318,39 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
 }
 
 fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
+    read_task_file_limited(file, path, None)
+}
+
+fn read_task_file_limited(
+    file: &mut File,
+    path: &Path,
+    limit: Option<u64>,
+) -> io::Result<PersistedTask> {
+    if let Some(limit) = limit {
+        if file.metadata()?.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "task scope record is oversized",
+            ));
+        }
+    }
     #[cfg(test)]
     work_counts::record_read();
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
-    file.read_to_string(&mut content)?;
+    if let Some(limit) = limit {
+        // A size check can race with appends. Bound the read too.
+        file.take(limit.saturating_add(1))
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "task scope record is oversized",
+            ));
+        }
+    } else {
+        file.read_to_string(&mut content)?;
+    }
     // The version is read before the full shape, so metadata written by a
     // newer build is refused by name (and kept out of quarantine) instead of
     // failing as an unparseable task.

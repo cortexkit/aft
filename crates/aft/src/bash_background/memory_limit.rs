@@ -459,16 +459,8 @@ mod linux {
         super::super::task_scope::user_manager_command(executable)
     }
 
-    fn systemd_run_path_with(mut exists: impl FnMut(&Path) -> bool) -> Option<&'static Path> {
-        for path in [
-            Path::new("/usr/bin/systemd-run"),
-            Path::new("/bin/systemd-run"),
-        ] {
-            if exists(path) {
-                return Some(path);
-            }
-        }
-        None
+    fn systemd_run_path_with(exists: impl FnMut(&Path) -> bool) -> Option<&'static Path> {
+        super::super::task_scope::systemd_run_path_with(exists)
     }
 
     fn current(pid: u32) -> Option<PathBuf> {

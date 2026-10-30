@@ -1995,9 +1995,11 @@ impl BgTaskRegistry {
             Err(error) => return Err(error.to_string()),
         };
         let mut records = HashMap::new();
+        let mut skipped_oversized = 0;
         loop {
             let batch = super::persistence::discover_storage_task_records(storage_dir, &mut cursor)
                 .map_err(|error| error.to_string())?;
+            skipped_oversized += batch.skipped_oversized;
             for record in batch.records {
                 records.insert(record.task_id.clone(), record);
             }
@@ -2007,6 +2009,11 @@ impl BgTaskRegistry {
             std::thread::yield_now();
         }
         records.retain(|id, _| !cursor.rejected_task_ids.contains(id));
+        if skipped_oversized > 0 {
+            crate::slog_info!(
+                "bash task scope cleanup skipped {skipped_oversized} oversized records"
+            );
+        }
         if records.is_empty() {
             return Ok(0);
         }
@@ -2019,9 +2026,14 @@ impl BgTaskRegistry {
             .collect::<Vec<_>>();
         self.inner
             .task_scopes
-            .cleanup_owned(&scope_records, terminal_only, |id| {
+            .cleanup_owned(&scope_records, terminal_only, |id, description| {
                 records
                     .get(id)
+                    .filter(|record| {
+                        super::persistence::task_store_root(&record.session_dir).is_some_and(
+                            |store| super::task_scope::scope_description(id, store) == description,
+                        )
+                    })
                     .and_then(|record| super::persistence::reread_storage_task_record(record).ok())
                     .is_some_and(|metadata| !terminal_only || metadata.is_terminal())
             })
@@ -5075,22 +5087,10 @@ impl BgTaskRegistry {
         Ok(None)
     }
 
-    #[cfg(target_os = "linux")]
-    fn task_scope_identity(&self, task_id: &str) -> Option<(u32, u64)> {
-        let task = self.task(task_id)?;
-        let state = task.lock_state().ok()?;
-        Some((
-            state.metadata.child_pid?,
-            state.metadata.child_start_time_ms?,
-        ))
-    }
-
     pub(crate) fn kill_task_scope(&self, task_id: &str) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
-            self.inner
-                .task_scopes
-                .kill(task_id, self.task_scope_identity(task_id))
+            self.inner.task_scopes.kill(task_id)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -5507,9 +5507,14 @@ impl BgTaskRegistry {
             .task_scopes
             .policy(linux_scope, None, spawn_plan.is_native_launcher())
             .map(|policy| {
-                self.inner
-                    .task_scopes
-                    .prepare(policy, &task_id, hard_kill, memory_limit_mib)
+                self.inner.task_scopes.prepare(
+                    policy,
+                    &task_id,
+                    hard_kill,
+                    memory_limit_mib,
+                    super::persistence::task_store_root(&paths.session_dir)
+                        .ok_or("task store root is unavailable")?,
+                )
             })
             .transpose()?
             .flatten();
@@ -13482,14 +13487,6 @@ impl BgTaskRegistry {
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         #[cfg(unix)]
         self.stop_secret_proxy(task_id);
-        #[cfg(target_os = "linux")]
-        {
-            // The leader can exit during group termination. Check its scope before sending signals.
-            let _ = self
-                .inner
-                .task_scopes
-                .resolve_handle(task_id, self.task_scope_identity(task_id));
-        }
         let pending_memory_reason = task
             .lock_state()
             .ok()

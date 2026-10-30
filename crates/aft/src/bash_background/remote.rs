@@ -4016,6 +4016,8 @@ impl BgTaskRegistry {
                     &task.task_id,
                     hard_kill,
                     local.memory_limit_mib,
+                    crate::bash_background::persistence::task_store_root(&task.paths.session_dir)
+                        .ok_or("task store root is unavailable")?,
                 )
             })
             .transpose()?

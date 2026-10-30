@@ -222,6 +222,12 @@ fn task_scope_survives_module_cgroup_kill() {
             "before\nafter\n"
         );
         assert_eq!(std::fs::read_to_string(&layout.paths.stderr).unwrap(), "");
+        until(|| {
+            registry
+                .pending_completions_for_session("task-scope")
+                .iter()
+                .any(|completion| completion.task_id == id)
+        });
         assert_eq!(
             registry
                 .pending_completions_for_session("task-scope")
@@ -686,7 +692,7 @@ fn task_scope_kill_without_handle_uses_exact_identity() {
 }
 
 #[test]
-fn task_scope_kill_without_handle_refuses_foreign_identity() {
+fn task_scope_kill_without_handle_does_not_need_pid_identity() {
     if !manager_available() {
         return;
     }
@@ -708,22 +714,19 @@ fn task_scope_kill_without_handle_refuses_foreign_identity() {
     second
         .insert_rehydrated_task(metadata, task.paths.clone(), true)
         .unwrap();
-    assert!(
-        second.kill_task_scope(&id).is_err(),
-        "unconfirmed scope kill reported success"
-    );
-    assert!(second.inner.task_scopes.get(&id).is_none());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
-    assert!(
-        std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
-            .unwrap()
+    second.kill_task_scope(&id).unwrap();
+    assert!(second.inner.task_scopes.get(&id).is_none());
+    until(|| {
+        !std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
+            .unwrap_or_default()
             .lines()
             .any(|line| line == "populated 1")
-    );
+    });
 }
 
 #[test]
-fn task_scope_kill_distinguishes_absent_unconfirmed_and_failed() {
+fn task_scope_kill_distinguishes_absent_present_and_failed() {
     if !manager_available() {
         return;
     }
@@ -739,10 +742,7 @@ fn task_scope_kill_distinguishes_absent_unconfirmed_and_failed() {
     );
     let _stop = StopOnDrop(id.clone());
     let other = BgTaskRegistry::default();
-    assert!(
-        other.kill_task_scope(&id).is_err(),
-        "present scope without identity reported success"
-    );
+    other.kill_task_scope(&id).unwrap();
     let fake = tempfile::tempdir().unwrap();
     std::fs::create_dir(fake.path().join("cgroup.kill")).unwrap();
     other
@@ -754,6 +754,65 @@ fn task_scope_kill_distinguishes_absent_unconfirmed_and_failed() {
         ));
     let error = other.kill_task_scope(&id).unwrap_err();
     assert_eq!(error, "failed to confirm or kill task scope");
+}
+
+#[test]
+fn task_scope_uncached_kill_does_not_need_user_bus() {
+    const ID: &str = "AFT_TEST_LOCAL_SCOPE_KILL_ID";
+    if let Ok(id) = std::env::var(ID) {
+        BgTaskRegistry::default()
+            .kill_task_scope(&id)
+            .expect("manager outage prevented local cgroup kill");
+        return;
+    }
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &registry,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
+    for target in [random_slug(), id] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::task_scope_tests::task_scope_uncached_kill_does_not_need_user_bus", "--nocapture"]).env(ID, target).env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/aft-probe-bus").env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime").output().unwrap();
+        assert!(
+            output.status.success(),
+            "uncached kill required manager: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    until(|| {
+        !std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == "populated 1")
+    });
+}
+
+#[test]
+fn task_scope_kill_file_write_failure_is_static() {
+    let fake = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fake.path().join("cgroup.kill")).unwrap();
+    let registry = BgTaskRegistry::default();
+    let id = random_slug();
+    registry
+        .inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(
+            &id,
+            fake.path().into(),
+        ));
+    assert_eq!(
+        registry.kill_task_scope(&id).unwrap_err(),
+        "failed to confirm or kill task scope"
+    );
 }
 
 #[test]
@@ -950,6 +1009,69 @@ fn task_scope_cleanup_and_hook_require_readable_owned_records() {
             "hook used the handle cache as ownership proof"
         );
     }
+}
+
+#[test]
+fn task_scope_cleanup_requires_this_storage_description() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &registry,
+        root.path(),
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let original = super::super::persistence::resolve_task(root.path(), "task-scope", &id).unwrap();
+    let mut metadata = read_task_at(&original).unwrap();
+    metadata.mark_terminal(super::super::BgTaskStatus::Completed, Some(0), None);
+    let forged =
+        super::super::persistence::create_task_layout(other.path(), "task-scope", &id).unwrap();
+    write_task_at(&forged, &metadata).unwrap();
+    assert_eq!(
+        registry.cleanup_terminal_task_scopes(other.path()).unwrap(),
+        0,
+        "cleanup stopped another root's scope"
+    );
+    assert_eq!(
+        registry.end_all_task_scopes(other.path()).unwrap(),
+        0,
+        "end-all stopped another root's scope"
+    );
+    assert!(super::super::task_scope::lookup(&id).unwrap().is_some());
+}
+
+#[test]
+fn task_scope_cleanup_keeps_harness_store_coverage() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let store = root.path().join("pi");
+    std::fs::create_dir(&store).unwrap();
+    let registry = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &registry,
+        &store,
+        "sleep 60",
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    let task = super::super::persistence::resolve_task(&store, "task-scope", &id).unwrap();
+    let mut metadata = read_task_at(&task).unwrap();
+    metadata.mark_terminal(super::super::BgTaskStatus::Completed, Some(0), None);
+    write_task_at(&task, &metadata).unwrap();
+    assert_eq!(
+        registry.cleanup_terminal_task_scopes(root.path()).unwrap(),
+        1,
+        "parent scan skipped owned harness-store scope"
+    );
 }
 
 #[test]
