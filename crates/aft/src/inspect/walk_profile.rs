@@ -1,7 +1,7 @@
 //! Opt-in measurements for the real-checkout inspect regression harness.
 
 use std::cell::Cell;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 thread_local! {
@@ -17,7 +17,8 @@ pub(crate) fn entry() {
 }
 
 fn enabled() -> bool {
-    std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").is_some())
 }
 
 pub(crate) fn cpu_ms() -> f64 {

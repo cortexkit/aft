@@ -7849,7 +7849,33 @@ mod deferred_terminal_tests {
                 "case": name, "ms": measurement["ms"], "cpu_ms": measurement["cpu_ms"], "walks": measurement["walks"],
             })).unwrap());
             assert!(response.success, "{measurement:#}");
-            assert_eq!(measurement["response"]["complete"], true, "{measurement:#}");
+            let snapshot = build_snapshot(&ctx).unwrap();
+            let cache = ctx.inspect_manager.cache_for_snapshot(&snapshot).unwrap();
+            let mut measurement = measurement;
+            for category in [
+                InspectCategory::DeadCode,
+                InspectCategory::UnusedExports,
+                InspectCategory::Duplicates,
+                InspectCategory::Cycles,
+            ] {
+                let aggregate = cache
+                    .latest_aggregate_any_hash(category)
+                    .unwrap()
+                    .expect("persisted category aggregate");
+                if category == InspectCategory::DeadCode {
+                    assert_eq!(
+                        aggregate["callgraph_available"], true,
+                        "dead-code comparison requires a real call graph"
+                    );
+                }
+                measurement["full_aggregates"][category.as_str()] = aggregate;
+                assert!(
+                    measurement["response"]["summary"]
+                        .get(category.as_str())
+                        .is_some(),
+                    "{measurement:#}"
+                );
+            }
             measurements.push(measurement);
         }
         std::fs::create_dir_all(output.parent().unwrap()).unwrap();
