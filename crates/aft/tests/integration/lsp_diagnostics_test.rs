@@ -3560,7 +3560,11 @@ mod mutation_events {
 
         // The importer is untouched by the mutation. Its acknowledgement is a
         // protocol barrier: every earlier watched-file event has been echoed.
-        let importer_uri = aft::lsp::position::uri_for_path(importer).unwrap();
+        // AFT sends the resolved path (macOS temp dirs resolve /var to
+        // /private/var), so the barrier must compare against that spelling.
+        let importer_uri =
+            aft::lsp::position::uri_for_path(&crate::helpers::canonicalize_like_product(importer))
+                .unwrap();
         ctx.lsp()
             .notify_file_changed(importer, "export const importer = 2;\n", &ctx.config())
             .unwrap();
