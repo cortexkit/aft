@@ -5422,6 +5422,7 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+    let gh_relay_requests = gh_relay_wait::Requests::default();
     let pending_deferred_setups = Arc::new(PendingDeferredSetups::default());
     let mut pending_responses = PendingSubcResponses::default();
     let mut database_waits = persistence::DatabaseWaits::default();
@@ -6171,6 +6172,8 @@ where
                                 &dispatch_path_metrics,
                                 true,
                                 gh_relay_route_scopes(&routes,&speech),
+                                &gh_relay_requests,
+                                module_drain.is_active(),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
@@ -6264,6 +6267,9 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if gh_relay_requests.cancel(channel, corr) {
+                            continue;
+                        }
                         if ledger_edge.cancel(channel, corr) {
                             continue;
                         }
@@ -6382,6 +6388,7 @@ where
                                 // bash waits: each checks it on its next poll.
                                  scope_describe_task.abort();
                                  module_drain.begin(until);
+                                 gh_relay_requests.drain();
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
                                     quiesced_reported: false,
@@ -9268,9 +9275,11 @@ fn gh_relay_route_scopes(
     scopes
 }
 
-/// Run a gh shim relay request on its own task. The relay makes up to two
-/// network calls (prefrontal, then plexus); running them here keeps the subc frame
-/// loop free, and the relay holds no lock across them.
+mod gh_relay_wait;
+
+/// Run the relay off-loop, retaining ownership of its terminal frame even when
+/// cancellation or drain interrupts the provider wait.
+#[allow(clippy::too_many_arguments)]
 fn spawn_gh_relay(
     tx: &WriterSender,
     frame: &Frame,
@@ -9278,7 +9287,10 @@ fn spawn_gh_relay(
     metrics: &Arc<DispatchPathMetrics>,
     first_party: bool,
     route_scopes: crate::gh_shim_relay::RouteScopes,
+    requests: &gh_relay_wait::Requests,
+    draining: bool,
 ) {
+    let mut wait = requests.register(frame, draining);
     let tx = tx.clone();
     let frame = frame.clone();
     let relay = Arc::clone(relay);
@@ -9296,7 +9308,8 @@ fn spawn_gh_relay(
             .unwrap_or_default()
             .to_string();
         let params = decoded.get("params").cloned().unwrap_or_else(|| json!({}));
-        let reply = crate::gh_shim_relay::relay(
+        let relay_log = |line: &str| log::info!("{line}");
+        let relay_call = crate::gh_shim_relay::relay(
             &relay.transport,
             crate::gh_shim_relay::RelayCall {
                 operation: &operation,
@@ -9304,26 +9317,10 @@ fn spawn_gh_relay(
                 first_party,
                 route_scopes: &route_scopes,
             },
-            &|line| log::info!("{line}"),
-        )
-        .await;
-        let body = json!({
-            "op": operation,
-            "status": if reply.ok { "ok" } else { "error" },
-            "data": reply.data,
-        });
-        let Ok(body) = serde_json::to_vec(&body) else {
-            return;
-        };
-        let Ok(response) = Frame::build_with_version(
-            frame.header.ver,
-            FrameType::Response,
-            frame.header.flags,
-            frame.header.channel,
-            frame.header.epoch,
-            frame.header.corr,
-            body,
-        ) else {
+            &relay_log,
+        );
+        let response = gh_relay_wait::terminal(&frame, &operation, &mut wait, relay_call).await;
+        let Ok(response) = response else {
             return;
         };
         if let Err(error) =
