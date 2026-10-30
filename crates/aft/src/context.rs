@@ -1155,14 +1155,15 @@ pub(crate) fn view_load_error_response(id: &str, message: String) -> crate::prot
 
 /// Error-level log throttle: one line per project and plane per minute.
 /// Repeats inside the window are counted and reported on the next emission.
-const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The most recent checkout view load failure of a project. Planes are the
 /// query planes a failed load serves: `trigram` for the lexical view behind
 /// grep, glob and aft_search, `callgraph` for the graph behind navigation,
-/// zoom and inspect. Semantic lane failures stay lane-level (the lane reports
-/// `unavailable` with its cause and the query continues lexically), so they
-/// are not load failures here.
+/// zoom and inspect, and `semantic` when a built semantic view cannot serve
+/// or score a query. The semantic lane still answers `unavailable` with its
+/// cause and the query continues lexically; health counts the failure too.
+/// Pending fill coverage is normal progress and is not counted.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ViewLoadFailure {
     pub plane: String,
@@ -1193,7 +1194,7 @@ struct ViewLoadHealth {
 /// Bucket a view load error into a stable short cause. I/O failures already
 /// name their path and operation; verification and manifest problems name
 /// what mismatches or is missing; the full text stays in the recorded error.
-fn view_load_cause(error: &str) -> &'static str {
+pub(crate) fn view_load_cause(error: &str) -> &'static str {
     let error = error.to_lowercase();
     if error.contains("busy") {
         "busy"
@@ -6015,17 +6016,40 @@ impl AppContext {
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
-        let (view_load_failures, view_load_failure_last) = match self.view_load_health.try_lock() {
-            Some(health) => (
-                health
-                    .by_cause
-                    .iter()
-                    .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
-                    .collect(),
-                health.last.clone(),
-            ),
-            None => return RootHealthSummary::busy(),
-        };
+        let (mut view_load_failures, mut view_load_failure_last): (BTreeMap<String, u64>, _) =
+            match self.view_load_health.try_lock() {
+                Some(health) => (
+                    health
+                        .by_cause
+                        .iter()
+                        .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
+                        .collect(),
+                    health.last.clone(),
+                ),
+                None => return RootHealthSummary::busy(),
+            };
+        // A parent folder's worker reads its children's views itself; their
+        // failures are recorded under the parent root and reported here too.
+        if config.views.enabled {
+            if let Some(root) = config.project_root.as_deref() {
+                match crate::views::parent::try_child_load_failures(root) {
+                    Some(Some((counts, last))) => {
+                        view_load_failures.extend(counts);
+                        if last.as_ref().is_some_and(|last| {
+                            view_load_failure_last
+                                .as_ref()
+                                .is_none_or(|own: &ViewLoadFailure| {
+                                    own.last_at_ms <= last.last_at_ms
+                                })
+                        }) {
+                            view_load_failure_last = last;
+                        }
+                    }
+                    Some(None) => {}
+                    None => return RootHealthSummary::busy(),
+                }
+            }
+        }
         let search_index = match self.search_index.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -14948,6 +14972,22 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
+        // A views-routed root's lexical and call-graph views hold installed
+        // snapshots, the call graph's open reader and v3 member protection.
+        // Releasing them here, as evict_idle_artifacts does, lets storage
+        // retention evict an idle root's views for disk budget.
+        let Some(mut lexical_view) = self.lexical_view.try_lock() else {
+            return false;
+        };
+        let Some(mut callgraph_view) = self.callgraph_view.try_lock() else {
+            return false;
+        };
+        let Some(mut lexical_retry) = self.lexical_load_retry.try_lock() else {
+            return false;
+        };
+        let Some(mut callgraph_retry) = self.callgraph_construction_retry.try_lock() else {
+            return false;
+        };
         // Publication memoization can be discarded independently of resident
         // artifact handles, including when the semantic lane remains busy.
         if !self.try_release_view_publication_cache() {
@@ -14962,11 +15002,17 @@ impl AppContext {
         semantic_index.take();
         borrowed_index_cache.clear();
         backup.release_memory();
+        *lexical_retry = Default::default();
+        *callgraph_retry = Default::default();
         let released = (
             embedding_model.take(),
             refresh_events.take(),
             refresh_requests.take(),
             refresh_worker.take(),
+            // Dropping a view can close its reader and unbind its generation,
+            // so the views drop on the release thread too.
+            lexical_view.take(),
+            callgraph_view.take(),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
@@ -14976,6 +15022,10 @@ impl AppContext {
             refresh_events,
             refresh_requests,
             refresh_worker,
+            lexical_view,
+            callgraph_view,
+            lexical_retry,
+            callgraph_retry,
         ));
         // Native session destruction can wait for ORT. Keep it, and worker
         // channel teardown, off the daemon's frame loop.

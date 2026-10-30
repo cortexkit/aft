@@ -15468,6 +15468,26 @@ mod tests {
     /// and the next query binds them again and answers.
     #[test]
     fn views_routed_idle_eviction_releases_views_and_the_next_query_rebinds() {
+        assert_idle_eviction_releases_views(|ctx| {
+            assert!(ctx.evict_idle_artifacts());
+        });
+    }
+
+    /// The daemon's idle reaper evicts through the non-blocking path, which
+    /// must release the views too: a held view keeps its v3 members
+    /// protected, so storage retention could never evict an idle root.
+    #[test]
+    fn views_routed_reaper_eviction_releases_views_and_the_next_query_rebinds() {
+        assert_idle_eviction_releases_views(|ctx| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ctx.try_evict_idle_artifacts() {
+                assert!(Instant::now() < deadline, "idle eviction stayed blocked");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
+    fn assert_idle_eviction_releases_views(evict: impl Fn(&AppContext)) {
         // Holds the process environment lock: these views resolve storage and
         // the Git conversion policy through the process environment.
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -15503,7 +15523,7 @@ mod tests {
         assert!(callers().success);
         assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
 
-        assert!(ctx.evict_idle_artifacts());
+        evict(&ctx);
         assert!(!ctx.lexical_view_is_ready() && !ctx.callgraph_view_is_ready());
         let before = (
             ctx.lexical_view_route_counts()[0],

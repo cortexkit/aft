@@ -72,6 +72,58 @@ fn default_cap_covers_the_operators_projects_folder() {
     assert_eq!(capped.skipped.len(), 7);
 }
 
+/// A child view the parent worker fails to read is counted for the parent
+/// root's health with its plane, cause and full error; a busy store is
+/// contention the worker retries and is not counted.
+#[test]
+fn child_view_failures_reach_the_parent_roots_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    assert_eq!(try_child_load_failures(&root), Some(None));
+
+    let error = "lexical view unreadable: view I/O failed: read /x/members.db: Permission denied";
+    record_child_failure_for_test(&root, "repo-a", "parent_trigram", error);
+    record_child_failure_for_test(&root, "repo-a", "parent_trigram", error);
+    record_child_failure_for_test(
+        &root,
+        "repo-b",
+        "parent_callgraph",
+        "call graph view unavailable: database is locked",
+    );
+
+    let (counts, last) = try_child_load_failures(&root).unwrap().unwrap();
+    assert_eq!(counts.get("parent_trigram:io"), Some(&2), "{counts:?}");
+    assert_eq!(counts.len(), 1, "a busy store must not count: {counts:?}");
+    let last = last.unwrap();
+    assert_eq!(
+        (last.plane.as_str(), last.count, last.total),
+        ("parent_trigram", 2, 2)
+    );
+    assert_eq!(last.error, format!("repo-a: {error}"));
+
+    // The parent root's own health snapshot reports them.
+    let storage = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config {
+        project_root: Some(root.clone()),
+        storage_dir: Some(storage.path().to_path_buf()),
+        ..crate::config::Config::default()
+    };
+    config.views.enabled = true;
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let health = ctx.try_health_snapshot(&root);
+    assert_eq!(
+        health.view_load_failures.get("parent_trigram:io"),
+        Some(&2),
+        "{:?}",
+        health.view_load_failures
+    );
+    assert_eq!(
+        health.view_load_failure_last.map(|last| last.plane),
+        Some("parent_trigram".to_string())
+    );
+}
+
 fn context() -> crate::context::AppContext {
     crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),

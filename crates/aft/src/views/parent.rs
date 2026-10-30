@@ -580,6 +580,117 @@ pub fn session_for_root(root: &Path) -> Option<Arc<ParentSession>> {
     (!session.stopped()).then_some(session)
 }
 
+/// Failed child view loads per parent folder root. A parent session holds no
+/// handle on the contexts bound to it, so its worker records failures here
+/// and the parent root's health snapshot reads them by root.
+static CHILD_LOAD_FAILURES: std::sync::LazyLock<Mutex<HashMap<PathBuf, ChildLoadFailures>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[derive(Default)]
+struct ChildLoadFailures {
+    /// Keyed `parent_<plane>:<cause>`, like a context's own view load counts.
+    by_cause: std::collections::BTreeMap<String, u64>,
+    total: u64,
+    last: Option<crate::context::ViewLoadFailure>,
+    /// Last error-level log per plane and the repeats suppressed since.
+    logged: HashMap<&'static str, (Option<Instant>, u64)>,
+}
+
+/// The parent folder's child view load failures for its root health: counts
+/// keyed `parent_<plane>:<cause>` and the latest failure. `Some(None)` when
+/// none were recorded; `None` when the record is locked right now.
+#[allow(clippy::type_complexity)]
+pub(crate) fn try_child_load_failures(
+    root: &Path,
+) -> Option<
+    Option<(
+        std::collections::BTreeMap<String, u64>,
+        Option<crate::context::ViewLoadFailure>,
+    )>,
+> {
+    let failures = match CHILD_LOAD_FAILURES.try_lock() {
+        Ok(failures) => failures,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(
+        failures
+            .get(root)
+            .map(|failures| (failures.by_cause.clone(), failures.last.clone())),
+    )
+}
+
+/// Counts a failed child view load under the parent `root` by plane and
+/// cause, keeping the full error (prefixed with the child's path) for the
+/// parent root's health, and logs it at error level at most once a minute per
+/// plane. A busy or locked store, or a child that changed mid-read, clears by
+/// itself and the worker retries it, so it is not counted.
+fn record_child_failure(root: &Path, child: &str, plane: &'static str, error: &str) {
+    if super::semantic_runtime::is_transient_reason(error) {
+        return;
+    }
+    let cause = crate::context::view_load_cause(error);
+    let error = format!("{child}: {error}");
+    let now = Instant::now();
+    let (count, suppressed) = {
+        let mut all = lock(&CHILD_LOAD_FAILURES);
+        let failures = all.entry(root.to_path_buf()).or_default();
+        let count = {
+            let slot = failures
+                .by_cause
+                .entry(format!("{plane}:{cause}"))
+                .or_default();
+            *slot = slot.saturating_add(1);
+            *slot
+        };
+        failures.total = failures.total.saturating_add(1);
+        failures.last = Some(crate::context::ViewLoadFailure {
+            plane: plane.to_string(),
+            cause: cause.to_string(),
+            error: error.clone(),
+            count,
+            total: failures.total,
+            last_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64),
+        });
+        let entry = failures.logged.entry(plane).or_default();
+        if entry
+            .0
+            .is_some_and(|last| now.duration_since(last) < crate::context::VIEW_LOAD_LOG_INTERVAL)
+        {
+            entry.1 = entry.1.saturating_add(1);
+            (count, None)
+        } else {
+            let suppressed = std::mem::take(&mut entry.1);
+            entry.0 = Some(now);
+            (count, Some(suppressed))
+        }
+    };
+    if let Some(suppressed) = suppressed {
+        crate::slog_error!(
+            "parent child view load failed root={} plane={} cause={} failures={} suppressed={} error={}",
+            root.display(),
+            plane,
+            cause,
+            count,
+            suppressed,
+            error
+        );
+    }
+}
+
+/// Test seam for [`record_child_failure`], so tests need no running worker.
+#[cfg(test)]
+pub(crate) fn record_child_failure_for_test(
+    root: &Path,
+    child: &str,
+    plane: &'static str,
+    error: &str,
+) {
+    record_child_failure(root, child, plane, error);
+}
+
 /// The parent session serving `ctx`'s root, when views are on.
 pub fn session_for(ctx: &crate::context::AppContext) -> Option<Arc<ParentSession>> {
     let config = ctx.config();
@@ -966,6 +1077,13 @@ impl ParentSession {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Records a child view the worker failed to open or read: an I/O,
+    /// verification or store error, not normal coverage such as a view the
+    /// child has not published yet. See [`record_child_failure`].
+    pub(crate) fn note_child_failure(&self, child: &Child, plane: &'static str, error: &str) {
+        record_child_failure(&self.root, &child.display(), plane, error);
     }
 
     /// The children found so far; empty until discovery finishes.

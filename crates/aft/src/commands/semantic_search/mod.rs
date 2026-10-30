@@ -553,7 +553,15 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                                 evicted: false,
                                 lock_contended: false,
                             },
-                            Err(reason) => unserved(SemanticIndexStatus::Failed(reason)),
+                            Err(reason) => {
+                                // A built semantic view whose index cannot be
+                                // served is a view failure: count it in health.
+                                // Contention clears by itself and is not counted.
+                                if !crate::views::semantic_runtime::is_transient_reason(&reason) {
+                                    self.ctx.note_view_load_failure("semantic", &reason);
+                                }
+                                unserved(SemanticIndexStatus::Failed(reason))
+                            }
                         },
                         CheckoutSemanticState::Loading => unserved(SemanticIndexStatus::Building {
                             stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE
@@ -1530,6 +1538,11 @@ fn split_semantic_results(
                 answer.results
             }
             Err(error) => {
+                // The reply names the gap; health counts the failed view
+                // unless it is contention that clears by itself.
+                if !crate::views::semantic_runtime::is_transient_reason(&error) {
+                    ctx.note_view_load_failure("semantic", &error);
+                }
                 checkout_gaps = Some(CheckoutSemanticGaps::unavailable(error));
                 Vec::new()
             }
@@ -6629,6 +6642,11 @@ fn handle_semantic_or_hybrid_search(
                 answer.results
             }
             Err(error) => {
+                // The reply names the gap; health counts the failed view
+                // unless it is contention that clears by itself.
+                if !crate::views::semantic_runtime::is_transient_reason(&error) {
+                    ctx.note_view_load_failure("semantic", &error);
+                }
                 semantic_gaps = Some(CheckoutSemanticGaps::unavailable(error));
                 Vec::new()
             }
@@ -10463,6 +10481,25 @@ mod tests {
             text.contains(&format!("semantic: unavailable for this query ({reason})")),
             "the lane footer must name the reason: {text}"
         );
+        // Health counts the view that could not serve, with its full error,
+        // and marks the project degraded until a later successful load.
+        let health = ctx.try_health_snapshot(&root);
+        let last = health
+            .view_load_failure_last
+            .expect("the semantic view failure must reach health");
+        assert_eq!(last.plane, "semantic");
+        assert_eq!(last.error, reason);
+        assert!(
+            health
+                .view_load_failures
+                .keys()
+                .any(|key| key.starts_with("semantic:")),
+            "{:?}",
+            health.view_load_failures
+        );
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
     }
 
     /// A started views-on lane with no loaded view yet answers for the state
