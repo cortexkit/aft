@@ -14378,7 +14378,7 @@ mod tests {
         let root = temp.path().join("project");
         init_git_fixture(&root);
         let ctx = test_context();
-        let response = handle_configure_for_test(
+        let response = handle_folder_configure_for_test(
             &configure_lexical_views(&root, &temp.path().join("storage")),
             &ctx,
         );
@@ -16438,7 +16438,7 @@ mod tests {
                 "semantic":{"backend":"openai_compatible","model":"counting-test-embedding","base_url":server.base_url,"max_input_tokens":20,"timeout_ms":5000,"max_batch_size":64}
             }))]
         }));
-        let response = handle_configure(&request, &ctx);
+        let response = handle_configure_and_settle_for_test(&request, &ctx);
         assert!(response.success, "{response:?}");
         wait_for_semantic_build_ready(&ctx, Duration::from_secs(30));
         {
@@ -17452,6 +17452,7 @@ mod tests {
             },
         ));
         let executor = crate::executor::Executor::new();
+        crate::test_admission::prepare_project(&ctx, &root);
         let root_id = crate::path_identity::ProjectRootId::from_path(&canonical_root)
             .expect("canonical project root id");
         assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
@@ -17626,7 +17627,7 @@ mod tests {
         let storage = base.join("storage");
         init_git_fixture(&root);
         let ctx = test_context();
-        let response = super::handle_configure(
+        let response = handle_configure_for_test(
             &configure_request_with_params(json!({
                 "project_root": root,
                 "harness": "opencode",
@@ -17799,6 +17800,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         let request = trigram_bind_request(&root, &storage);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
@@ -17875,6 +17877,7 @@ mod tests {
         }
         let lock = hold_aft_db_exclusively(&storage);
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         // A reader that ran before the bind published its degraded reasons.
         let git_key = ctx.memoized_artifact_cache_key(&root);
         assert_eq!(
@@ -17994,6 +17997,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
@@ -18036,6 +18040,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::ZERO,
@@ -18066,6 +18071,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
@@ -18121,6 +18127,7 @@ mod tests {
                 "fatal: detected dubious ownership in repository",
             );
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
@@ -19148,8 +19155,7 @@ mod tests {
         let ctx = test_context();
         let disabled =
             configure_semantic_with_options(&project, &storage, &server.base_url, false, 64, false);
-        assert!(super::handle_configure(&disabled, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(handle_configure_and_settle_for_test(&disabled, &ctx).success);
 
         let mut stale =
             configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, false);
@@ -24559,7 +24565,7 @@ mod tests {
         let req = configure_request_with_params(json!({
             "project_root": "/", "harness": "runner", "storage_dir": ctx._storage.path(),
         }));
-        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
         let project = tempfile::tempdir().unwrap();
         let file = project.path().join("readable.txt");
         std::fs::write(&file, "explicit path still works\n").unwrap();
