@@ -904,7 +904,12 @@ mod tests {
         probe(
             root,
             &ProjectDetectionConfig::default(),
-            ProbeBudgets::default(),
+            // Shape tests exercise evidence rules, not host Git startup speed.
+            // Deadline and default-budget tests pass their own budgets below.
+            ProbeBudgets {
+                time: Duration::from_secs(5),
+                ..ProbeBudgets::default()
+            },
         )
     }
 
@@ -981,7 +986,9 @@ mod tests {
         assert_eq!(result.observed.child_projects, 2);
         assert_eq!(result.observed.non_bulk_root_directories, 4);
         assert!(result.child_roots.contains(&nested.canonicalize().unwrap()));
-        assert!(!result.child_roots.contains(&root.path().join("two")));
+        assert!(!result
+            .child_roots
+            .contains(&root.path().join("two").canonicalize().unwrap()));
     }
 
     #[test]
@@ -1112,6 +1119,7 @@ mod tests {
             &ProjectDetectionConfig::default(),
             ProbeBudgets {
                 per_directory: 2,
+                time: Duration::from_secs(5),
                 ..ProbeBudgets::default()
             },
         );
