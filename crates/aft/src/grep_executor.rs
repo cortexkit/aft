@@ -2729,7 +2729,12 @@ mod tests {
         for index in 0..30 {
             std::fs::write(dir.path().join(format!("{index}.rs")), "needle\n").unwrap();
         }
-        let budget = crate::bounded_io::Budget::after(Duration::from_secs(5))
+        // Each entry takes 60 ms and one access may take 300 ms, so a walk
+        // that mistook steady progress for one stalled access would stop at
+        // about five entries. The walk's own budget must leave room for well
+        // over five entries even on a loaded runner, where a macOS run managed
+        // only five entries (about 180 ms each) in a 900 ms budget.
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(8))
             .with_access_budget(Duration::from_millis(300));
         let response = crate::bounded_io::with_budget(Some(budget), || {
             let walked = with_fallback_walk_entry_delay_for_test(Duration::from_millis(60), || {
@@ -2738,7 +2743,7 @@ mod tests {
                     dir.path(),
                     &PathFilters::default(),
                     100,
-                    Duration::from_millis(900),
+                    Duration::from_millis(3000),
                 )
             });
             assert!(
