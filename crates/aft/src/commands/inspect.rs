@@ -7848,7 +7848,7 @@ mod deferred_terminal_tests {
         let storage = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
-        config.cache_dir = Some(storage.path().to_path_buf());
+        config.storage_dir = Some(storage.path().to_path_buf());
         config.views.enabled = false;
         config.inspect.tier2_pass_timeout_ms = 600_000;
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
