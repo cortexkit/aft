@@ -236,8 +236,14 @@ fn assert_completed_scoped_dead_code_retries_transient_lock(wait_for_completion:
         )
         .unwrap()
     };
-    assert_eq!(payload, expected, "a short lock must not downgrade a ready graph");
-    assert!(released.load(Ordering::SeqCst), "the read must observe the lock");
+    assert_eq!(
+        payload, expected,
+        "a short lock must not downgrade a ready graph"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the read must observe the lock"
+    );
     assert_eq!(crate::callgraph_store::take_projection_work(), (0, 0));
     assert!(Arc::ptr_eq(
         &rollup,
