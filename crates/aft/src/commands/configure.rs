@@ -24406,7 +24406,7 @@ mod tests {
         assert_no_workers();
         let status = ctx.build_status_snapshot();
         for lane in ["search_index", "semantic_index"] {
-            assert_eq!(status[lane]["status"], "disabled");
+            assert_eq!(status[lane]["status"], "off");
             assert_eq!(status[lane]["reason"], folder["reason"]);
         }
         for plane in crate::feature_status::IndexPlane::ALL {
