@@ -177,6 +177,24 @@ class PrepushTests(unittest.TestCase):
         self.assertNotIn("background", wrapper)
         self.assertNotIn("ck motor", wrapper)
 
+    def test_linux_job_collects_every_phase_after_compile_failure(self):
+        scratch = Path("target/scratch")
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temp:
+            temp = Path(temp).resolve()
+            calls = temp / "calls"
+            fake_bash = temp / "bash"
+            fake_bash.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{calls}'\ncase \"$1\" in *fast-compile.sh) exit 7;; esac\nexit 0\n")
+            fake_bash.chmod(0o755)
+            uname = temp / "uname"
+            uname.write_text("#!/bin/sh\necho Linux\n")
+            uname.chmod(0o755)
+            env = {**os.environ, "PATH": f"{temp}{os.pathsep}{os.environ['PATH']}", "PREPUSH_LOG_DIR": str(temp / "logs")}
+            result = subprocess.run(["/bin/bash", str(HERE / "linux.sh")], env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), ["scripts/prepush/fast-compile.sh", "scripts/prepush/linux-rust.sh", "scripts/prepush/linux-typescript.sh", "scripts/prepush/linux-search.sh"])
+            self.assertEqual(result.stdout.splitlines()[-1], "GATE FAILED: linux fast-compile")
+
     def test_missing_tool_names_the_runner_without_a_deep_failure(self):
         result = subprocess.run(["bash", str(HERE / "require-tools.sh"), "linux", "aft-prepush-deliberately-missing-tool"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 127)
