@@ -2514,7 +2514,7 @@ pub(super) fn submit_deferred_bash(
                     Some(response) => response,
                     None => {
                         let startup_steps = receipt.startup_step_snapshot();
-                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed), startup_steps.current());
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, &spawn_cancel, admitted.load(Ordering::Relaxed), startup_steps.current());
                         capture_target = register_capture_target(&response);
                         let response = if blocking_intent && capture_deadline.is_some() {
                             if let Some(task_id) = response.data["task_id"].as_str().map(str::to_owned) {
@@ -2882,6 +2882,7 @@ fn startup_deadline_response(
     bash_watch_available: bool,
     executor: &Executor,
     root: &ProjectRootId,
+    cancellation: &JobCancellation,
     admitted: bool,
     slow_step: crate::bash_background::BashStartupStep,
 ) -> Response {
@@ -2927,7 +2928,7 @@ fn startup_deadline_response(
         StartupOutcome::Refused => Response::error(
             request_id,
             "bash_start_deadline",
-            startup_refusal_reason(executor, root, admitted, slow_step),
+            startup_refusal_reason(executor, root, cancellation, admitted, slow_step),
         ),
     }
 }
@@ -2938,6 +2939,7 @@ fn startup_deadline_response(
 fn startup_refusal_reason(
     executor: &Executor,
     root: &ProjectRootId,
+    cancellation: &JobCancellation,
     admitted: bool,
     slow_step: crate::bash_background::BashStartupStep,
 ) -> String {
@@ -2948,10 +2950,16 @@ fn startup_refusal_reason(
         );
     }
     if let Some(writer) = executor
-        .try_mutating_lane_snapshots()
-        .and_then(|writers| writers.into_iter().find(|writer| &writer.root_id == root))
+        .try_root_job_snapshots(root, Some(cancellation))
+        .and_then(|jobs| jobs.into_iter().find(|job| job.lane == Lane::Mutating))
     {
-        return format!("bash startup deadline: queued behind root Mutating job {} ({}); slow startup step: {}; command was not started", writer.request_id, writer.command, slow_step.description());
+        // The scheduler reserves the lane before the worker takes the epoch
+        // gate and enters the startup callback. That occupant can be this call,
+        // not a different job blocking it. Request IDs alone are not identity.
+        if writer.is_current {
+            return format!("bash startup deadline: this call's root Mutating job {} ({}, job_id={}, age_ms={}, execution_started={}) was admitted but startup has not reported entry; it may be waiting for the root epoch gate or worker scheduling; slow startup step: {}; command was not started", writer.request_id, writer.command, writer.job_id, writer.started_age_ms, writer.execution_started, slow_step.description());
+        }
+        return format!("bash startup deadline: queued behind root Mutating job {} ({}, job_id={}, age_ms={}); slow startup step: {}; command was not started", writer.request_id, writer.command, writer.job_id, writer.started_age_ms, slow_step.description());
     }
     if executor
         .try_dispatch_liveness_snapshot()
@@ -8245,6 +8253,65 @@ mod grant_path_tests {
         deadline_queue_case(false).await;
     }
 
+    #[test]
+    fn bash_deadline_distinguishes_own_admission_from_same_id_blocker() {
+        let (_dir, root) = super::super::test_support::test_root("bash-admission-identity");
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+        let current = JobCancellation::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let done = executor.submit_tool_call_with_cancellation_async(
+            root.clone(),
+            Lane::Mutating,
+            "reused-call".into(),
+            "bash",
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("reused-call", json!({}))
+            }),
+            current.clone(),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Sample the scheduler/callback gap without depending on how quickly
+        // the operating system schedules a worker or releases the epoch gate.
+        let own = startup_refusal_reason(
+            &executor,
+            &root,
+            &current,
+            false,
+            crate::bash_background::BashStartupStep::Admission,
+        );
+        let other = startup_refusal_reason(
+            &executor,
+            &root,
+            &JobCancellation::new(),
+            false,
+            crate::bash_background::BashStartupStep::Admission,
+        );
+        release_tx.send(()).unwrap();
+        assert!(done.blocking_recv().unwrap().success);
+
+        assert!(
+            own.contains("this call's root Mutating job reused-call"),
+            "{own}"
+        );
+        assert!(!own.contains("queued behind"), "{own}");
+        assert!(
+            other.contains("queued behind root Mutating job reused-call"),
+            "{other}"
+        );
+        for message in [&own, &other] {
+            assert!(
+                message.contains("job_id=") && message.contains("age_ms="),
+                "{message}"
+            );
+            assert!(message.contains("command was not started"), "{message}");
+        }
+    }
+
     #[tokio::test]
     async fn bash_deadline_refuses_executor_saturation() {
         deadline_queue_case(true).await;
@@ -9108,6 +9175,7 @@ mod grant_path_tests {
                 false,
                 &Executor::new(),
                 &root,
+                &JobCancellation::new(),
                 true,
                 receipt.startup_step_snapshot().current(),
             );

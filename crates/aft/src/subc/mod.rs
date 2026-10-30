@@ -22799,6 +22799,80 @@ mod tests {
         format!("Opens:\n{}", lines.join("\n"))
     }
 
+    /// Capture waits without taking the locks an open or a worker may be stuck
+    /// holding. Other roots' unfinished opens matter because the dedicated
+    /// database-open thread serves them in order.
+    fn rebind_wait_diagnostics(executor: &Executor, fixture: &ConfiguredRoot) -> String {
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let database = match slot.try_lock() {
+            Some(slot) => format!(
+                "epoch={} committed_age_ms={} running={} pending={:?} ready_for={:?}",
+                slot.epoch,
+                slot.committed_at.elapsed().as_millis(),
+                slot.running,
+                slot.pending.as_ref().map(|request| (
+                    request.epoch,
+                    request.dispatched_at.map(|at| at.elapsed().as_millis()),
+                    &request.storage_root,
+                )),
+                slot.ready_for,
+            ),
+            None => "database-open slot locked (attach/publication may be in progress)".into(),
+        };
+        let opens = crate::database_open::recorded_opens_for_test()
+            .into_iter()
+            .filter(|open| open.root == fixture.canonical_root || open.finished_at.is_none())
+            .map(|open| {
+                format!(
+                    "root={} lane={:?} age_ms={} queued_ms={:?} finished={} floor_ms={} open_ms={} outcome={:?}",
+                    open.root.display(), open.runner, open.started_at.elapsed().as_millis(),
+                    open.dispatched_at.map(|at| open.started_at.saturating_duration_since(at).as_millis()),
+                    open.finished_at.is_some(), open.floor_check.as_millis(), open.open.as_millis(), open.outcome,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "database: {database}; opens: {opens:?}; root jobs (None means scheduler locked): {:?}; barriers: {:?}; dispatch: {:?}",
+            executor.try_root_job_snapshots(&fixture.root, None),
+            executor.try_bind_blocker_snapshot(&fixture.root, "subc-41-7"),
+            executor.try_dispatch_liveness_snapshot(),
+        )
+    }
+
+    #[test]
+    fn rebind_wait_diagnostics_name_active_job_without_waiting_on_database_slot() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Executor::new();
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = executor.submit_async(
+            fixture.root.clone(),
+            Lane::Mutating,
+            "held-rebind-writer".into(),
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-rebind-writer", json!({}))
+            }),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let locked = slot.lock();
+        let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
+        drop(locked);
+        release_tx.send(()).unwrap();
+        assert!(writer.blocking_recv().unwrap().success);
+        for expected in [
+            "database-open slot locked",
+            "held-rebind-writer",
+            "lane: Mutating",
+            "started_age_ms:",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+    }
+
     /// A rebind can put a working root back into "initializing": here the
     /// rebind points the root at a different storage directory, and neither
     /// the post-reply dispatch nor the configure tail runs (the tail stands in
@@ -22815,7 +22889,8 @@ mod tests {
         start_post_ack_database_open(&executor, &fixture.root);
         assert!(
             wait_for_database_ready(&fixture.ctx, Duration::from_secs(5)).is_some(),
-            "first bind's database opened without the configure tail"
+            "first bind's database opened without the configure tail: {}",
+            rebind_wait_diagnostics(&executor, &fixture),
         );
 
         // A rebind that changes configuration but not the root or storage
@@ -22833,7 +22908,8 @@ mod tests {
                 .ctx
                 .database_runtime_refusal("probe", "bash")
                 .is_none(),
-            "a rebind onto the same database must not re-mark it as initializing"
+            "a rebind onto the same database must not re-mark it as initializing: {}",
+            rebind_wait_diagnostics(&executor, &fixture),
         );
 
         // A rebind onto another storage directory must reopen, and nothing
@@ -22853,11 +22929,23 @@ mod tests {
         let started = Instant::now();
         let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(5));
         assert_eq!(
-            bash["success"], true,
-            "bash after a rebind must get the database, not stay initializing: {bash}"
+            bash["success"],
+            true,
+            "bash after a rebind must get the database, not stay initializing: {bash}; {}",
+            rebind_wait_diagnostics(&executor, &fixture),
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bash exceeded its wait: {}; {}",
+            started.elapsed().as_millis(),
+            rebind_wait_diagnostics(&executor, &fixture),
+        );
         assert!(other_storage.path().join("aft.db").is_file());
+        eprintln!(
+            "rebind bash completed in {}ms; {}",
+            started.elapsed().as_millis(),
+            rebind_wait_diagnostics(&executor, &fixture),
+        );
     }
 
     #[test]
