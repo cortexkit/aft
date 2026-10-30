@@ -2788,8 +2788,11 @@ fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
     );
 }
 
+/// Waits for the fill to queue for a cold slot the test is holding. Every caller
+/// expects it to queue, so the deadline only bounds the failure case; 3 s was
+/// too short for a fill finishing its model call on a loaded Windows runner.
 fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if !limiter.census().queued.is_empty() {
             return true;
