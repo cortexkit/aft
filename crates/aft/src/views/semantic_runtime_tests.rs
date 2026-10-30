@@ -3953,6 +3953,10 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
         "view load",
         || {
             attempts += 1;
+            assert!(
+                attempts <= 2,
+                "a stopped writer must not keep the load busy"
+            );
             if attempts == 1 {
                 let (result, writes) = crate::blob_store::v3::with_changing_namespace_for_test(
                     storage.path(),
@@ -4002,7 +4006,10 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
                 .try_health_snapshot(root.path())
                 .view_load_failures
                 .is_empty());
-            runtime.load().map(|_| ())
+            runtime
+                .load()
+                .expect("the semantic view must load after the writer stops");
+            Ok(())
         },
     );
     assert_eq!(result, Ok(()));
