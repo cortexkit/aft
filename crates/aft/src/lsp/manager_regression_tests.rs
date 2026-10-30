@@ -273,6 +273,8 @@ fn workspace_pull_from_warming_server_remains_provisional() {
     let key = key(tmp.path());
     let file = tmp.path().join("lib.rs");
     let mut manager = LspManager::new();
+    std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 7);
     manager
         .clients
         .insert(key.clone(), sleeping_rust_client(&manager, tmp.path()));
