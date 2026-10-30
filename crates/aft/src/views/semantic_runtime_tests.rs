@@ -3989,7 +3989,14 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
                 rendered.lines().next(),
                 Some("Semantic index is building; lexical fallback results follow.")
             );
-            assert_eq!(rendered.lines().last(), Some("semantic: building"));
+            assert_eq!(
+                rendered.lines().find(|line| line.starts_with("semantic:")),
+                Some("semantic: building")
+            );
+            assert_eq!(
+                rendered.lines().last(),
+                Some("Search status: partial/incomplete.")
+            );
             assert!(!rendered.contains("This is an AFT bug"));
             assert!(ctx
                 .try_health_snapshot(root.path())
