@@ -663,6 +663,110 @@ fn refusal_explanation_table_covers_bot_request_codes() {
     }
 }
 
+#[test]
+fn approved_refusal_table_wording_is_pinned_byte_for_byte() {
+    const UNSENT_AGENT: &str = " Nothing reached GitHub. The agent must change the request.";
+    const UNSENT_OPERATOR: &str =
+        " Nothing reached GitHub. An operator must fix the setup, grants, or policy.";
+    const UNSENT_TRANSIENT: &str = " Nothing reached GitHub. Rerunning the command is safe.";
+    const READS_AGENT: &str =
+        " GitHub received only reads; nothing was written. The agent must change the request.";
+    const MAYBE_AGENT: &str = " Earlier reads or writes may have reached GitHub. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const MAYBE_OPERATOR: &str = " Earlier reads or writes may have reached GitHub. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const MAYBE_TRANSIENT: &str = " Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const RECEIVED_AGENT: &str = " GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const RECEIVED_OPERATOR: &str = " GitHub received a request. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const RECEIVED_TRANSIENT: &str = " GitHub received a request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+
+    // These literals are the approved output contract, not values read from the
+    // production table. Keep a case for every default and detail-specific row.
+    let cases = [
+        ("Plexus", "agent_grant_absent", "The agent has no grant for this write.", MAYBE_OPERATOR),
+        ("Plexus", "agent_grant_excludes_request", "The agent's grant does not cover this request.", UNSENT_OPERATOR),
+        ("Plexus", "agent_handle_unknown", "The agent's GitHub bot handle is unknown.", UNSENT_OPERATOR),
+        ("Plexus", "agent_repository_conflict{claimed_agent: alfonso-aft, bound_agent: alfonso-plexus}", "This command speaks as agent alfonso-aft, but the repository is bound to agent alfonso-plexus.", UNSENT_OPERATOR),
+        ("Plexus", "agent_repository_conflict", "The GitHub target does not match the bound repository.", READS_AGENT),
+        ("Plexus", "argument_undeclared", "The request contains an unsupported identity field.", UNSENT_AGENT),
+        ("Plexus", "approval_agent_mismatch", "The approval belongs to another agent.", UNSENT_AGENT),
+        ("Plexus", "approval_denied", "Approval for this write was denied.", UNSENT_OPERATOR),
+        ("Plexus", "approval_expired", "The approval has expired.", UNSENT_AGENT),
+        ("Plexus", "call_mode_unsupported", "This call mode cannot make bot writes.", UNSENT_AGENT),
+        ("Plexus", "comment_author_mismatch", "The comment was not written by the expected bot.", READS_AGENT),
+        ("Plexus", "connector_home_not_held", "This machine does not hold permission to send GitHub requests.", UNSENT_OPERATOR),
+        ("Plexus", "consent_unavailable", "This flow cannot answer the required consent prompt.", UNSENT_OPERATOR),
+        ("Plexus", "delegating_scope_required", "The route has no scope authorized to act as an agent.", UNSENT_AGENT),
+        ("Plexus", "flow_audience_conflict", "The flow's approved repository sets conflict.", UNSENT_OPERATOR),
+        ("Plexus", "flow_not_approved", "The flow is not approved.", UNSENT_OPERATOR),
+        ("Plexus", "flow_unknown", "The flow is unknown.", UNSENT_OPERATOR),
+        ("Plexus", "flow_audience_excludes_repository", "The repository is outside the flow's approved set.", UNSENT_AGENT),
+        ("Plexus", "flow_audience_mismatch", "The flow requires a matching agent-scoped route.", UNSENT_AGENT),
+        ("Plexus", "flow_audience_unavailable", "The flow's approved repository set could not be read.", UNSENT_OPERATOR),
+        ("Plexus", "flow_carrier_not_admitted", "This caller is not allowed to carry flow requests.", UNSENT_AGENT),
+        ("Plexus", "flow_scope_required", "The route has no required flow scope.", UNSENT_AGENT),
+        ("Plexus", "handle_credential_rejected", "GitHub rejected the bot's credential.", RECEIVED_OPERATOR),
+        ("Plexus", "handle_credential_unresolvable{class: transient}", "The bot's credential is temporarily unavailable.", MAYBE_TRANSIENT),
+        ("Plexus", "handle_credential_unresolvable", "The bot's credential could not be loaded.", MAYBE_OPERATOR),
+        ("Plexus", "handle_disabled", "The bot handle is disabled.", UNSENT_OPERATOR),
+        ("Plexus", "invalid_request", "The request has an invalid field or shape.", UNSENT_AGENT),
+        ("Plexus", "module_grant_absent", "The calling module has no grant for this write.", MAYBE_OPERATOR),
+        ("Plexus", "module_warming", "The module is still starting.", UNSENT_TRANSIENT),
+        ("Plexus", "nonce_in_flight", "Another worker is still handling this request nonce.", MAYBE_TRANSIENT),
+        ("Plexus", "nonce_payload_mismatch", "This nonce already belongs to a different request.", MAYBE_AGENT),
+        ("Plexus", "not_present", "The GitHub target was not found.", READS_AGENT),
+        ("Plexus", "outcome_unknown", "The GitHub read outcome is unknown.", MAYBE_OPERATOR),
+        ("Plexus", "pipeline_denied{gate: G10, denial: RecipientArgumentInvalid}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ArgumentUndeclared, field: body}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ResourceFilter(MissingRequiredFilter)}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ResourceFilter(ValueNotAllowed)}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ResourceFilter(WriteFiltersAbsent)}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied", "A permission or service check stopped the current step.", MAYBE_OPERATOR),
+        ("Plexus", "policy_blocked", "Policy blocks this write.", UNSENT_OPERATOR),
+        ("Plexus", "pre_dispatch_read_incomplete{reason: page_bound}", "The GitHub read exceeded its page limit.", READS_AGENT),
+        ("Plexus", "pre_dispatch_read_incomplete{reason: invalid_response}", "The GitHub read response could not be used.", MAYBE_TRANSIENT),
+        ("Plexus", "pre_dispatch_read_incomplete", "The GitHub read did not finish.", MAYBE_TRANSIENT),
+        ("Plexus", "pr_edit_not_own", "The pull request was not opened by this bot.", READS_AGENT),
+        ("Plexus", "review_thread_not_own", "The pull request was not opened by this bot.", READS_AGENT),
+        ("Plexus", "issue_edit_not_own", "The issue was not opened by this bot.", READS_AGENT),
+        ("Plexus", "pr_head_cross_repository", "The pull request head is outside the bound repository.", UNSENT_AGENT),
+        ("Plexus", "probe_unproven", "The bot handle has not passed its proof check.", UNSENT_OPERATOR),
+        ("Plexus", "repository_unbound", "The repository has no bot binding.", MAYBE_OPERATOR),
+        ("Plexus", "request_deadline_exceeded", "The request deadline expired before dispatch.", UNSENT_TRANSIENT),
+        ("Plexus", "request_field_forbidden", "The request contains a forbidden field.", UNSENT_AGENT),
+        ("Plexus", "request_kind_unmapped", "This request action or shape is not supported.", UNSENT_AGENT),
+        ("Plexus", "route_not_bound", "The route is not bound to GitHub.", UNSENT_OPERATOR),
+        ("Plexus", "run_scope_not_child", "The run scope is not a live child of the route scope.", MAYBE_AGENT),
+        ("Plexus", "scope_ended", "The agent's route scope has ended.", MAYBE_OPERATOR),
+        ("Plexus", "delegation_withdrawn", "Permission to act as this agent was withdrawn.", MAYBE_OPERATOR),
+        ("Plexus", "scope_not_synced", "The agent's scope has not synced yet.", MAYBE_OPERATOR),
+        ("Plexus", "scope_unverifiable", "The agent's scope could not be verified.", MAYBE_OPERATOR),
+        ("Plexus", "secret_input_rejected", "The request contains credential material that is not allowed here.", UNSENT_AGENT),
+        ("Plexus", "stale_authority{dimension: expected_handle}", "The expected bot handle has changed.", UNSENT_AGENT),
+        ("Plexus", "stale_authority{dimension: expected_binding}", "The expected repository binding has changed.", UNSENT_AGENT),
+        ("Plexus", "stale_authority", "The write's authorization changed or expired.", MAYBE_OPERATOR),
+        ("Plexus", "stack_pr_not_own", "A stacked pull request was not opened by this bot.", READS_AGENT),
+        ("Plexus", "store_failure", "Request storage failed.", MAYBE_OPERATOR),
+        ("Plexus", "transport_not_sent", "The current step was not sent.", MAYBE_OPERATOR),
+        ("Plexus", "vendor_rejected{status: 429}", "GitHub rejected the request.", RECEIVED_TRANSIENT),
+        ("Plexus", "vendor_rejected{status: 503}", "GitHub rejected the request.", RECEIVED_TRANSIENT),
+        ("Plexus", "vendor_rejected", "GitHub rejected the request.", RECEIVED_AGENT),
+        ("AFT", "agent_identity_conflict", "The repository is bound to another agent's bot.", UNSENT_AGENT),
+        ("AFT", "bot_write_requires_scope", "This session has no agent scope for bot writes.", UNSENT_OPERATOR),
+        ("AFT", "ticket_unknown", "This command's agent session ticket is no longer live.", UNSENT_AGENT),
+        ("AFT", "untrusted_principal", "Only first-party callers may relay bot writes.", UNSENT_OPERATOR),
+    ];
+    assert_eq!(cases.len(), REFUSAL_EXPLANATIONS.len());
+    for ((origin, code, explanation, suffix), (name, _, _, _, _)) in
+        cases.into_iter().zip(REFUSAL_EXPLANATIONS)
+    {
+        assert_eq!(code.split('{').next().unwrap(), *name, "golden row order");
+        assert_eq!(
+            refusal_text(origin, code, &RefusalFacts::default(), None),
+            format!("{origin} refused the bot write: {code}. {explanation}{suffix}"),
+            "{code}",
+        );
+    }
+}
+
 fn ok_envelope(reply: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"op": BOT_REQUEST_OPERATION, "status": "ok", "data": reply}))
         .unwrap()
@@ -842,6 +946,21 @@ fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
             status => panic!("{name}: untested reply status {status}"),
         };
         assert_eq!(parsed, expected, "{name}");
+        if let Reply::Refused {
+            code, stage, facts, ..
+        } = &parsed
+        {
+            if stage == PLEXUS_REPLY_STAGE {
+                if let Some(message) = result.pointer("/detail/message").and_then(Value::as_str) {
+                    assert!(
+                        plexus_refusal_text(code, facts).starts_with(&format!(
+                            "Plexus refused the bot write: {code}. {message}"
+                        )),
+                        "{name}: producer message changed"
+                    );
+                }
+            }
+        }
         if name == "resolve-thread-not-own" {
             let code = result["refusal_code"].as_str().unwrap();
             assert_eq!(result["transmission"], "not_sent");

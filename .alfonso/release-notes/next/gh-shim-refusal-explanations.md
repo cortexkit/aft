@@ -1,1 +1,0 @@
-- The gh shim now explains bot-write refusals, safely retries recoverable failures, and warns when rerunning may repeat a write.
