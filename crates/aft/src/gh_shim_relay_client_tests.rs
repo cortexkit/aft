@@ -1318,11 +1318,57 @@ fn a_changed_binding_generation_triggers_a_new_check() {
 }
 
 #[test]
-fn production_relay_budget_is_thirty_seconds() {
-    assert_eq!(RELAY_BUDGET, Duration::from_secs(30));
+fn production_governed_relay_budget_covers_the_post_send_wait() {
+    assert_eq!(RELAY_BUDGET, Duration::from_secs(180));
+    assert_eq!(READ_RELAY_BUDGET, Duration::from_secs(30));
     if std::env::var_os(REQUEST_TIMEOUT_TEST_ENV).is_none() {
         assert_eq!(RelayContext::from_process().relay_budget, RELAY_BUDGET);
     }
+}
+
+#[tokio::test]
+async fn write_exchange_allows_the_long_reply_but_binding_reads_remain_short() {
+    struct RecordingIo {
+        now: Instant,
+        timeouts: Mutex<Vec<Duration>>,
+    }
+    impl ExchangeIo for RecordingIo {
+        fn now(&self) -> Instant {
+            self.now
+        }
+        async fn sleep(&self, _: Duration) {
+            unreachable!()
+        }
+        async fn request(&self, _: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError> {
+            self.timeouts.lock().unwrap().push(options.timeout);
+            Ok(Vec::new())
+        }
+    }
+    let started = Instant::now();
+    let io = RecordingIo {
+        now: started + Duration::from_secs(10),
+        timeouts: Mutex::new(Vec::new()),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let exchange = Exchange {
+        io: &io,
+        ticket: "ticket",
+        stage: &stage,
+        started,
+        budget: RELAY_BUDGET,
+    };
+    exchange
+        .send(&json!({"op": BINDINGS_READ_OPERATION}))
+        .await
+        .unwrap();
+    exchange
+        .send(&json!({"op": BOT_REQUEST_OPERATION}))
+        .await
+        .unwrap();
+    assert_eq!(
+        *io.timeouts.lock().unwrap(),
+        vec![Duration::from_secs(30), Duration::from_secs(170)]
+    );
 }
 
 /// A write that gets no reply within the relay budget is an unknown

@@ -48,6 +48,12 @@ fn unavailable(reason: &str) -> Refusal {
     Refusal::new(Code::AuthorityUnavailable, reason)
 }
 
+fn unreachable(reason: &str) -> Refusal {
+    let mut refusal = unavailable(reason);
+    refusal.retry_before_send = true;
+    refusal
+}
+
 fn opening_refusal(error: TransportError, expected: &ScopeSelector) -> Refusal {
     match error {
         TransportError::ScopeEnded { selector, .. } if &selector == expected => {
@@ -83,7 +89,7 @@ impl SubcRelayTransport {
         let consumer = tokio::time::timeout_at(deadline, self.consumer())
             .await
             .map_err(|_| unavailable("reservation_timeout"))?
-            .map_err(|_| unavailable("relay_unavailable"))?;
+            .map_err(|_| unreachable("relay_unavailable"))?;
         let target = subc_protocol::RouteTarget::ToolProvider {
             module_id: PLEXUS_MODULE_ID.into(),
         };
@@ -103,6 +109,7 @@ impl SubcRelayTransport {
             return Err(unavailable("reservation_timeout"));
         }
         let route_open_deadline = self.route_open_deadline;
+        let reply_timeout = self.write_reply_timeout;
         let leases = self.leases.clone();
         let slot = self.consumer.clone();
         let (result, receiver) = tokio::sync::oneshot::channel();
@@ -128,7 +135,7 @@ impl SubcRelayTransport {
             let options = subc_client_rs::CallOptions {
                 consumer_identity: crate::launch_nonce::consumer_identity(),
                 timeout: open_limit,
-                route_retry_deadline: open_limit,
+                route_retry_deadline: open_limit.min(PRE_SEND_ROUTE_RETRY_TIMEOUT),
                 ..Default::default()
             };
             let route = match consumer
@@ -140,14 +147,18 @@ impl SubcRelayTransport {
                     let refusal = if let Some(error) = scope_open_refusal(&error, &selector) {
                         opening_refusal(error, &selector)
                     } else if let subc_client_rs::CallError::Module(body) = error {
-                        unavailable(&body.code)
+                        if plexus_unreachable_code(&body.code) {
+                            unreachable(&body.code)
+                        } else {
+                            unavailable(&body.code)
+                        }
                     } else {
                         clear_failed_slot(&slot, &consumer).await;
-                        unavailable(if tokio::time::Instant::now() >= deadline {
-                            "reservation_timeout"
+                        if tokio::time::Instant::now() >= deadline {
+                            unavailable("reservation_timeout")
                         } else {
-                            "relay_unavailable"
-                        })
+                            unreachable("relay_unavailable")
+                        }
                     };
                     let _ = result.send(Err(refusal));
                     drop(lease);
@@ -163,13 +174,11 @@ impl SubcRelayTransport {
                 Ok(reservation) => reservation,
                 Err(_) => {
                     clear_failed_slot(&slot, &consumer).await;
-                    let _ = result.send(Err(unavailable(
-                        if tokio::time::Instant::now() >= deadline {
-                            "reservation_timeout"
-                        } else {
-                            "route_closed"
-                        },
-                    )));
+                    let _ = result.send(Err(if tokio::time::Instant::now() >= deadline {
+                        unavailable("reservation_timeout")
+                    } else {
+                        unreachable("route_closed")
+                    }));
                     drop(lease);
                     return;
                 }
@@ -177,7 +186,13 @@ impl SubcRelayTransport {
             let reserved = ReservedBotRequest::new(move || {
                 // SDK 0.32.7 synchronously consumes a pre-reserved writer slot.
                 // No socket await or spawned send can escape the final DB gate.
-                let (_correlation, pending) = reservation.send(body, options);
+                let (_correlation, pending) = reservation.send(
+                    body,
+                    subc_client_rs::CallOptions {
+                        timeout: reply_timeout,
+                        ..options
+                    },
+                );
                 Ok(QueuedBotResponse::new(async move {
                     let _lease = lease;
                     match pending.await {
