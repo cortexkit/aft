@@ -1066,10 +1066,10 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
         }
         for session in sessions {
             if let Some(message) = notice(ctx, true, &session) {
-                let _ = ctx.configure_warnings_sender().send(crate::protocol::ConfigureWarningsFrame {
+                let _ = ctx.configure_warnings_sender().send((ctx.configure_generation(), crate::protocol::ConfigureWarningsFrame {
                     frame_type: "configure_warnings", session_id: Some(session), project_root: root.display().to_string(),
                     warnings: vec![json!({"code": "folder_not_admitted", "message": message, "folder": reply_snapshot(ctx)})],
-                });
+                }));
             }
         }
     }

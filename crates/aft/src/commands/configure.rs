@@ -3967,9 +3967,9 @@ pub(crate) fn handle_folder_admission_replay(req: &RawRequest, ctx: &AppContext)
             {
                 continue;
             }
-            let _ = ctx
-                .configure_warnings_sender()
-                .send(ConfigureWarningsFrame {
+            let _ = ctx.configure_warnings_sender().send((
+                ctx.configure_generation(),
+                ConfigureWarningsFrame {
                     frame_type: "configure_warnings",
                     session_id: Some(session),
                     project_root: ctx
@@ -3978,7 +3978,8 @@ pub(crate) fn handle_folder_admission_replay(req: &RawRequest, ctx: &AppContext)
                         .display()
                         .to_string(),
                     warnings: warnings.clone(),
-                });
+                },
+            ));
         }
     }
     response
