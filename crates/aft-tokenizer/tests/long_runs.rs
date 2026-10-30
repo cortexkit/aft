@@ -1,5 +1,5 @@
 use aft_tokenizer::count_tokens;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const INPUT_BYTES: usize = 128 * 1024;
 
@@ -39,8 +39,20 @@ fn long_run_count_timings() {
         for bytes in [16 * 1024, 32 * 1024, 64 * 1024, INPUT_BYTES] {
             let start = Instant::now();
             let count = count_tokens(std::hint::black_box(&text[..bytes])).unwrap();
-            eprintln!("{name}: {bytes} bytes, {count} tokens, {:?}", start.elapsed());
+            let elapsed = start.elapsed();
+            eprintln!("{name}: {bytes} bytes, {count} tokens, {elapsed:?}");
             assert!(count > 0);
+            if bytes == INPUT_BYTES {
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "{name}: counting {bytes} bytes took {elapsed:?}"
+                );
+                if name == "normal" {
+                    // Fixed normal-log baseline, not computed from another
+                    // invocation of the tokenizer under test.
+                    assert_eq!(count, 40_280);
+                }
+            }
         }
     }
 }

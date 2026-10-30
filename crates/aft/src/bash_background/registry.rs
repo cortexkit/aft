@@ -14436,7 +14436,12 @@ impl BgTaskRegistry {
         paths: Option<&TaskPaths>,
         rendered_output: Option<&str>,
     ) -> CompletionTokenCounts {
-        if metadata.mode == BgMode::Pty {
+        // Cancellation output is incomplete and its compression savings are not
+        // useful statistics. In particular, reclaim can kill many tasks in one
+        // pass: tokenizing each tail would delay every following kill and notice.
+        if metadata.mode == BgMode::Pty
+            || matches!(metadata.status, BgTaskStatus::Killed | BgTaskStatus::TimedOut)
+        {
             return CompletionTokenCounts::skipped();
         }
 
@@ -17661,6 +17666,40 @@ mod tests {
         assert_eq!(counts.original_bytes, Some(3));
         assert_eq!(counts.compressed_bytes, Some(8));
         assert_eq!(calls, ["raw", "rendered"]);
+    }
+
+    #[test]
+    fn completion_token_counts_skip_kills_but_preserve_normal_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = allocate_task_layout(root.path(), "session").unwrap();
+        fs::write(&layout.paths.stdout, "hello world").unwrap();
+        fs::write(&layout.paths.stderr, "").unwrap();
+        let buffer = BgBuffer::registered(&layout.paths, BgMode::Pipes);
+        let mut metadata = PersistedTask::starting(
+            layout.paths.task_id.clone(),
+            "session".into(),
+            "printf 'hello world'".into(),
+            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
+            None,
+            true,
+            false,
+        );
+        let registry = BgTaskRegistry::default();
+        for (status, skipped) in [
+            (BgTaskStatus::Completed, false),
+            (BgTaskStatus::Failed, false),
+            (BgTaskStatus::Killed, true),
+            (BgTaskStatus::TimedOut, true),
+        ] {
+            metadata.status = status;
+            let counts = registry.completion_token_counts(&metadata, Some(&buffer), None, None);
+            assert_eq!(counts.tokens_skipped, skipped, "{:?}", metadata.status);
+            assert_eq!(counts.original_tokens, (!skipped).then_some(2));
+            assert_eq!(counts.compressed_tokens, (!skipped).then_some(2));
+            assert_eq!(counts.original_bytes, (!skipped).then_some(11));
+            assert_eq!(counts.compressed_bytes, (!skipped).then_some(11));
+        }
     }
 
     #[test]
@@ -24558,6 +24597,31 @@ mod tests {
             .into_iter()
             .filter(|completion| completion.task_id == task_id)
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_kill_skips_tokens_without_changing_output() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(
+            &registry,
+            dir.path(),
+            "printf 'hello world'; touch ready; exec sleep 60",
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("ready").exists() {
+            assert!(Instant::now() < deadline, "child did not write its output");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snapshot = registry.kill(&task_id, "session").unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].tokens_skipped);
+        assert_eq!(completions[0].original_tokens, None);
+        assert_eq!(completions[0].compressed_tokens, None);
+        assert_eq!(completions[0].output_preview, "hello world");
     }
 
     #[cfg(unix)]
