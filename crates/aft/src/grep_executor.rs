@@ -854,7 +854,9 @@ fn execute_root_profiled(
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 return (
-                    failed_index_grep(std::io::Error::other(error)),
+                    failed_index_grep(std::io::Error::other(
+                        crate::context::view_load_failure_message(error),
+                    )),
                     GrepExecutionPhaseTimings::default(),
                 )
             }

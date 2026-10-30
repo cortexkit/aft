@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-v3-idle-eviction"
+  ],
+  "note": "With views on, storage retention evicts idle v3 view members of live roots, least recently bound first, until the family is under its allocated-byte target; readers, pins, sessions, intents and live reservations keep members. Views are off by default. No search, ranking or query routing changes."
+}
