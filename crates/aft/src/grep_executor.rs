@@ -2671,31 +2671,56 @@ mod tests {
             std::fs::write(dir.path().join(name), "needle\n").unwrap();
         }
         let budget = crate::bounded_io::Budget::after(Duration::from_millis(400));
-        let walked = crate::bounded_io::with_budget(Some(budget), || {
-            with_fallback_walk_sort_metadata_delay_for_test(Duration::from_secs(1), || {
-                bounded_fallback_walk_files_with_limits(
-                    dir.path(),
-                    dir.path(),
-                    &PathFilters::default(),
-                    10,
-                    Duration::from_secs(5),
-                )
-            })
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let walked =
+                with_fallback_walk_sort_metadata_delay_for_test(Duration::from_secs(1), || {
+                    bounded_fallback_walk_files_with_limits(
+                        dir.path(),
+                        dir.path(),
+                        &PathFilters::default(),
+                        10,
+                        Duration::from_secs(5),
+                    )
+                });
+            assert!(walked.walk_truncated);
+            assert!(walked.walk_time_limit_reached);
+            assert_eq!(walked.entries_visited, 3);
+            crate::bounded_io::finish_response(Response::success(
+                "walk-deadline",
+                serde_json::json!({"complete": true, "files": walked.files, "entries_examined": walked.entries_visited}),
+            ))
         });
-        let mut names = walked
-            .files
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["entries_examined"], 3);
+        assert_eq!(
+            response.data["gaps"],
+            serde_json::json!([
+                "Directory walk reached its time budget; only examined entries are reported."
+            ])
+        );
+        assert!(response.data["text"].as_str().unwrap().lines().any(|line| {
+            line == "Directory walk reached its time budget; only examined entries are reported."
+        }));
+        let mut names = response.data["files"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .map(|p| {
+                Path::new(p.as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(
             names,
             ["a.rs", "b.rs"],
-            "a late sort must not discard the walk: {walked:?}"
+            "a late sort must not discard the walk: {:?}",
+            response.data
         );
-        assert!(walked.walk_truncated);
-        assert!(walked.walk_time_limit_reached);
-        assert_eq!(walked.entries_visited, 3);
     }
 
     #[test]

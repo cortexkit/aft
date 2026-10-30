@@ -3918,20 +3918,18 @@ mod tests {
         let child = dir.path().join("child");
         std::fs::write(&keep, "fn keep() {}\n").unwrap();
         std::fs::create_dir(&child).unwrap();
-        let paused = child.join("pause.rs");
-        std::fs::write(&paused, "fn pause() {}\n").unwrap();
-        let stall = crate::bounded_io::stall_running_helper(&paused);
+        let stall = crate::bounded_io::stall_running_helper(&child);
         let budget = crate::bounded_io::Budget::after(std::time::Duration::from_secs(5))
             .with_access_budget(std::time::Duration::from_millis(200));
         let response = crate::bounded_io::with_budget(Some(budget), || {
             let discovery = discover_outline_files_with_options(dir.path(), true);
             assert_eq!(discovery.files, [keep.to_string_lossy().to_string()]);
             assert!(discovery.collection_truncated);
-            assert_eq!(discovery.entries_examined, 3);
+            assert_eq!(discovery.entries_examined, 2);
             crate::bounded_io::finish_response(Response::success(
                 "outline-stall",
                 serde_json::json!({
-                    "complete": false, "files": discovery.files, "entries_examined": discovery.entries_examined,
+                    "complete": true, "files": discovery.files, "entries_examined": discovery.entries_examined,
                 }),
             ))
         });
@@ -3941,14 +3939,27 @@ mod tests {
             .unwrap();
         assert!(response.success, "{:?}", response.data);
         assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["files"], serde_json::json!([keep]));
+        assert_eq!(response.data["entries_examined"], 2);
+        assert_eq!(
+            response.data["gaps"][0],
+            "Directory walk reached its time budget; only examined entries are reported."
+        );
+        assert!(response.data["text"].as_str().unwrap().lines().any(|line| {
+            line == "Directory walk reached its time budget; only examined entries are reported."
+        }));
         assert!(
-            response.data["gaps"][0]
+            response.data["gaps"][1]
                 .as_str()
                 .unwrap()
-                .contains(&format!("read_blocked: {}:", paused.display())),
+                .contains(&format!("read_blocked: {}:", child.display())),
             "{:?}",
             response.data
         );
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("read_blocked: {}:", child.display())));
     }
     use super::*;
     use crate::symbols::SymbolKind;

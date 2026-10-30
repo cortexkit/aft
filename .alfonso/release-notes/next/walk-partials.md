@@ -1,1 +1,0 @@
-- Timed-out fallback directory walks retain paths already found and report incomplete coverage with examination counts. Progressing walks are no longer mistaken for stalled filesystem access; a stalled access names the entry being read. Grep also retains partial replies instead of spending the remaining deadline on a second scope probe.
