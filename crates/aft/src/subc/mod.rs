@@ -22839,6 +22839,19 @@ mod tests {
         )
     }
 
+    struct RebindWaitDiagnostics<'a>(&'a Executor, &'a ConfiguredRoot);
+
+    impl Drop for RebindWaitDiagnostics<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "rebind wait failure: {}",
+                    rebind_wait_diagnostics(self.0, self.1)
+                );
+            }
+        }
+    }
+
     #[test]
     fn rebind_wait_diagnostics_name_active_job_without_waiting_on_database_slot() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -22885,12 +22898,14 @@ mod tests {
         let executor = Arc::new(Executor::new());
         let fixture = ConfiguredRoot::new(&executor);
         let _reap = ReapContextChildren(Arc::clone(&fixture.ctx));
+        // Diagnose panics inside database_wire_tool as well as failed response
+        // assertions. Run before child cleanup on unwind.
+        let _diagnostics = RebindWaitDiagnostics(&executor, &fixture);
         fixture.ctx.mark_subc_bound();
         start_post_ack_database_open(&executor, &fixture.root);
         assert!(
             wait_for_database_ready(&fixture.ctx, Duration::from_secs(5)).is_some(),
-            "first bind's database opened without the configure tail: {}",
-            rebind_wait_diagnostics(&executor, &fixture),
+            "first bind's database opened without the configure tail"
         );
 
         // A rebind that changes configuration but not the root or storage
@@ -22908,8 +22923,7 @@ mod tests {
                 .ctx
                 .database_runtime_refusal("probe", "bash")
                 .is_none(),
-            "a rebind onto the same database must not re-mark it as initializing: {}",
-            rebind_wait_diagnostics(&executor, &fixture),
+            "a rebind onto the same database must not re-mark it as initializing"
         );
 
         // A rebind onto another storage directory must reopen, and nothing
@@ -22929,17 +22943,10 @@ mod tests {
         let started = Instant::now();
         let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(5));
         assert_eq!(
-            bash["success"],
-            true,
-            "bash after a rebind must get the database, not stay initializing: {bash}; {}",
-            rebind_wait_diagnostics(&executor, &fixture),
+            bash["success"], true,
+            "bash after a rebind must get the database, not stay initializing: {bash}"
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "bash exceeded its wait: {}; {}",
-            started.elapsed().as_millis(),
-            rebind_wait_diagnostics(&executor, &fixture),
-        );
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(other_storage.path().join("aft.db").is_file());
         eprintln!(
             "rebind bash completed in {}ms; {}",
