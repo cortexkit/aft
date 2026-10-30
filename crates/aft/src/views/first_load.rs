@@ -2657,6 +2657,8 @@ impl FirstLoadDriver for CheckoutDriver {
                     let keys_present = old.attachments.values().all(|a| {
                         a.downcast_ref::<CachedAttachment>()
                             .is_none_or(|cached| v3_readers.contains(&cached.0))
+                            && a.downcast_ref::<super::callgraph::CallgraphAttachment>()
+                                .is_none_or(|attachment| attachment.payload().is_some())
                     });
                     if cached.reusable(current)
                         && delivered <= cached.delivery_seq
@@ -2966,6 +2968,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         progress = PublicationProgress::Published;
                         unpublished.complete();
                         published = true;
+                        super::callgraph::retire_attachments(&observed, &generation);
                         self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
                         for adapter in &self.adapters {
                             adapter.generation_published(access, &generation, &|| self.installed_cut().0)?;
@@ -3274,6 +3277,7 @@ impl CheckoutDriver {
                         },
                     );
                 drop(retired);
+                super::callgraph::retire_attachments(&observed, &composed);
                 Ok(composed)
             }
             Ok(super::base_refs::WorkerOutcome::Lost {
@@ -4696,10 +4700,9 @@ impl CompositePlane for CallgraphBridge {
                 keys.push((path.clone(), attachment.key));
                 payloads.push((
                     attachment.key,
-                    attachment
-                        .blob
-                        .to_bytes()
-                        .map_err(|e| error(e.to_string()))?,
+                    attachment.payload().ok_or_else(|| {
+                        error("callgraph payload retired before base completion".into())
+                    })?,
                 ));
             } else {
                 return Err(error(format!("{path:?}: callgraph attachment missing")));
@@ -4748,6 +4751,16 @@ impl CompositePlane for CallgraphBridge {
             None,
         )
         .map_err(|e| error(e.to_string()))?;
+        for (path, key) in &keys {
+            if let Some(attachment) = observed
+                .get(path)
+                .and_then(|entry| entry.attachments.get(&FamilyPlane::Callgraph))
+                .and_then(|a| a.downcast_ref::<super::callgraph::CallgraphAttachment>())
+                .filter(|a| a.key == *key)
+            {
+                attachment.retire();
+            }
+        }
         drop(live);
         Ok(())
     }
@@ -4857,10 +4870,14 @@ impl CompositePlane for CallgraphBridge {
             .collect();
         live.protect(&keys).map_err(|e| error(e.to_string()))?;
         for (path, attachment) in attachments {
-            let bytes = attachment
-                .blob
-                .to_bytes()
-                .map_err(|e| error(e.to_string()))?;
+            let bytes = match attachment.payload() {
+                Some(bytes) => bytes,
+                None => store
+                    .get(&attachment.key)
+                    .map_err(|e| error(e.to_string()))?
+                    .ok_or_else(|| error("retired callgraph payload missing from store".into()))?
+                    .into(),
+            };
             store
                 .put_or_touch(&attachment.key, &bytes)
                 .map_err(|e| error(e.to_string()))?;
@@ -5001,14 +5018,20 @@ impl CompositePlane for CallgraphBridge {
             .map_err(|e| error(e.to_string()))?;
         let mut payloads = Vec::new();
         for (path, attachment) in &attachments {
-            payloads.push((
-                path.clone(),
-                attachment.key,
-                attachment
-                    .blob
-                    .to_bytes()
-                    .map_err(|e| error(e.to_string()))?,
-            ));
+            let bytes = match attachment.payload() {
+                Some(bytes) => bytes,
+                None => crate::blob_store::v3::PlaneReader::open_existing(
+                    &route.storage,
+                    &route.family,
+                    FamilyPlane::Callgraph,
+                )
+                .map_err(super::callgraph::v3_error)?
+                .get(&attachment.key)
+                .map_err(super::callgraph::v3_error)?
+                .ok_or_else(|| error("retired callgraph payload missing from store".into()))?
+                .into(),
+            };
+            payloads.push((path.clone(), attachment.key, bytes));
         }
         if !payloads.is_empty() {
             let request = payloads
@@ -5045,7 +5068,7 @@ impl CompositePlane for CallgraphBridge {
         if super::callgraph::project_manifest(&composed).is_err() {
             return Ok(());
         }
-        let reader = super::callgraph::V3BlobReader(
+        let reader = super::callgraph::V3BlobReader::new(
             crate::blob_store::v3::PlaneReader::open_existing(
                 &route.storage,
                 &route.family,
@@ -6905,7 +6928,7 @@ mod v3_bootstrap_tests {
         assert_eq!(graph.key(&path, content), Some(extracted.key));
         let trigram_key = crate::blob_store::v2::TrigramKey { content, policy }.family_key();
         let trigram = super::super::segment_store::TrigramPayload::extract(bytes, &policy).encode();
-        let graph_payload = extracted.blob.to_bytes().unwrap();
+        let graph_payload = extracted.payload().unwrap();
         crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
             p.put(
                 &trigram_key,
@@ -6987,7 +7010,7 @@ mod v3_bootstrap_tests {
         crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
             p.put(
                 &key,
-                &attachment.blob.to_bytes().unwrap(),
+                &attachment.payload().unwrap(),
                 FamilyPlane::Callgraph.payload_schema(),
             )?;
             Ok(())

@@ -305,6 +305,11 @@ fn materialize_reading(
     reader: &impl join::ManifestBlobReader,
     blob_connection: Option<&Connection>,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
+    let shared_reader = join::SharedBlobReader {
+        inner: reader,
+        decoded: Default::default(),
+    };
+    let reader = &shared_reader;
     // Existing databases may be incremental baselines or legacy upgrades. Only
     // a newly created, unpublished file can trade recovery for cheaper writes.
     let private_cold = base.is_none() && !database_path.exists();
@@ -649,6 +654,7 @@ fn materialize_reading(
     let mut loaded_paths = BTreeSet::new();
     let mut owned_files = Vec::new();
     let mut owned_nodes = Vec::new();
+    let mut dispatch_inputs = dispatch::DecodedFiles::default();
     let mut cold_module_facts = HashMap::new();
     for (path, entry) in manifest.entries() {
         if changed
@@ -681,6 +687,7 @@ fn materialize_reading(
             CallGraphStoreError::Unavailable("non-UTF-8 manifest callgraph path".to_string())
         })?;
         loaded_paths.insert(path.clone());
+        dispatch_inputs.insert(path.clone(), parse)?;
         if changed.is_none() && path.ends_with(".rs") {
             if let Some(facts) = module_digest::RustParseFacts::of(parse) {
                 cold_module_facts.insert(path.clone(), facts);
@@ -732,6 +739,8 @@ fn materialize_reading(
         }
     }
 
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "owned_rows_prepared");
     if changed.is_some() {
         profile.measure(
             WritePhase::DeleteRows,
@@ -844,6 +853,9 @@ fn materialize_reading(
             .map(|written| count + written)
         })
     })?;
+    drop((owned_files, owned_nodes));
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "owned_rows_released");
     if changed.is_none() {
         module_digest::compute_full(&transaction, manifest, |path, _| {
             Ok(cold_module_facts.remove(path))
@@ -915,6 +927,7 @@ fn materialize_reading(
         selected_join_probe.finish(&transaction),
     );
     profile.finish("selected_join");
+    drop(joined.result.resolution_order);
     stats.unattributed_callers = joined
         .bindings
         .values()
@@ -1106,6 +1119,20 @@ fn materialize_reading(
     stats.dependency_deleted += binding_deleted;
     stats.dependency_inserted += binding_inserted;
     profile.finish("write_bindings");
+    drop((surface_updates, binding_updates));
+    drop((
+        surface_rows,
+        surface_deletes,
+        binding_inserts,
+        binding_deletes,
+        dependency_deletes,
+        dependency_inserts,
+        changed_dependencies,
+        cached,
+        joined.bindings,
+    ));
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "bindings_released");
     type ExistingRef = (
         Option<String>,
         String,
@@ -1300,6 +1327,7 @@ fn materialize_reading(
         });
     }
     drop(load_refs);
+    drop((parsed, nodes, loaded_paths));
     #[cfg(test)]
     drop(control_lookup);
     let edges_deleted = profile.measure(WritePhase::Edges, &transaction, || {
@@ -1462,7 +1490,10 @@ fn materialize_reading(
         .iter()
         .map(|row| row.caller_file.clone())
         .collect::<BTreeSet<_>>();
-    let dispatch_work = dispatch::emit(
+    drop((pending_refs, pending_edges, ref_deletes, existing));
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "dispatch_inputs_only");
+    let dispatch_work = dispatch::emit_from_decoded(
         &transaction,
         manifest,
         reader,
@@ -1473,6 +1504,7 @@ fn materialize_reading(
             type_targets: &joined.dispatch_type_targets,
             reuse: dispatch_reuse,
         },
+        dispatch_inputs,
     )?;
     stats.dispatch_decoded_blobs = dispatch_work.decoded_blobs;
     stats.dispatch_resolved_files = dispatch_work.resolved_files;
@@ -1538,10 +1570,8 @@ fn materialize_reading(
     if let Some(probe) = write_probe {
         probe.finish(&connection, database_path);
     }
-    // Include destruction in the bracket: freeing decoded blobs and closing
-    // SQLite handles happens before the caller observes materialization complete.
-    drop((parsed, nodes, cached));
-    drop(joined.bindings);
+    // Graph inputs have already been released before dispatch. Close SQLite
+    // before the caller observes materialization completion too.
     profile.finish("cleanup_memory");
     drop(connection);
     if let Some(unpublished) = unpublished.as_mut() {
@@ -1553,7 +1583,7 @@ fn materialize_reading(
 
 struct ManifestViewBlobReader<'a> {
     connection: &'a Connection,
-    decoded: RefCell<HashMap<String, Arc<join::CallgraphBlob>>>,
+    decoded: RefCell<HashMap<String, std::sync::Weak<join::CallgraphBlob>>>,
 }
 
 impl<'a> ManifestViewBlobReader<'a> {
@@ -1583,8 +1613,13 @@ impl<'a> ManifestViewBlobReader<'a> {
         &self,
         full_key: &str,
     ) -> std::result::Result<Option<Arc<join::CallgraphBlob>>, join::ManifestJoinError> {
-        if let Some(blob) = self.decoded.borrow().get(full_key) {
-            return Ok(Some(blob.clone()));
+        if let Some(blob) = self
+            .decoded
+            .borrow()
+            .get(full_key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Some(blob));
         }
         let Some(payload) = self.read_payload(full_key)? else {
             return Ok(None);
@@ -1592,7 +1627,7 @@ impl<'a> ManifestViewBlobReader<'a> {
         let blob = Arc::new(join::CallgraphBlob::from_bytes(&payload)?);
         self.decoded
             .borrow_mut()
-            .insert(full_key.to_string(), blob.clone());
+            .insert(full_key.to_string(), Arc::downgrade(&blob));
         Ok(Some(blob))
     }
 }
@@ -1623,8 +1658,13 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
         let mut pending = HashMap::<&str, usize>::new();
         let mut order = Vec::with_capacity(full_keys.len());
         for key in full_keys {
-            if let Some(blob) = self.decoded.borrow().get(*key) {
-                order.push(Some(Ok(blob.clone())));
+            if let Some(blob) = self
+                .decoded
+                .borrow()
+                .get(*key)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                order.push(Some(Ok(blob)));
                 continue;
             }
             if let Some(position) = pending.get(key) {
@@ -1665,7 +1705,7 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
                     break;
                 }
             };
-            cache.insert((*key).to_string(), blob.clone());
+            cache.insert((*key).to_string(), Arc::downgrade(&blob));
             blobs.push(Some(blob));
         }
         Ok(blobs)

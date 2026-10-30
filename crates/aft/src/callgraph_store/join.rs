@@ -118,6 +118,51 @@ pub trait ManifestBlobReader {
     }
 }
 
+/// Shares a decoded object while a consumer owns it, without retaining an
+/// all decoded blobs after emission has finished.
+#[derive(Default)]
+pub(crate) struct DecodedBlobCache(
+    std::cell::RefCell<HashMap<String, std::sync::Weak<CallgraphBlob>>>,
+);
+
+impl DecodedBlobCache {
+    pub(crate) fn read(
+        &self,
+        key: &str,
+        read: impl FnOnce() -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError>,
+    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
+        if let Some(blob) = self.0.borrow().get(key).and_then(std::sync::Weak::upgrade) {
+            return Ok(Some(blob));
+        }
+        let blob = read()?;
+        if let Some(blob) = &blob {
+            self.0
+                .borrow_mut()
+                .insert(key.to_string(), Arc::downgrade(blob));
+        }
+        Ok(blob)
+    }
+}
+
+pub(crate) struct SharedBlobReader<'a, R> {
+    pub(crate) inner: &'a R,
+    pub(crate) decoded: DecodedBlobCache,
+}
+
+impl<R: ManifestBlobReader> ManifestBlobReader for SharedBlobReader<'_, R> {
+    fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
+        self.inner.read_callgraph_blob(key)
+    }
+
+    fn read_callgraph_blob_decoded(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
+        self.decoded
+            .read(key, || self.inner.read_callgraph_blob_decoded(key))
+    }
+}
+
 /// Tree-sitter node position in canonical pre-order traversal order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AstPreorderNode {
@@ -2223,16 +2268,10 @@ fn join_manifest_with_surfaces(
         loaded.borrow_mut().insert(key.clone(), bytes.clone());
         Ok(bytes)
     };
-    let decoded = std::cell::RefCell::new(HashMap::<BlobKey, Arc<CallgraphBlob>>::new());
     let decode = |key: &BlobKey| -> Result<Arc<CallgraphBlob>, ManifestJoinError> {
-        if let Some(blob) = decoded.borrow().get(key) {
-            return Ok(blob.clone());
-        }
-        let blob = blobs
+        blobs
             .read_callgraph_blob_decoded(key)?
-            .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?;
-        decoded.borrow_mut().insert(key.clone(), blob.clone());
-        Ok(blob)
+            .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))
     };
     let read_error = std::cell::RefCell::new(None);
     let reader = |key: &BlobKey| match load(key) {
@@ -2252,9 +2291,7 @@ fn join_manifest_with_surfaces(
         root,
         facts: facts.as_ref(),
     };
-    let mut extracts = HashMap::new();
     let mut files = HashMap::new();
-    let mut work: BTreeMap<String, Vec<_>> = BTreeMap::new();
     let mut bindings = BTreeMap::new();
     let mut unbound_non_utf8_paths = Vec::new();
     let mut rebuilt_surface_paths = BTreeSet::new();
@@ -2371,31 +2408,8 @@ fn join_manifest_with_surfaces(
         {
             heap_parts[3] += crate::test_allocations::live_bytes() as isize - before as isize;
         }
-        #[cfg(test)]
-        let before = crate::test_allocations::live_bytes();
-        if resolve {
-            let caller_work = work.entry(rel.to_string()).or_default();
-            for ((raw, bound), reference_key) in blob
-                .refs
-                .iter()
-                .zip(&extract.raw_refs)
-                .zip(blob.reference_keys())
-            {
-                caller_work.push((
-                    CallerRefKey {
-                        caller_blob_key: key.clone(),
-                        ref_ordinal: reference_key,
-                        caller_path: path.as_bytes().to_vec(),
-                    },
-                    (raw.kind, bound.clone()),
-                ));
-            }
-        }
-        extracts.insert(rel.to_string(), extract);
-        #[cfg(test)]
-        {
-            heap_parts[4] += crate::test_allocations::live_bytes() as isize - before as isize;
-        }
+        // Only the resolver surface survives this pass. Nodes, caller data and
+        // raw references are rebuilt for one selected caller at a time below.
     }
     #[cfg(test)]
     if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
@@ -2465,59 +2479,14 @@ fn join_manifest_with_surfaces(
         }
     }
     profile.finish("index_and_surface_replay");
-    // Surface replay needs no call sites. Decode an unchanged caller only after
-    // replay proves that its reference results may change.
-    for caller in &resolved_callers {
-        if extracts.contains_key(caller) {
-            continue;
-        }
-        let path = RelPath::new(caller.as_bytes().to_vec()).expect("bound manifest path");
-        let Some(ManifestEntry::Regular { planes, .. }) = manifest.get(&path) else {
-            continue;
-        };
-        let key = planes.callgraph.as_ref().expect("bound caller key");
-        let decoded_blob = decode(key)?;
-        let CallgraphBlob::Parse(blob) = decoded_blob.as_ref() else {
-            continue;
-        };
-        decoded_caller_blobs += 1;
-        facts.take();
-        facts.take_config();
-        let extract =
-            blob.bind_with_dependencies(caller, &paths, Some(&bindings[caller].references))?;
-        let caller_work = work.entry(caller.clone()).or_default();
-        for ((raw, bound), reference_key) in blob
-            .refs
-            .iter()
-            .zip(&extract.raw_refs)
-            .zip(blob.reference_keys())
-        {
-            caller_work.push((
-                CallerRefKey {
-                    caller_blob_key: key.clone(),
-                    ref_ordinal: reference_key,
-                    caller_path: caller.as_bytes().to_vec(),
-                },
-                (raw.kind, bound.clone()),
-            ));
-        }
-        extracts.insert(caller.clone(), extract);
-    }
     let index = ManifestProjectIndex::from_parts(
         root,
         index.files,
-        extracts
-            .iter()
-            .map(|(path, extract)| (path.clone(), &extract.data))
-            .collect(),
+        HashMap::new(),
         super::WorkspaceCratePrefixCache::default(),
         facts.clone(),
     );
     profile.finish("decode_resolved_callers");
-    let surface_index = ViewSurfaceIndex {
-        inner: &index,
-        queries: Default::default(),
-    };
     let bases: BTreeMap<_, BTreeSet<_>> = resolved_callers
         .iter()
         .map(|caller| {
@@ -2535,30 +2504,52 @@ fn join_manifest_with_surfaces(
         })
         .collect();
     let mut resolved_bindings = 0;
-    for (caller, mut caller_work) in work {
-        if !resolved_callers.contains(&caller) {
+    for caller in &resolved_callers {
+        let path = RelPath::new(caller.as_bytes().to_vec()).expect("bound manifest path");
+        let Some(ManifestEntry::Regular { planes, .. }) = manifest.get(&path) else {
             continue;
-        }
-        caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
-        let receiver_ordinals = if let Some((key, _)) = caller_work.first() {
-            decode(&key.caller_blob_key)?
-                .parse()
-                .map(|p| {
-                    p.dispatch
-                        .sites
-                        .iter()
-                        .map(|s| s.ordinal)
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default()
-        } else {
-            BTreeSet::new()
         };
-        let caller_data = &extracts[&caller].data;
-        let basis = &bases[&caller];
-        let binding = bindings
-            .get_mut(&caller)
-            .expect("bound caller dependencies");
+        let key = planes.callgraph.as_ref().expect("bound caller key");
+        let decoded_blob = decode(key)?;
+        let CallgraphBlob::Parse(blob) = decoded_blob.as_ref() else {
+            continue;
+        };
+        if !rebuilt_surface_paths.contains(caller) {
+            decoded_caller_blobs += 1;
+        }
+        let extract =
+            blob.bind_with_dependencies(caller, &paths, Some(&bindings[caller].references))?;
+        let mut caller_work = blob
+            .refs
+            .iter()
+            .zip(extract.raw_refs)
+            .zip(blob.reference_keys())
+            .map(|((raw, bound), reference_key)| {
+                (
+                    CallerRefKey {
+                        caller_blob_key: key.clone(),
+                        ref_ordinal: reference_key,
+                        caller_path: caller.as_bytes().to_vec(),
+                    },
+                    (raw.kind, bound),
+                )
+            })
+            .collect::<Vec<_>>();
+        caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+        let receiver_ordinals = blob
+            .dispatch
+            .sites
+            .iter()
+            .map(|s| s.ordinal)
+            .collect::<BTreeSet<_>>();
+        let caller_data = &extract.data;
+        let surface_index = ViewSurfaceIndex {
+            inner: &index,
+            queries: Default::default(),
+            caller: Some((caller, caller_data)),
+        };
+        let basis = &bases[caller];
+        let binding = bindings.get_mut(caller).expect("bound caller dependencies");
         let mut resolutions =
             HashMap::<ViewResolutionBinding, (Option<String>, Option<String>)>::new();
         let mut caller_queries = BTreeMap::new();
@@ -2719,21 +2710,18 @@ fn join_manifest_with_surfaces(
             }
             // The caller data is the file's own parse; binding consults path
             // facts only for reference dependencies, which are not wanted here.
-            let bound;
-            let data = if let Some(extract) = extracts.get(file) {
-                &extract.data
-            } else {
+            if !rebuilt_surface_paths.contains(file) && !resolved_callers.contains(file) {
                 dispatch_type_target_decoded_blobs += 1;
-                bound = blob.bind(file, &paths)?;
-                &bound.data
-            };
+            }
+            let data = blob.file_data(file)?;
             facts.take();
             facts.take_config();
             let recording = ViewSurfaceIndex {
                 inner: &index,
                 queries: Default::default(),
+                caller: None,
             };
-            let targets = resolve_dispatch_type_names(&recording, file, blob, data);
+            let targets = resolve_dispatch_type_names(&recording, file, blob, &data);
             let probes = facts.take();
             facts.take_config();
             dispatch_type_targets.insert(
@@ -2884,6 +2872,7 @@ impl ViewSurfaceQuery {
 struct ViewSurfaceIndex<'a, I> {
     inner: &'a I,
     queries: std::cell::RefCell<BTreeMap<ViewSurfaceQuery, String>>,
+    caller: Option<(&'a str, &'a FileCallData)>,
 }
 
 impl<I> ViewSurfaceIndex<'_, I> {
@@ -2914,7 +2903,10 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         // resolve_ref reads only its own caller data; changed callers never reuse
         // surface answers, so the immutable blob itself guards this input.
-        self.inner.caller_data(file)
+        self.caller
+            .filter(|(caller, _)| *caller == file)
+            .map(|(_, data)| data)
+            .or_else(|| self.inner.caller_data(file))
     }
     fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
         // Local symbols come from the caller blob, not a consulted file surface.

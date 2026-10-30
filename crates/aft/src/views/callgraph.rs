@@ -37,8 +37,43 @@ pub const PRODUCER: &str = "ruled-callgraph-v12-rust-module-paths-and-function-r
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
-    pub blob: Arc<CallgraphBlob>,
+    payload: Arc<std::sync::Mutex<Option<Arc<[u8]>>>>,
     pub key: FamilyKey,
+}
+
+impl CallgraphAttachment {
+    pub fn payload(&self) -> Option<Arc<[u8]>> {
+        self.payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn retire(&self) {
+        self.payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+pub(super) fn retire_attachments(
+    entries: &BTreeMap<RelPath, LiveEntry>,
+    generation: &ComposedGeneration,
+) {
+    for (path, entry) in entries {
+        if let Some(attachment) = entry
+            .attachments
+            .get(&FamilyPlane::Callgraph)
+            .and_then(|a| a.downcast_ref::<CallgraphAttachment>())
+        {
+            if matches!(generation.plane_readiness(path, FamilyPlane::Callgraph),
+                Some(PlaneState::Ready { key }) if *key == attachment.key.to_hex())
+            {
+                attachment.retire();
+            }
+        }
+    }
 }
 
 /// Markdown has outline headings, not callable definitions or call references.
@@ -82,7 +117,11 @@ pub fn attach(
     };
     let key = crate::blob_store::CallgraphKey::from_bytes(source, language, PRODUCER).full_key();
     let attachment = CallgraphAttachment {
-        blob: Arc::new(blob),
+        // The extraction-only AST index is intentionally absent from the
+        // existing payload encoding; do not retain it for the whole checkout.
+        payload: Arc::new(std::sync::Mutex::new(Some(
+            blob.to_bytes().map_err(error)?.into(),
+        ))),
         key: FamilyKey::from(&key),
     };
     entry
@@ -103,7 +142,19 @@ impl ManifestBlobReader for BlobReader {
 }
 
 /// Reads callgraph blobs from the family's v3 callgraph plane store.
-pub struct V3BlobReader(pub crate::blob_store::v3::PlaneReader);
+pub struct V3BlobReader {
+    reader: crate::blob_store::v3::PlaneReader,
+    decoded: crate::callgraph_store::join::DecodedBlobCache,
+}
+
+impl V3BlobReader {
+    pub fn new(reader: crate::blob_store::v3::PlaneReader) -> Self {
+        Self {
+            reader,
+            decoded: Default::default(),
+        }
+    }
+}
 
 pub(super) fn v3_error(error: crate::blob_store::v3::Error) -> PlaneError {
     if error.is_busy() {
@@ -117,9 +168,20 @@ impl ManifestBlobReader for V3BlobReader {
     fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
         let bytes = parse_hex32(key)
             .ok_or_else(|| ManifestJoinError::InvalidBlob("invalid callgraph key".into()))?;
-        self.0
+        self.reader
             .get(&FamilyKey::new(FamilyPlane::Callgraph, bytes))
             .map_err(|e| ManifestJoinError::InvalidBlob(e.to_string()))
+    }
+
+    fn read_callgraph_blob_decoded(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
+        self.decoded.read(key, || {
+            self.read_callgraph_blob(key)?
+                .map(|bytes| CallgraphBlob::from_bytes(&bytes).map(Arc::new))
+                .transpose()
+        })
     }
 }
 
@@ -742,6 +804,28 @@ fn error(reason: impl std::fmt::Display) -> PlaneError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_attachment_retires_payload_for_every_snapshot_clone() {
+        let source = b"fn target() {} fn caller() { target(); }";
+        let mut entry = super::LiveEntry::new(super::DiskState::of_bytes(source), 0);
+        let attachment = super::attach(&mut entry, source, "rust").unwrap();
+        let clone = attachment.clone();
+        let bytes = attachment.payload().unwrap();
+        let expected = super::CallgraphBlob::extract(
+            std::str::from_utf8(source).unwrap(),
+            "rust",
+            super::PRODUCER,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        assert_eq!(bytes.as_ref(), expected);
+        let weak = std::sync::Arc::downgrade(&bytes);
+        attachment.retire();
+        assert!(clone.payload().is_none());
+        drop(bytes);
+        assert!(weak.upgrade().is_none());
+    }
     use super::*;
 
     const FILES: &[(&str, &str)] = &[

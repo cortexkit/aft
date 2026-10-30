@@ -344,6 +344,43 @@ fn manifest_blob_reader_decodes_each_payload_once() {
 
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(reader.decoded.borrow().len(), 1);
+    let weak = Arc::downgrade(&first);
+    drop((first, second));
+    assert!(
+        weak.upgrade().is_none(),
+        "the reader must not pin emitted blobs"
+    );
+}
+
+#[test]
+fn cold_materialization_decodes_parse_payloads_once_across_join_and_dispatch() {
+    struct Reader<'a> {
+        inner: ManifestViewBlobReader<'a>,
+        reads: RefCell<BTreeMap<String, usize>>,
+    }
+    impl join::ManifestBlobReader for Reader<'_> {
+        fn read_callgraph_blob(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+            *self.reads.borrow_mut().entry(key.to_string()).or_default() += 1;
+            self.inner.read_payload(key)
+        }
+    }
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let reader = Reader {
+        inner: ManifestViewBlobReader::new(&connection),
+        reads: Default::default(),
+    };
+    let database = f.dir.path().join("decoded-once.sqlite");
+    materialize_from_blob_reader(&database, &f.base, &reader).unwrap();
+    let reads = reader.reads.borrow();
+    assert_eq!(reads.len(), 4);
+    assert!(reads.values().all(|count| *count == 1), "{reads:?}");
+    let normal = f.dir.path().join("normal.sqlite");
+    materialize_manifest_view_database(&normal, &f.blobs, &f.base).unwrap();
+    assert_snapshot_parity(&snapshot(&database), &snapshot(&normal));
 }
 
 #[test]
