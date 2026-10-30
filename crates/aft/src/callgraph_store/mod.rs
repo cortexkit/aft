@@ -5422,6 +5422,7 @@ struct ProjectIndex<'a> {
     /// The lazy index overlays fresh caller extracts on stored rows. Its parent
     /// map and caller paths belong to that immutable snapshot, not the worker.
     lazy_module_parents: std::cell::OnceCell<HashMap<String, (String, String)>>,
+    lazy_inline_candidates: std::cell::OnceCell<RustInlineCandidates>,
     rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
     local_symbols: RefCell<CallerSymbolMemo>,
@@ -5578,6 +5579,7 @@ mod rust_module_work {
         pub parent_lookups: usize,
         pub parent_scans: usize,
         pub parent_file_visits: usize,
+        pub inline_file_visits: usize,
         pub caller_requests: usize,
         pub caller_walks: usize,
         pub parent_time: Duration,
@@ -5670,9 +5672,8 @@ mod rust_module_work {
 /// in-memory file set. Lookups return exactly what the scans return.
 #[derive(Clone, Debug, Default)]
 struct CrateScanMemo {
-    /// Rust files in path order, with the source prefix and module segments
-    /// the inline-module lookup compares against.
-    rust_files: Vec<(String, String, Vec<String>)>,
+    /// Module prefixes derived from Rust source-file paths, in scan order.
+    inline_candidates: RustInlineCandidates,
     /// For each declared module target, the smallest `(declaring file,
     /// module name)` pair, which is the scan's first match after sorting.
     module_parents: HashMap<String, (String, String)>,
@@ -5683,13 +5684,7 @@ impl CrateScanMemo {
         let mut rust_files = files
             .iter()
             .filter(|(_, index)| index.lang == Some(LangId::Rust))
-            .map(|(path, _)| {
-                (
-                    path.clone(),
-                    rust_src_prefix(path),
-                    rust_module_segments_for_rel(path),
-                )
-            })
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         rust_files.sort();
         let mut module_parents = HashMap::<String, (String, String)>::new();
@@ -5697,7 +5692,7 @@ impl CrateScanMemo {
             Self::note_module_parents(&mut module_parents, file, index);
         }
         Self {
-            rust_files,
+            inline_candidates: RustInlineCandidates::build(&rust_files),
             module_parents,
         }
     }
@@ -5932,12 +5927,27 @@ impl ResolverIndex for ProjectIndex<'_> {
         module_segments: &[String],
         short_name: &str,
     ) -> Option<(String, String)> {
-        match self.crate_scans() {
-            Some(memo) => {
-                self.inline_scoped_target_in(memo, caller_file, module_segments, short_name)
+        let candidates = match self.crate_scans() {
+            Some(memo) => &memo.inline_candidates,
+            None => {
+                #[cfg(test)]
+                if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
+                    return self.inline_scoped_target_by_scan(
+                        caller_file,
+                        module_segments,
+                        short_name,
+                    );
+                }
+                self.lazy_inline_candidates.get_or_init(|| {
+                    // Fresh caller extracts replace stored paths in this batch,
+                    // including files whose language or module layout changed.
+                    let mut paths = self.scan_paths(LazyDbFileIndexes::rust_files);
+                    paths.sort();
+                    RustInlineCandidates::build(&paths)
+                })
             }
-            None => self.inline_scoped_target_by_scan(caller_file, module_segments, short_name),
-        }
+        };
+        self.inline_scoped_target_in(candidates, caller_file, module_segments, short_name)
     }
 }
 
@@ -5982,9 +5992,8 @@ impl ProjectIndex<'_> {
             |file| self.file_index(file),
         )
     }
-    /// The eager crate-wide memo. Lazy indexes build their parent map
-    /// separately; resolving symbols inside inline Rust modules still scans
-    /// stored paths.
+    /// The eager crate-wide memo. Lazy indexes build their parent map and
+    /// inline candidate index separately from the current caller overlay.
     fn crate_scans(&self) -> Option<&CrateScanMemo> {
         #[cfg(test)]
         if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
@@ -6026,44 +6035,55 @@ impl ProjectIndex<'_> {
         parents.into_iter().next()
     }
 
-    /// `inline_scoped_target` from the memo. Same order as the scan: the
-    /// caller's own file first, then every other Rust file in path order.
+    /// Tries the caller first, then files whose path-derived module segments
+    /// prefix the requested module, in global path order. The candidate index
+    /// belongs to this eager or lazy resolver snapshot.
     fn inline_scoped_target_in(
         &self,
-        memo: &CrateScanMemo,
+        memo: &RustInlineCandidates,
         caller_file: &str,
         module_segments: &[String],
         short_name: &str,
     ) -> Option<(String, String)> {
-        let src_prefix = rust_src_prefix(caller_file);
-        let check =
-            |(file_path, file_prefix, file_module_segments): &(String, String, Vec<String>)| {
-                if *file_prefix != src_prefix || !module_segments.starts_with(file_module_segments)
-                {
-                    return None;
-                }
-                let scoped_segments = &module_segments[file_module_segments.len()..];
-                if scoped_segments.is_empty() {
-                    return None;
-                }
-                let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
-                self.node_for_symbol(file_path, &scoped_symbol)
-                    .map(|_| (file_path.clone(), scoped_symbol))
-            };
         let caller = memo
-            .rust_files
-            .binary_search_by(|entry| entry.0.as_str().cmp(caller_file))
-            .ok()
-            .map(|position| &memo.rust_files[position]);
+            .by_path
+            .get(caller_file)
+            .map(|ordinal| &memo.files[*ordinal]);
+        let fallback_prefix;
+        let src_prefix = if let Some(file) = caller {
+            file.src_prefix.as_str()
+        } else {
+            fallback_prefix = rust_src_prefix(caller_file);
+            &fallback_prefix
+        };
+        let check = |file: &RustInlineFile| {
+            #[cfg(test)]
+            rust_module_work::note(|work| work.inline_file_visits += 1);
+            if file.src_prefix != src_prefix
+                || !module_segments.starts_with(&file.module_segments)
+                || self.lang_for(&file.path) != Some(LangId::Rust)
+            {
+                return None;
+            }
+            let scoped_segments = &module_segments[file.module_segments.len()..];
+            if scoped_segments.is_empty() {
+                return None;
+            }
+            let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
+            self.node_for_symbol(&file.path, &scoped_symbol)
+                .map(|_| (file.path.clone(), scoped_symbol))
+        };
         caller.and_then(check).or_else(|| {
-            memo.rust_files
-                .iter()
-                .filter(|entry| entry.0 != caller_file)
+            memo.eligible_files(src_prefix, module_segments)
+                .into_iter()
+                .map(|ordinal| &memo.files[ordinal])
+                .filter(|file| file.path != caller_file)
                 .find_map(check)
         })
     }
 
     /// `inline_scoped_target` by sorting and scanning every indexed path.
+    #[cfg(test)]
     fn inline_scoped_target_by_scan(
         &self,
         caller_file: &str,
@@ -6080,6 +6100,7 @@ impl ProjectIndex<'_> {
             file_paths.insert(0, caller);
         }
         for file_path in file_paths {
+            rust_module_work::note(|work| work.inline_file_visits += 1);
             // Path checks come before the language check so that a stored
             // file's index is loaded only when its module path can match.
             if rust_src_prefix(&file_path) != src_prefix {
@@ -6152,6 +6173,7 @@ struct DiskIndexMemos {
     lookup_error: RefCell<Option<rusqlite::Error>>,
 }
 
+#[derive(Clone, Debug)]
 struct RustInlineFile {
     path: String,
     src_prefix: String,
@@ -6168,7 +6190,7 @@ impl RustInlineFile {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct RustInlineCandidates {
     files: Vec<RustInlineFile>,
     by_path: HashMap<String, usize>,
@@ -17923,6 +17945,7 @@ impl<'a> ProjectIndex<'a> {
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
             lazy_module_parents: std::cell::OnceCell::new(),
+            lazy_inline_candidates: std::cell::OnceCell::new(),
             rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
@@ -29324,6 +29347,72 @@ pub fn run() {
             8,
             "the original scan also visits unrelated crates and non-prefix paths"
         );
+
+        // Inspect-triggered refreshes use the lazy index; view joins use the
+        // eager one. Both must prune the same physical module prefixes.
+        let extracts = files
+            .iter()
+            .map(|path| {
+                let extract = build_file_extract(root, path).unwrap();
+                (extract.rel_path.clone(), extract)
+            })
+            .collect::<HashMap<_, _>>();
+        let empty = HashMap::new();
+        for eager in [false, true] {
+            let mut project = ProjectIndex::from_db_and_callers(
+                &conn,
+                root,
+                if eager { &extracts } else { &empty },
+                WorkspaceCratePrefixCache::default(),
+            );
+            if eager {
+                project.lazy = None;
+            }
+            let session = rust_module_work::Session::start(false);
+            assert_eq!(
+                project.inline_scoped_target("src/lib.rs", &segments, "missing"),
+                None
+            );
+            assert_eq!(session.finish().inline_file_visits, 5, "eager={eager}");
+            let session = rust_module_work::Session::start(false);
+            assert_eq!(
+                project.inline_scoped_target_by_scan("src/lib.rs", &segments, "missing"),
+                None
+            );
+            assert_eq!(session.finish().inline_file_visits, 8);
+            assert_eq!(
+                project.inline_scoped_target("src/lib.rs", &segments, "pick"),
+                Some(("src/a.rs".into(), "deep::exact::pick".into()))
+            );
+            assert_eq!(
+                project.inline_scoped_target("src/a/mod.rs", &segments, "pick"),
+                Some(("src/a/mod.rs".into(), "deep::exact::pick".into()))
+            );
+            if !eager {
+                let path = root.join("src/a.rs");
+                let original = fs::read_to_string(&path).unwrap();
+                fs::write(&path, "pub fn replacement() {}\n").unwrap();
+                let replacement = build_file_extract(root, &path).unwrap();
+                let next_extracts = HashMap::from([(replacement.rel_path.clone(), replacement)]);
+                let next = ProjectIndex::from_db_and_callers(
+                    &conn,
+                    root,
+                    &next_extracts,
+                    WorkspaceCratePrefixCache::default(),
+                );
+                assert_eq!(
+                    next.inline_scoped_target("src/lib.rs", &segments, "pick"),
+                    Some(("src/a/deep.rs".into(), "exact::pick".into())),
+                    "fresh extracts must replace stored symbols in a new snapshot"
+                );
+                assert_eq!(
+                    project.inline_scoped_target("src/lib.rs", &segments, "pick"),
+                    Some(("src/a.rs".into(), "deep::exact::pick".into())),
+                    "the previous snapshot retains its own index"
+                );
+                fs::write(path, original).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -33021,6 +33110,7 @@ mod reexport_resolution_tests {
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
             lazy_module_parents: std::cell::OnceCell::new(),
+            lazy_inline_candidates: std::cell::OnceCell::new(),
             rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
