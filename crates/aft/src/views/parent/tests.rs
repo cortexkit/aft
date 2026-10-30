@@ -63,7 +63,8 @@ fn discovery_finds_children_and_reports_the_rest_as_skipped_and_outside() {
         vec![root.join("a"), root.join("b"), root.join("c")]
     );
     assert_eq!(found.skipped, vec![root.join("group").join("nested")]);
-    assert_eq!(found.outside, vec![root.join("notes.md")]);
+    let identity = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+    assert_eq!(found.outside, vec![identity.as_path().join("notes.md")]);
 }
 
 #[test]

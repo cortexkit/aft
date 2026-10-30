@@ -17626,6 +17626,8 @@ mod tests {
         let root = projects.join("alpha");
         let storage = base.join("storage");
         init_git_fixture(&root);
+        // Parent indexing requires multiple sibling projects, not a lone child.
+        init_git_fixture(&projects.join("beta"));
         let ctx = test_context();
         let response = handle_configure_for_test(
             &configure_request_with_params(json!({
