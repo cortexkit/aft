@@ -7845,6 +7845,8 @@ mod deferred_terminal_tests {
                 .unwrap();
         let output =
             std::path::PathBuf::from(std::env::var_os("AFT_INSPECT_WALK_PROFILE_OUTPUT").unwrap());
+        let requested_scope = std::env::var("AFT_INSPECT_WALK_PROFILE_SCOPE")
+            .unwrap_or_else(|_| "crates/aft/src/inspect".to_string());
         let storage = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
@@ -7882,7 +7884,7 @@ mod deferred_terminal_tests {
         let mut measurements = Vec::new();
         for (name, scope) in [
             ("unscoped", None),
-            ("scoped", Some("crates/aft/src/inspect")),
+            ("scoped", Some(requested_scope.as_str())),
         ] {
             walk_profile::take();
             let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -7914,6 +7916,10 @@ mod deferred_terminal_tests {
             let snapshot = build_snapshot(&ctx).unwrap();
             let cache = ctx.inspect_manager().cache_for_snapshot(&snapshot).unwrap();
             let mut measurement = measurement;
+            let caller_scope = scope.map_or_else(
+                || JobScope::for_project(root.clone()),
+                |relative| JobScope::from_roots(root.clone(), vec![root.join(relative)]),
+            );
             for category in [
                 InspectCategory::DeadCode,
                 InspectCategory::UnusedExports,
@@ -7931,6 +7937,15 @@ mod deferred_terminal_tests {
                     );
                 }
                 measurement["full_aggregates"][category.as_str()] = aggregate;
+                let outcome = ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
+                    snapshot.clone(),
+                    category,
+                    caller_scope.clone(),
+                );
+                let JobOutcome::Fresh { payload } = outcome else {
+                    panic!("{category}: {outcome:?}");
+                };
+                measurement["job_aggregates"][category.as_str()] = payload;
                 assert!(
                     measurement["response"]["summary"]
                         .get(category.as_str())

@@ -7906,6 +7906,76 @@ thread_local! {
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod guard_tests {
     #[test]
+    #[ignore = "full-checkout walk-only measurement; requires AFT_INSPECT_WALK_PROFILE_ROOT"]
+    fn inspect_checkout_walk_only_profile() {
+        use super::super::{inventory::InspectInventory, walk_profile};
+        let root = canonicalize_for_snapshot(&PathBuf::from(
+            std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").unwrap(),
+        ));
+        let output = PathBuf::from(std::env::var_os("AFT_INSPECT_WALK_PROFILE_OUTPUT").unwrap());
+        let storage = tempfile::tempdir().unwrap();
+        let cache = InspectCache::open(storage.path().to_path_buf(), root.clone()).unwrap();
+        let full = JobScope::for_project(root.clone());
+        let scoped = JobScope::from_roots(root.clone(), vec![root.join("crates/aft/src/inspect")]);
+        let manifest_count = super::super::entry_points::collect_entry_point_manifests(&root).len();
+        let stat = |files: &[PathBuf]| {
+            files
+                .iter()
+                .map(|path| {
+                    let metadata = std::fs::metadata(path).unwrap();
+                    (path.clone(), metadata.len(), metadata.modified().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let measure = |reuse: bool| {
+            walk_profile::take();
+            let started = Instant::now();
+            let cpu = walk_profile::cpu_ms();
+            // Reproduce the two freshness listings without starting analyzers.
+            // Only the extra scoped listing and hash discovery differ below.
+            let initial_walk = walk_profile::Walk::start("freshness_listing_proxy");
+            let inventory = reuse.then(|| Arc::new(InspectInventory::collect(&root, || true)));
+            let initial = inventory.as_ref().map_or_else(
+                || scope_files(&root, &full),
+                |inventory| inventory.sources.clone(),
+            );
+            let initial_stats = stat(&initial);
+            drop(initial_walk);
+            let guard = inventory.as_ref().map(|inventory| inventory.install());
+            let selected = scope_files(&root, &scoped);
+            let hash = cache
+                .contribution_set_hash(InspectCategory::Duplicates)
+                .unwrap();
+            let final_walk = walk_profile::Walk::start("freshness_listing_proxy");
+            let final_files = if reuse {
+                InspectInventory::collect(&root, || true).sources
+            } else {
+                scope_files(&root, &full)
+            };
+            assert_eq!(initial_stats, stat(&final_files));
+            drop(final_walk);
+            drop(guard);
+            let measurement = serde_json::json!({
+                "case": if reuse { "after" } else { "before" },
+                "ms": started.elapsed().as_secs_f64() * 1000.0,
+                "cpu_ms": walk_profile::cpu_ms() - cpu,
+                "walks": walk_profile::take(), "hash": hash,
+                "source_files": initial.len(), "scoped_files": selected.len(), "manifests": manifest_count,
+            });
+            (measurement, initial, selected)
+        };
+        let (before, before_files, before_scope) = measure(false);
+        let (after, after_files, after_scope) = measure(true);
+        assert_eq!(before_files, after_files);
+        assert_eq!(before_scope, after_scope);
+        assert_eq!(before["hash"], after["hash"]);
+        let result = serde_json::json!([before, after]);
+        eprintln!("inspect walk-only profile {result}");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+    }
+
+    #[test]
     fn inspect_scope_files_reuses_the_freshness_inventory() {
         use super::super::inventory::InspectInventory;
         let root = tempfile::tempdir().unwrap();
