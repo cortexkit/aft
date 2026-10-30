@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use super::helpers::{user_config, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::project::project_tempdir();
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {

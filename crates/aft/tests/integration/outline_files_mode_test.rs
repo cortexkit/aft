@@ -2,7 +2,6 @@ use super::helpers::AftProcess;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 fn write_file(root: &Path, relative: &str, content: &str) -> PathBuf {
     write_bytes(root, relative, content.as_bytes())
@@ -53,7 +52,7 @@ fn response_paths(resp: &Value) -> Vec<String> {
 
 #[test]
 fn outline_files_mode_explicit_info_excluded_target_lists_its_files() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let status = std::process::Command::new("git")
         .args(["init", "--quiet"])
         .current_dir(dir.path())
@@ -94,7 +93,7 @@ fn outline_files_mode_explicit_info_excluded_target_lists_its_files() {
 
 #[test]
 fn outline_files_mode_empty_and_fully_ignored_subtrees_are_explained() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let status = std::process::Command::new("git")
         .args(["init", "--quiet"])
         .current_dir(dir.path())
@@ -129,7 +128,7 @@ fn outline_files_mode_empty_and_fully_ignored_subtrees_are_explained() {
 
 #[test]
 fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let _ts = write_file(
         dir.path(),
         "src/service.ts",
@@ -183,7 +182,7 @@ fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
 
 #[test]
 fn outline_files_false_keeps_symbol_focused_directory_output() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(
         dir.path(),
         "src/service.ts",
@@ -223,7 +222,7 @@ fn outline_files_false_keeps_symbol_focused_directory_output() {
 
 #[test]
 fn outline_files_mode_rejects_file_targets() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let file = write_file(dir.path(), "single.ts", "export function single() {}\n");
 
     let mut aft = AftProcess::spawn();
@@ -248,7 +247,7 @@ fn outline_files_mode_rejects_file_targets() {
 
 #[test]
 fn outline_files_mode_lists_binary_unknown_extension_files() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_bytes(dir.path(), "blob.dat", &[0, 159, 146, 150, 0, 1]);
 
     let mut aft = AftProcess::spawn();
@@ -274,7 +273,7 @@ fn outline_files_mode_lists_binary_unknown_extension_files() {
 
 #[test]
 fn outline_files_mode_excludes_gitignored_paths_when_matcher_is_active() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(dir.path(), ".gitignore", "ignored.ts\nignored-dir/\n");
     write_file(dir.path(), "visible.ts", "export function visible() {}\n");
     write_file(dir.path(), "ignored.ts", "export function ignored() {}\n");
@@ -323,7 +322,7 @@ fn outline_files_mode_excludes_gitignored_paths_when_matcher_is_active() {
 
 #[test]
 fn outline_files_mode_collapses_data_heavy_directory_without_marking_it_incomplete() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let long_dir = format!("src/{}", "very-long-segment-".repeat(8));
     for index in 0..200 {
         write_file(
@@ -361,7 +360,7 @@ fn outline_files_mode_collapses_data_heavy_directory_without_marking_it_incomple
 
 #[test]
 fn files_mode_multi_target_uses_project_root_relative_paths() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(
         dir.path(),
         "src/shared/index.ts",
@@ -413,7 +412,7 @@ fn files_mode_multi_target_uses_project_root_relative_paths() {
 
 #[test]
 fn files_mode_single_target_keeps_target_relative_behavior() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(
         dir.path(),
         "src/shared/index.ts",
@@ -446,7 +445,7 @@ fn files_mode_single_target_keeps_target_relative_behavior() {
 
 #[test]
 fn files_mode_retires_the_200_file_render_cap() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     for index in (0..260).rev() {
         write_file(dir.path(), &format!("files/file-{index:03}.txt"), "x\n");
     }
@@ -481,7 +480,7 @@ fn files_mode_retires_the_200_file_render_cap() {
 
 #[test]
 fn outline_files_mode_sorts_entries_by_path() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(dir.path(), "zeta.ts", "export function zeta() {}\n");
     write_file(dir.path(), "alpha.ts", "export function alpha() {}\n");
     write_file(dir.path(), "nested/beta.ts", "export function beta() {}\n");
@@ -507,7 +506,7 @@ fn outline_files_mode_sorts_entries_by_path() {
 // convention — not a hardcoded complete:true.
 #[test]
 fn outline_multi_file_array_marks_incomplete_when_a_file_is_skipped() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let ok = write_file(dir.path(), "ok.ts", "export function ok() {}\n");
 
     let mut aft = AftProcess::spawn();
@@ -551,7 +550,7 @@ fn outline_multi_file_array_marks_incomplete_when_a_file_is_skipped() {
 
 #[test]
 fn files_mode_breadth_first_rollups_keep_code_visible_past_large_json_tree() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(dir.path(), "Cargo.toml", "[workspace]\n");
     for (crate_name, count) in [("a", 120), ("b", 120), ("c", 20)] {
         for index in 0..count {
@@ -611,7 +610,7 @@ fn files_mode_breadth_first_rollups_keep_code_visible_past_large_json_tree() {
 
 #[test]
 fn files_mode_excludes_tests_from_rows_and_rollup_counts_by_default() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(dir.path(), "src/lib.rs", "pub fn product() {}\n");
     write_file(
         dir.path(),

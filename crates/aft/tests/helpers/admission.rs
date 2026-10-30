@@ -20,3 +20,23 @@ pub fn settle(ctx: &AppContext) -> serde_json::Value {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// Complete a known project's folder check with all indexes disabled. Tests of
+/// deferred index loading can then send an index-enabled configure request and
+/// inspect state before background maintenance releases the index loaders.
+pub fn prepare_project(ctx: &AppContext, root: &std::path::Path, storage: &std::path::Path) {
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "fixture-admission", "command": "configure", "harness": "opencode",
+        "project_root": root, "storage_dir": storage,
+        "config": [{"tier": "user", "source": root.join("fixture-admission.jsonc"),
+            "doc": serde_json::json!({
+                "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                "views": {"enabled": false}
+            }).to_string()}]
+    }))
+    .unwrap();
+    let response = aft::commands::configure::handle_configure(&request, ctx);
+    assert!(response.success, "project setup failed: {response:?}");
+    let folder = settle(ctx);
+    assert_eq!(folder["classification"], "project", "{folder}");
+}

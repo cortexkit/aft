@@ -23,6 +23,54 @@ pub fn project_tempdir() -> tempfile::TempDir {
     directory
 }
 
+/// Use Git evidence when a fixture asserts the exact visible file inventory.
+/// Git metadata is excluded by project walkers, unlike an added root manifest.
+pub fn git_project_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create test Git project");
+    let root = directory.path();
+    let ignored_config = root.join(".git/aft-no-user-config");
+    let git = || {
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", &ignored_config)
+            .env("GIT_CONFIG_SYSTEM", &ignored_config)
+            .env("GIT_CONFIG_COUNT", "0");
+        command
+    };
+    let output = git()
+        .args(["init", "--quiet", "--template="])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = git()
+        .args([
+            "-c",
+            "user.name=AFT Tests",
+            "-c",
+            "user.email=aft-tests@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+        ])
+        .arg(format!("fixture at {}", root.display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    directory
+}
+
 /// Preserve existing Git or workspace evidence; only bare tool fixtures need
 /// the extra marker. In particular, checked-in source fixtures stay untouched.
 pub fn ensure_project(root: &Path) -> io::Result<()> {

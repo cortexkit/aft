@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use serde_json::json;
-use tempfile::tempdir;
 
 use super::helpers::{
     canonicalize_like_product, link_cached_path, user_config, warm_executable, AftProcess,
@@ -17,7 +16,7 @@ fn fake_server_path() -> PathBuf {
 
 #[test]
 fn lsp_inspect_reports_no_matching_servers() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let file = dir.path().join("example.foo");
     std::fs::write(&file, "content\n").unwrap();
 
@@ -28,6 +27,7 @@ fn lsp_inspect_reports_no_matching_servers() {
         "configure failed: {configure:?}"
     );
 
+    aft.wait_for_folder_admission();
     let resp = aft.send(
         &json!({
             "id": "inspect-none",
@@ -48,7 +48,7 @@ fn lsp_inspect_reports_no_matching_servers() {
 
 #[test]
 fn lsp_inspect_reports_missing_pyright_binary() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let package_dir = dir.path().join("python");
     std::fs::create_dir_all(&package_dir).unwrap();
     std::fs::write(package_dir.join("requirements.txt"), "requests\n").unwrap();
@@ -63,6 +63,7 @@ fn lsp_inspect_reports_missing_pyright_binary() {
         "configure failed: {configure:?}"
     );
 
+    aft.wait_for_folder_admission();
     let resp = aft.send(
         &json!({
             "id": "inspect-missing-pyright",
@@ -94,9 +95,10 @@ fn lsp_inspect_reports_missing_pyright_binary() {
 
 #[test]
 fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let root = dir.path().join("workspace");
     std::fs::create_dir_all(&root).unwrap();
+    crate::test_helpers::project::mark_project(&root).unwrap();
     std::fs::write(root.join("fake.toml"), "[project]\n").unwrap();
     let file = root.join("main.fake");
     std::fs::write(&file, "hello\n").unwrap();
@@ -142,6 +144,7 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
         "configure failed: {configure:?}"
     );
 
+    aft.wait_for_folder_admission();
     let resp = aft.send(
         &json!({
             "id": "inspect-custom-ok",
@@ -166,7 +169,7 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
 
 #[test]
 fn lsp_inspect_reports_nested_python_virtualenv_binary() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let backend = dir.path().join("backend");
     let file = backend.join("app").join("main.py");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -203,6 +206,7 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
         "configure failed: {configure:?}"
     );
 
+    aft.wait_for_folder_admission();
     let response = aft.send(
         &json!({
             "id": "inspect-nested-python-lsp",
@@ -242,8 +246,10 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
 
 #[test]
 fn lsp_inspect_classifies_nested_python_node_modules_binary() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let repository = dir.path().join("repository");
+    std::fs::create_dir_all(&repository).unwrap();
+    crate::test_helpers::project::mark_project(&repository).unwrap();
     let backend = repository.join("backend");
     let file = backend.join("app").join("main.py");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -278,6 +284,7 @@ fn lsp_inspect_classifies_nested_python_node_modules_binary() {
         "configure failed: {configure:?}"
     );
 
+    aft.wait_for_folder_admission();
     let response = aft.send(
         &json!({
             "id": "inspect-nested-python-node-lsp",
@@ -309,8 +316,10 @@ fn lsp_inspect_classifies_nested_python_node_modules_binary() {
 
 #[test]
 fn lsp_inspect_classifies_non_python_binary_against_project_root() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let repository = dir.path().join("repository");
+    std::fs::create_dir_all(&repository).unwrap();
+    crate::test_helpers::project::mark_project(&repository).unwrap();
     let package = repository.join("packages").join("app");
     let file = package.join("main.ts");
     std::fs::create_dir_all(&package).unwrap();
@@ -343,6 +352,7 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
         "configure failed: {configure:?}"
     );
 
+    aft.wait_for_folder_admission();
     let response = aft.send(
         &json!({
             "id": "inspect-nested-typescript-lsp",
@@ -378,7 +388,7 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
 #[test]
 #[ignore = "requires npm and oxlint@1.86.0 from the network or npm cache"]
 fn lsp_inspect_real_oxlint_reports_no_debugger() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
     let install = std::process::Command::new(npm)
         .args([
