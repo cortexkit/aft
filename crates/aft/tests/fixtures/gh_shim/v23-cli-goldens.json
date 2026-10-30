@@ -104,7 +104,7 @@
     "reply": "pr-enqueue-not-own",
     "exit": 86,
     "stdout": "",
-    "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write with a code this shim does not know: pr_edit_not_own; it was not retried\n",
+    "stderr": "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: pr_edit_not_own. 'pr edit' changes only pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by human. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received only reads; nothing was written. The agent must change the request.\n",
     "request": {"action": "pr enqueue", "repository": "cortexkit/aft", "target": {"number": 7}, "body": {"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"}}
   },
   {
@@ -113,7 +113,7 @@
     "reply": "pr-enqueue-graphql-errors",
     "exit": 86,
     "stdout": "",
-    "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write: vendor_rejected{status: 422}\n",
+    "stderr": "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: vendor_rejected{status: 422}. GitHub rejected the request. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.\n",
     "request": {"action": "pr enqueue", "repository": "cortexkit/aft", "target": {"number": 7}, "body": {"expected_head_sha": "0123456789abcdef0123456789abcdef01234567"}}
   }
 ]
