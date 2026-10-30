@@ -7,7 +7,7 @@ use crate::bash_background::{
 const TASK: &str = "bash-0000000000000081";
 const TASK_TWO: &str = "bash-0000000000000082";
 
-fn seed(
+pub(super) fn seed(
     f: &Fixture,
     id: &str,
     session: &str,
@@ -60,7 +60,7 @@ fn save_row(f: &Fixture, layout: &ResolvedTask, task: &PersistedTask) {
         .unwrap();
 }
 
-async fn query(f: &Fixture, id: &str, key: &str, extra: Value) -> Value {
+pub(super) async fn query(f: &Fixture, id: &str, key: &str, extra: Value) -> Value {
     let name = if id == "bash_output" {
         "bash_status"
     } else {

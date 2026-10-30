@@ -2890,13 +2890,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -3967,21 +3966,24 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
-    // A released handle cannot receive queued work. Cancel only before the
-    // executor's start transition; already-running mutations keep their result.
-    let queued =
-        queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
-    for (corr, request) in queued {
-        let terminal = build_error_frame(
-            request.ver,
-            channel.channel,
-            channel.epoch,
-            corr,
-            request.flags,
-            "route_released",
-            "route released before execution; the tool did not run",
-        )?;
-        send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+    // A replacement project route keeps replayable calls, even those still
+    // waiting in the executor. Release queued calls only when no project route
+    // replaces the old handle; already-running mutations keep their result.
+    if replacement_root.is_none() {
+        let queued =
+            queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+        for (corr, request) in queued {
+            let terminal = build_error_frame(
+                request.ver,
+                channel.channel,
+                channel.epoch,
+                corr,
+                request.flags,
+                "route_released",
+                "route released before execution; the tool did not run",
+            )?;
+            send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+        }
     }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch allocation is a new daemon route/client handle. AFT retains
@@ -17707,6 +17709,23 @@ mod tests {
     }
 
     #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
+    }
+
+    #[test]
     fn quiesced_root_refuses_preserved_inspect_spawn_and_rebind_is_safe() {
         use crate::lsp::manager::ServerAttemptResult;
         use crate::lsp::registry::ServerKind;
@@ -17955,14 +17974,17 @@ mod tests {
             ctx.lsp_child_registry(),
         );
         assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
-        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
-        // The forced kill does not wait; its worker thread reaps the child
-        // right after. Hang guard only.
+        // The shared budget bounds the caller, not its detached reapers. A slow
+        // Windows force-kill can leave the completion report pending at that
+        // deadline. Require eventual process exit and registry cleanup instead;
+        // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
             assert!(
                 Instant::now() < deadline,
-                "exit sweep left server {pid} running"
+                "exit sweep did not reap server {pid}: {outcome:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }

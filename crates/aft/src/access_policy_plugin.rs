@@ -1,8 +1,9 @@
 //! Short-lived, route-bound capabilities for standalone host permission loops.
 
-use super::AccessGrant;
+use super::{AccessGrant, AccessOperation};
 use std::any::Any;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,10 @@ pub(crate) struct Scope {
     /// ask for one of them says so, so the host knows the user answered too
     /// late rather than the approval being refused.
     expired: Vec<AccessGrant>,
+    /// Grants presented on a different route with the same session and tool.
+    /// These are diagnostic only: a replacement route needs a fresh approval.
+    replaced: Vec<AccessGrant>,
+    presented_outside_token: bool,
 }
 
 impl Scope {
@@ -36,6 +41,8 @@ impl Scope {
             tool: String::new(),
             first_approved: None,
             expired: Vec::new(),
+            replaced: Vec::new(),
+            presented_outside_token: false,
         }
     }
 
@@ -45,6 +52,42 @@ impl Scope {
         self.expired
             .iter()
             .any(|expired| expired.operation == grant.operation && expired.path == grant.path)
+    }
+
+    pub(crate) fn retry_refusal_reason(
+        &self,
+        grant: &AccessGrant,
+        claimed_any: bool,
+    ) -> Option<&'static str> {
+        if self.presented_expired(grant) {
+            Some("approval_expired")
+        } else if self
+            .replaced
+            .iter()
+            .any(|replaced| replaced.covers_kind(grant.operation, &grant.path, grant.kind))
+        {
+            Some("approval_route_replaced")
+        } else if self.presented_outside_token {
+            Some(if claimed_any {
+                "approval_not_covered"
+            } else {
+                "approval_not_recognized"
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn log_retry_refusal(&self, operation: AccessOperation, path: &Path, reason: &str) {
+        if !self.presented_outside_token {
+            return;
+        }
+        let operation = match operation {
+            AccessOperation::Read => "read",
+            AccessOperation::Write => "write",
+        };
+        let path_hash = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+        crate::slog_info!("outside-access retry refused reason={reason} operation={operation} path_hash={path_hash}");
     }
 }
 
@@ -93,7 +136,9 @@ const TTL: Duration = Duration::from_secs(5 * 60);
 const EXPIRED_GRACE: Duration = Duration::from_secs(60 * 60);
 
 fn retained(token: &Issued, now: Instant) -> bool {
-    token.expires + EXPIRED_GRACE > now && token.scope.route.strong_count() > 0
+    // Keep dead-route records for the same bounded diagnostic window as
+    // expired tokens. Their weak route identity can never authorize a new route.
+    token.expires + EXPIRED_GRACE > now
 }
 /// How long one approval can be carried forward by preview-to-apply
 /// continuations. Past this, the host must ask the user again.
@@ -144,7 +189,18 @@ pub(crate) fn claim(scope: &mut Scope, ids: &[String]) -> Vec<AccessGrant> {
     let now = Instant::now();
     tokens.retain(|_, token| retained(token, now));
     let mut grants = Vec::new();
+    scope.presented_outside_token |= ids.iter().any(|id| id.starts_with("outside:"));
     for id in ids {
+        if let Some(token) = tokens.get(id) {
+            if token.scope.session == scope.session
+                && token.scope.tool == scope.tool
+                && !token.scope.route.ptr_eq(&scope.route)
+            {
+                // Do not consume another route's token or add its authority.
+                // The marker only lets the host offer a new approval prompt.
+                scope.replaced.push(token.grant.clone());
+            }
+        }
         if tokens.get(id).is_some_and(|token| token.scope == *scope) {
             if let Some(token) = tokens.remove(id) {
                 if token.expires <= now {
@@ -267,6 +323,64 @@ mod tests {
         TOKENS.lock().unwrap().get_mut(&expired).unwrap().expires =
             Instant::now() - Duration::from_secs(1);
         assert!(claim(&mut scope, &[expired]).is_empty());
+    }
+
+    #[test]
+    fn plugin_route_replacement_marker_does_not_consume_or_widen_grants() {
+        let owner = Arc::new(());
+        let replacement = Arc::new(());
+        let mut original = Scope::new(&owner, "session").for_tool("grep", &serde_json::Value::Null);
+        let grant = AccessGrant {
+            path: "/outside/packages".into(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        let token = issue(&original, &grant);
+        for (session, tool) in [("other", "grep"), ("session", "read")] {
+            let mut foreign =
+                Scope::new(&replacement, session).for_tool(tool, &serde_json::Value::Null);
+            assert!(claim(&mut foreign, std::slice::from_ref(&token)).is_empty());
+            assert_eq!(
+                foreign.retry_refusal_reason(&grant, false),
+                Some("approval_not_recognized")
+            );
+        }
+        let mut replaced =
+            Scope::new(&replacement, "session").for_tool("grep", &serde_json::Value::Null);
+        assert!(claim(&mut replaced, std::slice::from_ref(&token)).is_empty());
+        assert_eq!(
+            replaced.retry_refusal_reason(&grant, false),
+            Some("approval_route_replaced")
+        );
+        let sibling = AccessGrant {
+            path: "/outside/packages-sibling".into(),
+            ..grant.clone()
+        };
+        assert_eq!(
+            replaced.retry_refusal_reason(&sibling, false),
+            Some("approval_not_recognized")
+        );
+        // A foreign route's diagnostic probe must not spend the original route's approval.
+        assert_eq!(claim(&mut original, &[token]), vec![grant]);
+    }
+
+    #[test]
+    fn plugin_dead_route_diagnostics_have_a_bounded_lifetime() {
+        let owner = Arc::new(());
+        let now = Instant::now();
+        let issued = Issued {
+            scope: Scope::new(&owner, "session"),
+            grant: AccessGrant {
+                path: "/outside/packages".into(),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Read,
+            },
+            expires: now + TTL,
+            origin: None,
+        };
+        drop(owner);
+        assert!(retained(&issued, now));
+        assert!(!retained(&issued, now + TTL + EXPIRED_GRACE));
     }
 
     /// Each preview-to-apply renewal gets a fresh short TTL, but a chain of

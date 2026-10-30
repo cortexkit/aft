@@ -35,12 +35,24 @@ impl Store {
             return Ok(None);
         };
         if owner != incarnation || digest.as_slice() != payload_digest {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::legacy_dispatch_status",
+                if owner != incarnation {
+                    "nonce_owner_mismatch"
+                } else {
+                    "nonce_payload_mismatch"
+                },
+                serde_json::json!({"incarnation": incarnation}),
+            ));
         }
         match state.as_str() {
             "queued" => Ok(Some(LegacyDispatchStatus::Queued)),
             "settled" => Ok(Some(LegacyDispatchStatus::Settled)),
-            _ => Err(unavailable()),
+            _ => Err(unavailable(
+                "db::gh_speech::legacy_dispatch_status",
+                "dispatch_state",
+                serde_json::json!({"incarnation": incarnation}),
+            )),
         }
     }
 
@@ -103,7 +115,11 @@ impl Store {
         let changed = tx.execute("UPDATE gh_speech_legacy_dispatch SET state='settled' WHERE request_nonce=?1 AND incarnation=?2 AND forwarding_run=?3 AND state='queued'",
             params![nonce,incarnation,forwarding_run]).map_err(db_error)?;
         if changed != 1 {
-            return Err(unavailable());
+            return Err(unavailable(
+                "db::gh_speech::settle_legacy_dispatch",
+                "dispatch_not_queued_for_owner",
+                serde_json::json!({"incarnation": incarnation, "changed_rows": changed}),
+            ));
         }
         tx.commit().map_err(db_error)
     }
@@ -140,9 +156,19 @@ impl Store {
         for row in rows {
             let (text, digest, pending) = row.map_err(db_error)?;
             if digest.as_slice() != blake3::hash(text.as_bytes()).as_bytes() {
-                return Err(unavailable());
+                return Err(unavailable(
+                    "db::gh_speech::pending_legacy_for_scope",
+                    "record_digest_mismatch",
+                    serde_json::json!({"scope_epoch": scope.scope_epoch}),
+                ));
             }
-            let record: AuthorityRecord = serde_json::from_str(&text).map_err(|_| unavailable())?;
+            let record: AuthorityRecord = serde_json::from_str(&text).map_err(|_| {
+                unavailable(
+                    "db::gh_speech::pending_legacy_for_scope",
+                    "record_decode",
+                    serde_json::json!({"scope_epoch": scope.scope_epoch}),
+                )
+            })?;
             record.launch.validate()?;
             let lifecycle = record
                 .launch

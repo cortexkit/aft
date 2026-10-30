@@ -590,7 +590,11 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
             (raw_line, name, lines)
         }
         None => {
-            let matched = super::matching_line_from_source(&result.path, prose, None)
+            // Match against the same raw bytes used for the body, preserving
+            // strict UTF-8 admission without reopening every whole-file entry.
+            let matched = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|source| super::matching_line_in_text(source, prose, None))
                 .map(|(line, _)| line as usize);
             let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
             let name =

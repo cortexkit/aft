@@ -1,0 +1,1 @@
+- `aft_search` no longer returns stale exact matches after files change while views are off: a file edited or created to contain the searched text now appears, and one that no longer contains it drops out.

@@ -5399,21 +5399,32 @@ pub(crate) fn capture_speech_policy() -> Result<
 }
 
 fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
-    use crate::gh_shim_speech::{Code, Refusal};
-    let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
-    let envelope: SignedManifest = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-    if envelope.artifact_id != MANIFEST_ARTIFACT_ID || envelope.envelope_version != ENVELOPE_VERSION
-    {
-        return Err(invalid());
+    let invalid = |check| {
+        crate::gh_shim_speech::snapshot_invalid(
+            "gh_shim::verified_speech_manifest",
+            check,
+            json!({"envelope_bytes": bytes.len()}),
+        )
+    };
+    let envelope: SignedManifest =
+        serde_json::from_slice(bytes).map_err(|_| invalid("envelope_json"))?;
+    if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
+        return Err(invalid("artifact_id"));
+    }
+    if envelope.envelope_version != ENVELOPE_VERSION {
+        return Err(invalid("envelope_version"));
     }
     let verified = verify_manifest_envelope(&envelope, compiled_manifest_trust_set())
-        .map_err(|_| invalid())?;
+        .map_err(|_| invalid("envelope_verification"))?;
     let manifest = verified.manifest;
-    manifest.validate().map_err(|_| invalid())?;
-    if manifest.schema_floor < SCHEMA_FLOOR
-        || manifest.issued_at_unix_secs > unix_seconds() + ISSUED_AT_FUTURE_SKEW.as_secs()
-    {
-        return Err(invalid());
+    manifest
+        .validate()
+        .map_err(|_| invalid("manifest_validation"))?;
+    if manifest.schema_floor < SCHEMA_FLOOR {
+        return Err(invalid("schema_floor"));
+    }
+    if manifest.issued_at_unix_secs > unix_seconds() + ISSUED_AT_FUTURE_SKEW.as_secs() {
+        return Err(invalid("issued_at_in_future"));
     }
     Ok(manifest)
 }
@@ -14748,7 +14759,21 @@ INHERITED FLAGS
     #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn future_issued_at_fixture_is_refused_and_aged_fixture_serves_governed_classification() {
+        // Self-report reads process-wide config. Keep fixtures that disable the
+        // shim from changing it while this test observes an active manifest.
+        let _lock = crate::test_env::process_env_lock();
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let _home = ScopedTestEnvVar::set("HOME", Some(root));
+        let _profile = ScopedTestEnvVar::set("USERPROFILE", Some(root));
+        let _xdg = ScopedTestEnvVar::set("XDG_CONFIG_HOME", Some(root));
+        let config = crate::subc_config::user_config_path_from(
+            Some(directory.path().as_os_str()),
+            Some(directory.path().as_os_str()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, br#"{"github":{"shim":true}}"#).unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
 
         write_envelope_fixture(
@@ -16605,11 +16630,20 @@ fn run_captured_protected(
             return status;
         }
     }
-    let (manifest, classification, binding, rung) =
-        match captured_plan(args, paths, target, cwd, now) {
-            Ok(plan) => plan,
-            Err(error) => return refuse(RefusalCode::SeamRefusal, &error.agent_text()),
-        };
+    let (manifest, classification, binding, rung) = match captured_plan(
+        args, paths, target, cwd, now,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let mut text = error.agent_text();
+            // run_with refuses worker writes before this head-shell path.
+            // Do not put operator-bypass advice in shared refusal text.
+            if error.code == Code::PolicyDenied && error.reason == "not_governed" {
+                text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
+            }
+            return refuse(RefusalCode::SeamRefusal, &text);
+        }
+    };
     // Protected invocations never hand native gh the operator's credentials.
     dispatch_r3(
         args,

@@ -11,6 +11,102 @@ use crate::gh_shim_speech::ScopeRole;
 
 use super::*;
 
+#[test]
+fn database_error_warning_does_not_include_raw_error_values() {
+    crate::gh_shim_speech::tests::assert_snapshot_warning(
+        || {
+            db_error(rusqlite::Error::InvalidParameterName(
+                "secret-parameter".into(),
+            ))
+        },
+        "db::gh_speech::db_error",
+        "database_operation",
+        serde_json::json!({"sqlite_code": "None"}),
+    );
+}
+
+#[test]
+fn authority_refresh_accepts_only_exact_foreground_seal_and_activation_steps() {
+    let (_dir, store, record) = fixture();
+    store
+        .initialize_policy(record.policy.as_ref().unwrap(), 20)
+        .unwrap();
+    store.capture(&record).unwrap();
+    let initial = store.get(&record.incarnation).unwrap();
+    store
+        .seal(
+            &record.incarnation,
+            &ExecutionSeal {
+                child_pid: 123,
+                child_start_time_ms: 456,
+                birth_identity: "child".into(),
+            },
+        )
+        .unwrap();
+    let sealed = store
+        .revalidate_authority(&initial, &[7; 32], true)
+        .unwrap();
+    assert_eq!(sealed.generation, initial.generation + 1);
+    assert_eq!(
+        store
+            .revalidate_authority(&initial, &[7; 32], false)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+    store
+        .activate(&record.incarnation, &[7; 32], &record.minting_run)
+        .unwrap();
+    assert_eq!(
+        store
+            .revalidate_authority(&initial, &[7; 32], true)
+            .unwrap()
+            .generation,
+        initial.generation + 2
+    );
+    assert_eq!(
+        store
+            .revalidate_authority(&sealed, &[7; 32], true)
+            .unwrap()
+            .phase,
+        "active"
+    );
+    assert_eq!(
+        store
+            .revalidate_authority(&sealed, &[8; 32], true)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+    let active = store.get(&record.incarnation).unwrap();
+    let mut unsealed_active = active.clone();
+    unsealed_active.record.seal = None;
+    unsealed_active.generation -= 1;
+    assert_eq!(
+        store
+            .revalidate_authority(&unsealed_active, &[7; 32], true)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid",
+        "sealing an already-active row is not a recognized lifecycle step",
+    );
+    store
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE gh_speech_authorities SET generation=generation+1",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .revalidate_authority(&active, &[7; 32], true)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid"
+    );
+}
+
 fn stamp() -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Reserved {
@@ -231,6 +327,74 @@ fn own_run_memory_miss_cannot_use_the_cold_path() {
             .record
             .incarnation,
         "inc-a"
+    );
+}
+
+#[test]
+fn invalid_authority_rows_warn_with_the_failed_check_and_no_record_contents() {
+    let (_dir, store, record) = fixture();
+    let warn = |check, operation: &dyn Fn() -> Refusal| {
+        crate::gh_shim_speech::tests::assert_snapshot_warning(
+            operation,
+            "db::gh_speech::load",
+            check,
+            serde_json::json!({"incarnation": record.incarnation}),
+        );
+    };
+    warn("authority_row_missing", &|| {
+        store.get(&record.incarnation).unwrap_err()
+    });
+    store.capture(&record).unwrap();
+    let conn = store.connect().unwrap();
+    conn.execute(
+        "UPDATE gh_speech_authorities SET record_json='secret-invalid-json'",
+        [],
+    )
+    .unwrap();
+    warn("record_digest_mismatch", &|| {
+        store.get(&record.incarnation).unwrap_err()
+    });
+    conn.execute(
+        "UPDATE gh_speech_authorities SET record_digest=?1",
+        [blake3::hash(b"secret-invalid-json").as_bytes().as_slice()],
+    )
+    .unwrap();
+    warn("record_decode", &|| {
+        store.get(&record.incarnation).unwrap_err()
+    });
+    let (text, digest) = encoded(&record).unwrap();
+    conn.execute(
+        "UPDATE gh_speech_authorities SET record_json=?1,record_digest=?2,task_id='different-task'",
+        params![text, digest],
+    )
+    .unwrap();
+    warn("task_mismatch", &|| {
+        store.get(&record.incarnation).unwrap_err()
+    });
+}
+
+#[test]
+fn invalid_final_gate_warns_with_both_generations_and_never_sends() {
+    let (_dir, store, record) = fixture();
+    let stored = activate(&store, &record);
+    crate::gh_shim_speech::tests::assert_snapshot_warning(
+        || match store
+            .final_gate(
+                &record.incarnation,
+                "secret-nonce",
+                stored.generation - 1,
+                0,
+                record.policy.as_ref().unwrap(),
+                || -> Result<(), Refusal> { panic!("invalid authority must not enqueue a write") },
+            )
+            .unwrap_err()
+        {
+            GateError::BeforeSend(refusal) => refusal,
+            GateError::AfterSend => panic!("must refuse before sending"),
+        },
+        "db::gh_speech::validate_gate",
+        "authority_generation_mismatch",
+        serde_json::json!({"incarnation": record.incarnation, "generation": stored.generation, "expected_generation": stored.generation - 1, "allow_candidate": false}),
     );
 }
 
