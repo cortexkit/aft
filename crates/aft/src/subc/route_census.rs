@@ -636,7 +636,20 @@ mod tests {
             }),
         );
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let value = fixture.snapshot(&executor, &metrics, now).render(&executor);
+        // The census reads the executor's running read requests with a
+        // try-lock and reports `read_lease: null` (unknown) when the scheduler
+        // holds that lock at that instant. Take snapshots until one is not
+        // contended; the parked job keeps both pins in place meanwhile.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let value = loop {
+            let value = fixture.snapshot(&executor, &metrics, now).render(&executor);
+            if !value["roots"][0]["routes"][0]["pins"]["read_lease"].is_null()
+                || std::time::Instant::now() >= deadline
+            {
+                break value;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         drop(release_tx);
         assert!(response.blocking_recv().unwrap().success);
         assert_eq!(value["roots"][0]["routes"][0]["pins"]["in_flight_call"], 1);
