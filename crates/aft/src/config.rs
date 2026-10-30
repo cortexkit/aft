@@ -824,6 +824,7 @@ pub struct BashConfig {
     pub worker_wait_max_ms: u64,
     /// Put Linux tool shells in transient user scopes when systemd is available.
     pub linux_scope: bool,
+    pub linux_scope_max_runtime_secs: u64,
     /// Aggregate local-command memory ceiling in MiB; absent means unlimited.
     pub memory_limit_mib: Option<u64>,
     /// On macOS, agent commands become responsible for their own privacy permissions.
@@ -862,7 +863,8 @@ impl Default for BashConfig {
             db_schema_hints: true,
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             worker_wait_max_ms: default_bash_worker_wait_max_ms(),
-            linux_scope: false,
+            linux_scope: true,
+            linux_scope_max_runtime_secs: 86_400,
             memory_limit_mib: None,
             disclaim_privacy: false,
             powershell_tool: false,
