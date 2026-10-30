@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 #[cfg(test)]
 use crate::callgraph_store::join::Parser;
@@ -18,7 +18,7 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-use crate::callgraph_store::disk_facts::DiskFacts;
+use crate::callgraph_store::disk_facts::{CanonicalProbeMemo, DiskFacts};
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
 #[cfg(test)]
 use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
@@ -35,11 +35,9 @@ use crate::symbols::{Range, Symbol, SymbolKind};
 // ---------------------------------------------------------------------------
 
 type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
-// Member directories per canonical workspace root. The walk that produces them
-// visits every directory under the workspace with a realpath each, so it is
-// keyed by the workspace and not by the package being looked up: the first
-// resolution of each distinct bare import must not pay the walk again.
-type WorkspaceMemberDirsCache = HashMap<PathBuf, Arc<Vec<PathBuf>>>;
+// A cell per canonical root coalesces simultaneous parse-pool misses without
+// holding the process-wide map lock while traversing unrelated workspaces.
+type WorkspaceMemberDirsCache = HashMap<PathBuf, Arc<OnceLock<Arc<Vec<PathBuf>>>>>;
 type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
 type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
 
@@ -54,7 +52,8 @@ static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
 
 // Cold builds retain one resolver memo across every staged reference window. The
 // entry and retained-weight ceilings keep that speedup inside the bounded-build
-// working-set contract: at most 9 MiB of estimated keys/values are retained.
+// working-set contract: at most 9 MiB of estimated keys/values are retained here,
+// plus 4 MiB for canonical probe identities owned by the same snapshot.
 const MODULE_RESOLUTION_MEMO_MAX_ENTRIES: usize = 32_768;
 const MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES: usize = 3 * 1024 * 1024;
 const JSON_VALUE_MEMO_MAX_ENTRIES: usize = 8_192;
@@ -234,6 +233,7 @@ impl<K: Eq + std::hash::Hash + Clone + MemoKeyWeight, V> BoundedMemo<K, V> {
 /// the memo is dropped when publication completes or the build aborts.
 pub(crate) struct ModuleResolutionMemo {
     enabled: bool,
+    canonical_probes: Arc<CanonicalProbeMemo>,
     module_paths: MemoCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
     json_values: MemoCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
     workspace_packages: MemoCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
@@ -253,6 +253,7 @@ impl Default for ModuleResolutionMemo {
     fn default() -> Self {
         Self {
             enabled: true,
+            canonical_probes: Arc::default(),
             module_paths: MemoCell::new(BoundedMemo::new(
                 MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
                 MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
@@ -283,6 +284,14 @@ impl Default for ModuleResolutionMemo {
 }
 
 impl ModuleResolutionMemo {
+    pub(crate) fn disk_facts(&self, root: &Path) -> DiskFacts {
+        if self.enabled {
+            DiskFacts::with_probe_memo(root, Arc::clone(&self.canonical_probes))
+        } else {
+            DiskFacts::new(root)
+        }
+    }
+
     fn resolve_module_path(
         &self,
         from_dir: &Path,
@@ -3350,11 +3359,25 @@ fn cached_workspace_member_dirs(
             facts.facts.memo_replay(workspace_root, "members", "");
             return members;
         }
-    } else if let Ok(cache) = WORKSPACE_MEMBER_DIRS_CACHE.read() {
-        if let Some(members) = cache.get(workspace_root) {
+    } else {
+        let cell = WORKSPACE_MEMBER_DIRS_CACHE
+            .write()
+            .expect("workspace member cache poisoned")
+            .entry(workspace_root.to_path_buf())
+            .or_default()
+            .clone();
+        let mut populated = false;
+        let members = cell.get_or_init(|| {
+            populated = true;
+            facts.facts.memo_start(workspace_root, "members", "");
+            let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
+            facts.facts.memo_finish(workspace_root, "members", "");
+            members
+        });
+        if !populated {
             facts.facts.memo_replay(workspace_root, "members", "");
-            return Arc::clone(members);
         }
+        return Arc::clone(members);
     }
     facts.facts.memo_start(workspace_root, "members", "");
     let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
@@ -3363,8 +3386,6 @@ fn cached_workspace_member_dirs(
         facts
             .facts
             .remember_workspace_members(workspace_root, Arc::clone(&members));
-    } else if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
-        cache.insert(workspace_root.to_path_buf(), Arc::clone(&members));
     }
     members
 }
@@ -3472,12 +3493,34 @@ fn expand_workspace_patterns(
         .collect();
     let negatives = build_glob_set(&negative_patterns);
 
+    // Workspace membership is manifest-defined, not gitignore-defined: a
+    // manifest can intentionally name an ignored vendor directory. In addition
+    // to the existing excluded names and filesystem boundary, prune branches
+    // outside every positive pattern's literal directory prefix.
+    // Keep wildcard matching unchanged (including '*' matching separators).
+    let prefixes: Vec<_> = positive_patterns
+        .iter()
+        .map(|pattern| {
+            if pattern.contains('\\') {
+                return (PathBuf::new(), true);
+            }
+            match pattern.find(['*', '?', '[', '{']) {
+                Some(first_glob) => {
+                    let end = pattern[..first_glob].rfind('/').unwrap_or(0);
+                    (PathBuf::from(&pattern[..end]), true)
+                }
+                None => (PathBuf::from(pattern), false),
+            }
+        })
+        .collect();
+
     let mut members = Vec::new();
     collect_workspace_member_dirs(
         workspace_root,
         workspace_root,
         &positives,
         &negatives,
+        &prefixes,
         &mut members,
         facts,
     );
@@ -3501,9 +3544,12 @@ fn collect_workspace_member_dirs(
     dir: &Path,
     positives: &GlobSet,
     negatives: &GlobSet,
+    prefixes: &[(PathBuf, bool)],
     members: &mut Vec<PathBuf>,
     facts: &FactPaths<'_>,
 ) {
+    #[cfg(test)]
+    crate::callgraph_store::work_counts::note_workspace_directory(dir);
     for entry in facts.list_dir(dir) {
         if entry.kind != EntryKind::Directory {
             continue;
@@ -3517,16 +3563,35 @@ fn collect_workspace_member_dirs(
             continue;
         }
 
-        if facts.is_file(&path.join("package.json")) {
-            if let Ok(rel) = path.strip_prefix(workspace_root) {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                if positives.is_match(&rel) && !negatives.is_match(&rel) {
-                    members.push(path.clone());
-                }
-            }
+        let Ok(rel) = path.strip_prefix(workspace_root) else {
+            continue;
+        };
+        if !prefixes.iter().any(|(prefix, recursive)| {
+            prefix.starts_with(rel) || (*recursive && rel.starts_with(prefix))
+        }) {
+            continue;
+        }
+        let candidate = rel.to_string_lossy().replace('\\', "/");
+        if positives.is_match(&candidate)
+            && !negatives.is_match(&candidate)
+            && facts.is_file(&path.join("package.json"))
+        {
+            members.push(path.clone());
         }
 
-        collect_workspace_member_dirs(workspace_root, &path, positives, negatives, members, facts);
+        if prefixes.iter().any(|(prefix, recursive)| {
+            (prefix != rel && prefix.starts_with(rel)) || (*recursive && rel.starts_with(prefix))
+        }) {
+            collect_workspace_member_dirs(
+                workspace_root,
+                &path,
+                positives,
+                negatives,
+                prefixes,
+                members,
+                facts,
+            );
+        }
     }
 }
 
@@ -5394,6 +5459,114 @@ function hidden() {}
             resolved.ends_with("src/index.mts"),
             "dist/index.mjs should map to src/index.mts, got {resolved:?}"
         );
+    }
+
+    #[test]
+    fn cold_workspace_walk_prunes_unreachable_trees_but_keeps_ignored_members() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for member in ["packages/a", "packages/a/nested", "vendor/ignored"] {
+            fs::create_dir_all(root.join(member)).unwrap();
+            fs::write(root.join(member).join("package.json"), "{}").unwrap();
+        }
+        fs::write(root.join(".gitignore"), "vendor/\nbenchmarks/clones/\n").unwrap();
+        let mut clone = root.join("benchmarks/clones");
+        for _ in 0..40 {
+            clone.push("nested");
+        }
+        fs::create_dir_all(clone).unwrap();
+        for excluded in ["node_modules", ".git", "target", "dist", "build"] {
+            fs::create_dir_all(root.join(excluded).join("pkg")).unwrap();
+            fs::write(root.join(excluded).join("pkg/package.json"), "{}").unwrap();
+        }
+        let disk = DiskFacts::new(&root);
+        let facts = FactPaths {
+            root: &root,
+            facts: &disk,
+        };
+        crate::callgraph_store::work_counts::reset_under(&root);
+        let members = expand_workspace_patterns(&root, &["packages/*".into()], &facts);
+        assert_eq!(
+            members,
+            [root.join("packages/a"), root.join("packages/a/nested")],
+            "preserve the existing glob match semantics, including '*' across separators"
+        );
+        let (_, _, visits, _) = crate::callgraph_store::work_counts::filesystem_counts(&root);
+        assert_eq!(
+            visits, 4,
+            "only the root and the packages subtree need enumeration"
+        );
+        let members = expand_workspace_patterns(&root, &["vendor/*".into()], &facts);
+        assert_eq!(
+            members,
+            [root.join("vendor/ignored")],
+            "gitignore cannot veto a workspace manifest"
+        );
+
+        // An independent, unpruned enumeration provides the expected candidates.
+        fn candidates(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap().map(Result::unwrap) {
+                if !entry.file_type().unwrap().is_dir()
+                    || matches!(
+                        entry.file_name().to_str(),
+                        Some("node_modules" | ".git" | "target" | "dist" | "build")
+                    )
+                {
+                    continue;
+                }
+                let path = entry.path();
+                if path.join("package.json").is_file() {
+                    out.push(path.clone());
+                }
+                candidates(&path, out);
+            }
+        }
+        let mut all = Vec::new();
+        candidates(&root, &mut all);
+        for patterns in [
+            vec!["packages/a"],
+            vec!["packages/**", "!packages/*/nested"],
+            vec!["{packages,vendor}/**"],
+            vec!["pack*/a*"],
+            vec!["**/ignored"],
+            vec!["vendor/*"],
+            vec!["[pv]*/**"],
+            vec!["packages/a/"],
+        ] {
+            let positives = build_glob_set(
+                &patterns
+                    .iter()
+                    .copied()
+                    .filter(|p| !p.starts_with('!'))
+                    .collect::<Vec<_>>(),
+            );
+            let negatives = build_glob_set(
+                &patterns
+                    .iter()
+                    .filter_map(|p| p.strip_prefix('!'))
+                    .collect::<Vec<_>>(),
+            );
+            let mut expected: Vec<_> = all
+                .iter()
+                .filter(|p| {
+                    let rel = p
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    positives.is_match(&rel) && !negatives.is_match(&rel)
+                })
+                .cloned()
+                .collect();
+            let mut actual = expand_workspace_patterns(
+                &root,
+                &patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                &facts,
+            );
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{patterns:?}");
+        }
     }
 
     /// A bare package import that is not a workspace member costs one

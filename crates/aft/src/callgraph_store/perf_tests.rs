@@ -994,6 +994,116 @@ fn report(label: &str, counts: &WorkCounts) {
     );
 }
 
+/// Run against a fixed checkout so filesystem work and every persisted edge can
+/// be compared across resolver implementations, independently of source edits.
+#[test]
+#[ignore = "measurement: needs AFT_CALLGRAPH_MEASURE_ROOT and AFT_CALLGRAPH_MEASURE_DUMP"]
+fn cold_callgraph_filesystem_real_repo() {
+    let root = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_ROOT").expect("root"));
+    let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_DUMP").expect("dump"));
+    let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+    assert!(
+        !files.is_empty(),
+        "no source files under {}",
+        root.display()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+    let compiles = install_compile_counter(&store);
+    callgraph::clear_workspace_package_cache();
+    // This ignored test runs alone. Reset all paths, not just the corpus, so
+    // ancestor probes outside the checkout are included in the build census.
+    let all_paths = Path::new("");
+    work_counts::reset_under(all_paths);
+    let (result, counts) = measure(&root, compiles, || store.cold_build(&files));
+    result.unwrap();
+    report("cold_callgraph_filesystem", &counts);
+    let (canonical, unique, workspace_dirs, all_dirs) = work_counts::filesystem_counts(all_paths);
+    let realpaths = work_counts::realpaths_under(all_paths);
+    let rows = dump_graph_rows(&store);
+    let edges = rows
+        .lines()
+        .filter(|line| line.starts_with("edges\t"))
+        .collect::<Vec<_>>();
+    fs::create_dir_all(&dump).unwrap();
+    fs::write(dump.join("edges.txt"), edges.join("\n")).unwrap();
+    eprintln!("cold filesystem: files={} edges={} canonicalize_path={canonical} unique_paths={unique} repeated_paths={} realpaths={realpaths} workspace_directory_visits={workspace_dirs} all_directory_reads={all_dirs} wall_ms={}", files.len(), edges.len(), canonical - unique, counts.wall.as_millis());
+}
+
+#[test]
+fn cold_callgraph_probe_identities_are_shared_across_files_not_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    write(&root, "package.json", "{}");
+    let memo = callgraph::ModuleResolutionMemo::default();
+    work_counts::reset_under(&root);
+    for _ in 0..12 {
+        let disk = memo.disk_facts(&root);
+        let facts = FactPaths {
+            root: &root,
+            facts: &disk,
+        };
+        assert!(facts.is_file(&root.join("package.json")));
+        assert!(!facts.is_file(&root.join("tsconfig.json")));
+    }
+    let (calls, unique, _, _) = work_counts::filesystem_counts(&root);
+    assert_eq!(
+        (calls, unique),
+        (2, 2),
+        "positive and negative probes must each resolve once across file-local DiskFacts"
+    );
+    assert_eq!(work_counts::realpaths_under(&root), 3);
+
+    let next_build = callgraph::ModuleResolutionMemo::default();
+    let disk = next_build.disk_facts(&root);
+    let facts = FactPaths {
+        root: &root,
+        facts: &disk,
+    };
+    assert!(facts.is_file(&root.join("package.json")));
+    assert_eq!(
+        work_counts::filesystem_counts(&root).0,
+        3,
+        "a new build must not inherit the old snapshot's canonical identities"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cold_callgraph_probe_memo_revalidates_existing_and_dangling_symlinks() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let first = write(&root, "first/package.json", "{}");
+    fs::create_dir(root.join("second")).unwrap();
+    symlink("first", root.join("alias")).unwrap();
+    symlink("missing", root.join("dangling")).unwrap();
+    let memo = callgraph::ModuleResolutionMemo::default();
+    let disk = memo.disk_facts(&root);
+    let facts = FactPaths {
+        root: &root,
+        facts: &disk,
+    };
+    assert!(facts.is_file(&root.join("alias/package.json")));
+    assert_eq!(
+        facts.canonical(&root.join("alias/package.json")),
+        Some(first)
+    );
+    assert!(!facts.is_file(&root.join("dangling/package.json")));
+    assert!(!facts.is_file(&root.join("dangling")));
+    fs::remove_file(root.join("alias")).unwrap();
+    symlink("second", root.join("alias")).unwrap();
+    fs::remove_file(root.join("dangling")).unwrap();
+    symlink("first", root.join("dangling")).unwrap();
+    assert!(!facts.is_file(&root.join("alias/package.json")));
+    assert_eq!(
+        facts.canonical(&root.join("alias")),
+        Some(root.join("second"))
+    );
+    assert!(facts.is_file(&root.join("dangling/package.json")));
+    assert!(facts.is_dir(&root.join("dangling")));
+}
+
 /// Frozen tracked inputs and sorted logical rows follow the extraction-work
 /// census, but include both storage paths and the dead-code consumer this time.
 #[test]
