@@ -386,9 +386,19 @@ impl Default for EnforceOptions<'_> {
     }
 }
 
+/// A budget enforced by another maintenance lane, not measured by this pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnforcementDelegate {
+    /// V3 namespace measurement and idle-member eviction run in retention.
+    StorageRetentionV3,
+}
+
 /// What one enforcement pass did.
 #[derive(Clone, Debug, Default)]
 pub struct EnforcementReport {
+    /// When set, the zero/default usage fields are not measurements or an
+    /// assertion that no eviction is needed. Consult the retention report.
+    pub delegated_to: Option<EnforcementDelegate>,
     pub before: DiskUsage,
     pub after: DiskUsage,
     /// Evicted views with the view-store bytes each one freed, in order.
@@ -1301,7 +1311,10 @@ fn enforce_with_schedule(
     // V3 members and their namespace budget are collected by storage retention.
     // A v3-only owner has no legacy registry connection to measure or evict.
     if registry.is_v3_only() {
-        return Ok(EnforcementReport::default());
+        return Ok(EnforcementReport {
+            delegated_to: Some(EnforcementDelegate::StorageRetentionV3),
+            ..EnforcementReport::default()
+        });
     }
     let budget = registry.disk_budget();
     let deadline = options.deadline;
@@ -1970,6 +1983,9 @@ fn shown_bytes(bytes: u64, complete: bool) -> String {
 }
 
 fn report_line(family: &str, report: &EnforcementReport) -> String {
+    if report.delegated_to == Some(EnforcementDelegate::StorageRetentionV3) {
+        return format!("view disk limits family={family} delegated_to=storage_retention_v3");
+    }
     let after_views = report.after.views_complete();
     format!(
         "view disk limits family={} view_store_bytes={}->{} held_bytes={} family_store_bytes={}->{} \
@@ -2013,6 +2029,23 @@ mod tests {
     use crate::views::RelPath;
 
     const FAMILY: &str = "family";
+
+    #[test]
+    fn v3_enforcement_explicitly_delegates_to_retention() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let view =
+            ViewRegistration::register_v3(storage.path(), FAMILY, "scope", root.path()).unwrap();
+        let report = enforce(view.registry(), EnforceOptions::default()).unwrap();
+        assert_eq!(
+            report.delegated_to,
+            Some(EnforcementDelegate::StorageRetentionV3)
+        );
+        let line = report_line(FAMILY, &report);
+        assert!(line.contains("delegated_to=storage_retention_v3"), "{line}");
+        assert!(!line.contains("evicted=0"), "{line}");
+        assert!(!storage.path().join("blobs/v2").exists());
+    }
 
     /// Deciding whether a family fits its budget never walks for a zero
     /// budget and stops counting once the budget is passed, so an over-budget
