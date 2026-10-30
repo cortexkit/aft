@@ -248,6 +248,7 @@ impl ExecRemoteClient {
             consumer,
             finished: false,
             received_frame: false,
+            attached: method == "exec.attach",
             sent_at: (method == "exec.run").then_some(sent_at),
         })
     }
@@ -345,10 +346,17 @@ pub struct RemoteStream {
     finished: bool,
     received_frame: bool,
     #[cfg_attr(not(unix), allow(dead_code))]
+    attached: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
     sent_at: Option<Instant>,
 }
 
 impl RemoteStream {
+    #[cfg(unix)]
+    pub(crate) fn is_attach(&self) -> bool {
+        self.attached
+    }
+
     #[cfg(unix)]
     pub(crate) fn sent_at(&self) -> Option<Instant> {
         self.sent_at

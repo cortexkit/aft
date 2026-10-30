@@ -3408,7 +3408,9 @@ impl BgTaskRegistry {
                     if !platform_ok {
                         return Err("remote outcome unknown: Windows platform was not acknowledged; result not trusted".into());
                     }
-                    if verdict == Verdict::OutcomeUnknown {
+                    // An attach already queried the existing job; an unknown
+                    // terminal from it is not a reason to submit the command again.
+                    if verdict == Verdict::OutcomeUnknown && !stream.is_attach() {
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
                             .await?
@@ -3429,18 +3431,19 @@ impl BgTaskRegistry {
                     {
                         return Ok(());
                     }
-                    let keyed = task
+                    let current = task
                         .state
                         .lock()
                         .map_err(|_| "task lock poisoned")?
                         .metadata
                         .remote
                         .as_ref()
-                        .is_some_and(RemoteTask::resubmit_for_recovery);
+                        .cloned()
+                        .unwrap();
                     // Prefer the accepted job over resubmitting the command with
                     // its key. The shorter key-recovery limit must not abandon a
                     // job that can still be queued or running on the executor.
-                    if keyed && stream.resume_point().is_none() {
+                    if current.resubmit_for_recovery() && !current.accepted {
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
                             .await?
@@ -3450,7 +3453,7 @@ impl BgTaskRegistry {
                         }
                         return Err(format!("remote outcome unknown; keyed recovery unavailable or exhausted: {error}"));
                     }
-                    let Some(point) = stream.resume_point() else {
+                    let Some(point) = stream.resume_point().or_else(|| current.point()) else {
                         return Err(format!("remote outcome unknown; not resubmitted: {error}"));
                     };
                     sink.checkpoint_progress().map_err(|e| e.to_string())?;

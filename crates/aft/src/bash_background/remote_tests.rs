@@ -2265,6 +2265,26 @@ async fn exec_remote_bash_keyed_disconnect_repeated_closes_stop_at_allowance() {
     keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_tests::OutageReplay::Close).await;
 }
 
+#[tokio::test]
+async fn exec_remote_bash_keyed_disconnect_unknown_attach_terminal_is_not_resubmitted() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Unknown).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(1).await;
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(done
+        .info
+        .status_reason
+        .unwrap()
+        .starts_with(&format!("remote outcome unknown (job {})", id())));
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+    assert_eq!(daemon.methods("exec.attach").len(), 1);
+}
+
 /// The common agent call: `runon` with no `timeout`. It gets the 30-minute
 /// background default as its run timeout, which AFT records and sends to the
 /// runner, so a restart outage far past five minutes must still end with the
@@ -12910,6 +12930,36 @@ async fn submission_key_never_accepted_uses_one_new_key() {
         durable["remote"]["submission"]["key"],
         runs[2]["submission_key"]
     );
+}
+
+#[tokio::test]
+async fn submission_key_disconnect_before_acceptance_keeps_keyed_recovery() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Submission {
+            never_accepted: true,
+            mismatch: false,
+            always_unknown: false,
+            disconnect: true,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    assert_ne!(runs[1]["submission_key"], runs[2]["submission_key"]);
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.attach"));
 }
 
 #[tokio::test]

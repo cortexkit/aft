@@ -503,7 +503,7 @@ pub(crate) async fn daemon_with_capabilities(
                                             replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(format!("line-{seq}\n").into_bytes())))).unwrap()));
                                         }
                                     }
-                                    if !(disconnect && runs == 1) {
+                                    if !(disconnect && runs == 1) || never_accepted {
                                         replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), if unknown { Outcome::OutcomeUnknown } else { Outcome::Exit { code: 0 } }, 0, 0, 0))).unwrap()));
                                     }
                                 }
@@ -1115,6 +1115,7 @@ pub(crate) enum OutageReplay {
     Running,
     Finished,
     NotFound,
+    Unknown,
     Close,
 }
 
@@ -1258,7 +1259,11 @@ pub(crate) async fn outage_daemon_with_replay(replay: OutageReplay) -> OutageDae
                                     if matches!(replay, OutageReplay::Close) {
                                         return;
                                     }
-                                    if matches!(replay, OutageReplay::NotFound) {
+                                    if matches!(replay, OutageReplay::Unknown) {
+                                        let terminal = TerminalRecord::new(id(), Outcome::OutcomeUnknown, 0, 0, 0);
+                                        replies.push(record(&StreamRecord::Terminal(terminal)));
+                                        replies.push(frame_of(FrameType::StreamEnd, vec![]));
+                                    } else if matches!(replay, OutageReplay::NotFound) {
                                         replies.push(reply(FrameType::Error, json!({"code":"job_not_found", "message":"job not found"})));
                                     } else {
                                         let from = body["params"]["from_seq"].as_u64().unwrap();
