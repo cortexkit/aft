@@ -31,11 +31,7 @@ pub(super) fn initialize() {
 fn running_image() -> Result<&'static RunningImage, String> {
     IMAGE
         .get_or_init(|| {
-            // /proc retains the running inode even after an atomic binary upgrade.
-            #[cfg(target_os = "linux")]
-            let path = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
-            #[cfg(not(target_os = "linux"))]
-            let path = std::env::current_exe().map_err(|e| e.to_string())?;
+            let path = crate::pinned_executable::path().map_err(|e| e.to_string())?;
             let file = File::open(&path).map_err(|e| e.to_string())?;
             Ok(RunningImage { file, path })
         })

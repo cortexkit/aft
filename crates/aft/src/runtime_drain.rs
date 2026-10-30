@@ -881,9 +881,14 @@ pub fn drain_search_index_events(ctx: &AppContext) {
                 if !pending_paths.is_empty() {
                     replay_search_index_pending_updates(ctx, &mut index, pending_paths);
                 }
-                *ctx.search_index()
+                let mut search_index = ctx
+                    .search_index()
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *search_index = Some(index);
+                // A reload can keep the same receiver generation. Retire exact
+                // sets warmed against the previous resident index during the load.
+                ctx.search_exact_memo().clear();
                 *receiver = None;
                 true
             })
@@ -2968,6 +2973,8 @@ fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
         .as_ref()
         .map(crate::search_index::SearchIndex::max_file_size);
     let Some(max_file_size) = max_file_size else {
+        // Exact search also memoizes filesystem results before an index is ready.
+        ctx.search_exact_memo().clear();
         return;
     };
     let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
@@ -2979,6 +2986,11 @@ fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
     if let Some(index) = index_ref.as_mut() {
         index.apply_search_update(update);
     }
+    // Receiver generations identify loads, not edits to a resident index.
+    // Retire exact sets (including cached absence) under the index write lock
+    // so no query can pair updated contents with an old memo. Unchanged queries
+    // still reuse their memo without hashing the corpus on each request.
+    ctx.search_exact_memo().clear();
 }
 
 /// Reconcile the final disk state when an AFT mutation finishes, including
@@ -6993,6 +7005,69 @@ mod tests {
         tx.send(stale).unwrap();
         drain_search_index_events(&ctx);
         assert_fresh();
+    }
+
+    #[test]
+    fn exact_memo_publication_retires_stale_sets_but_keeps_warm_hits() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let seed = root.join("seed.rs");
+        let edited = root.join("edited.rs");
+        std::fs::write(&seed, "// quartz meadow beacon\n").unwrap();
+        std::fs::write(&edited, "// unrelated\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Disabled;
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "exact-memo-publication",
+            "command": "semantic_search",
+            "query": "quartz meadow beacon",
+            "hint": "literal",
+            "top_k": 10,
+        }))
+        .unwrap();
+        let search = || {
+            let response = serde_json::to_value(
+                crate::commands::semantic_search::handle_semantic_search(&request, &ctx),
+            )
+            .unwrap();
+            assert_eq!(response["success"], true, "{response}");
+            response
+        };
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 1);
+
+        let receiver_generation = ctx.search_index_rx_generation();
+        std::fs::write(&edited, "// quartz meadow beacon\n").unwrap();
+        refresh_search_index_after_write(&ctx, &edited);
+        assert_eq!(ctx.search_index_rx_generation(), receiver_generation);
+        assert_eq!(search()["result_count"], 2);
+        assert_eq!(search()["result_count"], 2);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 2);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        assert_eq!(ctx.search_index_rx_generation(), receiver_generation);
+        // A query may warm the memo against the old resident contents after a
+        // replacement receiver is installed but before its result is published.
+        assert_eq!(search()["result_count"], 2);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 2);
+        std::fs::write(&seed, "// retired\n").unwrap();
+        tx.send(crate::search_index::SearchIndex::build(&root))
+            .unwrap();
+        drain_search_index_events(&ctx);
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 3);
     }
 
     #[test]
