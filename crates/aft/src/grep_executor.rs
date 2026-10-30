@@ -2726,7 +2726,9 @@ mod tests {
     #[test]
     fn progressing_walk_is_not_a_stalled_access() {
         let dir = tempfile::tempdir().unwrap();
-        for index in 0..30 {
+        // 80 entries at 60 ms each need at least 4.8 s, so the 3 s walk budget
+        // always runs out before the walk finishes, on any runner.
+        for index in 0..80 {
             std::fs::write(dir.path().join(format!("{index}.rs")), "needle\n").unwrap();
         }
         // Each entry takes 60 ms and one access may take 300 ms, so a walk
