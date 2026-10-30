@@ -2447,6 +2447,7 @@ fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
     let replies = plexus_contract_judge::load_reply_vectors();
     let manifest = synthetic_v23_manifest(unix_seconds());
     assert_eq!(goldens.len(), 15);
+    let mut stderr_mismatches = Vec::new();
     for golden in goldens {
         let row = V22Row {
             name: leak(golden["name"].as_str().unwrap().to_string()),
@@ -2482,12 +2483,11 @@ fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
             "{}",
             row.name
         );
-        assert_eq!(
-            run.stderr,
-            golden["stderr"].as_str().unwrap(),
-            "{}",
-            row.name
-        );
+        if run.stderr != golden["stderr"].as_str().unwrap() {
+            stderr_mismatches.push(
+                json!({"name": row.name, "actual": run.stderr, "expected": golden["stderr"]}),
+            );
+        }
         assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
         if let Some(expected) = golden.get("request") {
             let mut routed = run.routed_request.expect("one queue request");
@@ -2513,6 +2513,11 @@ fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
             assert!(run.routed_request.is_none(), "{} routed", row.name);
         }
     }
+    assert!(
+        stderr_mismatches.is_empty(),
+        "stderr mismatches: {}",
+        json!(stderr_mismatches)
+    );
 }
 
 #[test]
