@@ -165,7 +165,7 @@ def preflight(repo: str, branch: str) -> None:
         if fnmatch.fnmatchcase(branch, rule["pattern"]):
             blocked.update(key for key, value in rule.items() if key != "pattern" and value)
     if blocked:
-        raise ValueError(f"{branch} blocks direct retry pushes ({', '.join(sorted(blocked))}); an administrator must exempt release/* from these requirements or authorize the operator; no merge queue may apply")
+        raise ValueError(f"{branch} blocks direct retry pushes ({', '.join(sorted(blocked))}); an administrator must exclude release/* from these requirements; no merge queue may apply")
 
 
 def run(arguments: list[str]) -> int:
