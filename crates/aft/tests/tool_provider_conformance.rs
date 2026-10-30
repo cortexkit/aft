@@ -37,6 +37,9 @@ use tokio::{
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
+#[path = "helpers/project.rs"]
+mod project_fixture;
+
 const LEGACY_FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/tool_provider_legacy_replies.json"
@@ -751,6 +754,8 @@ fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
             directory.display()
         ))
     })?;
+    project_fixture::mark_project(&root.join("project"))
+        .map_err(|error| HarnessError::new(format!("marking provider project: {error}")))?;
     let config = directory.join("aft.jsonc");
     std::fs::write(&config, serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "indexes": {"callgraph": false, "trigram": false, "semantic": false}})).unwrap()).map_err(|error| HarnessError::new(format!("writing provider config {}: {error}", config.display())))?;
     Ok(())

@@ -3,6 +3,7 @@
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
+pub mod project;
 mod timeout_forensics;
 
 #[path = "../../src/test_env.rs"]
