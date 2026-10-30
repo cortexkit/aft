@@ -1192,6 +1192,10 @@ pub(crate) fn spawn_with_secrets(
             &crate::sandbox_spawn::current_authenticated_principal(),
         ),
     );
+    ctx.bash_background().configure_task_scope_runtime(
+        ctx.is_daemon_mode(),
+        Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
+    );
     #[cfg(target_os = "linux")]
     if !pty && config.bash.linux_scope {
         env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());

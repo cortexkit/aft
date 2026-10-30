@@ -222,7 +222,6 @@ pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
 pub(crate) mod remote;
 #[path = "return_files.rs"]
 pub(crate) mod return_files;
-#[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[cfg(test)]
@@ -1339,6 +1338,7 @@ pub(crate) struct RegistryInner {
     #[cfg(unix)]
     revoked_secret_authorizations: Mutex<HashSet<(String, String, u64)>>,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
+    task_scopes: super::task_scope::TaskScopes,
     #[cfg(unix)]
     db_hint_jobs:
         Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
@@ -1977,6 +1977,44 @@ impl BgTaskRegistry {
             .and_then(|map| map.get(task_id).copied())
     }
 
+    pub(crate) fn configure_task_scope_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
+        self.inner
+            .task_scopes
+            .configure_runtime(daemon_mode, max_runtime);
+    }
+
+    #[cfg(unix)]
+    fn place_task_scope(
+        &self,
+        child: &mut Child,
+        scope: &super::task_scope::ScopeLaunch,
+    ) -> Result<bool, String> {
+        match scope.await_placement(child.id(), Duration::from_secs(1)) {
+            Ok(handle) => {
+                self.inner.task_scopes.register(handle);
+                Ok(false)
+            }
+            Err(error) => {
+                let exited = child.try_wait().map_err(|e| e.to_string())?.is_some();
+                let gate_closed = child.stdin.take().is_some();
+                if !exited {
+                    super::process::terminate_pgid(child.id() as i32, None);
+                }
+                let _ = scope.stop();
+                let _ = child.wait();
+                if exited && gate_closed {
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        crate::slog_info!("task scope creation failed before payload release; spawning without a scope: {error}");
+                    }
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub fn new(progress_sender: SharedProgressSender) -> Self {
         #[cfg(unix)]
         crate::posix_spawn::initialize();
@@ -1984,6 +2022,7 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 memory_monitors: Mutex::new(HashMap::new()),
+                task_scopes: super::task_scope::TaskScopes::default(),
                 #[cfg(unix)]
                 secret_proxies: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -5174,10 +5213,7 @@ impl BgTaskRegistry {
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
-        #[cfg(target_os = "linux")]
         let linux_scope = env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
-        #[cfg(not(target_os = "linux"))]
-        let linux_scope = false;
 
         let _admission = self.background_admission_guard(slot);
         if let Err(refusal) = self.check_background_slot_typed(slot, &session_id) {
@@ -5283,6 +5319,22 @@ impl BgTaskRegistry {
             Some(completion_secrets.has_non_ticket_secrets);
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
+        let mut scope = self
+            .inner
+            .task_scopes
+            .policy(linux_scope, None, spawn_plan.is_native_launcher())
+            .filter(|_| memory_limit_mib.is_none())
+            .map(|policy| {
+                self.inner.task_scopes.prepare(
+                    policy,
+                    &task_id,
+                    hard_kill,
+                    memory_limit_mib,
+                    spawn_plan.is_native_launcher(),
+                )
+            })
+            .transpose()?
+            .flatten();
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
         metadata.memory_policy = memory_monitor
@@ -5306,20 +5358,32 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
-        let mut child = match spawn_detached_child(
-            &spawn_plan,
-            command,
-            shell,
-            &shell_path,
-            &paths,
-            &workdir,
-            &env,
-            &mut io_handles,
-            capture_pipeline_status,
-            memory_monitor.is_some(),
-            linux_scope,
-            LocalIdentityGate::Required,
-        ) {
+        let mut spawn_child = |scope: Option<&super::task_scope::ScopeLaunch>| {
+            spawn_detached_child(
+                &spawn_plan,
+                command,
+                shell,
+                &shell_path,
+                &paths,
+                &workdir,
+                &env,
+                &mut io_handles,
+                capture_pipeline_status,
+                memory_monitor.is_some(),
+                scope,
+                LocalIdentityGate::Required,
+            )
+        };
+        let child_result = spawn_child(scope.as_ref()).and_then(|mut child| {
+            if let Some(launch) = scope.as_ref() {
+                if self.place_task_scope(&mut child, launch)? {
+                    scope = None;
+                    return spawn_child(None);
+                }
+            }
+            Ok(child)
+        });
+        let mut child = match child_result {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}: {error}");
@@ -5345,12 +5409,18 @@ impl BgTaskRegistry {
         let child_pid = child.id();
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
+            if let Some(scope) = scope.as_ref() {
+                let _ = scope.stop();
+            }
             let _ = child.wait();
             return Err(error.into());
         }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
+                if let Some(scope) = scope.as_ref() {
+                    let _ = scope.stop();
+                }
                 let _ = child.wait();
                 self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
@@ -5370,6 +5440,9 @@ impl BgTaskRegistry {
         metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
+            if let Some(scope) = scope.as_ref() {
+                let _ = scope.stop();
+            }
             let _ = child.wait();
             metadata.mark_terminal(
                 BgTaskStatus::Failed,
@@ -6142,7 +6215,7 @@ impl BgTaskRegistry {
             &mut io_handles,
             false,
             memory_monitor.is_some(),
-            false,
+            None,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -17231,7 +17304,7 @@ fn spawn_detached_child(
     io_handles: &mut TaskIoHandles,
     capture_pipeline_status: bool,
     memory_gated: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
+    scope: Option<&super::task_scope::ScopeLaunch>,
     #[cfg(unix)] identity_gate: LocalIdentityGate,
 ) -> Result<Child, String> {
     #[cfg(windows)]
@@ -17283,27 +17356,9 @@ fn spawn_detached_child(
                 LocalIdentityGate::CommittedFallback => "",
             }),
         ];
-        #[cfg(target_os = "linux")]
-        let (executable, args) = if linux_scope && !memory_gated {
-            if spawn_plan.is_native_launcher() {
-                crate::slog_info!(
-                    "bash.linux_scope requested but native sandbox launch cannot reach the user manager; spawning without a systemd scope"
-                );
-                (base_executable, base_args)
-            } else if let Some(launcher) = super::process::select_systemd_scope_launcher() {
-                super::process::systemd_scope_argv(&launcher, &base_executable, &base_args)
-            } else {
-                crate::slog_info!(
-                    "bash.linux_scope requested but systemd-run or the user manager is unavailable; spawning without a systemd scope"
-                );
-                (base_executable, base_args)
-            }
+        let (executable, args) = if let Some(scope) = scope {
+            scope.argv(&base_executable, &base_args)
         } else {
-            (base_executable, base_args)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (executable, args) = {
-            let _ = linux_scope;
             (base_executable, base_args)
         };
         let (mut child_command, profile_handle) = crate::sandbox_spawn::detached_command_for_plan(
@@ -17342,7 +17397,7 @@ fn spawn_detached_child(
     }
     #[cfg(windows)]
     {
-        let _ = shell_path;
+        let _ = (shell_path, scope);
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
             SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {}
@@ -17571,6 +17626,10 @@ fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
 #[cfg(all(test, unix))]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "task_scope_tests.rs"]
+mod task_scope_tests;
 
 #[cfg(test)]
 #[path = "default_kill_test.rs"]

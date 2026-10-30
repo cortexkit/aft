@@ -11,20 +11,12 @@ use std::{
 };
 
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Task 4: registry scope launch")
-)]
 pub(crate) struct ScopePolicy {
     pub daemon_mode: bool,
     pub enabled: bool,
     pub max_runtime: Duration,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Task 4: registry scope owner")
-)]
 pub(crate) struct TaskScopes {
     daemon_mode: AtomicBool,
     max_runtime: Mutex<Duration>,
@@ -41,14 +33,14 @@ impl Default for TaskScopes {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Tasks 4 and 7: registry scope management")
-)]
 impl TaskScopes {
     pub(crate) fn configure_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
         *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner()) = max_runtime;
         self.daemon_mode.store(daemon_mode, Ordering::Release);
+    }
+
+    pub(crate) fn max_runtime(&self) -> Duration {
+        *self.max_runtime.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn policy(
@@ -84,6 +76,10 @@ impl TaskScopes {
             .insert(handle.task_id.clone(), handle);
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by Task 7: scope termination")
+    )]
     pub(crate) fn get(&self, task_id: &str) -> Option<ScopeHandle> {
         self.handles
             .lock()
@@ -92,6 +88,10 @@ impl TaskScopes {
             .cloned()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by Task 7: scope termination")
+    )]
     pub(crate) fn kill(&self, task_id: &str) -> io::Result<()> {
         if let Some(handle) = self.get(task_id) {
             handle.kill()?;
@@ -101,13 +101,17 @@ impl TaskScopes {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Task 4: verified scope placement")
-)]
 pub(crate) struct ScopeHandle {
     task_id: String,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by Task 8: owned scope cleanup")
+    )]
     unit: String,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by Task 6: scoped memory monitor")
+    )]
     cgroup: PathBuf,
 }
 
@@ -121,19 +125,11 @@ impl ScopeHandle {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Task 4: named scope properties")
-)]
 pub(crate) fn scope_unit(task_id: &str) -> io::Result<String> {
     super::persistence::validate_task_id(task_id)?;
     Ok(format!("aft-task-{task_id}.scope"))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Task 4: scope launch deadline")
-)]
 pub(crate) fn backstop(hard_kill: super::HardKill, ceiling: Duration) -> Duration {
     match hard_kill {
         super::HardKill::After(limit) => limit.saturating_add(Duration::from_secs(60)),
@@ -159,17 +155,9 @@ mod linux {
     pub(crate) struct SystemdScopeLauncher {
         path: PathBuf,
         supports_expand_environment: bool,
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "used by Task 4: named scope argv")
-        )]
         supports_scope_oom_policy: bool,
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: registry scope launch")
-    )]
     pub(crate) struct ScopeLaunch {
         launcher: SystemdScopeLauncher,
         task_id: String,
@@ -187,17 +175,6 @@ mod linux {
             args.push("--expand-environment=no".into());
         }
         args
-    }
-
-    pub(crate) fn systemd_scope_argv(
-        launcher: &SystemdScopeLauncher,
-        executable: &Path,
-        args: &[OsString],
-    ) -> (PathBuf, Vec<OsString>) {
-        let mut wrapped = prefix(launcher.supports_expand_environment);
-        wrapped.push(executable.as_os_str().to_owned());
-        wrapped.extend_from_slice(args);
-        (launcher.path.clone(), wrapped)
     }
 
     fn run(command: &mut Command, limit: Duration) -> Result<Output, String> {
@@ -287,10 +264,6 @@ mod linux {
         let _ = child.wait();
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: stop failed scope launch")
-    )]
     fn successful(output: Output) -> Result<Vec<u8>, String> {
         if output.status.success() {
             Ok(output.stdout)
@@ -355,10 +328,6 @@ mod linux {
     }
 
     impl TaskScopes {
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "used by Task 4: registry scope preparation")
-        )]
         pub(crate) fn prepare(
             &self,
             policy: ScopePolicy,
@@ -399,10 +368,6 @@ mod linux {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: registry scope placement")
-    )]
     impl ScopeLaunch {
         pub(crate) fn argv(
             &self,
@@ -437,8 +402,7 @@ mod linux {
         ) -> Result<ScopeHandle, String> {
             let deadline = Instant::now() + limit.min(Duration::from_secs(1));
             loop {
-                let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-                    .map_err(|e| format!("task scope child exited before placement: {e}"))?;
+                let text = read_membership(pid, &self.task_id)?;
                 if let Some(path) = membership_path(&self.task_id, &text) {
                     return Ok(ScopeHandle {
                         task_id: self.task_id.clone(),
@@ -461,10 +425,6 @@ mod linux {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: exact scope placement")
-    )]
     fn cgroup_path(task_id: &str, text: &str) -> Option<PathBuf> {
         let unit = scope_unit(task_id).ok()?;
         let path = Path::new(text);
@@ -484,15 +444,49 @@ mod linux {
         Some(Path::new("/sys/fs/cgroup").join(path.strip_prefix("/").ok()?))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: exact scope placement")
-    )]
     fn membership_path(task_id: &str, text: &str) -> Option<PathBuf> {
         cgroup_path(
             task_id,
             text.lines().find_map(|line| line.strip_prefix("0::"))?,
         )
+    }
+
+    fn read_membership(pid: u32, task_id: &str) -> Result<String, String> {
+        #[cfg(test)]
+        if let Some(result) =
+            PLACEMENT_READER.with(|reader| reader.borrow().as_ref().map(|read| read(pid, task_id)))
+        {
+            return result;
+        }
+        #[cfg(not(test))]
+        let _ = task_id;
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .map_err(|e| format!("task scope child exited before placement: {e}"))
+    }
+
+    #[cfg(test)]
+    type PlacementReader = Box<dyn Fn(u32, &str) -> Result<String, String>>;
+
+    #[cfg(test)]
+    thread_local! {
+        static PLACEMENT_READER: std::cell::RefCell<Option<PlacementReader>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_placement_reader_for_test<T>(
+        reader: impl Fn(u32, &str) -> Result<String, String> + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<PlacementReader>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PLACEMENT_READER.with(|reader| {
+                    *reader.borrow_mut() = self.0.take();
+                });
+            }
+        }
+        let _restore = Restore(PLACEMENT_READER.with(|slot| slot.replace(Some(Box::new(reader)))));
+        run()
     }
 
     #[cfg_attr(
@@ -596,10 +590,6 @@ mod linux {
         list_with(Path::new("systemctl"))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: stop failed scope launch")
-    )]
     fn stop_with(systemctl: &Path, unit: &str) -> Result<(), String> {
         let id = unit
             .strip_prefix("aft-task-")
@@ -613,10 +603,6 @@ mod linux {
         .map(|_| ())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Task 4: stop failed scope launch")
-    )]
     fn stop_unit(unit: &str) -> Result<(), String> {
         stop_with(Path::new("systemctl"), unit)
     }
@@ -937,5 +923,36 @@ mod tests {
         ] {
             assert!(!matches_membership(id, text), "{text}");
         }
+    }
+
+    #[test]
+    fn task_scope_daemon_gate() {
+        let scopes = TaskScopes::default();
+        assert_eq!(
+            *scopes.max_runtime.lock().unwrap(),
+            Duration::from_secs(86400)
+        );
+        scopes.configure_runtime(false, Duration::from_secs(86400));
+        assert!(
+            scopes.policy(true, None, false).is_none(),
+            "standalone acquired a task scope"
+        );
+        assert!(scopes
+            .policy(true, Some(Duration::from_secs(7200)), false)
+            .is_none());
+        scopes.configure_runtime(true, Duration::from_secs(86400));
+        assert!(scopes.policy(true, None, false).is_some());
+        assert_eq!(
+            scopes
+                .policy(true, Some(Duration::from_secs(7200)), false)
+                .unwrap()
+                .max_runtime,
+            Duration::from_secs(7200)
+        );
+        assert!(
+            scopes.policy(true, None, true).is_none(),
+            "native launcher must stay unscoped"
+        );
+        assert!(scopes.policy(false, None, false).is_none());
     }
 }

@@ -342,9 +342,6 @@ fn user_name(uid: u32) -> String {
     uid.to_string()
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) use super::task_scope::{select_systemd_scope_launcher, systemd_scope_argv};
-
 /// Describe at most [`LIVE_DESCENDANT_CAP`] group members, lowest pid first,
 /// and count the rest without describing them. Listing a member is cheap (its
 /// pid and group); describing it reads its command line and owner, so that work

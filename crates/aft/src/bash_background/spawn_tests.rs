@@ -70,28 +70,34 @@ fn linux_scope_preserves_shell_dollar_expressions() {
     if let Some(root) = std::env::var_os(FIXTURE) {
         let root = PathBuf::from(root);
         let registry = BgTaskRegistry::default();
-        let command = r#"X=inner; printf '%s' "$BASHPID" > shell-pid; printf 'braced=%s plain=%s pid=%s\n' "${X}" "$X" "$$"; cd child-dir ; echo "${PWD}""#;
-        let id = registry
-            .spawn_with_shell(
-                SpawnPlan::Unsandboxed,
-                command,
-                super::super::BashShell::Bash,
-                PathBuf::from("/bin/bash"),
-                "scope-contract".into(),
-                root.clone(),
-                HashMap::from([
-                    (LINUX_SCOPE_ENV.into(), "1".into()),
-                    ("X".into(), "outer".into()),
-                ]),
-                super::super::HardKill::After(Duration::from_secs(15)),
-                None,
-                root.clone(),
-                4,
-                false,
-                false,
-                Some(root.clone()),
-            )
-            .unwrap();
+        registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
+        let command = r#"test -z "${AFT_INTERNAL_LINUX_SCOPE+x}" || exit 99; X=inner; printf '%s' "$BASHPID" > shell-pid; printf 'braced=%s plain=%s pid=%s\n' "${X}" "$X" "$$"; cd child-dir ; echo "${PWD}""#;
+        let id = super::super::task_scope::with_placement_reader_for_test(
+            |_, id| Ok(format!("0::/aft.slice/aft-task-{id}.scope\n")),
+            || {
+                registry
+                    .spawn_with_shell(
+                        SpawnPlan::Unsandboxed,
+                        command,
+                        super::super::BashShell::Bash,
+                        PathBuf::from("/bin/bash"),
+                        "scope-contract".into(),
+                        root.clone(),
+                        HashMap::from([
+                            (LINUX_SCOPE_ENV.into(), "1".into()),
+                            ("X".into(), "outer".into()),
+                        ]),
+                        super::super::HardKill::After(Duration::from_secs(15)),
+                        None,
+                        root.clone(),
+                        4,
+                        false,
+                        false,
+                        Some(root.clone()),
+                    )
+                    .unwrap()
+            },
+        );
         wait_done(&registry, &id);
         let task = registry.task(&id).unwrap();
         let stderr = std::fs::read_to_string(&task.paths.stderr).unwrap();
@@ -121,21 +127,25 @@ fn linux_scope_preserves_shell_dollar_expressions() {
     }
 
     // Isolate PATH changes from every other test, including launcher discovery.
-    for mode in ["modern", "legacy"] {
+    for mode in ["modern", "legacy", "v253"] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("child-dir")).unwrap();
         let script = r#"#!/bin/bash
 mode=@MODE@
+if [[ $1 == --version ]]; then
+    case $mode in modern) echo 'systemd 254';; v253) echo 'systemd 253';; *) echo 'systemd 252';; esac
+    exit 0
+fi
 expand=yes
 while [[ $1 == --* ]]; do
     case $1 in
         --expand-environment=no)
-            if [[ $mode == legacy ]]; then
+            if [[ $mode != modern ]]; then
                 echo probe:unsupported >> "${0%/*}/calls"
                 exit 1
             fi
             expand=no ;;
-        --user|--scope|--collect|--quiet) ;;
+        --user|--scope|--collect|--quiet|--unit=*|--slice=*|--property=*) ;;
         *) exit 2 ;;
     esac
     shift
@@ -203,6 +213,168 @@ exec "$@"
                 "probe:unsupported\nprobe:yes\nlaunch:yes\n"
             },
             "{mode} must exercise the availability probe and the real scope launch"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn task_scope_standalone_never_starts_systemd_run() {
+    const ROOT: &str = "AFT_TEST_STANDALONE_SCOPE_ROOT";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = PathBuf::from(root);
+        let r = BgTaskRegistry::default();
+        r.configure_task_scope_runtime(false, Duration::from_secs(86400));
+        let id = r
+            .spawn_with_shell(
+                SpawnPlan::Unsandboxed,
+                "echo standalone; printf ran > inner-ran",
+                super::super::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "standalone-scope".into(),
+                root.clone(),
+                HashMap::from([(LINUX_SCOPE_ENV.into(), "1".into())]),
+                super::super::HardKill::Default,
+                None,
+                root.clone(),
+                8,
+                false,
+                false,
+                Some(root.clone()),
+            )
+            .unwrap();
+        wait_done(&r, &id);
+        assert_eq!(
+            r.status(&id, "standalone-scope", None, None, 1024)
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
+        assert!(
+            !root.join("systemd-calls").exists(),
+            "standalone started systemd-run"
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    crate::executable_cache::write_executable(
+        &root.path().join("systemd-run"),
+        b"#!/bin/sh\nprintf called >> \"${0%/*}/systemd-calls\"\nexit 97\n",
+    )
+    .unwrap();
+    let path = std::env::join_paths(std::iter::once(root.path().to_owned()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "bash_background::registry::spawn_tests::task_scope_standalone_never_starts_systemd_run", "--nocapture"])
+        .env(ROOT, root.path()).env("PATH", path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("inner-ran")).unwrap(),
+        "ran"
+    );
+    assert!(
+        !root.path().join("systemd-calls").exists(),
+        "standalone started systemd-run"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn task_scope_creation_refusal_falls_back_without_payload_retry() {
+    const ROOT: &str = "AFT_TEST_SCOPE_REFUSAL_ROOT";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = PathBuf::from(root);
+        let released = std::env::var("AFT_TEST_SCOPE_REFUSAL_MODE").unwrap() == "released";
+        let registry = BgTaskRegistry::default();
+        registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
+        let command = format!("test -z \"${{AFT_INTERNAL_LINUX_SCOPE+x}}\" || exit 99; printf x >> payload-count; exit {}", if released { 23 } else { 0 });
+        let spawn = || {
+            registry.spawn_with_shell(
+                SpawnPlan::Unsandboxed,
+                &command,
+                super::super::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "scope-refusal".into(),
+                root.clone(),
+                HashMap::from([(LINUX_SCOPE_ENV.into(), "1".into())]),
+                super::super::HardKill::After(Duration::from_secs(15)),
+                None,
+                root.clone(),
+                8,
+                false,
+                false,
+                Some(root.clone()),
+            )
+        };
+        let id = if released {
+            super::super::task_scope::with_placement_reader_for_test(
+                |_, id| Ok(format!("0::/aft.slice/aft-task-{id}.scope\n")),
+                spawn,
+            )
+        } else {
+            spawn()
+        }
+        .unwrap();
+        wait_done(&registry, &id);
+        assert_eq!(
+            registry
+                .status(&id, "scope-refusal", None, None, 1024)
+                .unwrap()
+                .exit_code,
+            Some(if released { 23 } else { 0 })
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("payload-count")).unwrap(),
+            "x"
+        );
+        std::fs::write(root.join("inner-ran"), "ran").unwrap();
+        return;
+    }
+    for mode in ["rejected", "released"] {
+        let root = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/bash
+if [[ $1 == --version ]]; then echo 'systemd 254'; exit 0; fi
+while [[ $1 == --* ]]; do shift; done
+if [[ $1 == /bin/true ]]; then exec "$@"; fi
+echo launch >> "${0%/*}/calls"
+if [[ $AFT_TEST_SCOPE_REFUSAL_MODE == rejected ]]; then exit 97; fi
+exec "$@"
+"#;
+        crate::executable_cache::write_executable(
+            &root.path().join("systemd-run"),
+            script.as_bytes(),
+        )
+        .unwrap();
+        let path = std::env::join_paths(std::iter::once(root.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::spawn_tests::task_scope_creation_refusal_falls_back_without_payload_retry", "--nocapture"])
+            .env(ROOT, root.path()).env("AFT_TEST_SCOPE_REFUSAL_MODE", mode).env("PATH", path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{mode}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("inner-ran")).unwrap(),
+            "ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("calls")).unwrap(),
+            "launch\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("payload-count")).unwrap(),
+            "x"
         );
     }
 }
