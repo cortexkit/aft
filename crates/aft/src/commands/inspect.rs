@@ -2256,7 +2256,10 @@ fn finish_start_phases(
 fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'static str {
     match error {
         ApplicabilityResolutionError::RequestDeadline { .. } => "inspect_request_timeout",
-        ApplicabilityResolutionError::RootUnreadable { .. } => "applicability_resolution_failed",
+        ApplicabilityResolutionError::RootUnreadable { .. }
+        | ApplicabilityResolutionError::EntryLimitReached { .. } => {
+            "applicability_resolution_failed"
+        }
     }
 }
 
@@ -2265,6 +2268,10 @@ fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
         ApplicabilityResolutionError::RootUnreadable { root, reason } => {
             format!("cannot resolve {}: {reason}", root.display())
         }
+        ApplicabilityResolutionError::EntryLimitReached { root, entries } => format!(
+            "cannot resolve {}: applicability walk incomplete: entry limit {entries} reached",
+            root.display()
+        ),
         ApplicabilityResolutionError::RequestDeadline { root } => format!(
             "inspect_request_timeout: producer discovery for {} exceeded the shared request deadline",
             root.display()
@@ -5343,6 +5350,29 @@ fn empty_array(value: &Value) -> bool {
 
 fn invalid_request(id: &str, message: String) -> Response {
     Response::error(id, "invalid_request", message)
+}
+
+#[cfg(test)]
+mod lsp_applicability_failure_tests {
+    use super::*;
+
+    #[test]
+    fn entry_limit_preserves_incomplete_failure_response() {
+        let root = PathBuf::from("workspace");
+        let old_error = ApplicabilityResolutionError::RootUnreadable {
+            root: root.clone(),
+            reason: "applicability walk incomplete: entry limit 3 reached".into(),
+        };
+        let error = ApplicabilityResolutionError::EntryLimitReached { root, entries: 3 };
+        assert_eq!(
+            applicability_failure_reason(&error),
+            applicability_failure_reason(&old_error)
+        );
+        assert_eq!(
+            applicability_failure_detail(error),
+            applicability_failure_detail(old_error)
+        );
+    }
 }
 
 #[cfg(test)]

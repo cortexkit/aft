@@ -1,4 +1,5 @@
-//! Process-local single-flight for complete, whole-project applicability walks.
+//! Within this process, concurrent requests share one whole-project applicability
+//! walk, with complete snapshots and backoff for walks that exceed the entry limit.
 //! Physical roots, not Git identities, are the cache boundary: linked worktrees
 //! can have different untracked sources and installed TypeScript versions even
 //! when their HEAD commits match.
@@ -8,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -16,6 +17,15 @@ use super::manager::{ApplicabilityResolutionError, ApplicabilityWalk};
 use crate::config::Config;
 
 type Key = (PathBuf, Vec<u8>);
+
+const INITIAL_INCOMPLETE_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_INCOMPLETE_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+struct IncompleteWalk {
+    error: ApplicabilityResolutionError,
+    retry_at: Instant,
+    backoff: Duration,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum InvalidationCause {
@@ -288,6 +298,9 @@ struct State {
     generation: u64,
     running: Option<Arc<RunningScan>>,
     result: Option<ApplicabilityWalk>,
+    // This is a failed walk, never a partial applicability snapshot. Checks of
+    // cached inputs and changes absorbed from watcher batches cannot certify it.
+    incomplete: Option<IncompleteWalk>,
     dependencies: HashMap<PathBuf, PathState>,
     inputs: HashSet<PathBuf>,
     input_identities: HashSet<(u64, u64)>,
@@ -476,7 +489,7 @@ impl ApplicabilityCache {
                     return true;
                 }
                 let state = flight.state.lock();
-                state.result.is_some() || state.running.is_some()
+                state.result.is_some() || state.incomplete.is_some() || state.running.is_some()
             });
             for ((cached_root, _), flight) in entries.iter() {
                 if cached_root.starts_with(root) || root.starts_with(cached_root) {
@@ -484,6 +497,7 @@ impl ApplicabilityCache {
                     roots.insert(cached_root.clone());
                     let state = flight.state.lock();
                     if state.result.is_some()
+                        || state.incomplete.is_some()
                         || state.running.is_some()
                         || Arc::strong_count(flight) > 1
                     {
@@ -691,6 +705,17 @@ impl ApplicabilityCache {
         root: &Path,
         config: &Config,
         deadline: Instant,
+        scan: impl FnMut() -> Result<ApplicabilityWalk, ApplicabilityResolutionError>,
+    ) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
+        self.walk_with_clock(root, config, deadline, Instant::now, scan)
+    }
+
+    pub(super) fn walk_with_clock(
+        &self,
+        root: &Path,
+        config: &Config,
+        deadline: Instant,
+        retry_clock: impl Fn() -> Instant,
         mut scan: impl FnMut() -> Result<ApplicabilityWalk, ApplicabilityResolutionError>,
     ) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
         // Configuration controls custom markers, disabled servers and ignores.
@@ -727,6 +752,11 @@ impl ApplicabilityCache {
             let mut state = flight.state.lock();
             if Instant::now() >= deadline {
                 return Err(ApplicabilityResolutionError::RequestDeadline { root: root.into() });
+            }
+            if let Some(incomplete) = &state.incomplete {
+                if retry_clock() < incomplete.retry_at {
+                    return Err(incomplete.error.clone());
+                }
             }
             if let Some(result) = &state.result {
                 let start = Instant::now();
@@ -824,10 +854,32 @@ impl ApplicabilityCache {
                 &inputs,
             ));
             let mut state = flight.state.lock();
-            // Under continuous edits, returning one uncached scan preserves the
-            // uncached walk's progress. Only unchanged scans may serve new binds.
-            if state.generation == running.generation && unchanged(&dependencies) {
-                if let Ok(walk) = &result {
+            // Entry-limit failures throttle retries even if watcher events
+            // arrived during the scan. They never certify applicability.
+            if let Err(error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. }) =
+                &result
+            {
+                let backoff = state
+                    .incomplete
+                    .as_ref()
+                    .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
+                        (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
+                    });
+                // Frequent log or database writes must not shorten the delay.
+                // Only a completed walk clears the failure's retry history.
+                state.incomplete = Some(IncompleteWalk {
+                    error: error.clone(),
+                    retry_at: retry_clock() + backoff,
+                    backoff,
+                });
+                crate::slog_warn!(
+                    "language-server applicability walk incomplete: root={} entries={} retry_in_seconds={}",
+                    root.display(), entries, backoff.as_secs()
+                );
+            } else if let Ok(walk) = &result {
+                state.incomplete = None;
+                // Only unchanged complete scans become applicability snapshots.
+                if state.generation == running.generation && unchanged(&dependencies) {
                     state.input_dirs = input_dirs;
                     state.config = Some(Arc::new(config.clone()));
                     state.absorbed_entries = 0;
