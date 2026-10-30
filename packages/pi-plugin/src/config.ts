@@ -2068,6 +2068,11 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("bash.disclaim_privacy");
   if (typeof override.bash === "object" && override.bash.runon_env !== undefined)
     stripped.push("bash.runon_env");
+  if (typeof override.bash === "object") {
+    for (const key of ["linux_scope", "linux_scope_max_runtime_secs"] as const) {
+      if (override.bash[key] !== undefined) stripped.push(`bash.${key}`);
+    }
+  }
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.pi?.external_access_ask === false) stripped.push("pi.external_access_ask");
@@ -2146,6 +2151,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     if (projectBash.changed_files !== "off") delete projectBash.changed_files;
     delete projectBash.runon_enabled;
     delete projectBash.runon_env;
+    delete projectBash.linux_scope;
+    delete projectBash.linux_scope_max_runtime_secs;
     delete projectBash.env;
   }
   const bash = mergeBashConfig(base.bash, projectBash, "project");

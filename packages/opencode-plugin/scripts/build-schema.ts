@@ -479,7 +479,7 @@ function buildSchema(): Record<string, unknown> {
                 type: "boolean",
                 default: true,
                 description:
-                  "Linux daemon scopes are on by default. User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
+                  "Linux daemon scopes are on by default (user config only). User config can disable them. Standalone mode, PTY tasks, and native-sandbox launches use the usual spawn path. If systemd-run, the user manager, or cgroup access is unavailable, AFT uses the usual path.",
               },
               linux_scope_max_runtime_secs: {
                 type: "integer",

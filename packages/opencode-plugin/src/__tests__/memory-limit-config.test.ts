@@ -52,6 +52,43 @@ test("project memory ceilings can tighten but cannot raise or remove a user ceil
   }
 });
 
+test("project scope settings cannot override user settings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "aft-scope-config-"));
+  const savedXdg = process.env.XDG_CONFIG_HOME;
+  const savedOpenCode = process.env.OPENCODE_CONFIG_DIR;
+  process.env.XDG_CONFIG_HOME = dir;
+  delete process.env.OPENCODE_CONFIG_DIR;
+  const project = join(dir, "project");
+  mkdirSync(join(dir, "cortexkit"), { recursive: true });
+  mkdirSync(join(project, ".cortexkit"), { recursive: true });
+  try {
+    for (const enabled of [true, false]) {
+      writeFileSync(
+        join(dir, "cortexkit/aft.jsonc"),
+        JSON.stringify({
+          bash: { linux_scope: enabled, linux_scope_max_runtime_secs: 100 },
+        }),
+      );
+      writeFileSync(
+        join(project, ".cortexkit/aft.jsonc"),
+        JSON.stringify({
+          bash: { linux_scope: !enabled, linux_scope_max_runtime_secs: 1 },
+        }),
+      );
+      expect(loadAftConfig(project).bash).toMatchObject({
+        linux_scope: enabled,
+        linux_scope_max_runtime_secs: 100,
+      });
+    }
+  } finally {
+    if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = savedXdg;
+    if (savedOpenCode === undefined) delete process.env.OPENCODE_CONFIG_DIR;
+    else process.env.OPENCODE_CONFIG_DIR = savedOpenCode;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("published schema advertises the same MiB ceiling in base and harness blocks", () => {
   const schema = JSON.parse(
     readFileSync(new URL("../../../../assets/aft.schema.json", import.meta.url), "utf8"),
