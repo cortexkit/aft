@@ -445,6 +445,8 @@ pub struct ApplicableServerStartOutcomes {
 
 pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
 pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+
+const FILE_SERVER_RESTART_ATTEMPTS: usize = 3;
 pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
 pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
     "language-server startup notification queue is full; retry the file change";
@@ -691,7 +693,8 @@ where
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     // Start any missing server without the lock; the pulls below then only
     // open the document and send the requests under it.
-    let pulls = loop {
+    let mut pulls = None;
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
         let opened = ensure_file_open_unlocked(&lock, file_path, config)?;
         let mut manager = lock();
         if opened
@@ -701,8 +704,10 @@ where
         {
             continue;
         }
-        break manager.begin_file_pulls(file_path, config, deadline)?;
-    };
+        pulls = Some(manager.begin_file_pulls(file_path, config, deadline)?);
+        break;
+    }
+    let pulls = pulls.ok_or_else(|| LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))?;
     // All requests are in flight at once; wait for each without the lock.
     let replies = pulls
         .into_iter()
@@ -8807,7 +8812,7 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    loop {
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
         let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
         if outcomes
             .attempts
@@ -8828,6 +8833,7 @@ where
         }
         return manager.ensure_file_open(&canonical_path, config);
     }
+    Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))
 }
 
 /// rust-analyzer's own LSP request (not part of the LSP specification) that

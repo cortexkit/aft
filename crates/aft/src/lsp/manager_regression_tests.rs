@@ -97,6 +97,54 @@ fn idle_hover_params(file: &Path) -> lsp_types::HoverParams {
 }
 
 #[test]
+fn idle_lsp_restart_races_return_start_in_progress_after_three_attempts() {
+    for pull in [false, true] {
+        let fixture = IdleLspFixture::new();
+        let key = fixture
+            .ctx
+            .lsp()
+            .server_key_for_file(&fixture.idle, &fixture.config)
+            .unwrap();
+        let locks_per_attempt = if pull { 3 } else { 2 };
+        let locks = std::cell::Cell::new(0);
+        let detached = std::cell::RefCell::new(None);
+        let detachments = std::cell::Cell::new(0);
+        let lock = || {
+            let call = locks.get();
+            assert!(
+                call < 3 * locks_per_attempt,
+                "restart must stop after three attempts"
+            );
+            let mut manager = fixture.ctx.lsp();
+            // Keep startup successful without spawning another process, then
+            // detach the client again before the caller can re-lock to use it.
+            if call % locks_per_attempt == 0 {
+                if let Some(client) = detached.borrow_mut().take() {
+                    assert!(manager.clients.insert(key.clone(), client).is_none());
+                }
+            }
+            if (call + 1) % locks_per_attempt == 0 {
+                *detached.borrow_mut() = Some(manager.clients.remove(&key).expect("ready client"));
+                detachments.set(detachments.get() + 1);
+            }
+            locks.set(call + 1);
+            manager
+        };
+        let result = if pull {
+            pull_file_diagnostics_unlocked(lock, &fixture.idle, &fixture.config, None).map(|_| ())
+        } else {
+            ensure_file_open_unlocked(lock, &fixture.idle, &fixture.config).map(|_| ())
+        };
+        match result {
+            Err(LspError::ServerNotReady(reason)) => assert_eq!(reason, START_IN_PROGRESS_REASON),
+            other => panic!("expected retryable startup error, got {other:?}"),
+        }
+        assert_eq!(detachments.get(), 3);
+        assert_eq!(locks.get(), 3 * locks_per_attempt);
+    }
+}
+
+#[test]
 fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() {
     let fixture = IdleLspFixture::new();
     let old_pid = fixture.pid(&fixture.idle).unwrap();
