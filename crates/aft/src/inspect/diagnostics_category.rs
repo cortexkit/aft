@@ -1356,12 +1356,14 @@ impl DiagnosticsCollection {
 
     /// Whether collection can return a payload after the producer wait.
     /// Missing reports and unfinished checks are carried as named gaps, not
-    /// inferred to be clean from settlement. Scoped authority is per file.
+    /// inferred to be clean from settlement. An unverified file is reportable
+    /// even if no live producer remains, but its counts stay unknown.
     fn is_reportable(&self) -> bool {
         self.servers_pending.is_empty()
             && (self.server_ran
                 || self.applicability_is_empty
                 || !self.producer_failures.is_empty()
+                || !self.scope_coverage_gaps.is_empty()
                 || self.producers_settled)
             && (self.producers_settled
                 || self

@@ -5764,7 +5764,7 @@ fn scoped_blocking_inspect_stores_a_non_empty_publish_after_its_close() {
     let stored = ctx
         .lsp()
         .diagnostics_store_for_test()
-        .entries_for_file(&lib)
+        .entries_for_file(&crate::helpers::canonicalize_like_product(&lib))
         .into_iter()
         .flat_map(|(_, entry)| {
             entry
