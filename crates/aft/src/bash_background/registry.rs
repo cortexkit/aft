@@ -17719,7 +17719,10 @@ mod tests {
         let layout = allocate_task_layout(root.path(), "session").unwrap();
         fs::write(&layout.paths.stdout, "hello world").unwrap();
         fs::write(&layout.paths.stderr, "").unwrap();
-        let buffer = BgBuffer::registered(&layout.paths, BgMode::Pipes);
+        // This test is only about the counting policy, so read the files by
+        // exact path. The registered lookup re-resolves the task layout from
+        // its saved metadata, which this fixture never writes.
+        let buffer = BgBuffer::new(layout.paths.stdout.clone(), layout.paths.stderr.clone());
         let mut metadata = PersistedTask::starting(
             layout.paths.task_id.clone(),
             "session".into(),
