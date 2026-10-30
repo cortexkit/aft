@@ -271,8 +271,12 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
 }
 
 struct FreeSpaceOverrides {
-    storage: std::collections::BTreeMap<PathBuf, (u64, u64)>,
+    storage: std::collections::BTreeMap<PathBuf, FreeSpaceOverride>,
     unlimited: usize,
+}
+struct FreeSpaceOverride {
+    canonical: Option<PathBuf>,
+    value: (u64, u64),
 }
 static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
     storage: std::collections::BTreeMap::new(),
@@ -284,14 +288,14 @@ static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
 #[must_use]
 pub struct FreeSpaceTestGuard {
     storage: PathBuf,
-    previous: Option<(u64, u64)>,
+    previous: Option<FreeSpaceOverride>,
 }
 impl Drop for FreeSpaceTestGuard {
     fn drop(&mut self) {
         let mut overrides = FREE_SPACE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(previous) = self.previous {
+        if let Some(previous) = self.previous.take() {
             overrides.storage.insert(self.storage.clone(), previous);
         } else {
             overrides.storage.remove(&self.storage);
@@ -300,16 +304,37 @@ impl Drop for FreeSpaceTestGuard {
 }
 
 /// Overrides probes under `storage` on every thread until the guard drops.
-/// The most specific matching root wins. Production never calls this setter.
+/// Raw and canonical spellings both match; the most specific root wins.
+/// Production never calls this setter.
 #[doc(hidden)]
 pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
     let storage = storage.to_path_buf();
+    let entry = FreeSpaceOverride {
+        canonical: canonical_free_space_path(&storage),
+        value: (free, capacity),
+    };
     let previous = FREE_SPACE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .storage
-        .insert(storage.clone(), (free, capacity));
+        .insert(storage.clone(), entry);
     FreeSpaceTestGuard { storage, previous }
+}
+
+/// Admission can run before a storage root or its descendants exist. Resolve
+/// the existing ancestor, preserving missing components only for comparison.
+fn canonical_free_space_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return Some(canonical.join(path.strip_prefix(ancestor).ok()?));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -344,12 +369,28 @@ fn free_space(path: &Path) -> Option<(u64, u64)> {
         let overrides = FREE_SPACE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let canonical = if overrides.storage.is_empty() {
+            None
+        } else {
+            canonical_free_space_path(path)
+        };
         overrides
             .storage
             .iter()
-            .filter(|(root, _)| path.starts_with(root))
-            .max_by_key(|(root, _)| root.components().count())
-            .map(|(_, value)| *value)
+            .filter_map(|(root, entry)| {
+                let canonical_depth = canonical.as_ref().and_then(|path| {
+                    entry
+                        .canonical
+                        .as_ref()
+                        .filter(|root| path.starts_with(root))
+                        .map(|root| root.components().count())
+                });
+                let depth = canonical_depth
+                    .or_else(|| path.starts_with(root).then(|| root.components().count()))?;
+                Some((depth, entry.value))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, value)| value)
             .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
     };
     if let Some(value) = value {
