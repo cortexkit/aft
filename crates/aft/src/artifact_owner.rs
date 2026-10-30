@@ -341,7 +341,10 @@ fn start_heartbeat_thread(state: &Arc<HeartbeatState>) {
 }
 
 fn heartbeat_thread_loop(state: Arc<HeartbeatState>) {
-    let ticker = crossbeam_channel::tick(Duration::from_millis(heartbeat_interval_ms()));
+    // Keep retries short even though healthy leases rewrite less frequently.
+    let ticker = crossbeam_channel::tick(Duration::from_millis(
+        heartbeat_interval_ms().min(fs_lock::HEARTBEAT_INTERVAL_MS),
+    ));
     while !state.shutdown.load(Ordering::SeqCst) {
         if !heartbeat_registry_has_leases(&state) {
             if state.wake_rx.recv().is_err() {
@@ -436,7 +439,10 @@ impl ArtifactOwnerLease {
     }
 
     fn try_heartbeat_if_due(&mut self) -> io::Result<bool> {
-        let now = now_ms();
+        self.try_heartbeat_if_due_at(now_ms())
+    }
+
+    fn try_heartbeat_if_due_at(&mut self, now: u64) -> io::Result<bool> {
         if now.saturating_sub(self.last_heartbeat_ms) < heartbeat_interval_ms() {
             return Ok(false);
         }
@@ -786,7 +792,7 @@ const OWNER_REAP_SCAN_LIMIT: usize = 512;
 const OWNER_REAP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// A manifest must also have gone this long without a heartbeat before it is
-/// reaped. A live owner rewrites the heartbeat every few seconds, so this only
+/// reaped. A live owner refreshes well within the cross-host stale window, so this only
 /// keeps a manifest whose checkout was deleted moments ago (and whose owner may
 /// still be shutting down) out of the sweep.
 const OWNER_REAP_MIN_HEARTBEAT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -939,7 +945,7 @@ fn heartbeat_interval_ms() -> u64 {
         }
     }
 
-    fs_lock::HEARTBEAT_INTERVAL_MS
+    fs_lock::HEARTBEAT_REFRESH_INTERVAL_MS
 }
 
 fn now_ms() -> u64 {
@@ -1227,7 +1233,68 @@ mod tests {
         fs::metadata(path).unwrap().ino()
     }
 
-    /// Sixty seconds of owner-manifest heartbeats on several leases must not
+    #[test]
+    fn idle_owner_manifest_writes_twice_in_sixty_seconds() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let mut lease = claim_owner(temp.path(), &temp.path().join("root"), "idle-root");
+        let start = lease.last_heartbeat_ms;
+        let bytes = fs::metadata(&lease.path).unwrap().len();
+        let _ = fs_lock::io_ledger::take();
+        let mut writes = 0;
+        for elapsed in (5_000..=60_000).step_by(5_000) {
+            writes += usize::from(lease.try_heartbeat_if_due_at(start + elapsed).unwrap());
+        }
+        let ledger = fs_lock::io_ledger::take();
+        assert_eq!(writes, 2, "one idle owner must write at 25s and 50s only");
+        assert_eq!(ledger.bytes_written, bytes * 2);
+        assert_eq!(
+            (ledger.file_syncs, ledger.dir_syncs, ledger.new_files),
+            (0, 0, 0)
+        );
+        eprintln!("idle owner manifest / virtual 60s: before=12 after={writes} {ledger:?}");
+    }
+
+    #[test]
+    fn delayed_owner_heartbeat_preserves_local_and_foreign_liveness() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let mut lease = claim_owner(temp.path(), &root, "delayed-owner");
+        let now = now_ms();
+        lease.manifest.heartbeat_at_ms = now - 65_000;
+        lease.last_heartbeat_ms = now - 65_000;
+        atomic_write_manifest(&lease.path, &lease.manifest).unwrap();
+        let mut foreign = lease.manifest.clone();
+        foreign.hostname = "foreign-owner".into();
+        assert!(manifest_owner_alive(&foreign), "65s is still protected");
+        let mut local = lease.manifest.clone();
+        local.heartbeat_at_ms = 0;
+        assert!(
+            manifest_owner_alive(&local),
+            "local PID identity ignores age"
+        );
+        let sibling = claim_or_open_read_only(
+            Some(temp.path()),
+            &temp.path().join("sibling"),
+            "delayed-owner",
+            "sibling-scope",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sibling.status.mode, ArtifactOwnerMode::ReadOnly);
+        assert!(
+            lease.try_heartbeat_if_due_at(now).unwrap(),
+            "late wake refreshes now"
+        );
+        let mut refreshed = read_manifest(&lease.path).unwrap();
+        assert_eq!(refreshed.heartbeat_at_ms, now);
+        refreshed.hostname = "foreign-owner".into();
+        assert!(manifest_owner_alive(&refreshed));
+    }
+
+    /// Sixty seconds of forced owner-manifest heartbeats on several leases must not
     /// fsync anything or create a new file per beat. Totals are printed so the
     /// cost can be compared across changes.
     #[test]

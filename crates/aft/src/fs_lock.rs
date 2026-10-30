@@ -34,6 +34,10 @@ impl Drop for AdvisoryLockGuard {
 }
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+/// Successful refreshes need not rewrite every wake. Foreign hosts allow 75s
+/// of silence, leaving 50s of scheduling/I/O headroom after a normal refresh.
+/// Same-host readers use process identity, never heartbeat age, for takeover.
+pub const HEARTBEAT_REFRESH_INTERVAL_MS: u64 = 25_000;
 pub const STALE_HEARTBEAT_MS: u64 = 15_000;
 pub const LIVE_OWNER_WARN_MS: u64 = 600_000;
 pub const POLL_INTERVAL_MS: u64 = 100;
@@ -198,6 +202,7 @@ pub(crate) enum MalformedOwnerPolicy {
 #[derive(Clone, Copy, Debug)]
 struct LockConfig {
     heartbeat_interval_ms: u64,
+    heartbeat_refresh_interval_ms: u64,
     stale_heartbeat_ms: u64,
     live_owner_warn_ms: u64,
     poll_interval_ms: u64,
@@ -214,6 +219,7 @@ impl Default for LockConfig {
     fn default() -> Self {
         Self {
             heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+            heartbeat_refresh_interval_ms: HEARTBEAT_REFRESH_INTERVAL_MS,
             stale_heartbeat_ms: STALE_HEARTBEAT_MS,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: POLL_INTERVAL_MS,
@@ -805,6 +811,10 @@ fn acquire_with_deadline(
 }
 
 fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Result<LockGuard> {
+    // Anchor the first deadline before publication, not when the new thread
+    // eventually gets CPU time. A late-starting thread must refresh immediately.
+    let first_refresh =
+        Instant::now() + Duration::from_millis(config.heartbeat_refresh_interval_ms);
     let now = now_ms();
     let pid = std::process::id();
     let process_identity = process_identity(pid);
@@ -842,6 +852,7 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
                 &heartbeat_pump_for_thread,
                 heartbeat_shutdown_for_run,
                 config,
+                first_refresh,
             );
         }));
         if result.is_err() || !heartbeat_shutdown.load(Ordering::Acquire) {
@@ -905,9 +916,10 @@ fn run_heartbeat(
     pump: &HeartbeatPump,
     shutdown: Arc<AtomicBool>,
     config: LockConfig,
+    mut next_refresh: Instant,
 ) {
-    // Number of consecutive heartbeat intervals that can be missed before the
-    // same-host stale window elapses and another process may reclaim the lock.
+    // Number of consecutive retry intervals before the warning window elapses.
+    // Local takeover still requires proof of a dead or recycled process.
     // Beyond this point a sustained failure is genuinely dangerous, so we
     // escalate the log from warn to error — but we still keep retrying.
     let stale_intervals = config
@@ -916,15 +928,16 @@ fn run_heartbeat(
         .unwrap_or(3)
         .max(1);
     let mut consecutive_transient_failures: u64 = 0;
+    let refresh_interval = Duration::from_millis(config.heartbeat_refresh_interval_ms);
 
     loop {
-        thread::park_timeout(Duration::from_millis(config.heartbeat_interval_ms));
         if shutdown.load(Ordering::Acquire) {
             return;
         }
 
-        match pump.heartbeat_once() {
-            Ok(()) => {
+        match refresh_heartbeat_if_due(pump, &mut next_refresh, refresh_interval, Instant::now()) {
+            Ok(false) => {}
+            Ok(true) => {
                 if consecutive_transient_failures > 0 {
                     slog_info!(
                         "filesystem lock at {} heartbeat recovered after {} transient failure(s)",
@@ -966,7 +979,24 @@ fn run_heartbeat(
                 );
             }
         }
+        thread::park_timeout(Duration::from_millis(config.heartbeat_interval_ms));
     }
+}
+
+fn refresh_heartbeat_if_due(
+    pump: &HeartbeatPump,
+    next_refresh: &mut Instant,
+    interval: Duration,
+    now: Instant,
+) -> Result<bool, HeartbeatError> {
+    if now < *next_refresh {
+        return Ok(false);
+    }
+    // A delayed wake refreshes immediately. Only success advances the deadline,
+    // so transient failures retry at the short wake cadence, not another 25s.
+    pump.heartbeat_once()?;
+    *next_refresh = now + interval;
+    Ok(true)
 }
 
 /// A heartbeat failure is terminal when the lock is provably no longer ours to
@@ -3069,6 +3099,7 @@ mod tests {
     fn test_config() -> LockConfig {
         LockConfig {
             heartbeat_interval_ms: 25,
+            heartbeat_refresh_interval_ms: 25,
             stale_heartbeat_ms: 2_000,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: 10,
@@ -3440,7 +3471,102 @@ mod tests {
         fs::metadata(path).expect("lock metadata").ino()
     }
 
-    /// Sixty seconds of heartbeats on several leases must not fsync anything
+    #[test]
+    fn idle_writer_lease_writes_twice_in_sixty_seconds() {
+        let (_dir, path) = test_lock_path();
+        let owner = create_owned_lock(&path);
+        let (pump, _handle) = HeartbeatPump::attach(&path, &owner).unwrap();
+        let config = LockConfig::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(config.heartbeat_refresh_interval_ms);
+        let mut next = start + interval;
+        let bytes = fs::metadata(&path).unwrap().len();
+        let _ = io_ledger::take();
+        let mut writes = 0;
+        // Drive the production scheduler with a virtual minute; actual lease
+        // writes still go through the kept descriptor and I/O ledger.
+        for seconds in (5..=60).step_by(5) {
+            writes += usize::from(
+                refresh_heartbeat_if_due(
+                    &pump,
+                    &mut next,
+                    interval,
+                    start + Duration::from_secs(seconds),
+                )
+                .unwrap(),
+            );
+        }
+        let ledger = io_ledger::take();
+        assert_eq!(writes, 2, "one idle lease must write at 25s and 50s only");
+        assert_eq!(ledger.bytes_written, bytes * 2);
+        assert_eq!(
+            (ledger.file_syncs, ledger.dir_syncs, ledger.new_files),
+            (0, 0, 0)
+        );
+        eprintln!("idle writer lease / virtual 60s: before=12 after={writes} {ledger:?}");
+        unregister_lease_slot(pump.slot, &path);
+    }
+
+    #[test]
+    fn delayed_refresh_preserves_live_owner_and_foreign_freshness() {
+        let (_dir, path) = test_lock_path();
+        let mut owner = create_owned_lock(&path);
+        let now = now_ms();
+        // A wake delayed 40s beyond the 25s target is still inside the unchanged
+        // 75s foreign-host window. Local identity remains protected even later.
+        owner.heartbeat_at_ms = now - 65_000;
+        fs::write(&path, lock_metadata_bytes(&owner).unwrap()).unwrap();
+        let config = LockConfig::default();
+        assert_eq!(config.cross_host_stale_heartbeat_ms(), 75_000);
+        assert!(metadata_blocks_acquisition(
+            &owner,
+            "foreign-observer",
+            config,
+            now
+        ));
+        assert!(metadata_blocks_acquisition(
+            &owner,
+            &owner.hostname,
+            config,
+            now + 3_600_000
+        ));
+        let (pump, _handle) = HeartbeatPump::attach(&path, &owner).unwrap();
+        let wake = Instant::now();
+        let mut next = wake - Duration::from_secs(40);
+        assert!(refresh_heartbeat_if_due(&pump, &mut next, Duration::from_secs(25), wake).unwrap());
+        let refreshed = read_lock_metadata(&path).unwrap();
+        assert!(refreshed.heartbeat_at_ms >= now);
+        assert!(metadata_blocks_acquisition(
+            &refreshed,
+            "foreign-observer",
+            config,
+            now + 70_000
+        ));
+        unregister_lease_slot(pump.slot, &path);
+    }
+
+    #[test]
+    fn failed_refresh_retries_on_next_short_wake() {
+        let (_dir, path) = test_lock_path();
+        let owner = create_owned_lock(&path);
+        let (pump, _handle) = HeartbeatPump::attach(&path, &owner).unwrap();
+        let wake = Instant::now();
+        let mut next = wake;
+        fs::write(&path, b"partial").unwrap();
+        assert!(refresh_heartbeat_if_due(&pump, &mut next, Duration::from_secs(25), wake).is_err());
+        assert_eq!(next, wake, "a failed write must not postpone the retry");
+        fs::write(&path, lock_metadata_bytes(&owner).unwrap()).unwrap();
+        assert!(refresh_heartbeat_if_due(
+            &pump,
+            &mut next,
+            Duration::from_secs(25),
+            wake + Duration::from_secs(5)
+        )
+        .unwrap());
+        unregister_lease_slot(pump.slot, &path);
+    }
+
+    /// Sixty seconds of forced heartbeats on several leases must not fsync anything
     /// and must not create a new file per beat. The ledger totals are printed
     /// so the cost can be compared across changes.
     #[test]
