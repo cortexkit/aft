@@ -720,6 +720,7 @@ impl CallgraphView {
             return Err(CallgraphViewError {
                 reason: "checkout is unbound".into(),
                 busy: true,
+                completion_busy: false,
             });
         }
         let legacy_import = crate::migration::views_background::BackgroundImport::start(
@@ -838,6 +839,7 @@ impl CallgraphView {
             return Err(CallgraphViewError {
                 reason: "checkout is no longer bound to this generation".into(),
                 busy: true,
+                completion_busy: false,
             });
         }
         if self
@@ -848,6 +850,7 @@ impl CallgraphView {
             return Err(CallgraphViewError {
                 reason: "legacy text and symbol import building".into(),
                 busy: true,
+                completion_busy: false,
             });
         }
         let mut retry = self
