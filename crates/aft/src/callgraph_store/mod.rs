@@ -28449,6 +28449,86 @@ mod cold_build_insert_tests {
     }
 
     #[test]
+    #[ignore = "requires AFT_CALLERS_PREFETCH_STORE from a fixed real-source export"]
+    fn direct_callers_real_store_query_plan() {
+        let path = std::env::var("AFT_CALLERS_PREFETCH_STORE").expect("real store path");
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open real store read-only");
+        let (file, symbol, edges) = conn
+            .query_row(
+                "SELECT target_file, target_symbol, COUNT(*) FROM edges
+                 WHERE kind IN ('call', 'callback_ref')
+                 GROUP BY target_file, target_symbol ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("widely called target");
+        let optimized = direct_callers_batch_sql("(?, ?)");
+        let original = optimized.replace(
+            "LEFT JOIN nodes tgt\n             ON tgt.id = e.target_node\n            AND tgt.file_path IN (SELECT path FROM files)\n         LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path",
+            "LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path) ON tgt.id = e.target_node",
+        );
+        assert_ne!(original, optimized, "reference must retain the old join");
+        let mut reports = Vec::new();
+        let mut reference = None;
+        for (variant, sql) in [("before", original), ("after", optimized)] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan")
+                .query_map(params![file, symbol], |row| row.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("plan rows");
+            let mut stmt = conn.prepare(&sql).expect("prepare real query");
+            let mut times = Vec::new();
+            let mut fullscan_steps = 0;
+            let mut vm_steps = 0;
+            let mut row_count = 0;
+            for run in 0..7 {
+                let started = Instant::now();
+                let calls = stmt
+                    .query_map(params![file, symbol], direct_call_site_from_row)
+                    .expect("query real callers")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("real callers");
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                if run == 0 {
+                    fullscan_steps = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+                    vm_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                }
+                row_count = calls.len();
+                if let Some(expected) = &reference {
+                    assert_eq!(&calls, expected, "real caller rows and order must match");
+                } else {
+                    reference = Some(calls);
+                }
+            }
+            reports.push(serde_json::json!({
+                "variant": variant, "sql": sql, "plan": plan, "rows": row_count,
+                "fullscan_steps": fullscan_steps, "vm_steps": vm_steps, "times_ms": times,
+            }));
+        }
+        let report = serde_json::json!({
+            "sqlite_version": rusqlite::version(), "file": file, "symbol": symbol,
+            "edges": edges, "queries": reports, "identical_rows": true,
+        });
+        println!("CALLER_PREFETCH_PLAN {report}");
+        if let Ok(path) = std::env::var("AFT_CALLERS_PREFETCH_REPORT") {
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&report).expect("serialize report"),
+            )
+            .expect("write real-store report");
+        }
+    }
+
+    #[test]
     fn callers_depth_boundary_batches_sqlite_counts() {
         const CALLER_COUNT: usize = 1_000;
 
