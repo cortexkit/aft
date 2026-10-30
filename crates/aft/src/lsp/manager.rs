@@ -1107,6 +1107,7 @@ pub struct LspManager {
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
     pending_watched_changes: HashMap<ServerKey, PendingWatchedChanges>,
+    watched_lifecycle: HashMap<ServerKey, WatchedLifecycleCache>,
     /// rust-analyzer instances with a workspace reload running on a helper
     /// thread because the file watcher saw a Cargo manifest change (see
     /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
@@ -1387,6 +1388,7 @@ impl LspManager {
             transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
             pending_watched_changes: HashMap::new(),
+            watched_lifecycle: HashMap::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
@@ -3051,6 +3053,7 @@ impl LspManager {
         kind: FileChangeType,
         raw: Option<PathBuf>,
         extra_config_markers: Vec<String>,
+        stamp: Option<WatchedFileStamp>,
     ) -> Result<(), LspError> {
         let pid = self.clients.get(key).map(LspClient::child_pid);
         let pending = self
@@ -3083,6 +3086,7 @@ impl LspManager {
                 kind,
                 raw,
                 extra_config_markers,
+                stamp,
             },
         );
         Ok(())
@@ -3119,21 +3123,28 @@ impl LspManager {
                 continue;
             }
             let mut direct = Vec::new();
+            let mut stamps = WatchedFileStamps::new();
             let mut forwarded: HashMap<Vec<String>, Vec<(PathBuf, FileChangeType)>> =
                 HashMap::new();
             for (path, change) in pending.changes {
                 if let Some(raw) = change.raw {
+                    if let Some(stamp) = change.stamp {
+                        stamps.insert(raw.clone(), stamp);
+                    }
                     forwarded
                         .entry(change.extra_config_markers)
                         .or_default()
                         .push((raw, change.kind));
                 } else {
+                    if let Some(stamp) = change.stamp {
+                        stamps.insert(path.clone(), stamp);
+                    }
                     direct.push((path, change.kind));
                 }
             }
             if !direct.is_empty() {
                 if let Err(error) =
-                    self.notify_files_watched_changed_for_server(&direct, Some(&key))
+                    self.notify_files_watched_changed_for_server(&direct, Some(&key), &stamps)
                 {
                     crate::slog_warn!("queued watched-file sync failed for {key:?}: {error}");
                 }
@@ -3143,6 +3154,7 @@ impl LspManager {
                     &changes,
                     &markers,
                     Some(&key),
+                    &stamps,
                 ));
             }
         }
@@ -3158,13 +3170,22 @@ impl LspManager {
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
-        self.notify_files_watched_changed_for_server(paths, None)
+        self.notify_files_watched_changed_with_stamps(paths, &WatchedFileStamps::new())
+    }
+
+    pub(crate) fn notify_files_watched_changed_with_stamps(
+        &mut self,
+        paths: &[(PathBuf, FileChangeType)],
+        stamps: &WatchedFileStamps,
+    ) -> Result<(), LspError> {
+        self.notify_files_watched_changed_for_server(paths, None, stamps)
     }
 
     fn notify_files_watched_changed_for_server(
         &mut self,
         paths: &[(PathBuf, FileChangeType)],
         only_server: Option<&ServerKey>,
+        stamps: &WatchedFileStamps,
     ) -> Result<(), LspError> {
         if self.is_quiesced() {
             return Err(LspError::ProjectClosed);
@@ -3185,8 +3206,12 @@ impl LspManager {
         }
 
         let mut canonical_events = Vec::with_capacity(paths.len());
+        let mut canonical_stamps = WatchedFileStamps::new();
         for (path, typ) in paths {
             let canonical_path = resolve_for_lsp_uri(path);
+            if let Some(stamp) = stamps.get(path) {
+                canonical_stamps.insert(canonical_path.clone(), *stamp);
+            }
             canonical_events.push((canonical_path, *typ));
         }
         #[cfg(windows)]
@@ -3215,9 +3240,14 @@ impl LspManager {
             {
                 for (path, typ) in &canonical_events {
                     if path.starts_with(&key.root) {
-                        if let Err(error) =
-                            self.queue_watched_change(&key, path.clone(), *typ, None, Vec::new())
-                        {
+                        if let Err(error) = self.queue_watched_change(
+                            &key,
+                            path.clone(),
+                            *typ,
+                            None,
+                            Vec::new(),
+                            canonical_stamps.get(path).copied(),
+                        ) {
                             first_error.get_or_insert(error);
                         }
                     }
@@ -3283,6 +3313,18 @@ impl LspManager {
                 if let Err(error) = send_result {
                     log::warn!("watched-file notification failed for {key:?}: {error}");
                     first_error.get_or_insert(error);
+                } else {
+                    let delivered = self.watched_lifecycle.entry(key.clone()).or_default();
+                    for (path, kind) in &canonical_events {
+                        if path.starts_with(&key.root) && *kind != FileChangeType::CHANGED {
+                            delivered.remember(
+                                path.clone(),
+                                *kind,
+                                canonical_stamps.get(path).copied(),
+                                Instant::now(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3330,7 +3372,20 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
-        self.forward_watcher_file_events_for_server(events, extra_config_markers, None)
+        self.forward_watcher_file_events_with_stamps(
+            events,
+            extra_config_markers,
+            &WatchedFileStamps::new(),
+        )
+    }
+
+    pub(crate) fn forward_watcher_file_events_with_stamps(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        extra_config_markers: &[String],
+        stamps: &WatchedFileStamps,
+    ) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        self.forward_watcher_file_events_for_server(events, extra_config_markers, None, stamps)
     }
 
     fn forward_watcher_file_events_for_server(
@@ -3338,6 +3393,7 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
         only_server: Option<&ServerKey>,
+        stamps: &WatchedFileStamps,
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
         let mut rust_manifest_changes = Vec::new();
         if self.is_quiesced() {
@@ -3367,10 +3423,38 @@ impl LspManager {
             .into_iter()
             .collect();
         for key in keys {
+            // A create after a delete, or a delete after a create, clears the
+            // earlier event even when the server subscribed to only one kind.
+            if let Some(previous) = self.watched_lifecycle.get_mut(&key) {
+                for (raw, path, kind) in &events {
+                    if *kind != FileChangeType::CHANGED
+                        && (path.starts_with(&key.root) || raw.starts_with(&key.root))
+                        && previous
+                            .entries
+                            .get(path)
+                            .is_some_and(|last| last.kind != *kind)
+                    {
+                        previous.remove(path);
+                    }
+                }
+            }
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
                 .filter(|(raw, resolved, _)| {
                     resolved.starts_with(&key.root) || raw.starts_with(&key.root)
+                })
+                .filter(|(raw, resolved, kind)| {
+                    !self
+                        .watched_lifecycle
+                        .get_mut(&key)
+                        .is_some_and(|previous| {
+                            previous.absorb_echo(
+                                resolved,
+                                *kind,
+                                stamps.get(*raw).copied(),
+                                Instant::now(),
+                            )
+                        })
                 })
                 .collect();
             if in_root.is_empty() {
@@ -3401,6 +3485,7 @@ impl LspManager {
                         *typ,
                         Some(raw.to_path_buf()),
                         extra_config_markers.to_vec(),
+                        stamps.get(*raw).copied(),
                     ) {
                         crate::slog_warn!(
                             "queued watched-file forward failed for {key:?}: {error}"
@@ -3463,11 +3548,25 @@ impl LspManager {
                             )
                         });
                         match sent {
-                            Some(Ok(())) if watchers.is_some() => {
-                                sent_to_registered_watcher = selected
-                                    .iter()
-                                    .map(|(_, resolved, _)| resolved.clone())
-                                    .collect();
+                            Some(Ok(())) => {
+                                let delivered =
+                                    self.watched_lifecycle.entry(key.clone()).or_default();
+                                for (raw, path, kind) in &selected {
+                                    if *kind != FileChangeType::CHANGED {
+                                        delivered.remember(
+                                            path.clone(),
+                                            *kind,
+                                            stamps.get(*raw).copied(),
+                                            Instant::now(),
+                                        );
+                                    }
+                                }
+                                if watchers.is_some() {
+                                    sent_to_registered_watcher = selected
+                                        .iter()
+                                        .map(|(_, resolved, _)| resolved.clone())
+                                        .collect();
+                                }
                             }
                             Some(Err(error)) => {
                                 crate::slog_warn!(
@@ -4138,6 +4237,10 @@ impl LspManager {
         max_events: usize,
         preserve_pull_observations: bool,
     ) -> DrainedLspEvents {
+        let now = Instant::now();
+        for cache in self.watched_lifecycle.values_mut() {
+            cache.expire(now);
+        }
         self.publish_completed_starts();
         let mut events = Vec::new();
         let mut instances = Vec::new();
@@ -5622,6 +5725,7 @@ impl LspManager {
         self.watched_file_skip_logged.retain(keep);
         self.pending_watched_changes
             .retain(|server, _| keep(server));
+        self.watched_lifecycle.retain(|server, _| keep(server));
         self.latest_push_for_pull_servers
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
@@ -8476,6 +8580,103 @@ struct PendingWatchedChange {
     kind: FileChangeType,
     raw: Option<PathBuf>,
     extra_config_markers: Vec<String>,
+    stamp: Option<WatchedFileStamp>,
+}
+
+pub(crate) type WatchedFileStamp = (u64, Option<std::time::SystemTime>);
+pub(crate) type WatchedFileStamps = HashMap<PathBuf, WatchedFileStamp>;
+
+/// Capture disk observations before taking the LSP manager lock. Queued changes
+/// carry these observations through delivery and startup replay without new I/O.
+pub(crate) fn capture_watched_file_stamps<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> WatchedFileStamps {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((path.clone(), (metadata.len(), metadata.modified().ok())))
+        })
+        .collect()
+}
+
+/// Retain created/deleted file events just beyond the watcher's debounce window.
+const WATCHED_LIFECYCLE_TTL: Duration = Duration::from_secs(10);
+const WATCHED_LIFECYCLE_CAP: usize = 4_096;
+
+struct WatchedLifecycle {
+    kind: FileChangeType,
+    stamp: Option<WatchedFileStamp>,
+    order: (Instant, u64),
+}
+
+/// Keep both indexes bounded: replacing or consuming a path removes its age key.
+#[derive(Default)]
+struct WatchedLifecycleCache {
+    entries: HashMap<PathBuf, WatchedLifecycle>,
+    oldest: std::collections::BTreeMap<(Instant, u64), PathBuf>,
+    sequence: u64,
+}
+
+impl WatchedLifecycleCache {
+    fn remove(&mut self, path: &Path) {
+        if let Some(previous) = self.entries.remove(path) {
+            self.oldest.remove(&previous.order);
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .oldest
+            .first_key_value()
+            .is_some_and(|((at, _), _)| now.saturating_duration_since(*at) >= WATCHED_LIFECYCLE_TTL)
+        {
+            let (_, path) = self.oldest.pop_first().expect("oldest entry exists");
+            self.entries.remove(&path);
+        }
+    }
+
+    fn remember(
+        &mut self,
+        path: PathBuf,
+        kind: FileChangeType,
+        stamp: Option<WatchedFileStamp>,
+        now: Instant,
+    ) {
+        self.expire(now);
+        self.remove(&path);
+        if self.entries.len() >= WATCHED_LIFECYCLE_CAP {
+            if let Some((_, path)) = self.oldest.pop_first() {
+                self.entries.remove(&path);
+            }
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let order = (now, self.sequence);
+        self.oldest.insert(order, path.clone());
+        self.entries
+            .insert(path, WatchedLifecycle { kind, stamp, order });
+    }
+
+    fn absorb_echo(
+        &mut self,
+        path: &Path,
+        kind: FileChangeType,
+        stamp: Option<WatchedFileStamp>,
+        now: Instant,
+    ) -> bool {
+        self.expire(now);
+        let echo = self.entries.get(path).is_some_and(|previous| {
+            kind == previous.kind
+                || (kind == FileChangeType::CHANGED
+                    && previous.kind == FileChangeType::CREATED
+                    && stamp.is_some()
+                    && previous.stamp == stamp)
+        });
+        if echo {
+            self.remove(path);
+        }
+        echo
+    }
 }
 
 /// Wait through spawn and replay until a final startup outcome or the deadline.
@@ -8867,6 +9068,7 @@ pub type WatcherForwardSlot = Arc<parking_lot::Mutex<Option<WatcherForwardBacklo
 pub struct WatcherForwardBacklog {
     paths: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
+    stamps: WatchedFileStamps,
     /// Paths were dropped, so rust-analyzer must check its manifests itself.
     overflowed: bool,
     /// The watcher lost events; same consequence as `overflowed`.
@@ -8877,17 +9079,38 @@ pub struct WatcherForwardBacklog {
 impl WatcherForwardBacklog {
     /// Add one drain's changes. `extra_config_markers` replaces the previous
     /// value, so the latest configuration decides what counts as config.
+    #[cfg(test)]
     pub(crate) fn merge(
         &mut self,
         paths: &[PathBuf],
         reload_all_rust: bool,
         extra_config_markers: Vec<String>,
     ) {
+        self.merge_with_stamps(
+            paths,
+            reload_all_rust,
+            extra_config_markers,
+            &WatchedFileStamps::new(),
+        );
+    }
+
+    pub(crate) fn merge_with_stamps(
+        &mut self,
+        paths: &[PathBuf],
+        reload_all_rust: bool,
+        extra_config_markers: Vec<String>,
+        stamps: &WatchedFileStamps,
+    ) {
         self.extra_config_markers = extra_config_markers;
         self.reload_all_rust |= reload_all_rust;
         for path in paths {
             if self.overflowed && !self.is_config(path) {
                 continue;
+            }
+            if let Some(stamp) = stamps.get(path) {
+                self.stamps.insert(path.clone(), *stamp);
+            } else {
+                self.stamps.remove(path);
             }
             if !self.seen.insert(path.clone()) {
                 continue;
@@ -8913,6 +9136,7 @@ impl WatcherForwardBacklog {
             self.paths.clear();
         }
         self.seen = self.paths.iter().cloned().collect();
+        self.stamps.retain(|path, _| self.seen.contains(path));
     }
 
     fn is_empty(&self) -> bool {
@@ -8943,7 +9167,11 @@ impl WatcherForwardBacklog {
                 (path, typ)
             })
             .collect();
-        let mut reloads = lsp.forward_watcher_file_events(&events, &self.extra_config_markers);
+        let mut reloads = lsp.forward_watcher_file_events_with_stamps(
+            &events,
+            &self.extra_config_markers,
+            &self.stamps,
+        );
         if self.overflowed || self.reload_all_rust {
             for key in lsp.rust_server_keys() {
                 if !reloads.iter().any(|(known, _)| known == &key) {
@@ -9516,6 +9744,10 @@ pub(crate) mod instance_regression_tests;
 #[cfg(test)]
 #[path = "watcher_work_tests.rs"]
 mod watcher_work_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod env_binary_override_tests {

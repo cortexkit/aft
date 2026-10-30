@@ -475,6 +475,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded deduplication bookkeeping, not a result list; evicting an idle session only repeats its next bar and never suppresses a changed value",
     },
     ExclusionEntry {
+        file: "lsp/manager.rs",
+        enclosing_item: "remember",
+        location_or_primitive: "WATCHED_LIFECYCLE_CAP / oldest pop_first",
+        reason: "per-server watched-file echo bookkeeping, not a result list; eviction can only forward a duplicate lifecycle event, never hide a file change",
+    },
+    ExclusionEntry {
         file: "edit.rs",
         enclosing_item: "drop, notify_full_validation_start",
         location_or_primitive: "FULL_VALIDATION_START_HOOK Option::take",
