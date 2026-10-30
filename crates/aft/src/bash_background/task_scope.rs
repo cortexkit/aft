@@ -35,6 +35,8 @@ mod linux {
         handles: Mutex<HashMap<String, ScopeHandle>>,
         #[cfg(test)]
         launcher_path: Mutex<Option<PathBuf>>,
+        #[cfg(test)]
+        manager_path: Mutex<Option<PathBuf>>,
     }
 
     impl Default for TaskScopes {
@@ -47,11 +49,26 @@ mod linux {
                 handles: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 launcher_path: Mutex::new(None),
+                #[cfg(test)]
+                manager_path: Mutex::new(None),
             }
         }
     }
 
     impl TaskScopes {
+        #[cfg(test)]
+        pub(crate) fn set_manager_for_test(&self, path: PathBuf) {
+            *self.manager_path.lock().unwrap() = Some(path);
+        }
+
+        fn manager(&self) -> PathBuf {
+            #[cfg(test)]
+            if let Some(path) = self.manager_path.lock().unwrap().clone() {
+                return path;
+            }
+            PathBuf::from("systemctl")
+        }
+
         #[cfg(test)]
         pub(crate) fn set_launcher_for_test(&self, path: PathBuf) {
             *self.launcher_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
@@ -176,19 +193,30 @@ mod linux {
             terminal_only: bool,
             mut recheck: impl FnMut(&str, &str) -> bool,
         ) -> Result<usize, String> {
-            let units = list_units()?;
+            let manager = self.manager();
+            let units = list_with(&manager)?;
             let mut stopped = 0;
             for unit in select_owned_units(&units, records, terminal_only) {
                 let Some(id) = task_unit_id(&unit) else {
                     log_unconfirmed_scope();
                     continue;
                 };
-                match lookup(id) {
+                match lookup_with(&manager, id) {
                     Ok(Some(scope)) if recheck(id, &scope.description) => {
+                        #[cfg(test)]
+                        if self.manager_path.lock().unwrap().is_some() {
+                            stop_with(&manager, &scope.unit)?;
+                        } else {
+                            scope.stop()?;
+                        }
+                        #[cfg(not(test))]
                         scope.stop()?;
                         stopped += 1;
                     }
-                    Err(_) => log_unconfirmed_scope(),
+                    Err(error) => {
+                        log_unconfirmed_scope();
+                        return Err(error);
+                    }
                     _ => {}
                 }
             }
@@ -862,17 +890,16 @@ mod linux {
             };
             match lookup_with(systemctl, id) {
                 Ok(Some(_)) => units.push(unit.into()),
-                Err(_) => log_unconfirmed_scope(),
+                Err(error) => {
+                    log_unconfirmed_scope();
+                    return Err(error);
+                }
                 _ => {}
             }
         }
         units.sort();
         units.dedup();
         Ok(units)
-    }
-
-    pub(crate) fn list_units() -> Result<Vec<String>, String> {
-        list_with(Path::new("systemctl"))
     }
 
     fn stop_with(systemctl: &Path, unit: &str) -> Result<(), String> {

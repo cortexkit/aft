@@ -1206,6 +1206,79 @@ fn task_scope_cleanup_worker_is_root_keyed_and_daemon_only() {
 }
 
 #[test]
+fn task_scope_cleanup_retries_unconfirmed_owned_unit() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, _) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
+    let unit = format!("aft-task-{id}.scope");
+    let description = super::super::task_scope::scope_description(&id, root.path());
+    let manager = root.path().join("systemctl");
+    crate::executable_cache::write_executable(&manager, format!("#!/bin/sh\ncase \"$2\" in\nlist-units) echo '{unit}' ;;\nshow) if [ ! -e '{root}/looked-up' ]; then touch '{root}/looked-up'; exit 1; fi; printf 'LoadState=loaded\\nControlGroup=/aft.slice/{unit}\\nDescription={description}\\n' ;;\nstop) echo stopped >> '{root}/stopped' ;;\nesac\n", root = root.path().display()).as_bytes()).unwrap();
+    registry.inner.task_scopes.set_manager_for_test(manager);
+    registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    let key = canonicalized_path(root.path());
+    registry.start_task_scope_cleanup(root.path());
+    until(|| {
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|slot| !slot.running)
+    });
+    {
+        let slots = task_scope_cleanup_slots().lock().unwrap();
+        let slot = slots.get(&key).unwrap();
+        assert!(!slot.done, "unconfirmed lookup marked root cleanup done");
+        assert!(slot.retry_at.is_some());
+    }
+    assert!(
+        !root.path().join("stopped").exists(),
+        "unconfirmed unit was stopped"
+    );
+    registry.start_task_scope_cleanup(root.path());
+    assert_eq!(
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .runs,
+        1
+    );
+    until(|| {
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .retry_at
+            .is_some_and(|when| Instant::now() >= when)
+    });
+    registry.start_task_scope_cleanup(root.path());
+    until(|| {
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .done
+    });
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("stopped")).unwrap(),
+        "stopped\n"
+    );
+    assert_eq!(
+        task_scope_cleanup_slots()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .runs,
+        2
+    );
+}
+
+#[test]
 fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
     if !manager_available() {
         return;
