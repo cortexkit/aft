@@ -1,0 +1,614 @@
+//! Opt-in acquisition on a real checkout. Building the pre-view caches happens
+//! in a separate preparation process so its memory peak is not charged to the
+//! measured views-on acquisition.
+
+use super::*;
+
+const KEY: &str = "0011223344556677";
+const LIMIT: u64 = 1_048_576;
+
+fn warm_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let checkout = tempfile::tempdir().unwrap();
+    let root = checkout.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn alpha() { beta(); }\nfn beta() {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("other.rs"), "pub fn gamma() { }\n").unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let index = SearchIndex::build_with_limit_to_cache_dir(
+        &root,
+        LIMIT,
+        &storage.path().join("index").join(KEY),
+    );
+    let mut parser = crate::parser::FileParser::new();
+    let mut cache = crate::parser::SymbolCache::new();
+    cache.set_project_root(root.clone());
+    for entry in search_index_symbol_files(&index).iter() {
+        let symbols = parser.extract_symbols(&entry.path).unwrap();
+        cache.insert(
+            entry.path.clone(),
+            entry.modified,
+            entry.size,
+            entry.content_hash,
+            symbols,
+        );
+    }
+    crate::symbol_cache_disk::write_to_disk(&cache, storage.path(), KEY).unwrap();
+    (checkout, storage, root)
+}
+
+fn lexical_snapshot(root: &Path, storage: &Path) -> crate::search_index::SearchIndexSnapshot {
+    let view = crate::views::trigram::LexicalView::new(
+        root.to_path_buf(),
+        crate::root_cache::StoragePaths::same(storage),
+        KEY.into(),
+        crate::blob_store::v2::TrigramPolicy {
+            max_file_size: LIMIT,
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match view.snapshot() {
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => return snapshot,
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                assert!(Instant::now() < deadline, "legacy import did not finish");
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(error)
+                if crate::views::trigram::bind_is_busy(&error) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+#[test]
+fn views_import_warm_trigram_donor_avoids_full_extraction() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    use crate::views::segment_store::TrigramPayload;
+    let before = TrigramPayload::extraction_count();
+    let _snapshot = lexical_snapshot(&root, storage.path());
+    assert_eq!(
+        TrigramPayload::extraction_count() - before,
+        0,
+        "warm donor must bypass trigram extraction"
+    );
+    let _cold = TrigramPayload::extract(
+        b"counter control",
+        &crate::blob_store::v2::TrigramPolicy {
+            max_file_size: LIMIT,
+        },
+    );
+    assert!(
+        TrigramPayload::extraction_count() > before,
+        "counter must observe real work"
+    );
+}
+
+#[test]
+fn views_import_warm_symbol_donor_avoids_full_extraction() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let _snapshot = lexical_snapshot(&root, storage.path());
+    let index =
+        SearchIndex::read_from_disk(&storage.path().join("index").join(KEY), &root).unwrap();
+    let cache = Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+    let generation = cache.read().unwrap().generation();
+    let before = crate::parser::work_counters::cached_parser_parses();
+    let report = prewarm_symbol_cache_from_view(
+        storage.path(),
+        KEY,
+        &cache,
+        generation,
+        &search_index_symbol_files(&index),
+    );
+    assert_eq!(report.reused, 2);
+    assert_eq!(report.stored, 0);
+    assert_eq!(
+        crate::parser::work_counters::cached_parser_parses() - before,
+        0
+    );
+    let mut cold = crate::parser::FileParser::new();
+    for entry in search_index_symbol_files(&index).iter() {
+        let expected = cold.extract_symbols(&entry.path).unwrap();
+        let stored = crate::views::symbol_store::lookup(
+            storage.path(),
+            KEY,
+            crate::blob_store::v2::ContentHash::of(&std::fs::read(&entry.path).unwrap()),
+            &entry.path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(*stored, expected, "{}", entry.path.display());
+    }
+}
+
+#[test]
+fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let policy = crate::blob_store::v2::TrigramPolicy {
+        max_file_size: LIMIT,
+    };
+    crate::root_cache::configure_artifact_access(&root, KEY, true);
+    assert!(crate::migration::views_background::BackgroundImport::start(
+        storage.path(),
+        KEY,
+        &root,
+        policy,
+        Arc::new(|| true),
+        crate::cold_build_limiter::global_limiter(),
+    )
+    .is_none());
+    let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
+        storage.path().to_path_buf(),
+        KEY.into(),
+        KEY.into(),
+        root.clone(),
+        policy,
+        None,
+    );
+    assert!(matches!(
+        crate::migration::v3_ledger::run_v3_import(&request, None),
+        Err(crate::migration::v3_import::V3ImportError::Store(
+            crate::blob_store::v3::Error::Refused("legacy_import_borrow_only")
+        ))
+    ));
+    crate::root_cache::configure_artifact_access(&root, KEY, false);
+    assert!(crate::migration::views_background::BackgroundImport::start(
+        storage.path(),
+        KEY,
+        &root,
+        policy,
+        Arc::new(|| false),
+        crate::cold_build_limiter::global_limiter(),
+    )
+    .is_none());
+    assert!(!storage.path().join("blobs/v3").exists());
+    assert!(!storage.path().join("migration/v3").exists());
+}
+
+fn query_context(root: &Path, storage: &Path) -> AppContext {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.to_path_buf());
+    config.storage_dir = Some(storage.to_path_buf());
+    config.views.enabled = true;
+    config.indexes.trigram = true;
+    config.indexes.semantic = false;
+    config.indexes.callgraph = false;
+    let context = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    context.set_canonical_cache_root(root.to_path_buf());
+    context
+}
+
+#[test]
+fn views_import_building_serves_lexical_results_without_load_failures() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let ctx = query_context(&root, storage.path());
+    ctx.mark_subc_bound();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    let destination = storage.path().join("index").join(&family);
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::copy(
+        storage.path().join("index").join(KEY).join("cache.bin"),
+        destination.join("cache.bin"),
+    )
+    .unwrap();
+    ctx.isolate_cold_build_limiter_for_test(1);
+    let slot = ctx.take_cold_build_slot_for_test().unwrap();
+
+    assert!(matches!(
+        ctx.lexical_view_snapshot("grep"),
+        Some(Ok(
+            crate::views::trigram::LexicalViewSnapshot::ImportBuilding
+        ))
+    ));
+    let request = |command: &str, params| RawRequest {
+        id: format!("import-building-{command}"),
+        command: command.into(),
+        lsp_hints: None,
+        session_id: None,
+        params,
+    };
+    let grep = crate::commands::grep::handle_grep(
+        &request(
+            "grep",
+            serde_json::json!({"pattern": "alpha", "include": "**/*.rs"}),
+        ),
+        &ctx,
+    );
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["complete"], false, "{:?}", grep.data);
+    assert!(
+        grep.data["index_read_gap"]
+            .as_array()
+            .is_some_and(|gaps| gaps
+                .iter()
+                .any(|gap| gap == "legacy text and symbol import building")),
+        "{:?}",
+        grep.data
+    );
+    assert_eq!(grep.data["matches"].as_array().map(Vec::len), Some(1));
+    assert!(grep.data.to_string().contains("lib.rs"), "{:?}", grep.data);
+    let glob = crate::commands::glob::handle_glob(
+        &request("glob", serde_json::json!({"pattern": "**/*.rs"})),
+        &ctx,
+    );
+    assert!(glob.success, "{:?}", glob.data);
+    assert_eq!(glob.data["files"].as_array().map(Vec::len), Some(2));
+    assert!(glob.data.to_string().contains("lib.rs"), "{:?}", glob.data);
+    let search = crate::commands::semantic_search::handle_semantic_search(
+        &request("semantic_search", serde_json::json!({"query": "alpha"})),
+        &ctx,
+    );
+    assert!(search.success, "{:?}", search.data);
+    assert_eq!(search.data["complete"], false, "{:?}", search.data);
+    assert!(
+        search
+            .data
+            .to_string()
+            .contains("legacy text and symbol import building"),
+        "{:?}",
+        search.data
+    );
+    assert!(
+        search.data["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "{:?}",
+        search.data
+    );
+    for response in [&grep, &glob, &search] {
+        assert!(!response.data.to_string().contains("This is an AFT bug"));
+    }
+    let health = ctx.try_health_snapshot(&root);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
+    assert!(!ctx
+        .degraded_reasons()
+        .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+    drop(slot);
+}
+
+#[test]
+fn views_import_currency_is_revoked_on_unbind_and_not_revived_by_rebind() {
+    let (_checkout, storage, root) = warm_fixture();
+    let context = query_context(&root, storage.path());
+    context.mark_subc_bound();
+    let current = context.views_import_control();
+    assert!(current());
+    context.mark_subc_unbound();
+    assert!(!current());
+    context.mark_subc_bound();
+    assert!(!current(), "a new binding must not revive an old import");
+    assert!(context.views_import_control()());
+}
+
+#[test]
+fn views_import_semantic_retries_a_superseded_attempt_before_filling() {
+    let generation = std::sync::atomic::AtomicU64::new(0);
+    let mut attempts = 0;
+    finish_legacy_import_before_fill(
+        || true,
+        || {
+            attempts += 1;
+            let expected = generation.load(Ordering::Acquire);
+            if attempts == 1 {
+                generation.fetch_add(1, Ordering::AcqRel);
+            }
+            generation.load(Ordering::Acquire) == expected
+        },
+    );
+    assert_eq!(
+        attempts, 2,
+        "a cancelled import must resume before fills start"
+    );
+}
+
+#[test]
+fn views_import_semantic_waits_for_rebind_before_importing_or_filling() {
+    let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let imports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let live = live.clone();
+        let bound = bound.clone();
+        let imports = imports.clone();
+        let fills = fills.clone();
+        thread::spawn(move || {
+            let mut paused_tx = Some(paused_tx);
+            finish_legacy_import_before_fill(
+                || live.load(Ordering::Acquire),
+                || {
+                    if !bound.load(Ordering::Acquire) {
+                        if let Some(tx) = paused_tx.take() {
+                            tx.send(()).unwrap();
+                        }
+                        return false;
+                    }
+                    imports.fetch_add(1, Ordering::AcqRel);
+                    true
+                },
+            );
+            fills.fetch_add(1, Ordering::AcqRel);
+        })
+    };
+    if let Err(error) = paused_rx.recv_timeout(Duration::from_secs(5)) {
+        live.store(false, Ordering::Release);
+        bound.store(true, Ordering::Release);
+        worker.join().unwrap();
+        panic!("semantic import never observed the unbound state: {error}");
+    }
+    assert_eq!(imports.load(Ordering::Acquire), 0);
+    assert_eq!(fills.load(Ordering::Acquire), 0);
+    bound.store(true, Ordering::Release);
+    worker.join().unwrap();
+    assert_eq!(imports.load(Ordering::Acquire), 1);
+    assert_eq!(fills.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn views_import_semantic_does_not_retry_an_expired_lane() {
+    let live = std::cell::Cell::new(true);
+    let mut attempts = 0;
+    finish_legacy_import_before_fill(
+        || live.get(),
+        || {
+            assert_eq!(attempts, 0, "expired lane started another import");
+            attempts += 1;
+            live.set(false);
+            false
+        },
+    );
+    assert_eq!(attempts, 1);
+    finish_legacy_import_before_fill(|| live.get(), || panic!("expired lane started an import"));
+}
+
+#[test]
+fn views_import_public_grep_search_outline_zoom_match_fresh_builds() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let fresh_storage = tempfile::tempdir().unwrap();
+    let imported = query_context(&root, storage.path());
+    let fresh = query_context(&root, fresh_storage.path());
+    let family = imported.memoized_artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    for (dir, name) in [("index", "cache.bin"), ("symbols", "symbols.bin")] {
+        let destination = storage.path().join(dir).join(&family);
+        std::fs::create_dir_all(&destination).unwrap();
+        if family != KEY {
+            std::fs::copy(
+                storage.path().join(dir).join(KEY).join(name),
+                destination.join(name),
+            )
+            .unwrap();
+        }
+    }
+    for ctx in [&imported, &fresh] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match ctx.lexical_view_snapshot("bind").expect("views must route") {
+                Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
+                    spawn_symbol_view_prewarm(ctx, &snapshot);
+                    break;
+                }
+                Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                    assert!(Instant::now() < deadline, "legacy import did not finish");
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error)
+                    if crate::views::trigram::bind_is_busy(&error) && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        // The prewarm gets its own budget: on a loaded Windows runner the
+        // import alone used most of the shared 30 s, and the whole test then
+        // took 32.8 s with the prewarm still running.
+        let prewarm_started = Instant::now();
+        let prewarm_deadline = prewarm_started + Duration::from_secs(60);
+        while ctx.symbol_view_route_count() == 0 {
+            assert!(
+                Instant::now() < prewarm_deadline,
+                "symbol prewarm did not finish within {:?}",
+                prewarm_started.elapsed()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    type Handler = fn(&crate::protocol::RawRequest, &AppContext) -> crate::protocol::Response;
+    let requests: [(Handler, &str, serde_json::Value); 4] = [
+        (
+            crate::commands::grep::handle_grep,
+            "grep",
+            serde_json::json!({"pattern":"alpha|beta", "include":"**/*.rs", "max_results":10}),
+        ),
+        (
+            crate::commands::semantic_search::handle_semantic_search,
+            "semantic_search",
+            serde_json::json!({"query":"alpha"}),
+        ),
+        (
+            crate::commands::outline::handle_outline,
+            "outline",
+            serde_json::json!({"file":root.join("lib.rs")}),
+        ),
+        (
+            crate::commands::zoom::handle_zoom,
+            "zoom",
+            serde_json::json!({"file":root.join("lib.rs"), "symbol":"alpha", "context_lines":3}),
+        ),
+    ];
+    for (handler, command, params) in requests {
+        let request = crate::protocol::RawRequest {
+            id: command.into(),
+            command: command.into(),
+            lsp_hints: None,
+            session_id: None,
+            params,
+        };
+        let warm = handler(&request, &imported);
+        let cold = handler(&request, &fresh);
+        assert!(warm.success, "{command}: {:?}", warm.data);
+        assert!(cold.success, "{command}: {:?}", cold.data);
+        for field in ["text", "matches", "results", "symbols", "content", "range"] {
+            assert_eq!(warm.data[field], cold.data[field], "{command}.{field}");
+        }
+        assert!(
+            warm.data.to_string().contains("alpha"),
+            "{command} must answer the witness, not an empty gap"
+        );
+    }
+    assert!(imported
+        .lexical_view_route_counts()
+        .iter()
+        .any(|count| *count > 0));
+    assert!(
+        imported.symbol_view_route_count() > 0,
+        "outline/zoom must use the v3 symbol route"
+    );
+}
+
+fn benchmark_paths() -> (PathBuf, PathBuf, String) {
+    let root = PathBuf::from(std::env::var_os("AFT_IMPORT_BENCH_ROOT").expect("benchmark root"))
+        .canonicalize()
+        .unwrap();
+    let storage =
+        PathBuf::from(std::env::var_os("AFT_IMPORT_BENCH_STORAGE").expect("benchmark storage"));
+    let plane = std::env::var("AFT_IMPORT_BENCH_PLANE").expect("benchmark plane");
+    crate::root_cache::configure_artifact_access(&root, KEY, false);
+    (root, storage, plane)
+}
+
+#[test]
+#[ignore = "manual large-checkout acquisition; requires isolated benchmark paths"]
+fn views_import_benchmark_prepare() {
+    let (root, storage, plane) = benchmark_paths();
+    let key = "0011223344556677";
+    std::fs::create_dir_all(&storage).unwrap();
+    let index = SearchIndex::build_with_limit_to_cache_dir(
+        &root,
+        1_048_576,
+        &storage.join("index").join(key),
+    );
+    println!("corpus={} files={}", root.display(), index.file_count());
+    if plane == "symbols" {
+        let cache = Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+        let generation = cache.read().unwrap().generation();
+        cache
+            .write()
+            .unwrap()
+            .set_project_root_for_generation(generation, root.clone());
+        let mut parser = crate::parser::FileParser::with_symbol_cache(cache.clone());
+        for file in search_index_symbol_files(&index).iter() {
+            let _ = prewarm_symbol_cache_file(&mut parser, &file.path);
+        }
+        crate::symbol_cache_disk::write_to_disk(&cache.read().unwrap(), &storage, key).unwrap();
+    }
+    if plane == "callgraph" {
+        let (store, stats) = crate::callgraph_store::CallGraphStore::cold_build_with_lease_chunked(
+            storage.join("callgraph").join(key),
+            root,
+            &[],
+            256,
+        )
+        .unwrap();
+        println!("legacy_graph_files={}", stats.files);
+        drop(store);
+    }
+}
+
+#[test]
+#[ignore = "manual large-checkout acquisition; requires prepared legacy artifacts"]
+fn views_import_benchmark_measure() {
+    let (root, storage, plane) = benchmark_paths();
+    let key = "0011223344556677";
+    let started = Instant::now();
+    let policy = crate::blob_store::v2::TrigramPolicy {
+        max_file_size: 1_048_576,
+    };
+    let paths = crate::root_cache::StoragePaths::same(&storage);
+    match plane.as_str() {
+        "trigram" => {
+            let view =
+                crate::views::trigram::LexicalView::new(root, paths, key.into(), policy).unwrap();
+            loop {
+                match view.snapshot() {
+                    Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => break,
+                    Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) if crate::views::trigram::bind_is_busy(&error) => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+        "symbols" => {
+            let index =
+                SearchIndex::read_from_disk(&storage.join("index").join(key), &root).unwrap();
+            // Isolate symbol-plane acquisition; the text donor is timed by the
+            // trigram arm rather than charged again to symbol import.
+            std::fs::rename(
+                storage.join("index").join(key).join("cache.bin"),
+                storage.join("text-donor.bin"),
+            )
+            .unwrap();
+            if let Some(job) = crate::migration::views_background::BackgroundImport::start(
+                &storage,
+                key,
+                &root,
+                policy,
+                Arc::new(|| true),
+                crate::cold_build_limiter::global_limiter(),
+            ) {
+                while job.is_building() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let cache = Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+            let generation = cache.read().unwrap().generation();
+            let report = prewarm_symbol_cache_from_view(
+                &storage,
+                key,
+                &cache,
+                generation,
+                &search_index_symbol_files(&index),
+            );
+            println!(
+                "symbols_reused={} symbols_extracted={}",
+                report.reused, report.stored
+            );
+        }
+        "callgraph" => {
+            let view = crate::views::callgraph::CallgraphView::new(root, paths, key.into(), policy)
+                .unwrap();
+            loop {
+                match view.reader() {
+                    Ok(_reader) => break,
+                    Err(error) if error.busy => thread::sleep(Duration::from_millis(10)),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            println!("graph_extractions={}", view.extraction_count());
+        }
+        _ => panic!("unknown plane"),
+    }
+    println!(
+        "plane={plane} wall_seconds={:.6}",
+        started.elapsed().as_secs_f64()
+    );
+}

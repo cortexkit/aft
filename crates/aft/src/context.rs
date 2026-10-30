@@ -318,7 +318,7 @@ thread_local! {
 thread_local! {
     static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
+    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::views::trigram::LexicalViewSnapshot, String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The call-graph reader each pinned request acquired from its checkout
     /// view, so every graph read in one request answers from one generation.
@@ -12430,7 +12430,7 @@ impl AppContext {
     pub(crate) fn lexical_view_snapshot(
         &self,
         tool: &str,
-    ) -> Option<Result<crate::search_index::SearchIndexSnapshot, String>> {
+    ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
         if !self.lexical_views_enabled() {
             return None;
         }
@@ -12465,8 +12465,13 @@ impl AppContext {
                             .as_ref()
                             .is_some_and(|view| view.matches(&root, &storage, &family, policy))
                         {
-                            match crate::views::trigram::LexicalView::new(
-                                root, storage, family, policy,
+                            match crate::views::trigram::LexicalView::new_with_import(
+                                root,
+                                storage,
+                                family,
+                                policy,
+                                self.views_import_control(),
+                                self.cold_build_limiter(),
                             ) {
                                 Ok(view) => *slot = Some(Arc::new(view)),
                                 Err(error) => return Err(error),
@@ -12486,7 +12491,7 @@ impl AppContext {
                     .push((self.config_pin_key(), result.clone()))
             });
         }
-        if result.is_ok() && tool != "bind" {
+        if result.as_ref().is_ok_and(|snapshot| snapshot.is_ready()) && tool != "bind" {
             let index = match tool {
                 "grep" => 0,
                 "glob" => 1,
@@ -12495,7 +12500,10 @@ impl AppContext {
             self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
         }
         match &result {
-            Ok(_) => self.note_view_load_success(),
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => {
+                self.note_view_load_success()
+            }
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {}
             Err(error) => self.note_view_load_failure("trigram", error),
         }
         Some(result)
@@ -12517,7 +12525,8 @@ impl AppContext {
     /// (lexical, call graph and semantic) rather than the content-addressed
     /// v1 view or the legacy stores. Such a root runs none of the legacy
     /// views-on writers: no v1 view publication or import, no v1 blob puts
-    /// and no legacy semantic import. An explicitly installed checkout query
+    /// and no import into the old semantic runtime. Compatible pre-view caches
+    /// may still be imported into v3 on background workers. A checkout query
     /// runtime keeps the older route.
     pub(crate) fn views_route_root(&self) -> bool {
         let config = self.config();
@@ -12526,6 +12535,13 @@ impl AppContext {
             && self.heavy_root_work_allowed()
             && self.cache_unavailable_reason().is_none()
             && !self.checkout_query_runtime_active()
+    }
+
+    pub(crate) fn views_import_control(&self) -> crate::migration::v3_ledger::ImportControl {
+        let lifecycle = self.subc_lifecycle_admission();
+        let generation = self.configure_generation_flag();
+        let expected = generation.load(Ordering::Acquire);
+        Arc::new(move || lifecycle.is_bound() && generation.load(Ordering::Acquire) == expected)
     }
 
     pub(crate) fn callgraph_view_is_ready(&self) -> bool {
@@ -12608,7 +12624,16 @@ impl AppContext {
                 match self.callgraph_construction_retry.lock().run(
                     Instant::now,
                     |error| error.busy,
-                    || crate::views::callgraph::CallgraphView::new(root, storage, family, policy),
+                    || {
+                        crate::views::callgraph::CallgraphView::new_with_import(
+                            root,
+                            storage,
+                            family,
+                            policy,
+                            self.views_import_control(),
+                            self.cold_build_limiter(),
+                        )
+                    },
                 ) {
                     Ok(view) => *slot = Some(Arc::new(view)),
                     Err(error) => {
