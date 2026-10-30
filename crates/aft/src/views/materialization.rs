@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 pub mod dispatch;
 
 use self::profile::{PhaseProbe, WritePhase};
+use crate::callgraph_store::join::ManifestBlobReader;
 use crate::callgraph_store::{
     initialize_schema, join, set_meta_ready, CallGraphStoreError, Result, PROVENANCE_TREESITTER,
 };
