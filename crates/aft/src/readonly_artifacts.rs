@@ -1656,6 +1656,7 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(response["success"], true, "{response}");
+            crate::test_admission::settle(&owner);
             owner
                 .cached_artifact_cache_key(&root)
                 .expect("settled repository identity")

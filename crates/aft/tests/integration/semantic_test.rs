@@ -50,7 +50,7 @@ fn configure_semantic(
     storage_dir: &Path,
     enabled: bool,
 ) -> Value {
-    send(
+    let response = send(
         aft,
         json!({
             "id": "cfg-semantic",
@@ -68,7 +68,11 @@ fn configure_semantic(
                 serde_json::json!({ "indexes": { "semantic": false, "trigram": false } })
             }),
         }),
-    )
+    );
+    if response["success"] == true {
+        aft.wait_for_folder_admission();
+    }
+    response
 }
 
 fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {

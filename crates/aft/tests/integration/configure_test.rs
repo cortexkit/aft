@@ -16,6 +16,7 @@ fn empty_path() -> std::ffi::OsString {
 }
 
 fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, storage: &Path) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     let configure = aft.send(
         &json!({
             "id": "cfg-search-index-storage",
@@ -188,7 +189,7 @@ fn configure_warnings_frame_after_main_response() {
 
 #[test]
 fn configure_warns_for_missing_formatter_and_checker_tools() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
     std::fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
 
@@ -331,7 +332,7 @@ fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
 
 #[test]
 fn configure_warns_for_missing_explicit_tsgo_checker() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
 
     let path = empty_path();
@@ -403,7 +404,7 @@ fn configure_only_warns_for_languages_present() {
 
 #[test]
 fn configure_warns_for_missing_builtin_and_custom_lsp_binaries() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     std::fs::write(dir.path().join("script.sh"), "echo hi\n").unwrap();
 
     let path = empty_path();
@@ -625,7 +626,7 @@ fn configure_does_not_warn_for_file_discovered_non_auto_installable_lsp() {
 
 #[test]
 fn configure_warns_for_file_discovered_auto_installable_lsp() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
 
     let path = empty_path();
@@ -662,7 +663,7 @@ fn configure_warns_for_file_discovered_auto_installable_lsp() {
 
 #[test]
 fn configure_warns_for_custom_lsp_regardless_of_auto_install_set() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::project::project_tempdir();
 
     let path = empty_path();
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);

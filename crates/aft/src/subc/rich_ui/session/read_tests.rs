@@ -63,6 +63,7 @@ pub(super) fn indexed_fixture(shape: &str) -> Fixture {
 
 pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fixture)) -> Fixture {
     let mut f = Fixture::new(if shape == "worker" { "worker" } else { "head" });
+    crate::test_project::mark_project(&f.policy.project_root).unwrap();
     setup(&mut f);
     std::fs::write(f.policy.project_root.join("main.rs"), SOURCE).unwrap();
     let request: RawRequest = serde_json::from_value(json!({
@@ -74,7 +75,7 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
     .unwrap();
     let response = crate::commands::configure::handle_configure(&request, &f.ctx);
     assert!(response.success, "configure: {response:?}");
-    crate::runtime_drain::drain_deferred_configure_maintenance(&f.ctx);
+    crate::test_admission::settle(&f.ctx);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         crate::runtime_drain::drain_search_index_events(&f.ctx);

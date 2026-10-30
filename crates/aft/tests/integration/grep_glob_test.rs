@@ -51,6 +51,7 @@ fn configure(aft: &mut AftProcess, root: &Path) {
 }
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     let resp = send(
         aft,
         json!({
@@ -62,6 +63,7 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {

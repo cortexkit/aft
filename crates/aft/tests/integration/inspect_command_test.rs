@@ -136,6 +136,7 @@ fn configured_context(root: &Path) -> AppContext {
 }
 
 fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -167,6 +168,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -174,6 +176,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
 /// reserves terminal-egress time inside this value, and timeout detail still
 /// carries the configured budget.
 fn configured_restricted_context(root: &Path) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -199,10 +202,12 @@ fn configured_restricted_context(root: &Path) -> AppContext {
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -228,6 +233,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -8182,6 +8188,7 @@ fn configured_context_with_held_applicability(
     root: &Path,
     timeout_ms: u64,
 ) -> (AppContext, aft::context::ProjectApplicabilityHold) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -8208,6 +8215,7 @@ fn configured_context_with_held_applicability(
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     (ctx, hold)
 }
 

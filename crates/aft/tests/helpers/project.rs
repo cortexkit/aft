@@ -22,3 +22,20 @@ pub fn project_tempdir() -> tempfile::TempDir {
     mark_project(directory.path()).expect("mark test project");
     directory
 }
+
+/// Preserve existing Git or workspace evidence; only bare tool fixtures need
+/// the extra marker. In particular, checked-in source fixtures stay untouched.
+pub fn ensure_project(root: &Path) -> io::Result<()> {
+    let decision = aft::folder_admission::probe(
+        root,
+        &Default::default(),
+        aft::folder_admission::ProbeBudgets {
+            time: std::time::Duration::from_secs(5),
+            ..Default::default()
+        },
+    );
+    if decision.classification == aft::folder_admission::FolderClassification::NotProject {
+        mark_project(root)?;
+    }
+    Ok(())
+}

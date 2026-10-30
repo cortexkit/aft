@@ -41,6 +41,7 @@ fn seed_stale_storage_entries(storage: &Path, transient_root: &Path, count: usiz
 }
 
 fn configure_without_indexes(project: &Path) -> String {
+    crate::test_helpers::project::ensure_project(project).unwrap();
     serde_json::to_string(&json!({
         "id": "configure-maintenance",
         "command": "configure",
@@ -584,6 +585,7 @@ fn assert_read_answers_during_inspect_lsp_work(
     read_path: &str,
     arguments: serde_json::Value,
 ) {
+    aft.wait_for_folder_admission();
     aft.send_silent(
         &serde_json::to_string(&json!({
             "id": "inspect-in-lsp-work",
@@ -984,7 +986,7 @@ fn standalone_edit_then_queued_grep_is_fresh_without_watcher_delivery() {
 
 #[cfg(unix)]
 fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
-    let project = tempfile::tempdir().expect("create freshness project");
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().expect("create freshness storage");
     let target = project.path().join("source.ts");
     fs::write(&target, "export const value = 'old_watcher_token';\n")
@@ -1152,7 +1154,7 @@ fn mutation_freshness_fixture() -> (tempfile::TempDir, tempfile::TempDir, AftPro
 fn mutation_freshness_fixture_with_content(
     content: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("src")).unwrap();
     fs::write(project.path().join("src/source.ts"), content).unwrap();

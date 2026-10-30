@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod admission;
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
@@ -858,6 +859,35 @@ impl AftProcess {
             "project_root": project_root.to_string_lossy(),
         });
         self.send(&request.to_string())
+    }
+
+    /// Configure an ordinary tool-behavior fixture, not a folder-admission test.
+    pub fn configure_project(&mut self, project_root: &std::path::Path) -> serde_json::Value {
+        project::ensure_project(project_root).expect("mark test project");
+        let response = self.configure(project_root);
+        if response["success"] == true {
+            self.wait_for_folder_admission();
+        }
+        response
+    }
+
+    /// The configure acknowledgement precedes the folder decision. Fixtures
+    /// testing tools rather than the acknowledgement must wait until the folder
+    /// decision is complete.
+    pub fn wait_for_folder_admission(&mut self) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = self.send(r#"{"id":"fixture-folder-admission","command":"status"}"#);
+            assert_eq!(status["success"], true, "status failed: {status}");
+            if status["folder"]["state"] == "decided" {
+                return status["folder"].clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder admission did not settle: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Send a configure command with `format_on_edit: true`.

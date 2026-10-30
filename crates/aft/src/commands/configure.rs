@@ -10370,6 +10370,21 @@ mod tests {
 
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
+        if crate::folder_admission_runtime::snapshot(ctx).is_none() {
+            if let Some(root) = req.params.get("project_root").and_then(Value::as_str) {
+                let root = Path::new(root);
+                if root.is_absolute() && root.is_dir() {
+                    // These fixtures exercise configure work for a known project.
+                    // Admission's pending/ack tests use the raw handler instead.
+                    crate::test_admission::prepare_project(ctx, root);
+                }
+            }
+        }
+        super::handle_configure(req, ctx)
+    }
+
+    fn handle_folder_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         super::handle_configure(req, ctx)
     }
 
@@ -24355,7 +24370,7 @@ mod tests {
                 "views": { "enabled": true },
             }))],
         }));
-        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
         assert!(
             !ctx.heavy_root_work_allowed(),
             "an undecided folder must close the heavy-root-work gate"
@@ -24364,7 +24379,9 @@ mod tests {
         let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
         assert_eq!(folder["classification"], "not_project");
         assert_eq!(folder["state"], "decided");
-        assert!(ctx.degraded_reasons().contains(&"folder_not_admitted".into()));
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"folder_not_admitted".into()));
         let assert_no_workers = || {
             assert!(!ctx.config().indexes.trigram);
             assert!(!ctx.config().indexes.semantic);
@@ -24418,7 +24435,7 @@ mod tests {
         // A backend left by an older bind must be removed even on the same root.
         install_project_watcher_with(&ctx, root, Vec::new(), |_, _, tx| Ok::<_, &'static str>(tx));
         assert!(ctx.watcher_runtime_active());
-        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
         settle_configure_for_test(&ctx);
         super::ensure_project_watcher(&ctx);
         assert_no_workers();
@@ -24610,7 +24627,7 @@ mod tests {
         ctx.stop_watcher_runtime();
     }
 
-        #[test]
+    #[test]
     fn handle_configure_refuses_a_home_folder_without_project_evidence() {
         let _guard = home_env_mutex();
         let temp = tempfile::tempdir().unwrap();
@@ -24623,11 +24640,14 @@ mod tests {
             "harness": "opencode",
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": true } }))],
         }));
-        let response = handle_configure_and_settle_for_test(&req, &ctx);
+        let response = handle_folder_configure_for_test(&req, &ctx);
+        settle_configure_for_test(&ctx);
         assert!(response.success);
         assert!(ctx.is_degraded());
         assert!(!ctx.heavy_root_work_allowed());
-        assert!(ctx.degraded_reasons().contains(&"folder_not_admitted".into()));
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"folder_not_admitted".into()));
         assert!(!ctx.degraded_reasons().contains(&"home_root".into()));
         let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
         assert_eq!(folder["classification"], "not_project");

@@ -980,7 +980,7 @@ mod tests {
         assert_eq!(result.reason, AdmissionReason::MultipleChildProjects);
         assert_eq!(result.observed.child_projects, 2);
         assert_eq!(result.observed.non_bulk_root_directories, 4);
-        assert!(result.child_roots.contains(&nested));
+        assert!(result.child_roots.contains(&nested.canonicalize().unwrap()));
         assert!(!result.child_roots.contains(&root.path().join("two")));
     }
 

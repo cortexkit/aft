@@ -20066,12 +20066,7 @@ mod callgraph_store_for_ops_tests {
             &ctx,
         );
         assert!(response.success, "configure should succeed: {response:?}");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while crate::folder_admission_runtime::pending(&ctx) || !ctx.configure_tail_idle() {
-            crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-            assert!(std::time::Instant::now() < deadline, "configure did not settle");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        crate::test_admission::settle(&ctx);
         ctx
     }
 

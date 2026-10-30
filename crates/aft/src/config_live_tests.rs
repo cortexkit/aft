@@ -23,6 +23,7 @@ impl Fixture {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().join("project");
         std::fs::create_dir_all(&root).expect("project root");
+        crate::test_project::mark_project(&root).unwrap();
         let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
         let project_path = project_config_path(&root);
         write(&user_path, user);
@@ -59,6 +60,7 @@ impl Fixture {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let response = crate::commands::configure::handle_configure(&req, &self.ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
+        crate::test_admission::settle(&self.ctx);
     }
 
     /// Run the reload the file watcher would have asked for.

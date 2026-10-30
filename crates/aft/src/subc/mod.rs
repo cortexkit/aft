@@ -21178,6 +21178,7 @@ mod tests {
                     ..Config::default()
                 },
             ));
+            crate::test_admission::prepare_project(&ctx, dir.path());
             assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
             Self {
                 root,
@@ -21642,7 +21643,7 @@ mod tests {
         let configured = ConfiguredRoot::unconfigured(&executor);
         let canonical_root = configured.canonical_root.clone();
         let ctx = Arc::clone(&configured.ctx);
-        let standing_dir = tempfile::tempdir().unwrap();
+        let standing_dir = crate::test_project::project_tempdir();
         std::fs::write(standing_dir.path().join("lib.rs"), "pub fn standing() {}\n").unwrap();
         let standing_root = std::fs::canonicalize(standing_dir.path()).unwrap();
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));

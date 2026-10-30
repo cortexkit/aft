@@ -98,6 +98,14 @@ pub mod exec_remote;
 #[cfg(test)]
 #[path = "../tests/helpers/executable_cache.rs"]
 mod executable_cache;
+
+#[cfg(test)]
+#[path = "../tests/helpers/project.rs"]
+pub(crate) mod test_project;
+
+#[cfg(test)]
+extern crate self as aft;
+
 pub mod executor;
 pub mod extract;
 pub mod feature_config;
@@ -211,6 +219,8 @@ pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
 pub(crate) mod task_temp_reads;
+#[cfg(test)]
+pub(crate) mod test_admission;
 #[cfg(test)]
 pub(crate) mod test_storage;
 pub mod tool_gate;

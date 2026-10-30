@@ -154,7 +154,7 @@ fn configure(root: &Path, storage: &Path) -> Arc<AppContext> {
         &ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    test_helpers::admission::settle(&ctx);
     wait_until_ready(&ctx);
     ctx
 }
