@@ -2413,13 +2413,19 @@ mod tests {
                     // A disappearing pending name makes std's metadata open
                     // and fallback fail. Deny listing after enumeration to make
                     // the fallback failure deterministic instead of timing it.
-                    *hook_denied.borrow_mut() = Some(crate::blob_store::v3::deny_read_for_test(
+                    let (guard, enforced) = crate::blob_store::v3::deny_read_for_test(
                         path.parent().unwrap(),
-                    ));
-                    assert_eq!(
-                        fs::symlink_metadata(path).unwrap_err().raw_os_error(),
-                        Some(5)
+                        "stat of a delete-pending file",
+                        || fs::symlink_metadata(path),
                     );
+                    *hook_denied.borrow_mut() = Some(guard);
+                    if enforced {
+                        assert_eq!(
+                            fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                            Some(5)
+                        );
+                    }
+                    eprintln!("pathname-stat race modelled: {enforced}");
                 }
             }));
         });
@@ -2431,13 +2437,20 @@ mod tests {
         );
         assert_eq!(result.unwrap(), (payload.len() as u64, true));
 
-        let denied = crate::blob_store::v3::deny_read_for_test(root.path());
+        let (denied, enforced) =
+            crate::blob_store::v3::deny_read_for_test(root.path(), "directory listing", || {
+                fs::read_dir(root.path())
+            });
         let result = tree_bytes(root.path(), None);
         drop(denied);
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
+        if enforced {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        } else {
+            assert_eq!(result.unwrap(), (0, true));
+        }
     }
 
     #[cfg(unix)]

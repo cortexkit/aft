@@ -150,7 +150,11 @@ fn open_permission_fixture(
 }
 
 #[cfg(windows)]
-pub(crate) fn deny_read_for_test(path: &Path) -> impl Drop {
+pub(crate) fn deny_read_for_test<T>(
+    path: &Path,
+    operation: &str,
+    probe: impl FnOnce() -> std::io::Result<T>,
+) -> (impl Drop, bool) {
     fn icacls(path: &Path, action: &str, rights: &str) {
         let output = std::process::Command::new("icacls")
             .arg(path)
@@ -168,7 +172,30 @@ pub(crate) fn deny_read_for_test(path: &Path) -> impl Drop {
     // Everyone's read-data right is also the directory-listing right. A SID
     // avoids depending on the localized account name on the Windows runner.
     icacls(path, "/deny", "*S-1-1-0:(RD)");
-    Restore(path.to_path_buf())
+    let restore = Restore(path.to_path_buf());
+    // Installing an access control entry does not prove the process observes it.
+    // Probe the operation the fixture needs denied before asserting denial-dependent behavior.
+    let enforced = match probe() {
+        Err(error) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            eprintln!("ACL denial confirmed: {operation} at {}", path.display());
+            true
+        }
+        Ok(_) => {
+            eprintln!(
+                "note: this machine cannot model ACL denial for {operation} at {}; \
+                 the operation succeeded after icacls /deny; skipping only the \
+                 ACL-dependent assertions, not the accounting checks",
+                path.display()
+            );
+            false
+        }
+    };
+    (restore, enforced)
 }
 
 /// A deletion can make the initial metadata open fail with error 5, then remove
@@ -218,20 +245,19 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
                     "{}",
                     std::io::Error::last_os_error()
                 );
-                *hook_denied.borrow_mut() = Some(deny_read_for_test(path.parent().unwrap()));
-                // GitHub's hosted Windows runners can still stat this file;
-                // native machines fail with error 5 as in the CI incident.
-                // Where the race can't be modelled, the walk is still checked.
-                match fs::symlink_metadata(path) {
-                    Err(error) => {
-                        assert_eq!(error.raw_os_error(), Some(5), "{error}");
-                        hook_modelled.set(true);
-                    }
-                    Ok(_) => eprintln!(
-                        "note: this machine can stat a delete-pending file in a \
-                         listing-denied folder; the pathname-stat race is not modelled here"
-                    ),
+                let (guard, enforced) = deny_read_for_test(
+                    path.parent().unwrap(),
+                    "stat of a delete-pending file",
+                    || fs::symlink_metadata(path),
+                );
+                *hook_denied.borrow_mut() = Some(guard);
+                if enforced {
+                    assert_eq!(
+                        fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                        Some(5)
+                    );
                 }
+                hook_modelled.set(enforced);
             }
         }));
     });
@@ -256,28 +282,40 @@ fn accounting_counts_unreadable_files_but_refuses_unreadable_directories() {
     let payload = b"still charged from the directory listing";
     fs::write(&file, payload).unwrap();
 
-    let denied = deny_read_for_test(&file);
+    let (denied, file_denial_enforced) = deny_read_for_test(&file, "file content open", || {
+        open_permission_fixture(
+            &file,
+            windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+        )
+    });
     let read = open_permission_fixture(
         &file,
         windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
     );
     let measured = allocated_bytes_until(&dir, None);
     drop(denied);
-    assert_eq!(
-        read.unwrap_err().kind(),
-        std::io::ErrorKind::PermissionDenied
-    );
+    if file_denial_enforced {
+        assert_eq!(
+            read.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
     // File content access is unnecessary for accounting, but its bytes must
     // never be silently discarded just because the content is unreadable.
     assert_eq!(measured.unwrap(), Some(payload.len() as u64));
 
-    let denied = deny_read_for_test(&dir);
+    let (denied, directory_denial_enforced) =
+        deny_read_for_test(&dir, "directory listing", || fs::read_dir(&dir));
     let measured = allocated_bytes_until(&dir, None);
     drop(denied);
-    let Error::Io(error) = measured.unwrap_err() else {
-        panic!("unreadable directory must report an I/O error");
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    if directory_denial_enforced {
+        let Error::Io(error) = measured.unwrap_err() else {
+            panic!("unreadable directory must report an I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    } else {
+        assert_eq!(measured.unwrap(), Some(payload.len() as u64));
+    }
 }
 
 #[cfg(unix)]
