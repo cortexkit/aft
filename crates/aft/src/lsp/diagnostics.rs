@@ -70,6 +70,9 @@ pub struct DiagnosticEntry {
     pub provisional: bool,
     /// A document pull, rather than an asynchronous push, certified this entry.
     pub from_document_pull: bool,
+    /// Hash of the exact synchronized text certified by this report. Arrival
+    /// order alone cannot certify an unversioned or delayed publication.
+    pub content_hash: Option<[u8; 32]>,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -119,6 +122,23 @@ thread_local! {
 }
 
 impl DiagnosticsStore {
+    pub(crate) fn certify_content(
+        &mut self,
+        server: &ServerKey,
+        file: &Path,
+        hash: Option<[u8; 32]>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&(server.clone(), file.to_path_buf())) {
+            entry.content_hash = hash;
+        }
+    }
+
+    pub(crate) fn reports(&self) -> impl Iterator<Item = (&ServerKey, &Path, &DiagnosticEntry)> {
+        self.entries
+            .iter()
+            .map(|((server, file), entry)| (server, file.as_path(), entry))
+    }
+
     pub fn new() -> Self {
         Self::with_capacity(5000)
     }
@@ -326,6 +346,7 @@ impl DiagnosticsStore {
             stale: false,
             provisional,
             from_document_pull,
+            content_hash: None,
         };
 
         self.last_publish_at_for_file

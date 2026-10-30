@@ -2569,6 +2569,7 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
 
     let file = PathBuf::from("/tmp/aft-stale.rs");
     let stale = DiagnosticEntry {
+        content_hash: None,
         diagnostics: vec![StoredDiagnostic {
             file,
             line: 1,
@@ -2606,6 +2607,7 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
 
     let file = PathBuf::from("/tmp/aft-unversioned.rs");
     let unversioned = DiagnosticEntry {
+        content_hash: None,
         diagnostics: vec![StoredDiagnostic {
             file,
             line: 1,
@@ -2922,6 +2924,7 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
         root: PathBuf::from("/workspace"),
     };
     let entry = DiagnosticEntry {
+        content_hash: None,
         diagnostics: vec![StoredDiagnostic {
             file,
             line: 1,

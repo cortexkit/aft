@@ -6899,6 +6899,65 @@ fn configure_content_pull_typescript_lsp(ctx: &AppContext, native: ServerKind) {
         .set_extra_env("AFT_FAKE_LSP_SERVER_NAME", "typescript-go");
 }
 
+#[test]
+fn unscoped_inspect_checks_current_content_after_outside_edits_without_a_watcher() {
+    let (_temp, root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "100");
+    let before = scoped_diagnostics_inspect(&ctx, "current-before", "broken.ts");
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert_eq!(before["summary"]["diagnostics"]["errors"], 1, "{before:#}");
+
+    for (text, errors) in [
+        ("export const n = 42;\n", 0),
+        ("export const n = BROKEN;\n", 1),
+    ] {
+        fs::write(&file, text).unwrap();
+        let response = inspect(
+            &ctx,
+            json!({"id":"current-outside", "command":"inspect", "sections":["diagnostics"]}),
+        );
+        assert_eq!(
+            response["complete"], true,
+            "a matching response within the deadline must complete: {response:#}"
+        );
+        assert_eq!(
+            response["summary"]["diagnostics"]["errors"], errors,
+            "{response:#}"
+        );
+    }
+}
+
+#[test]
+fn unscoped_inspect_current_content_timeout_names_the_file_instead_of_old_results() {
+    let (_temp, root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context_with_diagnostics_timeout(&root, 250);
+    configure_content_pull_typescript_lsp(&ctx, native);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "1000");
+    let config = ctx.config().clone();
+    let pulled = ctx.lsp().pull_file_diagnostics(&file, &config).unwrap();
+    assert!(!pulled.is_empty());
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+    fs::write(&file, "export const n = 42;\n").unwrap();
+    let response = inspect(
+        &ctx,
+        json!({"id":"current-timeout", "command":"inspect", "sections":["diagnostics"]}),
+    );
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        diagnostic_messages_for(&response, "broken.ts").is_empty(),
+        "old errors must not be returned: {response:#}"
+    );
+    assert!(uncovered_files(&response).iter().any(|(file, reason)| file == "broken.ts" && reason ==
+        "diagnostics for the file's current content were not confirmed before the check deadline; retry aft_inspect"), "{response:#}");
+}
+
 const CONTENT_PULL_ERROR: &str = "BROKEN marker in synced text";
 
 /// `edit_match` dispatched as an OpenCode host's request is, so a file
@@ -7158,8 +7217,8 @@ fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
     // delayed reply to the inspect's close arrives.
     edit_match_as_opencode(&ctx, "late-clear-edit", &file, "other = 1", "other = 2");
 
-    // Control: the late clearing push reached the store as a current,
-    // pushed (not pulled), empty report for the file.
+    // Control: the late clearing push reached the store, but without a
+    // document version it cannot certify the reopened file's content.
     let canonical = crate::helpers::canonicalize_like_product(&file);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -7171,7 +7230,7 @@ fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
             .into_iter()
             .any(|(key, entry)| {
                 key.kind == native
-                    && !entry.stale
+                    && entry.stale
                     && !entry.from_document_pull
                     && entry.diagnostics.is_empty()
             });
@@ -7185,6 +7244,8 @@ fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+
+    assert!(!ctx.lsp().has_authoritative_report_for_file(&file));
 
     let after =
         scoped_diagnostics_inspect_outside(&ctx, "late-clear-after", file.to_str().unwrap());

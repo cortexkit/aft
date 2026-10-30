@@ -35,6 +35,11 @@ pub(crate) const EXPLICIT_CHECK_UNVERIFIED_REASON: &str = "cargo check for aft_i
 
 const EXPLICIT_CHECK_RUNNING_REASON: &str = "cargo check running for aft_inspect; retry";
 
+/// PROPOSED AGENT-VISIBLE WORDING — approval is required before merge.
+/// Used for named file gaps, not as a checked-clean fallback.
+pub(crate) const CURRENT_CONTENT_UNVERIFIED_REASON: &str =
+    "diagnostics for the file's current content were not confirmed before the check deadline; retry aft_inspect";
+
 /// The cargo check inspect runs itself for one Rust producer whose automatic
 /// checks are off. Its outcome arrives on `outcome`: `Ok` once the result is
 /// saved and certified current, or the reason it is unknown together with any
@@ -199,8 +204,8 @@ struct DiagnosticsCollection {
 /// publish only for files they were told about; without that step a scoped
 /// file nobody had opened stayed unknown even with a working server. The
 /// sweep is bounded by a file cap and the deadline, and closes what it
-/// opened after the payload is built. Unscoped and nonblocking requests do
-/// no per-file work.
+/// opened after the payload is built. Blocking unscoped requests refresh the
+/// known working set too; nonblocking requests disclose any unverified files.
 ///
 /// The authority halves differ by design. An unscoped request makes a
 /// full-root claim. Rust needs current reports or a completed current compiler
@@ -281,6 +286,15 @@ pub(crate) fn run_diagnostics_category(
             .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
             .min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
     );
+    let warm_files = if scoped.is_none() {
+        ctx.lsp()
+            .diagnostic_working_files()
+            .into_iter()
+            .filter(|file| file.starts_with(&snapshot.project_root))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut sweep = match (&scoped, sweep_deadline) {
         (Some((candidates, _)), Some(deadline)) if !applicability_is_empty => {
             Some(sweep_scoped_files(
@@ -298,6 +312,24 @@ pub(crate) fn run_diagnostics_category(
                     .filter(|key| !saved.contains_key(*key))
                     .cloned()
                     .collect::<Vec<_>>(),
+                deadline,
+            ))
+        }
+        (None, Some(deadline)) if !applicability_is_empty && !warm_files.is_empty() => {
+            let refresh = {
+                let lsp = ctx.lsp();
+                warm_files
+                    .iter()
+                    .filter(|file| !lsp.has_authoritative_report_for_file(file))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            Some(sweep_scoped_files(
+                ctx,
+                &snapshot.config,
+                &snapshot.project_root,
+                &refresh,
+                expected_producers,
                 deadline,
             ))
         }
@@ -374,6 +406,52 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|server| (server.server_id.clone(), server.reason()))
         .collect();
+    if scoped.is_none() {
+        let lsp = ctx.lsp();
+        for (key, file) in lsp.unverified_diagnostic_files() {
+            if !file.starts_with(&snapshot.project_root)
+                || sweep.as_ref().is_some_and(|sweep| {
+                    matches!(
+                        sweep.requested_reports.get(&(file.clone(), key.clone())),
+                        Some(Ok(_))
+                    )
+                })
+            {
+                continue;
+            }
+            collection.scope_coverage_gaps.push(ScopedCoverageGap {
+                file,
+                reason: CURRENT_CONTENT_UNVERIFIED_REASON,
+                cause: CoverageCause {
+                    producer: Some(server_id(&key)),
+                    root: Some(key.root),
+                    reason: CURRENT_CONTENT_UNVERIFIED_REASON.into(),
+                },
+            });
+        }
+        // An opened document with no publication is unknown too. A report with
+        // no document version must never turn that absence into checked-clean.
+        for file in &warm_files {
+            if !lsp.has_authoritative_report_for_file(file)
+                && !collection
+                    .scope_coverage_gaps
+                    .iter()
+                    .any(|gap| gap.file == *file)
+                && !sweep.as_ref().is_some_and(|sweep| {
+                    sweep
+                        .requested_reports
+                        .iter()
+                        .any(|((path, _), result)| path == file && result.is_ok())
+                })
+            {
+                collection.scope_coverage_gaps.push(ScopedCoverageGap {
+                    file: file.clone(),
+                    reason: CURRENT_CONTENT_UNVERIFIED_REASON,
+                    cause: CoverageCause::unattributed(CURRENT_CONTENT_UNVERIFIED_REASON),
+                });
+            }
+        }
+    }
     for (id, root) in &collection.checking_producers {
         let key = ServerKey {
             kind: ServerKind::Rust,
@@ -424,6 +502,9 @@ pub(crate) fn run_diagnostics_category(
         collection
             .diagnostics
             .retain(|row| !check.covers(&row.diagnostic.file));
+        collection
+            .scope_coverage_gaps
+            .retain(|gap| !check.covers(&gap.file));
         if let Some((candidates, _)) = &scoped {
             collection.saved_files.extend(
                 candidates
@@ -1126,6 +1207,24 @@ impl DiagnosticsCollection {
                         root: Some(key.root.clone()),
                         reason: reason.clone(),
                     },
+                });
+                continue;
+            }
+            if !matches!(
+                coverage,
+                ScopedFileCoverage::Covered
+                    | ScopedFileCoverage::NoProducer
+                    | ScopedFileCoverage::ExcludedByTsconfig
+            ) && ctx
+                .lsp()
+                .unverified_diagnostic_files()
+                .iter()
+                .any(|(_, path)| path == file)
+            {
+                self.scope_coverage_gaps.push(ScopedCoverageGap {
+                    file: file.clone(),
+                    reason: CURRENT_CONTENT_UNVERIFIED_REASON,
+                    cause: CoverageCause::unattributed(CURRENT_CONTENT_UNVERIFIED_REASON),
                 });
                 continue;
             }

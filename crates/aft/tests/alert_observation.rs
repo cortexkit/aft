@@ -236,6 +236,7 @@ fn post_edit_acceptance_keeps_clean_snapshot_and_omits_unversioned_report() {
         root: PathBuf::from("/alert-fixture/project"),
     };
     let fresh_clean = DiagnosticEntry {
+        content_hash: None,
         diagnostics: Vec::new(),
         epoch: 2,
         result_id: None,
@@ -258,6 +259,7 @@ fn post_edit_acceptance_keeps_clean_snapshot_and_omits_unversioned_report() {
     assert!(accepted.pending_servers.is_empty());
 
     let unversioned = DiagnosticEntry {
+        content_hash: None,
         version: None,
         ..fresh_clean
     };

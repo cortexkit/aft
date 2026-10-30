@@ -3,11 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-const CONTENT_HASH_SIZE_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Per-document state tracked for LSP synchronization.
 ///
-/// We track `mtime`, `size`, and (for small files) a content hash so we can
+/// We track `mtime`, `size`, and a content hash so we can
 /// detect when a file has been changed
 /// outside the AFT pipeline (another tool, another session, manual edit) and
 /// resync the LSP server before issuing diagnostic requests. Without this,
@@ -25,9 +23,8 @@ pub struct DocumentEntry {
     /// Filesystem byte size at the moment we last synced. `None` for the
     /// same reasons as `mtime`.
     pub size: Option<u64>,
-    /// BLAKE3 content hash captured at the last sync for files up to
-    /// `CONTENT_HASH_SIZE_LIMIT_BYTES`. Large files skip hashing and rely on
-    /// `(mtime, size)` to avoid expensive reads.
+    /// BLAKE3 hash of the synchronized text. Metadata alone cannot prove that
+    /// diagnostics describe the current content, even for a large document.
     pub content_hash: Option<[u8; 32]>,
 }
 
@@ -44,13 +41,12 @@ pub struct DocumentEntry {
 #[derive(Debug, Default)]
 pub struct DocumentStore {
     entries: HashMap<PathBuf, DocumentEntry>,
+    closed_versions: HashMap<PathBuf, i32>,
 }
 
 impl DocumentStore {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
@@ -69,7 +65,7 @@ impl DocumentStore {
     }
 
     /// Open a new document, recording the current on-disk metadata/hash. Returns
-    /// the initial version (0). If the file's metadata cannot be read, the
+    /// the initial version (0), or a later version on reopen. If metadata cannot be read, the
     /// document is still tracked but `mtime`/`size` will be `None`, which
     /// causes `is_stale_on_disk()` to conservatively report stale on the
     /// next check (forcing a resync).
@@ -81,14 +77,22 @@ impl DocumentStore {
     /// [`Self::open`] with the file's disk state already read, so a document
     /// opened in several servers reads and hashes the file once.
     pub fn open_with(&mut self, path: PathBuf, snapshot: &DiskSnapshot) -> i32 {
+        let version = self.next_open_version(&path);
         let entry = DocumentEntry {
-            version: 0,
+            version,
             mtime: snapshot.mtime,
             size: snapshot.size,
             content_hash: snapshot.content_hash(&path),
         };
         self.entries.insert(path, entry);
-        0
+        version
+    }
+
+    /// Reopening must not reuse a version that a delayed publication can carry.
+    pub(crate) fn next_open_version(&self, path: &Path) -> i32 {
+        self.closed_versions
+            .get(path)
+            .map_or(0, |version| version + 1)
     }
 
     /// Bump the version for an already-open document and refresh the
@@ -133,7 +137,10 @@ impl DocumentStore {
     /// Close a document and remove from tracking. Returns the last known
     /// version, or `None` if the document was not open.
     pub fn close(&mut self, path: &Path) -> Option<i32> {
-        self.entries.remove(path).map(|e| e.version)
+        let entry = self.entries.remove(path)?;
+        self.closed_versions
+            .insert(path.to_path_buf(), entry.version);
+        Some(entry.version)
     }
 
     /// Get all open document paths.
@@ -175,7 +182,6 @@ impl DocumentStore {
                 }
 
                 match current_size {
-                    Some(size) if size > CONTENT_HASH_SIZE_LIMIT_BYTES => false,
                     Some(_) => match (entry.content_hash, snapshot.content_hash(path)) {
                         (Some(prev_hash), Some(now_hash)) => prev_hash != now_hash,
                         _ => true,
@@ -190,12 +196,12 @@ impl DocumentStore {
     }
 }
 
-/// One file's disk state: metadata read at once, and for small files a
+/// One file's disk state: metadata read at once, and a
 /// BLAKE3 content hash read on first use and then shared, so every server's
 /// store and every staleness check in one operation reads the file once.
 /// Metadata fields are `None` if the path cannot be statted or if the
 /// platform doesn't support the queried metadata (rare). The hash is `None`
-/// for unreadable files and files above `CONTENT_HASH_SIZE_LIMIT_BYTES`.
+/// for unreadable files.
 #[derive(Debug, Default)]
 pub struct DiskSnapshot {
     mtime: Option<SystemTime>,
@@ -204,6 +210,15 @@ pub struct DiskSnapshot {
 }
 
 impl DiskSnapshot {
+    /// Use the text actually sent, not a second disk read that could observe a
+    /// concurrent write and incorrectly certify text the server never received.
+    pub(crate) fn for_content(path: &Path, content: &str) -> Self {
+        let snapshot = Self::read(path);
+        let _ = snapshot
+            .content_hash
+            .set(Some(*blake3::hash(content.as_bytes()).as_bytes()));
+        snapshot
+    }
     pub fn read(path: &Path) -> Self {
         match std::fs::metadata(path) {
             Ok(meta) => Self {
@@ -217,17 +232,20 @@ impl DiskSnapshot {
 
     fn content_hash(&self, path: &Path) -> Option<[u8; 32]> {
         *self.content_hash.get_or_init(|| {
-            let size = self.size?;
-            if size > CONTENT_HASH_SIZE_LIMIT_BYTES {
-                return None;
-            }
+            self.size?;
             #[cfg(test)]
             CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
-            std::fs::read(path)
-                .ok()
-                .map(|bytes| *blake3::hash(&bytes).as_bytes())
+            file_content_hash(path)
         })
     }
+}
+
+/// Stream large files rather than allocating another full document buffer.
+pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
