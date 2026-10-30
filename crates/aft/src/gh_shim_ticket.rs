@@ -278,6 +278,13 @@ pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::Persist
                 birth_identity: crate::fs_lock::speech_process_identity(pid)?,
             })
         });
+    let _local = speech
+        .prepared
+        .context
+        .service
+        .admission
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let result = seal
         .ok_or_else(|| {
             crate::gh_shim_speech::Refusal::new(
@@ -301,11 +308,13 @@ pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::Persist
         return;
     }
     if speech.background.load(Ordering::SeqCst) {
-        activate_speech(&speech, &raw);
+        activate_speech_locked(&speech, &raw);
     }
 }
 
-fn activate_speech(speech: &SpeechTicket, raw: &[u8; TICKET_BYTES]) {
+// The caller holds the service admission mutex through lifecycle changes, so a
+// final authority refresh cannot observe half of a seal/activation transition.
+fn activate_speech_locked(speech: &SpeechTicket, raw: &[u8; TICKET_BYTES]) {
     if speech.active.load(Ordering::SeqCst)
         || speech
             .failure
@@ -355,8 +364,15 @@ pub(crate) fn promote_speech_task(session: &str, task: &str) {
         .filter_map(|entry| entry.speech.clone().map(|speech| (speech, entry.ticket)))
         .collect();
     for (speech, raw) in entries {
+        let _local = speech
+            .prepared
+            .context
+            .service
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         speech.background.store(true, Ordering::SeqCst);
-        activate_speech(&speech, &raw);
+        activate_speech_locked(&speech, &raw);
     }
 }
 

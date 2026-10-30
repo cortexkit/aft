@@ -1,6 +1,25 @@
 use super::*;
 use sha2::Digest;
 
+#[test]
+fn invalid_signed_speech_manifest_warns_without_envelope_contents() {
+    crate::gh_shim_speech::tests::assert_snapshot_warning(
+        || verified_speech_manifest(b"secret-invalid-envelope").unwrap_err(),
+        "gh_shim::verified_speech_manifest",
+        "envelope_json",
+        json!({"envelope_bytes": 23}),
+    );
+    let mut envelope = super::tests::signed(&super::tests::fixture_manifest(), unix_seconds());
+    envelope.envelope_version += 1;
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    crate::gh_shim_speech::tests::assert_snapshot_warning(
+        || verified_speech_manifest(&bytes).unwrap_err(),
+        "gh_shim::verified_speech_manifest",
+        "envelope_version",
+        json!({"envelope_bytes": bytes.len()}),
+    );
+}
+
 fn snapshot(manifest: &Manifest) -> crate::gh_shim_speech::model::PolicySnapshot {
     let bytes = serde_json::to_vec(&super::tests::signed(manifest, unix_seconds())).unwrap();
     crate::gh_shim_speech::model::PolicySnapshot {
