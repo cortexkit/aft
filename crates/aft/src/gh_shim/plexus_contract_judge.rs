@@ -620,6 +620,31 @@ pub fn assert_reply_contract(vector: &Value) {
         assert!(leg.get("response").is_some(), "{name}");
     }
     let result = &vector["reply"]["result"];
+    if matches!(
+        name,
+        "comment-edit-pre-read-unknown"
+            | "pr-edit-pull-request-not-found"
+            | "pr-ready-pull-request-read-incomplete"
+            | "resolve-thread-graphql-errors"
+            | "stack-unstack-stack-read-incomplete"
+    ) {
+        let expected = match name {
+            "comment-edit-pre-read-unknown" => {
+                "pre_dispatch_read_incomplete{reason: transport_unknown}"
+            }
+            "pr-edit-pull-request-not-found" => "vendor_rejected{status: 404}",
+            "resolve-thread-graphql-errors" => "vendor_rejected{status: 422}",
+            _ => "pre_dispatch_read_incomplete{reason: invalid_response}",
+        };
+        assert_eq!(
+            result,
+            &serde_json::json!({
+                "status": "refused", "refusal_code": expected,
+                "retry_same_nonce": true, "transmission": "not_sent",
+            }),
+            "{name}"
+        );
+    }
     match result["status"].as_str() {
         Some("refused") => {
             assert!(result["refusal_code"].is_string(), "{name}");

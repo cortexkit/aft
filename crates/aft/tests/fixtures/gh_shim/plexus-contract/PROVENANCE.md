@@ -1,12 +1,18 @@
 # Provenance of this directory
 
 Copied byte-for-byte from the Plexus repository (`cortexkit/plexus`),
-commit `3a702b4dc39eca2013407c8bed82b2adc5bc968b` (2026-10-29,
-"mason: add owned bot pull request merge queue operations"), directory
 `crates/plexus-core/tests/fixtures/gh_shim_wire/`:
-`README.md`, `requests-contract/` (159 vectors) and `replies-contract/`
-(26 vectors). This replaces the copy from Plexus commit
-`0025bdf6cdca8c2d9c6aa10409df9424260d7b5e`.
+
+- `README.md` and `replies-contract/` (27 vectors): commit
+  `fec01fefcd8aee8a5e25ced70585ecb12a7d8685` (2026-10-30,
+  "mason: isolate paused relay timing tests from real TCP").
+- `requests-contract/` (159 vectors): commit
+  `3a702b4dc39eca2013407c8bed82b2adc5bc968b` (2026-10-29,
+  "mason: add owned bot pull request merge queue operations").
+
+The README and reply vectors replace the earlier contract import from Plexus
+commit `0025bdf6cdca8c2d9c6aa10409df9424260d7b5e`
+("mason: refuse foreign-PR review-thread resolves").
 As in the previous vendoring, Plexus's AFT-derived `requests/` captures and
 its `PROVENANCE.md` are not copied; this file records AFT's contract import.
 
@@ -26,22 +32,23 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 
 | Path | SHA-256 |
 | --- | --- |
-| `README.md` | `83865eb4155c7ee99eb8ae3efb4f3b39308fea8b5a622c1c55f71cf7b54593ed` |
+| `README.md` | `cda24bab7c08fb2caf7b5b7542ece62629a22d2f6645f47ff69731ff61cc03c4` |
+| `replies-contract/comment-edit-pre-read-unknown.json` | `f46647cf863fdeb0919f38df2e530df1ac1860a5b88462defbc19aad038a8331` |
 | `replies-contract/pr-dequeue-closed.json` | `a325282140b12603035d0925c3068c42872e54f0ca5a86a3760aeb0f884eba02` |
 | `replies-contract/pr-dequeue-graphql-errors.json` | `69a7cc46a10cef3b8a9d3934896add2915d17ef55975678e3b78a5d1c6710282` |
 | `replies-contract/pr-dequeue-not-own.json` | `32c72e5195ec93a61fda09b95ab093e6de27c615ffbbe0dbb975fd1cab16034f` |
 | `replies-contract/pr-dequeue-own.json` | `53268db11e0077d539863791b1ac0c3011f495250d9790498fd0800c8cf36431` |
 | `replies-contract/pr-draft-not-own.json` | `2291c88046bf5f97179f06a26091861beda31b3fc66cab8c1d88439ca8c9a3e5` |
 | `replies-contract/pr-edit-not-own.json` | `fdb61597f7b15e9e1da6ca5648250e1fcae09a98ae42d9ea3552111695c71621` |
-| `replies-contract/pr-edit-pull-request-not-found.json` | `c391b6fe818cb1fa6318ad65e44c540c1153ab82c5ec71bd67680b91a2f3ed90` |
+| `replies-contract/pr-edit-pull-request-not-found.json` | `1a19a35d2929e989bbe6f5213a123efce5e4101ff00e4ca774893456b30f8982` |
 | `replies-contract/pr-enqueue-closed.json` | `d6de551937145eb949a69717c1e0cf824e4c9987b4f08da1c58c5e9959f13cec` |
 | `replies-contract/pr-enqueue-graphql-errors.json` | `cd08865baf532049d3685452260dd77be657a82eedb47a0abdaa92d5847d0553` |
 | `replies-contract/pr-enqueue-head-moved.json` | `2b655f033baa4109e0f3d373d7dac5b3b0b1a3b63d386783351417761188bcc1` |
 | `replies-contract/pr-enqueue-not-own.json` | `ddf9e52cebbcef7f885d6ff995457e799426714b37b432988cbcebd65af3c7a8` |
 | `replies-contract/pr-enqueue-own.json` | `f27d754fb60d1fc7fce566f62c55c949c095fde0c0d71840b4299ebcb0dfb55c` |
 | `replies-contract/pr-ready-not-own.json` | `1cc3bcdc280efb26f96ee91275c99df7085e3b25a180b0f3c6789cdf8718b34c` |
-| `replies-contract/pr-ready-pull-request-read-incomplete.json` | `3f61bb24e26b692790b51f82b025c9d0818ce280d0f3b12c7636552e162dac54` |
-| `replies-contract/resolve-thread-graphql-errors.json` | `332ebe6a0e7ba8e0c9708b360b5817dca2f0cf4f8e28bd8d169965455f64467d` |
+| `replies-contract/pr-ready-pull-request-read-incomplete.json` | `c49a9d14cf1776ab95dd2c7bb7b9df2ebb7eef9fa248e59ec0fc6e5b36201929` |
+| `replies-contract/resolve-thread-graphql-errors.json` | `6afcd80ea593f360ec394fc0ef0e921275f120dd17486fa5344ceb86af13801b` |
 | `replies-contract/resolve-thread-not-own.json` | `96f53998f58735d57549ec7fbcdcf73f030eab3797da2d26e4751b506d08394e` |
 | `replies-contract/resolve-thread-not-present.json` | `d40d1bb65a9e57046416b4766676b743b831e5068af1e2997cfe96c1abaa1ec3` |
 | `replies-contract/resolve-thread-own.json` | `c34059de27a62ccf44224775d2552cd0aa611f600f3e5fe57a0be3891f11496b` |
@@ -51,7 +58,7 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `replies-contract/stack-unstack-foreign-member.json` | `1a49d1c3aeb8ca28c32ed14b0d513c5e516e0a0fa9233892ef7ea3a10956101a` |
 | `replies-contract/stack-unstack-foreign-stack.json` | `90a1f6c7d98266173d6c0706562ec4da69de37e407bcc40d648e673e830e867b` |
 | `replies-contract/stack-unstack-pr-not-own.json` | `3ac6c70c153772efeeec861640ad85689e84176b08a037806b8595fc5ff502d5` |
-| `replies-contract/stack-unstack-stack-read-incomplete.json` | `d9908a4a288aad6c9c2e7fc342aa07d41bffd4a659342f2b624320bbeeb49e8c` |
+| `replies-contract/stack-unstack-stack-read-incomplete.json` | `bf81bb341d8fa14d83140bccb98e1877635a787da8f51d6665fc255f52c88bee` |
 | `replies-contract/unresolve-thread-repository-mismatch.json` | `fa00db99df7a386d17e23ffabe5cc7f563137c51b3adcdd0b02fc77028578e46` |
 | `requests-contract/accepted-close-issue.json` | `84724715a3bcbad824af0fb9efd60216cedef4986b6b89f8020b5e51c14fba62` |
 | `requests-contract/accepted-close-pr.json` | `b21a42f6b45f435ef533f39b23634dbb80791c53224a4d6050762ddc7b3ea95a` |

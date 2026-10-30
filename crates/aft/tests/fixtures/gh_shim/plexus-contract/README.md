@@ -252,6 +252,15 @@ refusals, `code` and `detail`:
 with a bare `refusal_code: "pr_edit_not_own"` and no `code` or `detail`; see
 `pr-ready-not-own.json`.
 
+`comment-edit-pre-read-unknown.json` records an HTTP 500 ownership pre-read,
+which the transport classifies as an unknown outcome, just like a read timeout.
+No write was attempted: the reply uses
+`pre_dispatch_read_incomplete{reason: transport_unknown}`, with
+`transmission: "not_sent"` and `retry_same_nonce: true`. The claim is released
+so a same-nonce retry can perform the read and write normally. Other failed
+pre-reads before any write also release the claim, retaining their diagnostic
+code. Successful reads that prove an ownership mismatch remain terminal.
+
 Keys in these files are sorted; parse them rather than relying on key order.
 Every refusal code `src/github/facade/vendor_band.rs` writes as a string
 literal must have a reply file, or be listed with its reason in the test's
