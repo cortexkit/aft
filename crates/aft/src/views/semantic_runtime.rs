@@ -1788,8 +1788,15 @@ pub(crate) fn run_worker(
         return;
     }
     // Build the index queries score before the lane is served, so neither
-    // the first query nor a readiness sample has to build it.
-    let _ = runtime.index();
+    // the first query nor a readiness sample has to build it. A failure here
+    // is retried by the first query, which also counts it in health.
+    if let Err(error) = runtime.index() {
+        crate::slog_warn!(
+            "semantic view index build failed root={} error={}",
+            config.root.display(),
+            error
+        );
+    }
     crate::slog_info!(
         "semantic view loaded root={} family={} scope={} load_ms={}",
         config.root.display(),
@@ -2689,9 +2696,16 @@ pub fn is_transient_reason(reason: &str) -> bool {
 }
 
 /// Rebuilds the scored index after a fill, on the worker rather than on the
-/// next query.
+/// next query. A failure is retried by the next query, which also counts it
+/// in health; the log names it here so it is not lost when no query follows.
 fn warm_index(runtime: &CheckoutSemantic) {
-    let _ = runtime.index();
+    if let Err(error) = runtime.index() {
+        crate::slog_warn!(
+            "semantic view index rebuild failed root={} error={}",
+            runtime.root.display(),
+            error
+        );
+    }
 }
 
 #[cfg(test)]

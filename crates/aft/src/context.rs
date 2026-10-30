@@ -1155,14 +1155,15 @@ pub(crate) fn view_load_error_response(id: &str, message: String) -> crate::prot
 
 /// Error-level log throttle: one line per project and plane per minute.
 /// Repeats inside the window are counted and reported on the next emission.
-const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The most recent checkout view load failure of a project. Planes are the
 /// query planes a failed load serves: `trigram` for the lexical view behind
 /// grep, glob and aft_search, `callgraph` for the graph behind navigation,
-/// zoom and inspect. Semantic lane failures stay lane-level (the lane reports
-/// `unavailable` with its cause and the query continues lexically), so they
-/// are not load failures here.
+/// zoom and inspect, and `semantic` when a built semantic view cannot serve
+/// or score a query. The semantic lane still answers `unavailable` with its
+/// cause and the query continues lexically; health counts the failure too.
+/// Pending fill coverage is normal progress and is not counted.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ViewLoadFailure {
     pub plane: String,
@@ -1193,7 +1194,7 @@ struct ViewLoadHealth {
 /// Bucket a view load error into a stable short cause. I/O failures already
 /// name their path and operation; verification and manifest problems name
 /// what mismatches or is missing; the full text stays in the recorded error.
-fn view_load_cause(error: &str) -> &'static str {
+pub(crate) fn view_load_cause(error: &str) -> &'static str {
     let error = error.to_lowercase();
     if error.contains("busy") {
         "busy"
@@ -6015,17 +6016,38 @@ impl AppContext {
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
-        let (view_load_failures, view_load_failure_last) = match self.view_load_health.try_lock() {
-            Some(health) => (
-                health
-                    .by_cause
-                    .iter()
-                    .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
-                    .collect(),
-                health.last.clone(),
-            ),
-            None => return RootHealthSummary::busy(),
-        };
+        let (mut view_load_failures, mut view_load_failure_last): (BTreeMap<String, u64>, _) =
+            match self.view_load_health.try_lock() {
+                Some(health) => (
+                    health
+                        .by_cause
+                        .iter()
+                        .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
+                        .collect(),
+                    health.last.clone(),
+                ),
+                None => return RootHealthSummary::busy(),
+            };
+        // A parent folder's worker reads its children's views itself; their
+        // failures are recorded under the parent root and reported here too.
+        if config.views.enabled {
+            if let Some(root) = config.project_root.as_deref() {
+                match crate::views::parent::try_child_load_failures(root) {
+                    Some(Some((counts, last))) => {
+                        view_load_failures.extend(counts);
+                        if last.as_ref().is_some_and(|last| {
+                            view_load_failure_last
+                                .as_ref()
+                                .is_none_or(|own: &ViewLoadFailure| own.last_at_ms <= last.last_at_ms)
+                        }) {
+                            view_load_failure_last = last;
+                        }
+                    }
+                    Some(None) => {}
+                    None => return RootHealthSummary::busy(),
+                }
+            }
+        }
         let search_index = match self.search_index.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
