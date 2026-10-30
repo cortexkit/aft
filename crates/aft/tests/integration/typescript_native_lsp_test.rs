@@ -163,6 +163,62 @@ fn runtime_notes(aft: &mut AftProcess, file: &Path) -> Vec<String> {
 }
 
 #[test]
+fn typescript_5_inspect_resolves_module_created_by_aft_write() {
+    let Some(ts5) = installed(
+        TS5_ENV,
+        "typescript_5_inspect_resolves_module_created_by_aft_write",
+    ) else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    typescript_package(&root, &ts5);
+    write(
+        &root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"noEmit":true,"target":"es2022","module":"esnext","moduleResolution":"bundler","allowImportingTsExtensions":true},"include":["src","lib"]}"#,
+    );
+    let importer = root.join("lib/use.ts");
+    write(&importer, "import { scan } from '../src/scanner2.ts';\nexport const value: number = scan(1);\nexport const control: number = 'positive control';\n");
+    // AftProcess disables the OS project watcher, so resolution must come from
+    // the write notification rather than a later filesystem event.
+    let mut aft = spawn_configured(&root, &[ts5.join(".bin")]);
+    let inspect = |aft: &mut AftProcess| {
+        let response = aft.send(&json!({"id": "inspect-importer", "command": "inspect", "scope": importer, "sections": ["diagnostics"]}).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        response
+    };
+    let before = inspect(&mut aft);
+    assert_eq!(before["summary"]["diagnostics"]["errors"], 2, "{before}");
+    assert!(
+        before["details"]["diagnostics"]
+            .to_string()
+            .contains("Cannot find module"),
+        "{before}"
+    );
+    let written = aft.send(&json!({"id": "write-module", "command": "write", "file": root.join("src/scanner2.ts"), "content": "export function scan(n: number): number { return n + 1; }\n"}).to_string());
+    assert_eq!(written["success"], true, "{written}");
+
+    // Keep the independent assignment error as a positive control: an empty
+    // or missing diagnostics report must not look like successful resolution.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let after = inspect(&mut aft);
+        let messages = after["details"]["diagnostics"].to_string();
+        if after["summary"]["diagnostics"]["errors"] == 1
+            && !messages.contains("Cannot find module")
+            && messages.contains("not assignable")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "importer stayed stale after AFT write: {after}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
 fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
     let Some(ts5) = installed(
         TS5_ENV,

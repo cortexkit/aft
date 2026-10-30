@@ -1056,6 +1056,29 @@ pub(crate) fn daemon_log_path() -> PathBuf {
         .join(format!("aft-{}.log", std::process::id()))
 }
 
+/// The standalone gh shim runs before logger initialization. Preserve its rare
+/// authority diagnostics in the process log without adding agent-visible stderr.
+pub(crate) fn write_preinit_warning(message: &str) -> io::Result<()> {
+    write_preinit_warning_to(&daemon_log_path(), message)
+}
+
+fn write_preinit_warning_to(path: &Path, message: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_log_dir(parent)?;
+    }
+    let mut line = Vec::new();
+    write_log_line(
+        &mut line,
+        &format_utc_timestamp(),
+        log::Level::Warn,
+        "aft::gh_shim_speech",
+        &format_args!("{message}"),
+    )?;
+    let mut file = open_private_log_file(path, false)?;
+    file.write_all(&crate::log_redact::aft_redact_bytes(&line))?;
+    file.sync_all()
+}
+
 fn bounded_panic_text(args: std::fmt::Arguments<'_>, max_bytes: usize) -> String {
     use std::fmt::Write;
 
@@ -2708,6 +2731,19 @@ fn perf_tick_interval() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gh_shim_preinit_warning_is_durable_and_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("aft-shim.log");
+        super::write_preinit_warning_to(&path, "gh speech snapshot invalid: first").unwrap();
+        super::write_preinit_warning_to(&path, "gh speech snapshot invalid: second").unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with(" [aft] WARN gh speech snapshot invalid: first"));
+        assert!(lines[1].ends_with(" [aft] WARN gh speech snapshot invalid: second"));
+    }
+
     #[test]
     fn terminal_sync_redacts_both_sinks() {
         let directory = tempfile::tempdir().unwrap();

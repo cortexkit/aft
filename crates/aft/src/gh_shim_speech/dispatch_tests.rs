@@ -20,6 +20,8 @@ mod audit_proofs;
 mod cold;
 #[path = "crash_dispatch_tests.rs"]
 mod crash;
+#[path = "lifecycle_dispatch_tests.rs"]
+mod lifecycle;
 #[path = "pty_dispatch_tests.rs"]
 mod pty;
 
