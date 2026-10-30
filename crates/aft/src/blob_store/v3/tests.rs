@@ -60,6 +60,36 @@ fn free_space_override_reaches_other_threads_under_its_storage_root() {
     assert_eq!(free_space(&inner.join("blobs/v3")), Some((23, 84)));
     assert_eq!(free_space(&storage), Some((17, 42)));
 }
+
+#[cfg(unix)]
+#[test]
+fn free_space_override_matches_resolved_symlink_roots() {
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    let storage = root.path().join("storage");
+    fs::create_dir(&storage).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&storage, &alias).unwrap();
+    let resolved = fs::canonicalize(&storage).unwrap();
+
+    for suffix in ["", "not-created"] {
+        let raw = alias.join(suffix);
+        let canonical = resolved.join(suffix);
+        let _space = set_free_space_for_test(&raw, 17, 42);
+        assert_eq!(free_space(&raw), Some((17, 42)));
+        assert_eq!(free_space(&canonical), Some((17, 42)));
+        assert_eq!(
+            free_space(&canonical.join("missing/blobs/v3")),
+            Some((17, 42))
+        );
+        assert_eq!(
+            free_space(&root.path().join("other-storage")),
+            Some((u64::MAX, u64::MAX / 2))
+        );
+    }
+    assert!(!storage.join("not-created").exists());
+}
+
 fn key() -> FamilyKey {
     FamilyKey::new(FamilyPlane::Semantic, [7; 32])
 }
