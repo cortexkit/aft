@@ -1534,8 +1534,10 @@ fn retry_activation<T>(
                     &config.status,
                     if store_busy {
                         crate::context::SemanticIndexStatus::Building {
-                            started_at: Instant::now(),
                             stage: CHECKOUT_VIEW_LOADING_STAGE.into(),
+                            files: None,
+                            entries_done: None,
+                            entries_total: None,
                         }
                     } else {
                         crate::context::SemanticIndexStatus::Failed(format!(

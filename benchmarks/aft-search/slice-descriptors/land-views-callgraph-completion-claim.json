@@ -1,12 +1,13 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
-  "kind": "readiness",
+  "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
   ],
   "slices": [
     "views-callgraph-completion-claim"
   ],
-  "note": "Views-only: a failed bind releases its base completion claim; the call-graph view retries live completion contention with backoff and reports building. No changed path matches RANKING_FENCE_PREFIXES."
+  "note": "Views-only readiness change: a failed bind releases its base completion claim; call-graph and lexical views retry store or completion-owner contention with backoff, while semantic activation remains building during store retries. Busy loads do not count as failures or receive bug guidance. The ranking fence hit is crates/aft/src/commands/semantic_search/mod.rs, where only the lexical view-load error response changes from internal_error to retryable busy; no query planning, candidate selection, scoring, ranking or normal ready-index output changes. Views are off by default; benchmark rows must remain byte-identical."
 }
