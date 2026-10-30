@@ -25,6 +25,7 @@ fn assert_approved_background_refusal(
         wire["refusal_code"].as_str().unwrap(),
         wire["stage"].as_str().unwrap(),
         wire["message"].as_str().unwrap(),
+        &RefusalFacts::default(),
     ) {
         RouteOutcome::RelayRefusal { code: actual, text } => {
             assert_eq!(actual, code);
@@ -61,6 +62,7 @@ fn approved_background_render_probe() {
         wire["refusal_code"].as_str().unwrap(),
         wire["stage"].as_str().unwrap(),
         wire["message"].as_str().unwrap(),
+        &RefusalFacts::default(),
     );
     let root = tempfile::tempdir().unwrap();
     let paths = StatePaths::from_root(root.path().to_path_buf());
@@ -267,6 +269,7 @@ fn retry_classes_cover_plexus_closed_codes_one_row_per_class() {
         }
     }
     assert_eq!(classify_code("brand_new_code"), CodeClass::Unknown);
+    assert_eq!(classify_code("module_warming"), CodeClass::Transient);
     assert_eq!(
         classify_code("handle_credential_unresolvable{class: transient}"),
         CodeClass::Transient
@@ -281,12 +284,487 @@ fn retry_classes_cover_plexus_closed_codes_one_row_per_class() {
 fn agent_repository_conflict_names_both_agents() {
     let text = plexus_refusal_text(
         "agent_repository_conflict{claimed_agent: alfonso-aft, bound_agent: alfonso-plexus}",
-        CodeClass::Terminal,
+        &RefusalFacts::default(),
     );
     assert!(text.contains("speaks as agent alfonso-aft"), "{text}");
     assert!(text.contains("bound to agent alfonso-plexus"), "{text}");
-    let setup = plexus_refusal_text("module_grant_absent", CodeClass::PlexusSetup);
-    assert!(setup.starts_with("plexus configuration problem: module_grant_absent"));
+    assert_eq!(text, "Plexus refused the bot write: agent_repository_conflict{claimed_agent: alfonso-aft, bound_agent: alfonso-plexus}. This command speaks as agent alfonso-aft, but the repository is bound to agent alfonso-plexus. Nothing reached GitHub. An operator must fix the setup, grants, or policy.");
+}
+
+fn refusal_explanation(reply: Value) -> String {
+    match parse_reply(&ok_envelope(reply)) {
+        Reply::Refused { code, facts, .. } | Reply::ModuleRefused { code, facts } => {
+            plexus_refusal_text(&code, &facts)
+        }
+        other => panic!("not a refusal: {other:?}"),
+    }
+}
+
+#[test]
+fn refusal_explanation_preserves_plexus_detail_message_verbatim() {
+    let refusal = json!({"status":"refused","refusal_code":"pr_edit_not_own","code":"pr_edit_not_own","detail":{"message":"'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."},"retry_same_nonce":false});
+    assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), "Plexus refused the bot write: pr_edit_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received only reads; nothing was written. The agent must change the request.");
+    let mut stack = refusal;
+    stack["refusal_code"] = json!("stack_pr_not_own");
+    stack["code"] = json!("stack_pr_not_own");
+    stack["detail"]["number"] = json!(285);
+    stack["detail"]["author_login"] = json!("contributor");
+    assert_eq!(refusal_explanation(json!({"result": stack})), "Plexus refused the bot write: stack_pr_not_own. 'pr edit' changes only pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator. GitHub received only reads; nothing was written. The agent must change the request.");
+}
+
+#[test]
+fn refusal_explanation_review_thread_not_own_preserves_not_sent_detail() {
+    let refusal = json!({
+        "status": "refused",
+        "refusal_code": "review_thread_not_own",
+        "code": "review_thread_not_own",
+        "transmission": "not_sent",
+        "retry_same_nonce": false,
+        "detail": {
+            "number": 285,
+            "author_login": "<author>",
+            "message": "'resolveReviewThread' works only on pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Reply to the finding as the bot, then resolve the thread as the operator.",
+        },
+    });
+    assert_eq!(refusal_explanation(json!({"result": refusal})), "Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (<bot>); #<n> was opened by <author>. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.");
+}
+
+#[test]
+fn refusal_explanation_bare_pr_edit_not_own_keeps_generic_fallback() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "pr_edit_not_own", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: pr_edit_not_own. The pull request was not opened by this bot. GitHub received only reads; nothing was written. The agent must change the request.");
+}
+
+#[test]
+fn refusal_explanation_read_only_gates_do_not_warn_unless_steps_were_sent() {
+    for (code, explanation) in [
+        (
+            "pr_edit_not_own",
+            "The pull request was not opened by this bot.",
+        ),
+        (
+            "review_thread_not_own",
+            "The pull request was not opened by this bot.",
+        ),
+        (
+            "issue_edit_not_own",
+            "The issue was not opened by this bot.",
+        ),
+        (
+            "stack_pr_not_own",
+            "A stacked pull request was not opened by this bot.",
+        ),
+        (
+            "comment_author_mismatch",
+            "The comment was not written by the expected bot.",
+        ),
+        (
+            "agent_repository_conflict",
+            "The GitHub target does not match the bound repository.",
+        ),
+        ("not_present", "The GitHub target was not found."),
+        (
+            "pre_dispatch_read_incomplete{reason: page_bound}",
+            "The GitHub read exceeded its page limit.",
+        ),
+    ] {
+        let mut refusal =
+            json!({"status": "refused", "refusal_code": code, "retry_same_nonce": false});
+        assert_eq!(refusal_explanation(json!({"result": refusal.clone()})), format!("Plexus refused the bot write: {code}. {explanation} GitHub received only reads; nothing was written. The agent must change the request."));
+        refusal["legs_sent"] = json!(["comment"]);
+        refusal["transmission"] = json!("not_sent");
+        refusal["retry_same_nonce"] = json!(true);
+        assert_eq!(refusal_explanation(json!({"result": refusal})), format!("Plexus refused the bot write: {code}. {explanation} GitHub received a request. Already-sent write steps: comment. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+}
+
+#[test]
+fn refusal_explanation_ambiguous_read_failures_keep_conservative_warning() {
+    for (code, explanation) in [
+        (
+            "pre_dispatch_read_incomplete{reason: invalid_response}",
+            "The GitHub read response could not be used.",
+        ),
+        (
+            "pre_dispatch_read_incomplete{reason: lease_expired}",
+            "The GitHub read did not finish.",
+        ),
+    ] {
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": code, "retry_same_nonce": false,
+        }})), format!("Plexus refused the bot write: {code}. {explanation} Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+}
+
+#[test]
+fn non_retryable_posted_steps_are_reported_as_partially_applied() {
+    for retry in [None, Some(false)] {
+        let mut refusal = json!({"status": "refused", "refusal_code": "transport_not_sent", "legs_sent": ["comment"]});
+        if let Some(retry) = retry {
+            refusal["retry_same_nonce"] = json!(retry);
+        }
+        let Reply::Completed { result, .. } = parse_reply(&ok_envelope(json!({"result": refusal})))
+        else {
+            panic!("expected posted-work report");
+        };
+        assert_eq!(
+            result,
+            json!({"status": "partial_posted", "posted_legs": ["comment"], "refusal_code": "transport_not_sent", "scope_role": null})
+        );
+        let Err(outcome @ RouteOutcome::PartiallyApplied(_)) = render_completed(&result) else {
+            panic!("expected partial-application outcome");
+        };
+        let RouteOutcome::PartiallyApplied(ref text) = outcome else {
+            unreachable!()
+        };
+        assert_eq!(text, "Posted as the bot: [\"comment\"].\nThe rest of this GitHub write did not finish (transport_not_sent). Check GitHub before trying again.\n");
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "alfonso-aft".into(),
+        };
+        assert_eq!(
+            super::super::governed_outcome_status(&paths, &binding, TEST_NOW, outcome),
+            1
+        );
+    }
+}
+
+#[test]
+fn posted_step_names_are_validated_even_when_same_nonce_retry_is_allowed() {
+    for retry in [None, Some(false), Some(true)] {
+        for invalid in [Value::Null, json!(""), json!(7)] {
+            let mut refusal = json!({"status": "refused", "refusal_code": "transport_not_sent", "legs_sent": [invalid]});
+            if let Some(retry) = retry {
+                refusal["retry_same_nonce"] = json!(retry);
+            }
+            assert_eq!(parse_reply(&ok_envelope(json!({"result": refusal}))), Reply::Malformed("plexus reported posted legs without valid action names; check GitHub before retrying".into()));
+        }
+    }
+}
+
+#[test]
+fn refusal_explanation_never_sent_terminal() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "approval_denied", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: approval_denied. Approval for this write was denied. Nothing reached GitHub. An operator must fix the setup, grants, or policy.");
+}
+
+#[test]
+fn refusal_explanation_maybe_sent() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "transport_not_sent", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: transport_not_sent. The current step was not sent. Earlier reads or writes may have reached GitHub. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
+fn refusal_explanation_retryable_true_from_module_error() {
+    let reply = json!({"error": {
+        "code": "request_deadline_exceeded", "retry_same_nonce": true, "transmission": "not_sent",
+    }});
+    assert_eq!(refusal_explanation(reply.clone()), "Plexus refused the bot write: request_deadline_exceeded. The request deadline expired before dispatch. Nothing reached GitHub. Rerunning the command is safe.");
+    assert_eq!(refusal_text("Plexus", "request_deadline_exceeded", &RefusalFacts::from_reply(&reply["error"]), Some(30000)), "Plexus refused the bot write: request_deadline_exceeded. The request deadline expired before dispatch. Nothing reached GitHub. The relay's 30000 ms budget cannot fit another retry. Rerunning the command is safe.");
+    assert!(matches!(
+        parse_reply(&ok_envelope(reply.clone())),
+        Reply::ModuleRefused { .. }
+    ));
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-module-refusal", "call-mr", "/p");
+    let harness = harness(ticket_gated(vec![
+        json!({
+            "op": BOT_REQUEST_OPERATION, "status": "ok", "data": reply,
+        }),
+        plexus_completed(),
+    ]));
+    assert_eq!(
+        dispatch_comment(&harness, live.value(), "hello"),
+        (0, false)
+    );
+    let sent = nonces(&harness);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0], sent[1]);
+    let terminal = self::harness(ticket_gated(vec![
+        json!({
+            "op": BOT_REQUEST_OPERATION, "status": "ok", "data": {"error": {
+                "code": "request_deadline_exceeded", "retry_same_nonce": false,
+            }},
+        }),
+        plexus_completed(),
+    ]));
+    assert_eq!(
+        dispatch_comment(&terminal, live.value(), "hello"),
+        (OUTCOME_UNKNOWN_EXIT_STATUS, false)
+    );
+    assert_eq!(nonces(&terminal).len(), 1);
+}
+
+#[test]
+fn refusal_explanation_nonce_in_flight_warns_about_rerunning() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "nonce_in_flight", "retry_same_nonce": true,
+    }})), "Plexus refused the bot write: nonce_in_flight. Another worker is still handling this request nonce. Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "nonce_in_flight", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: nonce_in_flight. Another worker is still handling this request nonce. Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
+fn refusal_explanation_missing_retry_field_warns_about_rerunning() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "nonce_in_flight",
+    }})), "Plexus refused the bot write: nonce_in_flight. Another worker is still handling this request nonce. Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
+fn refusal_explanation_relay_originated_identity_conflict() {
+    let RouteOutcome::RelayRefusal { code, text } = daemon_refusal(
+        "agent_identity_conflict",
+        "scope",
+        "scope mismatch",
+        &RefusalFacts::default(),
+    ) else {
+        panic!("expected AFT refusal");
+    };
+    assert_eq!(code, "agent_identity_conflict");
+    assert_eq!(text, "AFT refused the bot write: agent_identity_conflict. The repository is bound to another agent's bot. Nothing reached GitHub. The agent must change the request.");
+}
+
+#[test]
+fn refusal_explanation_forwarded_plexus_gate_keeps_its_origin() {
+    let RouteOutcome::RelayRefusal { code, text } = daemon_refusal(
+        "scope_not_synced",
+        "plexus",
+        "scope not ready",
+        &RefusalFacts::default(),
+    ) else {
+        panic!("expected forwarded refusal");
+    };
+    assert_eq!(code, "scope_not_synced");
+    assert_eq!(text, "Plexus refused the bot write: scope_not_synced. The agent's scope has not synced yet. Earlier reads or writes may have reached GitHub. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
+fn refusal_explanation_unknown_code_warns_about_rerunning_for_all_retry_metadata() {
+    for (retry, expected) in [
+        (Value::Null, "Plexus refused the bot write: future_code. This shim does not recognize the refusal code. Whether anything reached GitHub is unknown. Check GitHub before rerunning."),
+        (json!(true), "Plexus refused the bot write: future_code. This shim does not recognize the refusal code. Whether anything reached GitHub is unknown. Check GitHub before rerunning."),
+        (json!(false), "Plexus refused the bot write: future_code. This shim does not recognize the refusal code. Whether anything reached GitHub is unknown. Check GitHub before rerunning."),
+    ] {
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": "future_code", "retry_same_nonce": retry,
+        }})), expected);
+    }
+}
+
+#[test]
+fn refusal_explanation_names_already_sent_steps() {
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "transport_not_sent", "retry_same_nonce": true,
+        "legs_sent": ["comment", "close"], "transmission": "not_sent",
+    }})), "Plexus refused the bot write: transport_not_sent. The current step was not sent. GitHub received a request. Already-sent write steps: comment, close. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    let facts = RefusalFacts::from_reply(
+        &json!({"retry_same_nonce": true, "legs_sent": ["comment", "close"]}),
+    );
+    assert_eq!(refusal_text("Plexus", "transport_not_sent", &facts, Some(30000)), "Plexus refused the bot write: transport_not_sent. The current step was not sent. GitHub received a request. Already-sent write steps: comment, close. An operator must fix the setup, grants, or policy. The relay's 30000 ms budget cannot fit another retry. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+}
+
+#[test]
+fn refusal_explanation_table_covers_bot_request_codes() {
+    // Known refusal codes need a default explanation in addition to any
+    // detail-specific entries.
+    for code in [
+        "agent_grant_absent",
+        "agent_grant_excludes_request",
+        "agent_handle_unknown",
+        "agent_repository_conflict",
+        "argument_undeclared",
+        "approval_agent_mismatch",
+        "approval_denied",
+        "approval_expired",
+        "call_mode_unsupported",
+        "comment_author_mismatch",
+        "connector_home_not_held",
+        "consent_unavailable",
+        "delegating_scope_required",
+        "flow_audience_conflict",
+        "flow_not_approved",
+        "flow_unknown",
+        "flow_audience_excludes_repository",
+        "flow_audience_mismatch",
+        "flow_audience_unavailable",
+        "flow_carrier_not_admitted",
+        "flow_scope_required",
+        "handle_credential_rejected",
+        "handle_credential_unresolvable",
+        "handle_disabled",
+        "invalid_request",
+        "module_grant_absent",
+        "module_warming",
+        "nonce_in_flight",
+        "nonce_payload_mismatch",
+        "not_present",
+        "outcome_unknown",
+        "pipeline_denied",
+        "policy_blocked",
+        "pre_dispatch_read_incomplete",
+        "pr_edit_not_own",
+        "review_thread_not_own",
+        "issue_edit_not_own",
+        "pr_head_cross_repository",
+        "probe_unproven",
+        "repository_unbound",
+        "request_deadline_exceeded",
+        "request_field_forbidden",
+        "request_kind_unmapped",
+        "route_not_bound",
+        "run_scope_not_child",
+        "scope_ended",
+        "delegation_withdrawn",
+        "scope_not_synced",
+        "scope_unverifiable",
+        "secret_input_rejected",
+        "stale_authority",
+        "stack_pr_not_own",
+        "store_failure",
+        "transport_not_sent",
+        "vendor_rejected",
+    ] {
+        assert!(
+            REFUSAL_EXPLANATIONS
+                .iter()
+                .any(|(name, selector, ..)| *name == code && selector.is_empty()),
+            "missing {code}"
+        );
+    }
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "agent_repository_conflict", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: agent_repository_conflict. The GitHub target does not match the bound repository. GitHub received only reads; nothing was written. The agent must change the request.");
+    assert_eq!(refusal_explanation(json!({"result": {
+        "status": "refused", "refusal_code": "pr_head_cross_repository", "retry_same_nonce": false,
+    }})), "Plexus refused the bot write: pr_head_cross_repository. The pull request head is outside the bound repository. Nothing reached GitHub. The agent must change the request.");
+    for status in [429, 503] {
+        let code = format!("vendor_rejected{{status: {status}}}");
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": code, "retry_same_nonce": true,
+        }})), format!("Plexus refused the bot write: {code}. GitHub rejected the request. GitHub received a request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+    for denial in [
+        "RecipientArgumentInvalid",
+        "ArgumentUndeclared, field: body",
+        "ResourceFilter(MissingRequiredFilter)",
+        "ResourceFilter(ValueNotAllowed)",
+        "ResourceFilter(WriteFiltersAbsent)",
+    ] {
+        let code = format!("pipeline_denied{{gate: G10, denial: {denial}}}");
+        assert_eq!(refusal_explanation(json!({"result": {
+            "status": "refused", "refusal_code": code, "retry_same_nonce": false,
+        }})), format!("Plexus refused the bot write: {code}. A permission or service check stopped the current step. Earlier reads or writes may have reached GitHub. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+}
+
+#[test]
+fn approved_refusal_table_wording_is_pinned_byte_for_byte() {
+    const UNSENT_AGENT: &str = " Nothing reached GitHub. The agent must change the request.";
+    const UNSENT_OPERATOR: &str =
+        " Nothing reached GitHub. An operator must fix the setup, grants, or policy.";
+    const UNSENT_TRANSIENT: &str = " Nothing reached GitHub. Rerunning the command is safe.";
+    const READS_AGENT: &str =
+        " GitHub received only reads; nothing was written. The agent must change the request.";
+    const MAYBE_AGENT: &str = " Earlier reads or writes may have reached GitHub. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const MAYBE_OPERATOR: &str = " Earlier reads or writes may have reached GitHub. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const MAYBE_TRANSIENT: &str = " Earlier reads or writes may have reached GitHub. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const RECEIVED_AGENT: &str = " GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const RECEIVED_OPERATOR: &str = " GitHub received a request. An operator must fix the setup, grants, or policy. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+    const RECEIVED_TRANSIENT: &str = " GitHub received a request. Check GitHub before rerunning; a rerun may repeat the steps that were sent.";
+
+    // These literals are the approved output contract, not values read from the
+    // production table. Keep a case for every default and detail-specific row.
+    let cases = [
+        ("Plexus", "agent_grant_absent", "The agent has no grant for this write.", MAYBE_OPERATOR),
+        ("Plexus", "agent_grant_excludes_request", "The agent's grant does not cover this request.", UNSENT_OPERATOR),
+        ("Plexus", "agent_handle_unknown", "The agent's GitHub bot handle is unknown.", UNSENT_OPERATOR),
+        ("Plexus", "agent_repository_conflict{claimed_agent: alfonso-aft, bound_agent: alfonso-plexus}", "This command speaks as agent alfonso-aft, but the repository is bound to agent alfonso-plexus.", UNSENT_OPERATOR),
+        ("Plexus", "agent_repository_conflict", "The GitHub target does not match the bound repository.", READS_AGENT),
+        ("Plexus", "argument_undeclared", "The request contains an unsupported identity field.", UNSENT_AGENT),
+        ("Plexus", "approval_agent_mismatch", "The approval belongs to another agent.", UNSENT_AGENT),
+        ("Plexus", "approval_denied", "Approval for this write was denied.", UNSENT_OPERATOR),
+        ("Plexus", "approval_expired", "The approval has expired.", UNSENT_AGENT),
+        ("Plexus", "call_mode_unsupported", "This call mode cannot make bot writes.", UNSENT_AGENT),
+        ("Plexus", "comment_author_mismatch", "The comment was not written by the expected bot.", READS_AGENT),
+        ("Plexus", "connector_home_not_held", "This machine does not hold permission to send GitHub requests.", UNSENT_OPERATOR),
+        ("Plexus", "consent_unavailable", "This flow cannot answer the required consent prompt.", UNSENT_OPERATOR),
+        ("Plexus", "delegating_scope_required", "The route has no scope authorized to act as an agent.", UNSENT_AGENT),
+        ("Plexus", "flow_audience_conflict", "The flow's approved repository sets conflict.", UNSENT_OPERATOR),
+        ("Plexus", "flow_not_approved", "The flow is not approved.", UNSENT_OPERATOR),
+        ("Plexus", "flow_unknown", "The flow is unknown.", UNSENT_OPERATOR),
+        ("Plexus", "flow_audience_excludes_repository", "The repository is outside the flow's approved set.", UNSENT_AGENT),
+        ("Plexus", "flow_audience_mismatch", "The flow requires a matching agent-scoped route.", UNSENT_AGENT),
+        ("Plexus", "flow_audience_unavailable", "The flow's approved repository set could not be read.", UNSENT_OPERATOR),
+        ("Plexus", "flow_carrier_not_admitted", "This caller is not allowed to carry flow requests.", UNSENT_AGENT),
+        ("Plexus", "flow_scope_required", "The route has no required flow scope.", UNSENT_AGENT),
+        ("Plexus", "handle_credential_rejected", "GitHub rejected the bot's credential.", RECEIVED_OPERATOR),
+        ("Plexus", "handle_credential_unresolvable{class: transient}", "The bot's credential is temporarily unavailable.", MAYBE_TRANSIENT),
+        ("Plexus", "handle_credential_unresolvable", "The bot's credential could not be loaded.", MAYBE_OPERATOR),
+        ("Plexus", "handle_disabled", "The bot handle is disabled.", UNSENT_OPERATOR),
+        ("Plexus", "invalid_request", "The request has an invalid field or shape.", UNSENT_AGENT),
+        ("Plexus", "module_grant_absent", "The calling module has no grant for this write.", MAYBE_OPERATOR),
+        ("Plexus", "module_warming", "The module is still starting.", UNSENT_TRANSIENT),
+        ("Plexus", "nonce_in_flight", "Another worker is still handling this request nonce.", MAYBE_TRANSIENT),
+        ("Plexus", "nonce_payload_mismatch", "This nonce already belongs to a different request.", MAYBE_AGENT),
+        ("Plexus", "not_present", "The GitHub target was not found.", READS_AGENT),
+        ("Plexus", "outcome_unknown", "The GitHub read outcome is unknown.", MAYBE_OPERATOR),
+        ("Plexus", "pipeline_denied{gate: G10, denial: RecipientArgumentInvalid}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ArgumentUndeclared, field: body}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ResourceFilter(MissingRequiredFilter)}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ResourceFilter(ValueNotAllowed)}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied{gate: G10, denial: ResourceFilter(WriteFiltersAbsent)}", "A permission or service check stopped the current step.", MAYBE_AGENT),
+        ("Plexus", "pipeline_denied", "A permission or service check stopped the current step.", MAYBE_OPERATOR),
+        ("Plexus", "policy_blocked", "Policy blocks this write.", UNSENT_OPERATOR),
+        ("Plexus", "pre_dispatch_read_incomplete{reason: page_bound}", "The GitHub read exceeded its page limit.", READS_AGENT),
+        ("Plexus", "pre_dispatch_read_incomplete{reason: invalid_response}", "The GitHub read response could not be used.", MAYBE_TRANSIENT),
+        ("Plexus", "pre_dispatch_read_incomplete", "The GitHub read did not finish.", MAYBE_TRANSIENT),
+        ("Plexus", "pr_edit_not_own", "The pull request was not opened by this bot.", READS_AGENT),
+        ("Plexus", "review_thread_not_own", "The pull request was not opened by this bot.", READS_AGENT),
+        ("Plexus", "issue_edit_not_own", "The issue was not opened by this bot.", READS_AGENT),
+        ("Plexus", "pr_head_cross_repository", "The pull request head is outside the bound repository.", UNSENT_AGENT),
+        ("Plexus", "probe_unproven", "The bot handle has not passed its proof check.", UNSENT_OPERATOR),
+        ("Plexus", "repository_unbound", "The repository has no bot binding.", MAYBE_OPERATOR),
+        ("Plexus", "request_deadline_exceeded", "The request deadline expired before dispatch.", UNSENT_TRANSIENT),
+        ("Plexus", "request_field_forbidden", "The request contains a forbidden field.", UNSENT_AGENT),
+        ("Plexus", "request_kind_unmapped", "This request action or shape is not supported.", UNSENT_AGENT),
+        ("Plexus", "route_not_bound", "The route is not bound to GitHub.", UNSENT_OPERATOR),
+        ("Plexus", "run_scope_not_child", "The run scope is not a live child of the route scope.", MAYBE_AGENT),
+        ("Plexus", "scope_ended", "The agent's route scope has ended.", MAYBE_OPERATOR),
+        ("Plexus", "delegation_withdrawn", "Permission to act as this agent was withdrawn.", MAYBE_OPERATOR),
+        ("Plexus", "scope_not_synced", "The agent's scope has not synced yet.", MAYBE_OPERATOR),
+        ("Plexus", "scope_unverifiable", "The agent's scope could not be verified.", MAYBE_OPERATOR),
+        ("Plexus", "secret_input_rejected", "The request contains credential material that is not allowed here.", UNSENT_AGENT),
+        ("Plexus", "stale_authority{dimension: expected_handle}", "The expected bot handle has changed.", UNSENT_AGENT),
+        ("Plexus", "stale_authority{dimension: expected_binding}", "The expected repository binding has changed.", UNSENT_AGENT),
+        ("Plexus", "stale_authority", "The write's authorization changed or expired.", MAYBE_OPERATOR),
+        ("Plexus", "stack_pr_not_own", "A stacked pull request was not opened by this bot.", READS_AGENT),
+        ("Plexus", "store_failure", "Request storage failed.", MAYBE_OPERATOR),
+        ("Plexus", "transport_not_sent", "The current step was not sent.", MAYBE_OPERATOR),
+        ("Plexus", "vendor_rejected{status: 429}", "GitHub rejected the request.", RECEIVED_TRANSIENT),
+        ("Plexus", "vendor_rejected{status: 503}", "GitHub rejected the request.", RECEIVED_TRANSIENT),
+        ("Plexus", "vendor_rejected", "GitHub rejected the request.", RECEIVED_AGENT),
+        ("AFT", "agent_identity_conflict", "The repository is bound to another agent's bot.", UNSENT_AGENT),
+        ("AFT", "bot_write_requires_scope", "This session has no agent scope for bot writes.", UNSENT_OPERATOR),
+        ("AFT", "ticket_unknown", "This command's agent session ticket is no longer live.", UNSENT_AGENT),
+        ("AFT", "untrusted_principal", "Only first-party callers may relay bot writes.", UNSENT_OPERATOR),
+    ];
+    assert_eq!(cases.len(), REFUSAL_EXPLANATIONS.len());
+    for ((origin, code, explanation, suffix), (name, _, _, _, _)) in
+        cases.into_iter().zip(REFUSAL_EXPLANATIONS)
+    {
+        assert_eq!(code.split('{').next().unwrap(), *name, "golden row order");
+        assert_eq!(
+            refusal_text(origin, code, &RefusalFacts::default(), None),
+            format!("{origin} refused the bot write: {code}. {explanation}{suffix}"),
+            "{code}",
+        );
+    }
 }
 
 fn ok_envelope(reply: Value) -> Vec<u8> {
@@ -408,6 +886,7 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
             stage: PLEXUS_REPLY_STAGE.to_string(),
             message: String::new(),
             generation: Some(4),
+            facts: RefusalFacts::default(),
         }
     );
     let daemon = serde_json::to_vec(&json!({
@@ -421,11 +900,11 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
         Reply::Refused { ref code, ref stage, .. } if code == "assertion_session_unknown" && stage == "mint"
     ));
     assert!(matches!(
-        daemon_refusal("assertion_session_unknown", "mint", ""),
+        daemon_refusal("assertion_session_unknown", "mint", "", &RefusalFacts::default()),
         RouteOutcome::RelayRefusal { ref text, .. } if text.contains("prefrontal refused to mint")
     ));
     assert!(matches!(
-        daemon_refusal("ticket_absent", "ticket", ""),
+        daemon_refusal("ticket_absent", "ticket", "", &RefusalFacts::default()),
         RouteOutcome::NoAgentSession
     ));
 }
@@ -446,6 +925,19 @@ fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
                 stage: PLEXUS_REPLY_STAGE.to_string(),
                 message: String::new(),
                 generation,
+                facts: RefusalFacts {
+                    retry_same_nonce: result.get("retry_same_nonce").and_then(Value::as_bool),
+                    legs_sent: result
+                        .get("legs_sent")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                    not_sent: result["transmission"] == "not_sent",
+                    detail_message: result
+                        .pointer("/detail/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
             },
             "completed" => Reply::Completed {
                 generation,
@@ -454,12 +946,30 @@ fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
             status => panic!("{name}: untested reply status {status}"),
         };
         assert_eq!(parsed, expected, "{name}");
+        if let Reply::Refused {
+            code, stage, facts, ..
+        } = &parsed
+        {
+            if stage == PLEXUS_REPLY_STAGE {
+                if let Some(message) = result.pointer("/detail/message").and_then(Value::as_str) {
+                    assert!(
+                        plexus_refusal_text(code, facts).starts_with(&format!(
+                            "Plexus refused the bot write: {code}. {message}"
+                        )),
+                        "{name}: producer message changed"
+                    );
+                }
+            }
+        }
         if name == "resolve-thread-not-own" {
             let code = result["refusal_code"].as_str().unwrap();
             assert_eq!(result["transmission"], "not_sent");
             assert_eq!(classify_code(code), CodeClass::Unknown);
-            assert_eq!(plexus_refusal_text(code, classify_code(code)),
-                "plexus refused the bot write with a code this shim does not know: review_thread_not_own; it was not retried");
+            let Reply::Refused { facts, .. } = parsed else {
+                panic!("expected refusal");
+            };
+            assert_eq!(plexus_refusal_text(code, &facts),
+                "Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by octocat. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.");
         }
     }
 }
@@ -480,11 +990,13 @@ fn bot_write_requires_scope_is_an_aft_refusal_with_the_governance_exit() {
     else {
         panic!("not a daemon refusal");
     };
-    let RouteOutcome::RelayRefusal { code, text } = daemon_refusal(&code, &stage, &message) else {
+    let RouteOutcome::RelayRefusal { code, text } =
+        daemon_refusal(&code, &stage, &message, &RefusalFacts::default())
+    else {
         panic!("not a governance refusal");
     };
     assert_eq!(code, "bot_write_requires_scope");
-    assert_eq!(text, "AFT refused the bot write: this session's tool route has no agent scope, so bot writes are refused; a head session needs to bind with its core scope");
+    assert_eq!(text, "AFT refused the bot write: bot_write_requires_scope. This session has no agent scope for bot writes. Nothing reached GitHub. An operator must fix the setup, grants, or policy.");
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-unscoped", "call-unscoped", "/p");
     let harness = harness(ticket_gated(vec![refusal]));
     let (status, upstream) = dispatch_comment(&harness, live.value(), "hello");
@@ -1111,6 +1623,275 @@ fn nonces(harness: &Harness) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum WarmingArrival {
+    ErrorFrame,
+    PlexusBody,
+}
+
+struct WarmingIo {
+    arrival: WarmingArrival,
+    code: &'static str,
+    warming_left: std::cell::Cell<usize>,
+    warm_operation: &'static str,
+    now: std::cell::Cell<Instant>,
+    attempts: std::cell::RefCell<Vec<(Duration, Value)>>,
+    sleeps: std::cell::RefCell<Vec<Duration>>,
+    stand_in_sends: std::cell::RefCell<Vec<Value>>,
+}
+
+impl ExchangeIo for WarmingIo {
+    fn now(&self) -> Instant {
+        self.now.get()
+    }
+
+    async fn sleep(&self, delay: Duration) {
+        self.sleeps.borrow_mut().push(delay);
+        self.now.set(self.now() + delay);
+    }
+
+    async fn request(&self, bytes: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError> {
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        if body["op"] == self.warm_operation {
+            self.attempts
+                .borrow_mut()
+                .push((options.timeout, body.clone()));
+            if self.warming_left.get() > 0 {
+                self.warming_left.set(self.warming_left.get() - 1);
+                return match self.arrival {
+                    WarmingArrival::ErrorFrame => {
+                        // The SDK delivers an Error frame through CallError::Module.
+                        let mut error = serde_json::to_value(subc_protocol::ErrorBody::new(
+                            self.code,
+                            "module is starting",
+                        ))
+                        .unwrap();
+                        error["retryable"] = json!(true);
+                        Err(CallError::Module(serde_json::from_value(error).unwrap()))
+                    }
+                    WarmingArrival::PlexusBody => Ok(serde_json::to_vec(&json!({
+                        "op": body["op"], "status": "error", "data": {
+                            "refusal_code": self.code, "stage": "plexus",
+                            "message": "module is starting", "retryable": true,
+                        },
+                    }))
+                    .unwrap()),
+                };
+            }
+        }
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+        }
+        // Only accepted bot requests reach the downstream stand-in.
+        assert_eq!(body["op"], BOT_REQUEST_OPERATION);
+        self.stand_in_sends.borrow_mut().push(body);
+        Ok(serde_json::to_vec(&plexus_completed()).unwrap())
+    }
+}
+
+struct WarmingRun {
+    io: WarmingIo,
+    body: Value,
+    status: i32,
+    refusal: Option<(String, String)>,
+    elapsed: Duration,
+}
+
+fn run_warming(
+    arrival: WarmingArrival,
+    warming_replies: usize,
+    budget: Duration,
+    warm_bindings: bool,
+    code: &'static str,
+) -> WarmingRun {
+    let started = Instant::now();
+    let io = WarmingIo {
+        arrival,
+        code,
+        warming_left: std::cell::Cell::new(warming_replies),
+        warm_operation: if warm_bindings {
+            BINDINGS_READ_OPERATION
+        } else {
+            BOT_REQUEST_OPERATION
+        },
+        now: std::cell::Cell::new(started),
+        attempts: Default::default(),
+        sleeps: Default::default(),
+        stand_in_sends: Default::default(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(temp.path().join("state"));
+    let manifest = v12_manifest();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let timing = Exchange {
+        io: &io,
+        ticket: "test-ticket",
+        stage: &stage,
+        started,
+        budget,
+    };
+    let body = json!({"op": BOT_REQUEST_OPERATION, "params": {
+        "ticket": "test-ticket", "request_nonce": "same-nonce",
+        "request": {"repository": "cortexkit/aft", "action": "issue comment", "body": "hi"},
+    }});
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            [Duration::from_secs(5), Duration::from_secs(10)],
+        ));
+    let refusal = match &outcome {
+        RouteOutcome::RelayRefusal { code, text } => Some((code.clone(), text.clone())),
+        RouteOutcome::Result(_) => None,
+        other => panic!("unexpected warming outcome: {other:?}"),
+    };
+    let status = super::super::governed_outcome_status(&paths, &binding, TEST_NOW, outcome);
+    let elapsed = io.now() - started;
+    WarmingRun {
+        io,
+        body,
+        status,
+        refusal,
+        elapsed,
+    }
+}
+
+fn assert_warming_recovers(arrival: WarmingArrival) {
+    for warm_bindings in [false, true] {
+        let run = run_warming(
+            arrival,
+            1,
+            Duration::from_secs(30),
+            warm_bindings,
+            "module_warming",
+        );
+        assert_eq!(run.status, 0);
+        assert_eq!(run.refusal, None);
+        assert_eq!(*run.io.sleeps.borrow(), [Duration::from_secs(5)]);
+        assert_eq!(run.elapsed, Duration::from_secs(5));
+        let attempts = run.io.attempts.borrow();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].1, attempts[1].1);
+        assert_eq!(attempts[0].0, Duration::from_secs(30));
+        assert_eq!(attempts[1].0, Duration::from_secs(25));
+        let sent = run.io.stand_in_sends.borrow();
+        assert_eq!(
+            sent.len(),
+            1,
+            "warming must refuse before forwarding a write"
+        );
+        assert_eq!(sent[0], run.body);
+        if !warm_bindings {
+            assert_eq!(
+                attempts[0].1, run.body,
+                "retry must keep the whole body and nonce"
+            );
+        }
+    }
+}
+
+fn assert_warming_exhausts(arrival: WarmingArrival, expected: &str) {
+    for warm_bindings in [false, true] {
+        let run = run_warming(
+            arrival,
+            usize::MAX,
+            Duration::from_secs(30),
+            warm_bindings,
+            "module_warming",
+        );
+        assert_eq!(run.status, REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            run.refusal,
+            Some(("module_warming".into(), expected.into()))
+        );
+        assert!(run.io.stand_in_sends.borrow().is_empty());
+        assert_eq!(
+            *run.io.sleeps.borrow(),
+            [Duration::from_secs(5), Duration::from_secs(10)]
+        );
+        assert_eq!(run.elapsed, Duration::from_secs(15));
+        let attempts = run.io.attempts.borrow();
+        assert_eq!(attempts.len(), 3);
+        for ((timeout, sent), remaining) in attempts.iter().zip([30, 25, 15]) {
+            assert_eq!(*timeout, Duration::from_secs(remaining));
+            assert_eq!(sent, &attempts[0].1);
+        }
+        if !warm_bindings {
+            assert_eq!(attempts[0].1, run.body);
+        }
+    }
+}
+
+#[test]
+fn module_warming_error_frame_then_success_forwards_one_write() {
+    assert_warming_recovers(WarmingArrival::ErrorFrame);
+}
+
+#[test]
+fn module_warming_plexus_body_then_success_forwards_one_write() {
+    assert_warming_recovers(WarmingArrival::PlexusBody);
+}
+
+#[test]
+fn module_warming_error_frame_exhaustion_is_safe_refusal_exit_86() {
+    assert_warming_exhausts(WarmingArrival::ErrorFrame, "AFT refused the bot write: module_warming. The module is still starting. Nothing reached GitHub. Rerunning the command is safe.");
+}
+
+#[test]
+fn module_warming_plexus_body_exhaustion_is_safe_refusal_exit_86() {
+    assert_warming_exhausts(WarmingArrival::PlexusBody, "Plexus refused the bot write: module_warming. The module is still starting. Nothing reached GitHub. Rerunning the command is safe.");
+}
+
+#[test]
+fn module_warming_retry_cannot_extend_the_shared_budget() {
+    for arrival in [WarmingArrival::ErrorFrame, WarmingArrival::PlexusBody] {
+        let run = run_warming(
+            arrival,
+            usize::MAX,
+            Duration::from_secs(4),
+            false,
+            "module_warming",
+        );
+        assert_eq!(run.status, REFUSAL_EXIT_STATUS);
+        assert!(run.io.sleeps.borrow().is_empty());
+        assert_eq!(run.io.attempts.borrow().len(), 1);
+        assert!(run.io.stand_in_sends.borrow().is_empty());
+        assert_eq!(run.elapsed, Duration::ZERO);
+        let (_, text) = run.refusal.unwrap();
+        assert!(text.ends_with("Nothing reached GitHub. Rerunning the command is safe."));
+    }
+}
+
+#[test]
+fn other_retryable_daemon_codes_do_not_gain_not_sent_retries() {
+    for arrival in [WarmingArrival::ErrorFrame, WarmingArrival::PlexusBody] {
+        let run = run_warming(
+            arrival,
+            1,
+            Duration::from_secs(30),
+            false,
+            "other_daemon_code",
+        );
+        assert_eq!(run.status, REFUSAL_EXIT_STATUS);
+        assert!(run.io.sleeps.borrow().is_empty());
+        assert_eq!(run.io.attempts.borrow().len(), 1);
+        assert!(run.io.stand_in_sends.borrow().is_empty());
+        let (code, text) = run.refusal.unwrap();
+        assert_eq!(code, "other_daemon_code");
+        assert!(!text.contains("Nothing reached GitHub"));
+        assert!(!text.contains("Rerunning the command is safe"));
+    }
+}
+
 #[test]
 fn transient_refusals_retry_twice_with_the_same_nonce() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-transient", "call-t", "/p");
@@ -1133,6 +1914,56 @@ fn transient_refusals_retry_twice_with_the_same_nonce() {
     let (status, _) = dispatch_comment(&exhausted, live.value(), "hi");
     assert_eq!(status, REFUSAL_EXIT_STATUS);
     assert_eq!(nonces(&exhausted).len(), 3, "two retries, then refuse");
+}
+
+#[test]
+fn retry_metadata_resends_the_identical_request_and_succeeds() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-safe-retry", "call-sr", "/p");
+    for code in [
+        "transport_not_sent",
+        "nonce_in_flight",
+        "future_code",
+        "outcome_unknown",
+    ] {
+        let mut refusal = plexus_refused(code);
+        refusal["data"]["result"]["retry_same_nonce"] = json!(true);
+        refusal["data"]["result"]["legs_sent"] = json!(["comment"]);
+        let harness = harness(ticket_gated(vec![refusal, plexus_completed()]));
+        assert_eq!(
+            dispatch_comment(&harness, live.value(), "hi"),
+            (0, false),
+            "{code}"
+        );
+        let sent = harness.daemon.bot_requests();
+        assert_eq!(sent.len(), 2, "{code}");
+        assert_eq!(
+            sent[0], sent[1],
+            "{code}: the entire request and nonce must be reused"
+        );
+        let sent_nonces = nonces(&harness);
+        assert_eq!(sent_nonces.len(), 2);
+        assert_eq!(sent_nonces[0], sent_nonces[1]);
+    }
+}
+
+#[test]
+fn false_retry_metadata_stops_legacy_transient_resends() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-terminal-retry", "call-tr", "/p");
+    for code in ["nonce_in_flight", "store_failure", "assertion_expired"] {
+        let mut refusal = plexus_refused(code);
+        refusal["data"]["result"]["retry_same_nonce"] = json!(false);
+        let harness = harness(ticket_gated(vec![refusal, plexus_completed()]));
+        assert_eq!(
+            dispatch_comment(&harness, live.value(), "hi"),
+            (REFUSAL_EXIT_STATUS, false),
+            "{code}"
+        );
+        assert_eq!(
+            nonces(&harness).len(),
+            1,
+            "{code}: terminal metadata must stop resends"
+        );
+    }
 }
 
 #[test]
@@ -1480,9 +2311,9 @@ fn dispatch_timed(
     (status, started.elapsed())
 }
 
-/// Transient refusals whose retries would outlast the relay budget stop at
-/// the budget instead of sleeping past it. Each refusal proves nothing was
-/// written, so the exchange returns the named refusal (reported by dispatch as 86).
+/// Transient refusals whose retries would outlast the relay budget stop instead
+/// of sleeping past it. A delivered refusal names the outcome even when earlier
+/// steps were sent, so dispatch reports the refusal exit rather than a timeout.
 #[test]
 fn transient_retries_stop_inside_the_relay_budget_with_a_named_refusal() {
     struct ClockedRelay {
@@ -1574,6 +2405,127 @@ fn transient_retries_stop_inside_the_relay_budget_with_a_named_refusal() {
         );
         assert_eq!(sent, &body, "a retry reuses the request nonce");
     }
+}
+
+#[test]
+fn explicit_retries_reuse_nonce_until_only_the_budget_stops_them() {
+    struct ClockedRelay {
+        now: std::cell::Cell<Instant>,
+        attempts: std::cell::RefCell<Vec<(Duration, Value)>>,
+        sleeps: std::cell::RefCell<Vec<Duration>>,
+        module_gate_after_first: bool,
+    }
+    impl ExchangeIo for ClockedRelay {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        async fn sleep(&self, delay: Duration) {
+            self.sleeps.borrow_mut().push(delay);
+            self.now.set(self.now() + delay);
+        }
+        async fn request(
+            &self,
+            bytes: Vec<u8>,
+            options: CallOptions,
+        ) -> Result<Vec<u8>, CallError> {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if body["op"] == BINDINGS_READ_OPERATION {
+                return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+            }
+            self.attempts.borrow_mut().push((options.timeout, body));
+            if self.module_gate_after_first && self.attempts.borrow().len() > 1 {
+                return Ok(ok_envelope(json!({"error": {
+                    "code": "request_deadline_exceeded", "retry_same_nonce": true, "transmission": "not_sent",
+                }})));
+            }
+            let mut refusal = plexus_refused("transport_not_sent");
+            refusal["data"]["result"]["retry_same_nonce"] = json!(true);
+            refusal["data"]["result"]["legs_sent"] = json!(["comment"]);
+            Ok(serde_json::to_vec(&refusal).unwrap())
+        }
+    }
+    let started = Instant::now();
+    let io = ClockedRelay {
+        now: std::cell::Cell::new(started),
+        attempts: Default::default(),
+        sleeps: Default::default(),
+        module_gate_after_first: false,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(temp.path().join("state"));
+    let manifest = v12_manifest();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let timing = Exchange {
+        io: &io,
+        ticket: "test-ticket",
+        stage: &stage,
+        started,
+        budget: Duration::from_secs(30),
+    };
+    let body = json!({"op": BOT_REQUEST_OPERATION, "params": {"request_nonce": "same-nonce"}});
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            [Duration::from_secs(5), Duration::from_secs(10)],
+        ));
+    let RouteOutcome::RelayRefusal { code, text } = outcome else {
+        panic!("expected refusal");
+    };
+    assert_eq!(code, "transport_not_sent");
+    assert_eq!(text, "Plexus refused the bot write: transport_not_sent. The current step was not sent. GitHub received a request. Already-sent write steps: comment. An operator must fix the setup, grants, or policy. The relay's 30000 ms budget cannot fit another retry. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    assert_eq!(
+        *io.sleeps.borrow(),
+        [
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(10)
+        ]
+    );
+    assert_eq!(io.now() - started, Duration::from_secs(25));
+    let attempts = io.attempts.borrow();
+    assert_eq!(attempts.len(), 4);
+    for ((timeout, sent), remaining) in attempts.iter().zip([30, 25, 15, 5]) {
+        assert_eq!(*timeout, Duration::from_secs(remaining));
+        assert_eq!(sent, &body);
+    }
+    let module_io = ClockedRelay {
+        now: std::cell::Cell::new(started),
+        attempts: Default::default(),
+        sleeps: Default::default(),
+        module_gate_after_first: true,
+    };
+    let module_timing = Exchange {
+        io: &module_io,
+        ..timing
+    };
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &module_timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            [Duration::from_secs(5), Duration::from_secs(10)],
+        ));
+    let RouteOutcome::OutcomeUndetermined(text) = outcome else {
+        panic!("expected final module refusal");
+    };
+    assert_eq!(text, "Plexus refused the bot write: request_deadline_exceeded. The request deadline expired before dispatch. GitHub received a request. Already-sent write steps: comment. The relay's 30000 ms budget cannot fit another retry. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    let attempts = module_io.attempts.borrow();
+    assert_eq!(attempts.len(), 4);
+    assert!(attempts.iter().all(|(_, sent)| sent == &body));
 }
 
 /// A retried attempt only gets what is left of the relay budget, so a silent
@@ -1761,10 +2713,9 @@ fn a_github_head_refusal_is_relayed_verbatim_and_never_retried() {
         assert_eq!(nonces(&harness).len(), 1, "{code} was retried");
         let seam = super::super::seam_state(&harness.paths);
         assert_eq!(seam.last_seam_refusal.unwrap().code, code);
-        // The caller-facing text is the named seam refusal carrying the code,
-        // not a paraphrase of it.
-        let text = plexus_refusal_text(code, classify_code(code));
-        assert_eq!(text, format!("plexus refused the bot write: {code}"));
+        // Keep GitHub's full code alongside the explanation.
+        let text = plexus_refusal_text(code, &RefusalFacts::default());
+        assert_eq!(text, format!("Plexus refused the bot write: {code}. GitHub rejected the request. GitHub received a request. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
         assert_eq!(RefusalCode::SeamRefusal.as_str(), "gh_shim_seam_refusal");
     }
     // Plexus's own `pr_head_cross_repository` refusal takes the same path.
