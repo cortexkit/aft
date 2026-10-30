@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "readiness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-embed-single-flight"
+  ],
+  "note": "With views on, AFT processes sharing one storage folder coordinate paid embedding batches through a per-family, per-producer lease, so the same new code is embedded once; waiters stay pending and the status view shows the approved coordination lines. No changed path matches RANKING_FENCE_PREFIXES."
+}
