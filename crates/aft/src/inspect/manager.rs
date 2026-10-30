@@ -3260,7 +3260,7 @@ impl InspectManager {
 
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
-                None,
+                Some(self),
                 outcome,
                 &snapshot,
                 category,
@@ -3512,8 +3512,10 @@ impl InspectManager {
         snapshot: &InspectSnapshot,
     ) -> JobOutcome {
         match waiter_rx.recv() {
+            // Scoped completions need the shared scan's revision-checked graph
+            // and contribution-checked rollup, not a full projection per waiter.
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
-                None,
+                Some(self),
                 outcome,
                 snapshot,
                 key.category,
@@ -8022,6 +8024,7 @@ mod guard_tests {
 
     include!("view_projection_tests.rs");
     include!("completion_perf_tests.rs");
+    include!("tier2_refresh_perf_tests.rs");
 
     fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
         let dir = tempfile::tempdir().expect("tempdir");
