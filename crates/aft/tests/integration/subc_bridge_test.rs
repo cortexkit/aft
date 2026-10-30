@@ -218,12 +218,12 @@ pub(super) struct SubcBridgeTestRoots {
 
 impl SubcBridgeTestRoots {
     fn new() -> Self {
-        let root1 = tempfile::tempdir().expect("root1 tempdir");
-        let root2 = tempfile::tempdir().expect("root2 tempdir");
+        let root1 = crate::test_helpers::project::project_tempdir();
+        let root2 = crate::test_helpers::project::project_tempdir();
         let failed_root = tempfile::tempdir().expect("failed root tempdir");
-        let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
-        let slow_root = tempfile::tempdir().expect("slow root tempdir");
-        let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
+        let push_burst_root = crate::test_helpers::project::project_tempdir();
+        let slow_root = crate::test_helpers::project::project_tempdir();
+        let callgraph_root = crate::test_helpers::project::project_tempdir();
         let canonical_callgraph_root = std::fs::canonicalize(callgraph_root.path())
             .unwrap_or_else(|_| callgraph_root.path().to_path_buf());
         // Register the fixture's writer capability before transport timing begins.
@@ -769,6 +769,7 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
     if !configured.success {
         return configured;
     }
+    crate::test_helpers::admission::settle(ctx);
     let root = match req.params.get("project_root").and_then(Value::as_str) {
         Some(root) => std::path::PathBuf::from(root),
         None => {

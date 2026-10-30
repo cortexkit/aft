@@ -7,7 +7,7 @@ pub(crate) use shared::settle;
 pub(crate) fn prepare_project(ctx: &crate::context::AppContext, root: &std::path::Path) {
     assert!(crate::folder_admission_runtime::snapshot(ctx).is_none());
     let root = root.canonicalize().unwrap();
-    let mut config = ctx.config().clone();
+    let mut config = (*ctx.config()).clone();
     config.project_root = Some(root.clone());
     let budgets = crate::folder_admission::ProbeBudgets {
         time: std::time::Duration::from_secs(5),
