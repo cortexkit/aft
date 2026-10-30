@@ -231,7 +231,7 @@ fn discovery_from_admission(
     for path in &admission.outside_paths {
         note_outside(&mut found, root, path);
     }
-    if !admission.coverage.complete {
+    if !admission.coverage.workspace_complete {
         for path in &admission.immediate_directories {
             let name = path
                 .file_name()

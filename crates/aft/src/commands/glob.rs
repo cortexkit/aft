@@ -1100,7 +1100,8 @@ mod tests {
         let capped = crate::grep_executor::with_walk_limit(1, || handle_glob(&request, &ctx));
         let body = serde_json::to_value(&capped).unwrap();
         assert_eq!(body["success"], true, "{body}");
-        assert_eq!(body["total"], 1, "{body}");
+        assert_eq!(body["total"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["total_lower_bound"], 1, "{body}");
         assert_eq!(body["walk_truncated"], true, "{body}");
         assert_eq!(body["complete"], false, "{body}");
         assert_eq!(body["walk_entries_examined"], 3, "{body}");
@@ -1116,7 +1117,8 @@ mod tests {
         );
         let body = serde_json::to_value(&timed).unwrap();
         assert_eq!(body["success"], true, "{body}");
-        assert_eq!(body["total"], 1, "{body}");
+        assert_eq!(body["total"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["total_lower_bound"], 1, "{body}");
         assert_eq!(body["complete"], false, "{body}");
         assert_eq!(body["walk_entries_examined"], 2, "{body}");
         assert_eq!(

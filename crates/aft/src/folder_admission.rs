@@ -193,6 +193,10 @@ pub struct ProbeCoverage {
     pub complete: bool,
     pub count_kind: CountKind,
     pub root_listing_complete: bool,
+    /// Project roots within two directory levels below the selected root are
+    /// known, and remaining paths not owned by them are reported as gaps.
+    /// Sampling the projects' own source files is not required for this flag.
+    pub workspace_complete: bool,
     pub stop: ProbeStop,
     pub entry_budget: usize,
     pub time_budget_ms: u64,
@@ -287,6 +291,7 @@ impl Probe {
             };
         }
         coverage.complete = coverage.stop == ProbeStop::Complete;
+        coverage.workspace_complete |= coverage.complete;
         coverage.count_kind = if coverage.complete {
             CountKind::Exact
         } else {
@@ -369,6 +374,7 @@ fn probe_with_read_dir(
                 complete: false,
                 count_kind: CountKind::LowerBound,
                 root_listing_complete: false,
+                workspace_complete: false,
                 stop: ProbeStop::Complete,
                 entry_budget: budgets.entries,
                 time_budget_ms: millis(budgets.time),
@@ -562,6 +568,10 @@ impl Probe {
         loop {
             if pending.is_empty() {
                 if !diagnostics && self.enough_workspace_evidence() {
+                    self.result.coverage.workspace_complete = self.result.coverage.directory_cuts
+                        == 0
+                        && self.result.coverage.depth_cuts == 0
+                        && self.result.observed.errors == 0;
                     self.result.coverage.stop = ProbeStop::StrongEvidence;
                     return;
                 }
@@ -582,6 +592,19 @@ impl Probe {
             }
             if !diagnostics && level > 2 {
                 if self.enough_workspace_evidence() {
+                    if !bulk {
+                        self.outside_candidates.push(directory.clone());
+                    }
+                    self.outside_candidates.extend(
+                        pending
+                            .iter()
+                            .filter(|(_, _, bulk, _)| !*bulk)
+                            .map(|(directory, _, _, _)| directory.clone()),
+                    );
+                    self.result.coverage.workspace_complete = self.result.coverage.directory_cuts
+                        == 0
+                        && self.result.coverage.depth_cuts == 0
+                        && self.result.observed.errors == 0;
                     self.result.coverage.stop = ProbeStop::StrongEvidence;
                     return;
                 }
