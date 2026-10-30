@@ -143,6 +143,63 @@ impl Drop for BlockDirectory {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn walk_read_block_and_time_budget_report_both_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let keep = dir.path().join("keep.rs");
+    let child = dir.path().join("child");
+    std::fs::write(&keep, "fn keep() {}\n").unwrap();
+    std::fs::create_dir(&child).unwrap();
+    let blocked = BlockDirectory::new(&child);
+    let after_error = dir.path().join("after-directory-error");
+    let stall = stall_running_helper(&after_error);
+    let kept = keep.clone();
+    let blocked_child = child.clone();
+    let budget = Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_secs(2));
+    let response = with_budget(Some(budget), || {
+        let (files, completion) = run_walk(
+            dir.path(),
+            Some(Instant::now() + Duration::from_millis(300)),
+            Vec::<PathBuf>::new(),
+            move |_, progress| {
+                progress.update(|files| files.push(kept.clone()));
+                let error = probe_directory(&blocked_child, None).unwrap_err();
+                assert!(error.to_string().contains("read_blocked"));
+                // Keep the same walk alive after its injected directory failure
+                // until the caller's walk deadline expires.
+                after_helper_start(&after_error);
+                Ok(vec![kept])
+            },
+        );
+        assert!(completion.incomplete);
+        assert!(completion.time_limit);
+        finish_response(Response::success(
+            "walk-both-gaps",
+            serde_json::json!({
+                "complete": true, "files": files,
+            }),
+        ))
+    });
+    stall.reached.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(blocked.1.load(Ordering::Relaxed), 1);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(response.data["files"], serde_json::json!([keep]));
+    let gaps = response.data["gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 2);
+    assert_eq!(
+        gaps[0],
+        "Directory walk reached its time budget; only examined entries are reported."
+    );
+    let named_gap = format!("read_blocked: {}:", child.display());
+    assert!(gaps[1].as_str().unwrap().starts_with(&named_gap));
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.lines().any(|line| line
+        == "Directory walk reached its time budget; only examined entries are reported."));
+    assert!(text.contains(&named_gap));
+}
+
 #[test]
 fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
     use crate::commands::read::{

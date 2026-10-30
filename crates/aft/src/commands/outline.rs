@@ -3941,15 +3941,15 @@ mod tests {
         assert_eq!(response.data["complete"], false);
         assert_eq!(response.data["files"], serde_json::json!([keep]));
         assert_eq!(response.data["entries_examined"], 2);
-        assert_eq!(
-            response.data["gaps"][0],
+        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 1);
+        assert!(!response.data["gaps"].to_string().contains(
             "Directory walk reached its time budget; only examined entries are reported."
-        );
-        assert!(response.data["text"].as_str().unwrap().lines().any(|line| {
-            line == "Directory walk reached its time budget; only examined entries are reported."
-        }));
+        ));
+        assert!(!response.data["text"].as_str().unwrap().contains(
+            "Directory walk reached its time budget; only examined entries are reported."
+        ));
         assert!(
-            response.data["gaps"][1]
+            response.data["gaps"][0]
                 .as_str()
                 .unwrap()
                 .contains(&format!("read_blocked: {}:", child.display())),
