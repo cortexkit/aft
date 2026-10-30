@@ -1,7 +1,7 @@
 //! A request-local census shared by freshness checks, Tier-2 jobs and manifest hashing.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -182,7 +182,7 @@ impl InspectInventory {
             struct Census {
                 // Some directories belong to just one walk. Their descendants
                 // inherit each policy's decision even when the union descends.
-                directories: BTreeMap<PathBuf, (bool, bool)>,
+                directories: HashMap<PathBuf, (bool, bool)>,
                 sources: Vec<PathBuf>,
                 entries: Vec<PathBuf>,
             }

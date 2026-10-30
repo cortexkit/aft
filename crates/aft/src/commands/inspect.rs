@@ -7855,11 +7855,28 @@ mod deferred_terminal_tests {
         config.inspect.tier2_pass_timeout_ms = 600_000;
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let configure: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "inspect-profile-configure", "command": "configure", "params": {
+                "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
+                "config": {
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": true},
+                    "views": {"enabled": false},
+                },
+            },
+        }))
+        .unwrap();
+        let configured = crate::commands::configure::handle_configure(&configure, &ctx);
+        assert!(configured.success, "{}", configured.data);
+        ctx.inspect_manager()
+            .set_automatic_tier2_refresh_allowed(false);
         // Seed heavy analyzers outside the command's per-phase deadline, so a
         // large checkout measures cache reuse rather than timeout handling.
         let snapshot = build_snapshot(&ctx).unwrap();
+        start_on_demand_callgraph_for_inspect(&ctx, snapshot.config.as_ref());
         let scope = JobScope::for_project(root.clone());
         for category in InspectCategory::active().iter().copied() {
+            eprintln!("inspect profile seed starting: {category}");
             let outcome = if category.is_tier2() {
                 ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
                     snapshot.clone(),
@@ -7880,6 +7897,7 @@ mod deferred_terminal_tests {
                 matches!(outcome, JobOutcome::Fresh { .. }),
                 "{category}: {outcome:?}"
             );
+            eprintln!("inspect profile seed completed: {category}");
         }
         let mut measurements = Vec::new();
         for (name, scope) in [
