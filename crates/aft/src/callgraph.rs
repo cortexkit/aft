@@ -4126,6 +4126,8 @@ fn walk_project_paths_filtered_while_with_builder(
     let mut walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(move |entry| {
             #[cfg(test)]
+            crate::inspect::walk_profile::entry();
+            #[cfg(test)]
             PROJECT_WALK_FILTER_ENTRIES
                 .with(|entries| entries.borrow_mut().push(entry.path().to_path_buf()));
             // The ignore crate filters hidden and ignored entries before this hook.

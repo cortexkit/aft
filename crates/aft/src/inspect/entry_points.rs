@@ -154,6 +154,8 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
 }
 
 fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
+    #[cfg(test)]
+    let _profile = super::walk_profile::Walk::start("entry_point_walk_files");
     // Skip nested linked worktrees of this repository; the walk root itself
     // is always admitted (depth 0).
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
@@ -168,6 +170,8 @@ fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
         .require_git(false)
         .add_custom_ignore_filename(".aftignore")
         .filter_entry(move |entry| {
+            #[cfg(test)]
+            super::walk_profile::entry();
             // Manifests inside a nested linked worktree of this repository
             // belong to that checkout's own scope, not this one.
             if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {

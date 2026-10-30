@@ -14,6 +14,8 @@ pub mod oxc_engine;
 pub mod phase_log;
 pub mod scanners;
 pub mod tier2_scheduler;
+#[cfg(test)]
+pub(crate) mod walk_profile;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};
 pub use diagnostics_category::force_scoped_diagnostic_coverage_for_test;

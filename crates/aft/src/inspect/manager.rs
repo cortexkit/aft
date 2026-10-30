@@ -5169,6 +5169,8 @@ thread_local! {
 
 fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
     #[cfg(test)]
+    let _profile = super::walk_profile::Walk::start("scope_files");
+    #[cfg(test)]
     SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut files = crate::callgraph::walk_project_files(project_root)
         .filter(|path| scope.contains(path))

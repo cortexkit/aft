@@ -295,6 +295,8 @@ fn capture_inspect_root_stats_while(
     has_work_budget: impl Fn() -> bool + Send + Sync + 'static,
     timeout_detail: impl Fn() -> String,
 ) -> Result<InspectRootStatSnapshot, String> {
+    #[cfg(test)]
+    let _profile = crate::inspect::walk_profile::Walk::start("freshness_listing");
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
@@ -7797,6 +7799,62 @@ mod fresh_payload_tests {
 
 #[cfg(test)]
 mod deferred_terminal_tests {
+    #[test]
+    #[ignore = "real-checkout inspect walk and output measurement; requires AFT_INSPECT_WALK_PROFILE_ROOT"]
+    fn inspect_checkout_walk_profile() {
+        use crate::inspect::walk_profile;
+        let root =
+            std::fs::canonicalize(std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").unwrap())
+                .unwrap();
+        let output =
+            std::path::PathBuf::from(std::env::var_os("AFT_INSPECT_WALK_PROFILE_OUTPUT").unwrap());
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.storage.cache_dir = Some(storage.path().to_path_buf());
+        config.views.enabled = false;
+        config.inspect.tier2_pass_timeout_ms = 600_000;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let mut measurements = Vec::new();
+        for (name, scope) in [
+            ("cold", None),
+            ("unscoped", None),
+            ("scoped", Some("crates/aft/src/inspect")),
+        ] {
+            walk_profile::take();
+            let req: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": name, "command": "inspect", "params": {
+                    "sections": ["dead_code", "unused_exports", "duplicates", "cycles"],
+                    "scope": scope, "top_k": 100,
+                }
+            }))
+            .unwrap();
+            let started = Instant::now();
+            let cpu = walk_profile::cpu_ms();
+            let response = run_blocking_inspect_body(
+                &req,
+                &ctx,
+                ApplicableServerSnapshot::default(),
+                false,
+                InspectPhaseLog::for_request(name.to_string()),
+                InspectRequestDeadline::new(Duration::from_secs(900), Duration::from_secs(1)),
+            );
+            let measurement = serde_json::json!({
+                "case": name, "ms": started.elapsed().as_secs_f64() * 1000.0,
+                "cpu_ms": walk_profile::cpu_ms() - cpu, "walks": walk_profile::take(),
+                "response": response.data,
+            });
+            eprintln!("inspect checkout profile {}", serde_json::to_string(&serde_json::json!({
+                "case": name, "ms": measurement["ms"], "cpu_ms": measurement["cpu_ms"], "walks": measurement["walks"],
+            })).unwrap());
+            assert!(response.success, "{measurement:#}");
+            assert_eq!(measurement["response"]["complete"], true, "{measurement:#}");
+            measurements.push(measurement);
+        }
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
+    }
     #[test]
     fn root_too_broad_inspect_refuses_snapshot() {
         let ctx = crate::context::AppContext::new(
