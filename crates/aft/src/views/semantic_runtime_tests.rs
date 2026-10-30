@@ -2258,10 +2258,19 @@ fn large_semantic_materialization_batches_pins_and_touches() {
 /// independent cold index, not to another copy of the fast path.
 #[test]
 fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
+    // The assertions (one edit embeds one text; answers match a strict and a
+    // cold index) hold at any size. 512 files keep the default run short on
+    // loaded Windows runners, where 2048 took over 7 minutes in a CI shard;
+    // AFT_STRESS=1 keeps the full size.
+    let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        2048
+    } else {
+        512
+    };
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(root.path()).unwrap();
-    for i in 0..2048 {
+    for i in 0..files {
         let path = root.join(format!("file_{i:04}.rs"));
         std::fs::write(&path, format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
         // Windows refuses to change times through a read-only handle.
@@ -2361,7 +2370,8 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         // graph) for the one file read.
         assert_eq!(work.attachments, 3);
         assert_eq!(
-            work.stats, 2049,
+            work.stats,
+            files + 1,
             "one stat per member plus a post-read stability stat"
         );
     }
