@@ -14011,7 +14011,7 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("AFT is running without its caches until it is back.")));
-        super::drain_deferred_configure_maintenance(&ctx);
+        settle_configure_for_test(&ctx);
         assert!(ctx.cache_unavailable_reason().is_some());
         assert_eq!(
             ctx.try_health_snapshot(&project).cache_unavailable_reason,
@@ -14301,11 +14301,16 @@ mod tests {
         )
         .unwrap();
         filetime::set_file_mtime(root.join("shared.ts"), stamp).unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
         std::fs::remove_file(root.join("shared.ts")).unwrap();
         std::fs::write(root.join(".gitignore"), "").unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
+        ctx.record_checkout_watcher_change(&root.join(".gitignore"));
         lexical_views_assert_public_parity(&ctx, &root);
         std::fs::rename(root.join("new.ts"), root.join("moved.ts")).unwrap();
+        ctx.record_checkout_watcher_change(&root.join("new.ts"));
+        ctx.record_checkout_watcher_change(&root.join("moved.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
         ctx.record_checkout_watcher_overflow();
         std::fs::write(root.join("moved.ts"), "needle alpha after overflow\n").unwrap();
@@ -14402,6 +14407,7 @@ mod tests {
             "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
         )
         .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("new.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
         assert!(!storage.join("blobs/v2").exists());
     }
@@ -21006,7 +21012,8 @@ mod tests {
         git_commit_all(&live, "live head");
 
         let owner = test_context();
-        let response = handle_configure_for_test(&configure_with_storage(&live, &storage), &owner);
+        let response =
+            handle_configure_and_settle_for_test(&configure_with_storage(&live, &storage), &owner);
         assert!(
             response.success,
             "owner configure failed: {:?}",
