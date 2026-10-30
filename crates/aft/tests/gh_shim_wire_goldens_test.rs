@@ -2516,6 +2516,74 @@ fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
 }
 
 #[test]
+fn queue_pre_read_refusals_and_uncertain_writes_keep_their_retry_boundaries() {
+    let manifest = synthetic_v23_manifest(unix_seconds());
+    for vector in plexus_contract_judge::load_reply_vectors()
+        .into_iter()
+        .filter(|vector| {
+            matches!(
+                vector["name"].as_str(),
+                Some("pr-enqueue-own" | "pr-dequeue-own")
+            )
+        })
+    {
+        let row = reply_contract_row(&vector);
+        for (result, attempts, exit, sentence) in [
+            (
+                json!({"status": "refused", "refusal_code": "pre_dispatch_read_incomplete{reason: transport_unknown}", "transmission": "not_sent", "retry_same_nonce": true}),
+                2,
+                86,
+                "The GitHub read did not finish. Nothing reached GitHub. Rerunning the command is safe.",
+            ),
+            (
+                json!({"status": "refused", "refusal_code": "pre_dispatch_read_incomplete{reason: invalid_response}", "transmission": "not_sent", "retry_same_nonce": true}),
+                1,
+                86,
+                "Nothing reached GitHub. Rerunning the command is safe.",
+            ),
+            (
+                json!({"status": "refused", "refusal_code": "vendor_rejected{status: 422}", "transmission": "not_sent", "retry_same_nonce": true}),
+                1,
+                86,
+                "Nothing reached GitHub. The agent must change the request.",
+            ),
+            (
+                json!({"status": "refused", "refusal_code": "transport_not_sent", "transmission": "not_sent", "retry_same_nonce": true}),
+                1,
+                86,
+                "Nothing reached GitHub.",
+            ),
+            (
+                json!({"status": "outcome_unknown"}),
+                1,
+                87,
+                "the bot write may have executed; check before retrying",
+            ),
+        ] {
+            let mut reply = vector["reply"].clone();
+            reply["result"] = result.clone();
+            let run = run_v22_row_with_timing(
+                &row,
+                &manifest,
+                "alfonso-aft",
+                serde_json::to_vec(&reply).unwrap(),
+                "",
+                15000,
+                attempts,
+            );
+            assert_eq!(run.exit_code, Some(exit), "{}: {result}: {}", row.name, run.stderr);
+            assert!(run.stderr.contains(sentence), "{}: {result}: {}", row.name, run.stderr);
+            assert!(run.stdout.is_empty(), "{}: {result}", row.name);
+            assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
+            assert_eq!(run.request_nonces.len(), attempts, "{}: {result}", row.name);
+            assert!(run.request_nonces[0].as_str().is_some_and(|nonce| !nonce.is_empty()));
+            assert!(run.request_nonces.iter().all(|nonce| nonce == &run.request_nonces[0]));
+            assert_eq!(run.routed_request.unwrap()["action"], vector["request"]["action"]);
+        }
+    }
+}
+
+#[test]
 fn queue_writes_from_worker_shells_keep_the_approved_refusal() {
     let manifest = synthetic_v23_manifest(unix_seconds());
     for argv in [
