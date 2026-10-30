@@ -198,6 +198,76 @@ fn views_import_currency_is_revoked_on_unbind_and_not_revived_by_rebind() {
 }
 
 #[test]
+fn views_import_semantic_retries_a_superseded_attempt_before_filling() {
+    let generation = std::sync::atomic::AtomicU64::new(0);
+    let mut attempts = 0;
+    finish_legacy_import_before_fill(
+        || true,
+        || {
+            attempts += 1;
+            let expected = generation.load(Ordering::Acquire);
+            if attempts == 1 {
+                generation.fetch_add(1, Ordering::AcqRel);
+            }
+            generation.load(Ordering::Acquire) == expected
+        },
+    );
+    assert_eq!(
+        attempts, 2,
+        "a cancelled import must resume before fills start"
+    );
+}
+
+#[test]
+fn views_import_semantic_waits_for_rebind_before_importing_or_filling() {
+    let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let imports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let live = live.clone();
+        let bound = bound.clone();
+        let imports = imports.clone();
+        let fills = fills.clone();
+        thread::spawn(move || {
+            let mut paused_tx = Some(paused_tx);
+            finish_legacy_import_before_fill(
+                || live.load(Ordering::Acquire),
+                || {
+                    if !bound.load(Ordering::Acquire) {
+                        if let Some(tx) = paused_tx.take() {
+                            tx.send(()).unwrap();
+                        }
+                        return false;
+                    }
+                    imports.fetch_add(1, Ordering::AcqRel);
+                    true
+                },
+            );
+            fills.fetch_add(1, Ordering::AcqRel);
+        })
+    };
+    if let Err(error) = paused_rx.recv_timeout(Duration::from_secs(5)) {
+        live.store(false, Ordering::Release);
+        bound.store(true, Ordering::Release);
+        worker.join().unwrap();
+        panic!("semantic import never observed the unbound state: {error}");
+    }
+    assert_eq!(imports.load(Ordering::Acquire), 0);
+    assert_eq!(fills.load(Ordering::Acquire), 0);
+    bound.store(true, Ordering::Release);
+    worker.join().unwrap();
+    assert_eq!(imports.load(Ordering::Acquire), 1);
+    assert_eq!(fills.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn views_import_semantic_does_not_retry_an_expired_lane() {
+    finish_legacy_import_before_fill(|| false, || panic!("expired lane started an import"));
+}
+
+#[test]
 fn views_import_public_grep_search_outline_zoom_match_fresh_builds() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let (_checkout, storage, root) = warm_fixture();
