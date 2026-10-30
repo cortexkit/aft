@@ -1341,7 +1341,7 @@ fn next_transient_backoff(previous: Option<Duration>) -> Duration {
 
 /// A retry delay in whole seconds, rounded up so a pending retry never reads
 /// as "after 0s": `45s`, `2m`, `4m 30s`.
-fn format_retry_delay(delay: Duration) -> String {
+pub(crate) fn format_retry_delay(delay: Duration) -> String {
     let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
     match (seconds / 60, seconds % 60) {
         (0, seconds) => format!("{seconds}s"),
