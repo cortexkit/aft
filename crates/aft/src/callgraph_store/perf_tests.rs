@@ -1003,10 +1003,18 @@ fn cold_callgraph_filesystem_real_repo() {
     let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_DUMP").expect("dump"));
     let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
     let dir = tempfile::tempdir().unwrap();
-    let (store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+    let compiles = install_compile_counter(&store);
+    callgraph::clear_workspace_package_cache();
+    // This ignored test runs alone. Reset all paths, not just the corpus, so
+    // ancestor probes outside the checkout are included in the build census.
+    let all_paths = Path::new("");
+    work_counts::reset_under(all_paths);
+    let (result, counts) = measure(&root, compiles, || store.cold_build(&files));
+    result.unwrap();
     report("cold_callgraph_filesystem", &counts);
-    let (canonical, unique, workspace_dirs, all_dirs) = work_counts::filesystem_counts(&root);
-    let realpaths = work_counts::realpaths_under(&root);
+    let (canonical, unique, workspace_dirs, all_dirs) = work_counts::filesystem_counts(all_paths);
+    let realpaths = work_counts::realpaths_under(all_paths);
     let rows = dump_graph_rows(&store);
     let edges = rows
         .lines()
