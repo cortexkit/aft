@@ -8,7 +8,7 @@ trap 'prepush_abort $?' EXIT
 prepush_step platform prepush_require_platform linux
 export CI=1
 unset AFT_STORAGE_DIR AFT_CACHE_DIR
-prepush_step prerequisites bash scripts/prepush/require-tools.sh linux bun node cargo npm rg timeout gh unzip
+prepush_step prerequisites bash scripts/prepush/require-tools.sh linux bun node cargo npm rg timeout curl unzip
 prepush_step tool-versions bash -c 'set -euo pipefail; bun --version; node --version; cargo --version; rg --version'
 # Build-server job VMs deliberately cannot create the namespaces containers
 # need, so the Docker suites run only where a Docker daemon answers.

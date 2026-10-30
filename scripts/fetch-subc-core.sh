@@ -124,7 +124,23 @@ if [[ -f "$CACHED_TARBALL" && -f "$CACHED_SIDECAR" ]] && sidecar_matches "$CACHE
   exit 0
 fi
 
-command -v gh >/dev/null 2>&1 || fail 'GitHub CLI (gh) is required to fetch subc-core'
+# The subconscious repository is public, so its release assets download over
+# plain HTTPS without credentials. CI uses gh; the build server's job VMs carry
+# no GitHub CLI or token on purpose, so they use curl.
+download_asset() {
+  if command -v gh >/dev/null 2>&1; then
+    gh release download "$SUBC_CORE_TAG" \
+      --repo "$SUBC_REPO" \
+      --dir "$stage_dir" \
+      --pattern "$TARBALL_NAME"
+  elif command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --location \
+      --output "$stage_dir/$TARBALL_NAME" \
+      "https://github.com/$SUBC_REPO/releases/download/$SUBC_CORE_TAG/$TARBALL_NAME"
+  else
+    fail 'Neither the GitHub CLI (gh) nor curl is available to fetch subc-core'
+  fi
+}
 
 stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/subc-core-fetch.XXXXXX")"
 trap 'rm -rf "$stage_dir"' EXIT
@@ -136,10 +152,7 @@ echo "Fetching $TARBALL_NAME from $SUBC_REPO@$SUBC_CORE_TAG" >&2
 max_attempts=4
 attempt=1
 delay=5
-until gh release download "$SUBC_CORE_TAG" \
-  --repo "$SUBC_REPO" \
-  --dir "$stage_dir" \
-  --pattern "$TARBALL_NAME"; do
+until download_asset; do
   if (( attempt >= max_attempts )); then
     fail "Could not download $TARBALL_NAME from $SUBC_REPO@$SUBC_CORE_TAG after $max_attempts attempts"
   fi
