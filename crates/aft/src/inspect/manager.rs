@@ -302,6 +302,7 @@ impl Tier2RunSubmission {
 
 #[derive(Debug, Clone)]
 struct Tier2ReuseOptions {
+    inventory: Option<Arc<super::inventory::InspectInventory>>,
     force_rescan_paths: BTreeSet<PathBuf>,
     allow_callgraph_cold_build: bool,
     require_callgraph_snapshot: bool,
@@ -319,6 +320,7 @@ impl Tier2ReuseOptions {
 impl Default for Tier2ReuseOptions {
     fn default() -> Self {
         Self {
+            inventory: super::inventory::inherited(),
             force_rescan_paths: BTreeSet::new(),
             allow_callgraph_cold_build: true,
             require_callgraph_snapshot: false,
@@ -3825,6 +3827,26 @@ impl InspectManager {
 
         let project_scope = JobScope::for_project(job.project_root.clone());
         self.record_build_progress(&job.key, "enumerating checkout source files");
+        // A blocking inspect already has the initial freshness census. Carry it
+        // across the worker hop; background jobs collect their own census once.
+        let inventory = options
+            .inventory
+            .take()
+            .filter(|inventory| inventory.matches(&job.project_root))
+            .unwrap_or_else(|| {
+                Arc::new(super::inventory::InspectInventory::collect(
+                    &job.project_root,
+                    || !crate::executor::current_job_cancelled(),
+                ))
+            });
+        let _inventory = inventory.install();
+        if crate::executor::current_job_cancelled() {
+            return InspectResult::failed(
+                &job,
+                "tier2 pass cancelled before incremental scan",
+                started.elapsed(),
+            );
+        }
         job.scope_files = scope_files(&job.project_root, &project_scope);
         self.record_build_progress(
             &job.key,
@@ -5168,6 +5190,14 @@ thread_local! {
 }
 
 fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
+    if let Some(inventory) = super::inventory::current(project_root) {
+        return inventory
+            .sources
+            .iter()
+            .filter(|path| scope.contains(path))
+            .cloned()
+            .collect();
+    }
     #[cfg(test)]
     let _profile = super::walk_profile::Walk::start("scope_files");
     #[cfg(test)]
@@ -7875,6 +7905,25 @@ thread_local! {
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod guard_tests {
+    #[test]
+    fn inspect_scope_files_reuses_the_freshness_inventory() {
+        use super::super::inventory::InspectInventory;
+        let root = tempfile::tempdir().unwrap();
+        let root = canonicalize_for_snapshot(root.path());
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/one.ts"), "export const one = 1;\n").unwrap();
+        std::fs::write(root.join("outside.ts"), "export const outside = 1;\n").unwrap();
+        let inventory = Arc::new(InspectInventory::collect(&root, || true));
+        let _guard = inventory.install();
+        SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+        assert_eq!(
+            scope_files(&root, &JobScope::for_project(root.clone())),
+            inventory.sources
+        );
+        let scope = JobScope::from_roots(root.clone(), vec![root.join("src")]);
+        assert_eq!(scope_files(&root, &scope), vec![root.join("src/one.ts")]);
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
+    }
     use super::*;
 
     #[cfg(debug_assertions)]

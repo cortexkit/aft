@@ -4143,19 +4143,7 @@ fn walk_project_paths_filtered_while_with_builder(
                 PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
                     .with(|entries| entries.borrow_mut().push(entry.path().to_path_buf()));
             }
-            let file_type = entry.file_type();
-            if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
-                || !include(entry.path())
-                || crate::search_index::is_nested_worktree_entry(entry, &worktrees)
-            {
-                return false;
-            }
-            let name = entry.file_name().to_string_lossy();
-            // Always exclude these directories regardless of .gitignore
-            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
-                return !WALK_EXCLUDED_DIR_NAMES.contains(&name.as_ref());
-            }
-            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            include(entry.path()) && project_walk_entry_is_included(entry, &worktrees)
         })
         .build();
     // Filtering to source paths first can hide arbitrarily many directory/file
@@ -4166,6 +4154,22 @@ fn walk_project_paths_filtered_while_with_builder(
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
         .map(|entry| entry.into_path())
+}
+
+pub(crate) fn project_walk_entry_is_included(
+    entry: &ignore::DirEntry,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    let file_type = entry.file_type();
+    if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
+        || crate::search_index::is_nested_worktree_entry(entry, worktrees)
+    {
+        return false;
+    }
+    if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
+        return !WALK_EXCLUDED_DIR_NAMES.contains(&entry.file_name().to_string_lossy().as_ref());
+    }
+    !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
 }
 
 #[cfg(test)]

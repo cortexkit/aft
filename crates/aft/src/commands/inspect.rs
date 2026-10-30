@@ -272,8 +272,20 @@ impl Drop for DeferredInspectRootPermit {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct InspectRootStatSnapshot(Vec<(PathBuf, u64, SystemTime)>);
+#[derive(Debug)]
+struct InspectRootStatSnapshot(
+    Vec<(PathBuf, u64, SystemTime)>,
+    Arc<crate::inspect::inventory::InspectInventory>,
+    Vec<(PathBuf, blake3::Hash)>,
+);
+
+impl PartialEq for InspectRootStatSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.2 == other.2
+    }
+}
+
+impl Eq for InspectRootStatSnapshot {}
 
 fn capture_inspect_root_stats_until(
     root: &Path,
@@ -300,7 +312,11 @@ fn capture_inspect_root_stats_while(
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
-    for file in crate::callgraph::walk_project_files_while(root, move || walk_budget()) {
+    let inventory = Arc::new(crate::inspect::inventory::InspectInventory::collect(
+        root,
+        move || walk_budget(),
+    ));
+    for file in &inventory.sources {
         if !has_work_budget() {
             return Err(timeout_detail());
         }
@@ -308,7 +324,7 @@ fn capture_inspect_root_stats_while(
         INSPECT_STAT_CALLS.with(|count| count.set(count.get() + 1));
         match std::fs::metadata(&file) {
             Ok(metadata) => files.push((
-                file,
+                file.clone(),
                 metadata.len(),
                 metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             )),
@@ -329,7 +345,25 @@ fn capture_inspect_root_stats_while(
         return Err(timeout_detail());
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(InspectRootStatSnapshot(files))
+    // Manifest membership is shared with hash calculations during the request.
+    // Fence it too, so an added manifest cannot make a snapshot appear current.
+    let mut manifests = Vec::new();
+    for manifest in &inventory.manifests {
+        if !has_work_budget() {
+            return Err(timeout_detail());
+        }
+        let contents = std::fs::read(manifest).map_err(|error| {
+            format!(
+                "failed to stat {} during inspect verification: {error}",
+                manifest.display()
+            )
+        })?;
+        manifests.push((manifest.clone(), blake3::hash(&contents)));
+    }
+    if !has_work_budget() {
+        return Err(timeout_detail());
+    }
+    Ok(InspectRootStatSnapshot(files, inventory, manifests))
 }
 
 #[cfg(test)]
@@ -643,6 +677,7 @@ fn handle_inspect_payload(
     observed_stats: Option<&InspectRootStatSnapshot>,
     rust_checks: Vec<InspectRustCheck>,
 ) -> Response {
+    let _inventory = observed_stats.map(|stats| stats.1.install());
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
         Err(message) => return invalid_request(&req.id, message),
@@ -903,7 +938,9 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         let grant_scope = crate::access_policy::current_scope();
         let ask_route = crate::access_policy::capture_ask_route();
+        let inventory = crate::inspect::inventory::current(&snapshot.project_root);
         std::thread::spawn(move || {
+            let _inventory = inventory.as_ref().map(|inventory| inventory.install());
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
@@ -8339,6 +8376,30 @@ mod deferred_terminal_tests {
             .is_some_and(|phases| phases
                 .iter()
                 .all(|phase| phase["id"] != "stat_verification")));
+    }
+
+    #[test]
+    fn inspect_final_stat_verification_fences_shared_manifest_membership_and_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        let manifest = root.path().join("package.json");
+        std::fs::write(&manifest, "{\"main\":\"one.js\"}").unwrap();
+        let added = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_ne!(initial, added);
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&manifest).unwrap());
+        std::fs::write(&manifest, "{\"main\":\"two.js\"}").unwrap();
+        filetime::set_file_mtime(&manifest, mtime).unwrap();
+        let changed = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_ne!(
+            added, changed,
+            "same-size, same-mtime manifest edits are fenced"
+        );
+        std::fs::remove_file(&manifest).unwrap();
+        assert_eq!(
+            initial,
+            capture_inspect_root_stats_until(root.path(), None).unwrap()
+        );
     }
 
     #[test]

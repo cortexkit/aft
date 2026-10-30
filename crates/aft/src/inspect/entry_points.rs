@@ -138,7 +138,10 @@ pub(crate) fn collect_entry_point_manifests(project_root: &Path) -> Vec<PathBuf>
 }
 
 fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
-    for path in entry_point_walk_files(project_root) {
+    let paths = super::inventory::current(project_root)
+        .map(|inventory| inventory.manifests.clone())
+        .unwrap_or_else(|| entry_point_walk_files(project_root));
+    for path in paths {
         match path.file_name().and_then(|name| name.to_str()) {
             Some("Cargo.toml") => manifests.cargo_tomls.push(path),
             Some("package.json") => manifests.package_jsons.push(path),
@@ -154,37 +157,32 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
 }
 
 fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
+    if let Some(inventory) = super::inventory::current(project_root) {
+        return inventory.entry_point_files.clone();
+    }
+    uncached_entry_point_files_while(project_root, || true)
+}
+
+pub(super) fn uncached_entry_point_files_while(
+    project_root: &Path,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
+) -> Vec<PathBuf> {
     #[cfg(test)]
     let _profile = super::walk_profile::Walk::start("entry_point_walk_files");
     // Skip nested linked worktrees of this repository; the walk root itself
     // is always admitted (depth 0).
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
-    let mut builder = ignore::WalkBuilder::new(project_root);
-    // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-    builder
-        .same_file_system(true)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .require_git(false)
-        .add_custom_ignore_filename(".aftignore")
-        .filter_entry(move |entry| {
-            #[cfg(test)]
-            super::walk_profile::entry();
-            // Manifests inside a nested linked worktree of this repository
-            // belong to that checkout's own scope, not this one.
-            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
-                return false;
-            }
-            !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_dir())
-                || !should_skip_manifest_dir(entry.path())
-        });
+    let budget = std::sync::Arc::new(keep_walking);
+    let filter_budget = std::sync::Arc::clone(&budget);
+    let mut builder = manifest_walk_builder(project_root);
+    builder.filter_entry(move |entry| {
+        #[cfg(test)]
+        super::walk_profile::entry();
+        filter_budget() && manifest_walk_entry_is_included(entry, &worktrees)
+    });
 
-    let mut files = builder
-        .build()
+    let mut walker = builder.build();
+    let mut files = std::iter::from_fn(move || budget().then(|| walker.next()).flatten())
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
@@ -195,6 +193,42 @@ fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     files.sort();
     files
+}
+
+pub(super) fn manifest_walk_builder(project_root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    // A vanished child filesystem can make directory cleanup abort; stay on
+    // the root filesystem instead of opening directories on child mounts.
+    builder
+        .same_file_system(true)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .add_custom_ignore_filename(".aftignore");
+    builder
+}
+
+pub(super) fn manifest_walk_entry_is_included(
+    entry: &ignore::DirEntry,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    !crate::search_index::is_nested_worktree_entry(entry, worktrees)
+        && (!entry.file_type().is_some_and(|kind| kind.is_dir())
+            || !should_skip_manifest_dir(entry.path()))
+}
+
+pub(super) fn is_entry_point_manifest(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("Cargo.toml" | "package.json" | "go.mod")
+    )
+}
+
+#[cfg(test)]
+pub(super) fn uncached_entry_point_files(project_root: &Path) -> Vec<PathBuf> {
+    uncached_entry_point_files_while(project_root, || true)
 }
 
 fn should_skip_manifest_dir(path: &Path) -> bool {
