@@ -96,13 +96,21 @@ fn typescript_package(dir: &Path, modules: &Path) {
 }
 
 fn spawn_configured(root: &Path, lsp_paths_extra: &[PathBuf]) -> AftProcess {
-    // On macOS typescript-language-server probes case sensitivity in a shared
-    // typescript-language-server<uid> temp directory using existsSync + mkdirSync.
-    // Concurrent first starts can race to create it, so isolate each fixture's
-    // server temp files as well as its workspace and HOME.
-    let server_tmp = root.join(".typescript-server-tmp");
-    fs::create_dir_all(&server_tmp).unwrap();
-    let mut aft = AftProcess::spawn_with_env(&[("TMPDIR", server_tmp.as_os_str())]);
+    spawn_configured_with_tmp(root, lsp_paths_extra, &root.join(".typescript-server-tmp"))
+}
+
+/// `tmp` becomes TMPDIR for AFT and, through it, the TypeScript server.
+///
+/// On macOS typescript-language-server probes case sensitivity in a shared
+/// typescript-language-server<uid> temp directory using existsSync + mkdirSync.
+/// Concurrent first starts can race to create it, so each fixture gets its own
+/// temp directory as well as its own workspace and HOME. On macOS AFT also
+/// treats TMPDIR as the temp root a standalone call may use without an
+/// outside-access ask, so a test that reads a sibling of `root` must pass a
+/// `tmp` that contains that sibling.
+fn spawn_configured_with_tmp(root: &Path, lsp_paths_extra: &[PathBuf], tmp: &Path) -> AftProcess {
+    fs::create_dir_all(tmp).unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[("TMPDIR", tmp.as_os_str())]);
     let configure = aft.send(
         &json!({
             "id": "cfg",
@@ -275,7 +283,10 @@ fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
     typescript_package(&external, &ts5);
     let broken = external.join("src/broken.ts");
     write(&broken, "export const broken: number = \"not a number\";\n");
-    let mut aft = spawn_configured(&root, &[ts5.join(".bin")]);
+    // The external workspace is outside the project root, so on macOS it is
+    // readable without an ask only because it sits under AFT's TMPDIR. This
+    // fixture's own temp directory still gives its server a private temp dir.
+    let mut aft = spawn_configured_with_tmp(&root, &[ts5.join(".bin")], &parent);
     let response = aft.send(
         &json!({
             "id": "inspect-external", "command": "inspect", "scope": broken,
