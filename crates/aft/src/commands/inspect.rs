@@ -7848,7 +7848,7 @@ mod deferred_terminal_tests {
         let storage = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
-        config.storage.cache_dir = Some(storage.path().to_path_buf());
+        config.cache_dir = Some(storage.path().to_path_buf());
         config.views.enabled = false;
         config.inspect.tier2_pass_timeout_ms = 600_000;
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
@@ -7887,7 +7887,7 @@ mod deferred_terminal_tests {
             })).unwrap());
             assert!(response.success, "{measurement:#}");
             let snapshot = build_snapshot(&ctx).unwrap();
-            let cache = ctx.inspect_manager.cache_for_snapshot(&snapshot).unwrap();
+            let cache = ctx.inspect_manager().cache_for_snapshot(&snapshot).unwrap();
             let mut measurement = measurement;
             for category in [
                 InspectCategory::DeadCode,
