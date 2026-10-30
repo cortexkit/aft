@@ -14419,8 +14419,18 @@ mod tests {
             assert_eq!(writes, first_writes);
             assert!(!first.success, "{:?}", first.data);
             assert_eq!(first.data, held.data);
-            let name = if callgraph { "callers" } else { "grep" };
-            let text = crate::subc_format::format_response(name, &first, false);
+            let text = if callgraph {
+                crate::subc_format::format_response_with_context(
+                    "callgraph",
+                    &first,
+                    &crate::subc_format::FormatContext {
+                        callgraph_op: Some("callers".into()),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                crate::subc_format::format_response("grep", &first, false)
+            };
             if callgraph {
                 assert_eq!(first.data["code"], "callgraph_building");
                 assert_eq!(text, "callers: callgraph_building — callers: persisted callgraph store is busy; retry shortly");
@@ -14441,7 +14451,7 @@ mod tests {
                     crate::blob_store::v3::family_dir(&storage, &family).unwrap().display(),
                 );
                 assert_eq!(first.data["message"], cause);
-                assert_eq!(text, format!("grep: busy — {cause}"));
+                assert_eq!(text, cause);
                 let search = crate::commands::semantic_search::handle_semantic_search(
                     &semantic_search_request("needle"),
                     &ctx,
@@ -14456,12 +14466,17 @@ mod tests {
                     },
                     &ctx,
                 );
-                for (name, response) in [("semantic_search", search), ("glob", glob)] {
+                for (name, response) in [("search", search), ("glob", glob)] {
                     assert_eq!(response.data["code"], "busy");
                     assert_eq!(response.data["retryable"], true);
+                    let expected = if name == "search" {
+                        format!("semantic_search: busy — {cause}")
+                    } else {
+                        cause.clone()
+                    };
                     assert_eq!(
                         crate::subc_format::format_response(name, &response, false),
-                        format!("{name}: busy — {cause}")
+                        expected
                     );
                 }
             }

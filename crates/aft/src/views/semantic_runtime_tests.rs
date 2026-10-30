@@ -3921,7 +3921,7 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
     ctx.set_canonical_cache_root(root.path().to_path_buf());
     let slot = ctx.checkout_semantic();
     let (epoch, wake) = slot.begin();
-    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled));
+    let status = ctx.semantic_index_status_handle();
     let config = WorkerConfig {
         root: root.path().to_path_buf(),
         storage: crate::root_cache::StoragePaths::same(storage.path()),
@@ -3984,7 +3984,7 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
             );
             assert!(response.success, "{:?}", response.data);
             assert_eq!(response.data["semantic_status"], "building");
-            let rendered = crate::subc_format::format_response("semantic_search", &response, false);
+            let rendered = crate::subc_format::format_response("search", &response, false);
             assert_eq!(
                 rendered.lines().next(),
                 Some("Semantic index is building; lexical fallback results follow.")
