@@ -84,6 +84,11 @@ fn scratch(root: &Path) {
 }
 
 #[test]
+fn folder_admission_off_notice_is_pinned_byte_for_byte() {
+    assert_eq!(admission::OFF_TEXT, "Indexing is off: this folder does not look like a project. grep and glob still work, with limits. To index it, set project_detection in your AFT user config.");
+}
+
+#[test]
 fn folder_admission_configure_and_restart_never_load_old_indexes() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
