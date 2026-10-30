@@ -115,6 +115,41 @@ fn publication_survives_a_sidecar_disappearing_during_accounting() {
     assert_eq!(reader.get(&run).unwrap().unwrap(), b"run");
 }
 #[cfg(windows)]
+fn open_permission_fixture(
+    path: &Path,
+    access: u32,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // These handles probe rights on dedicated non-SQLite fixtures; they never
+    // read content or open a live database inode through another descriptor.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: CreateFileW returned a valid, uniquely owned handle.
+        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn deny_read_for_test(path: &Path) -> impl Drop {
     fn icacls(path: &Path, action: &str, rights: &str) {
         let output = std::process::Command::new("icacls")
@@ -143,10 +178,10 @@ pub(crate) fn deny_read_for_test(path: &Path) -> impl Drop {
 #[cfg(windows)]
 #[test]
 fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_READ_ATTRIBUTES,
     };
 
     let root = tempdir().unwrap();
@@ -155,11 +190,7 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     let pending = dir.join("..retention-sweep.lock.tmp");
     let payload = b"delete-pending lock bytes";
     fs::write(&pending, payload).unwrap();
-    let handle = fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .open(&pending)
-        .unwrap();
+    let handle = open_permission_fixture(&pending, DELETE | FILE_READ_ATTRIBUTES).unwrap();
     let handle = std::rc::Rc::new(handle);
     let pending_handle = std::rc::Rc::clone(&handle);
     let removed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -214,7 +245,10 @@ fn accounting_counts_unreadable_files_but_refuses_unreadable_directories() {
     fs::write(&file, payload).unwrap();
 
     let denied = deny_read_for_test(&file);
-    let read = fs::read(&file);
+    let read = open_permission_fixture(
+        &file,
+        windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+    );
     let measured = allocated_bytes_until(&dir, None);
     drop(denied);
     assert_eq!(
