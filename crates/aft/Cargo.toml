@@ -9,6 +9,10 @@ keywords = ["tree-sitter", "code-analysis", "ai-agent", "ast"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 rust-version.workspace = true
+# crates.io refuses uploads over 10 MiB. Integration suites and their fixtures
+# are only needed in this repository, so they stay out of the published crate;
+# the release workflow's packaging check guards the limit.
+exclude = ["tests/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
 # Aggregate integration suites avoid linking one executable per source file.
 # Explicit targets leave fixture/descriptor paths stable without autodiscovery.
 autotests = false

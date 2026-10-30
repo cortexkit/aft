@@ -213,6 +213,26 @@ bun run typecheck 2>&1 || { echo "Error: Typecheck failed"; exit 1; }
 echo "  cargo fmt --check..."
 cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fmt')"; exit 1; }
 
+# crates.io refuses any upload over 10 MiB, and it only says so at the final
+# publish step, after the tag and every build (0.63.3 was lost that way).
+# Packaging without verification takes seconds and compiles nothing.
+echo "  crates.io package sizes..."
+crate_limit=$((10 * 1024 * 1024))
+crate_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/package
+for crate in aft-tokenizer aft-secret-rules agent-file-tools; do
+  cargo package -p "$crate" --no-verify --allow-dirty -q >/dev/null 2>&1 || {
+    echo "Error: cargo package -p $crate failed; run it to see why"; exit 1;
+  }
+  crate_file=$(ls -t "$crate_dir"/"$crate"-*.crate | head -1)
+  crate_bytes=$(wc -c <"$crate_file" | tr -d ' ')
+  if [ "$crate_bytes" -ge "$crate_limit" ]; then
+    echo "Error: $crate packages to $crate_bytes bytes; crates.io refuses uploads of $crate_limit bytes or more"
+    echo "  ↳ keep test-only files out of the crate with 'exclude' in its Cargo.toml"
+    exit 1
+  fi
+  echo "    $crate: $crate_bytes bytes"
+done
+
 # Validate publication inputs before spending time on the release suites.
 # Snapshots are disposable; only source and release policy belong in Git.
 # The final candidate snapshot is prepared after the version commit below.
