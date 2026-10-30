@@ -13,7 +13,7 @@ pub(crate) fn assert_snapshot_warning(
     );
     assert_eq!(lines.len(), 1, "one warning per refusal: {lines:?}");
     let diagnostic = lines[0]
-        .strip_prefix("gh speech snapshot invalid: ")
+        .strip_prefix("WARN gh speech snapshot invalid: ")
         .unwrap();
     assert!(!diagnostic.contains(['\n', '\r']));
     assert_eq!(

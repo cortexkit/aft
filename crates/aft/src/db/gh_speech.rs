@@ -399,6 +399,7 @@ impl Store {
         let sealed = previous.record.seal.is_none() && current.record.seal.is_some();
         if previous.record.seal != current.record.seal
             && !(foreground
+                && previous.phase == "candidate"
                 && sealed
                 && current.record.seal.as_ref().is_some_and(|seal| {
                     seal.child_pid != 0

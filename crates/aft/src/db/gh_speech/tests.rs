@@ -79,6 +79,17 @@ fn authority_refresh_accepts_only_exact_foreground_seal_and_activation_steps() {
         "snapshot_invalid"
     );
     let active = store.get(&record.incarnation).unwrap();
+    let mut unsealed_active = active.clone();
+    unsealed_active.record.seal = None;
+    unsealed_active.generation -= 1;
+    assert_eq!(
+        store
+            .revalidate_authority(&unsealed_active, &[7; 32], true)
+            .unwrap_err()
+            .reason,
+        "snapshot_invalid",
+        "sealing an already-active row is not a recognized lifecycle step",
+    );
     store
         .connect()
         .unwrap()
