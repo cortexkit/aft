@@ -6175,6 +6175,118 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn runon_pre_acceptance_refusal_ends_subc_worker_wait_promptly() {
+        use crate::exec_remote::wire_tests::Script;
+        for (reason, detail) in [
+            ("runner_full", Some("hosted_host_full")),
+            ("network_unsupported", None),
+            ("queue_wait_exceeded", None),
+        ] {
+            for mode in ["wait", "block_to_completion"] {
+                let (daemon, _dir, root, executor, ctx) =
+                    capture_fixture(Script::GatedPreStartRefusal { reason, detail }).await;
+                let mut args =
+                    json!({"command":"printf must-not-run", "runon":"linux", "compressed":false});
+                args[mode] = json!(true);
+                let mut rx =
+                    with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+                        deadline_test_call_controlled(
+                            &executor,
+                            &root,
+                            remote_runon_stub,
+                            args,
+                            Instant::now(),
+                            false,
+                            true,
+                            Arc::new(DispatchPathMetrics::new()),
+                            capture_cancel(),
+                        )
+                    });
+                daemon.wait_for_requests("exec.run", 1).await;
+                assert!(rx.try_recv().is_err());
+                daemon.acceptance_gate.notify_one();
+                let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("a pre-start refusal must not consume the worker wait budget")
+                    .unwrap();
+                let response = done.response_for_test();
+                assert!(!response.success, "{response:?}");
+                assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+                let task_id = response.data["task_id"].as_str().unwrap();
+                assert_eq!(
+                    ctx.bash_background()
+                        .runon_inputs_captured(task_id, "deadline-session"),
+                    Some(false)
+                );
+                let status = crate::commands::bash_status::handle(
+                    &RawRequest {
+                        id: "refusal-status".into(),
+                        command: "bash_status".into(),
+                        session_id: Some("deadline-session".into()),
+                        lsp_hints: None,
+                        params: json!({"task_id": task_id}),
+                    },
+                    &ctx,
+                );
+                assert_eq!(response.data["code"], status.data["code"]);
+                assert_eq!(response.data["message"], status.data["message"]);
+                assert!(!done
+                    .text_for_test()
+                    .unwrap()
+                    .contains(REMOTE_INPUT_CAPTURE_WARNING));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_pre_submission_failures_end_subc_worker_wait_promptly() {
+        use crate::exec_remote::wire_tests::Script;
+        for unavailable_connection in [false, true] {
+            let (daemon, _dir, root, executor, _ctx) =
+                capture_fixture_with_claims(Script::Plain, &["unrelated/v1"]).await;
+            if unavailable_connection {
+                std::fs::remove_file(&daemon.connection).unwrap();
+            }
+            let mut rx =
+                with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+                    deadline_test_call_controlled(
+                        &executor,
+                        &root,
+                        remote_runon_stub,
+                        json!({"command":"printf must-not-run", "runon":"linux", "wait":true}),
+                        Instant::now(),
+                        false,
+                        true,
+                        Arc::new(DispatchPathMetrics::new()),
+                        capture_cancel(),
+                    )
+                });
+            let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("a capability or connection refusal must end the worker wait")
+                .unwrap();
+            let response = done.response_for_test();
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("command did not run"),
+                "{response:?}"
+            );
+            assert!(!daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["method"] == "exec.run"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn runon_capture_status_is_starting_until_accepted() {
         use crate::exec_remote::wire_tests::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedAcceptance).await;
