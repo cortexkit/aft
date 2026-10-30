@@ -414,8 +414,17 @@ fn views_import_public_grep_search_outline_zoom_match_fresh_builds() {
                 Err(error) => panic!("{error}"),
             }
         }
+        // The prewarm gets its own budget: on a loaded Windows runner the
+        // import alone used most of the shared 30 s, and the whole test then
+        // took 32.8 s with the prewarm still running.
+        let prewarm_started = Instant::now();
+        let prewarm_deadline = prewarm_started + Duration::from_secs(60);
         while ctx.symbol_view_route_count() == 0 {
-            assert!(Instant::now() < deadline, "symbol prewarm did not finish");
+            assert!(
+                Instant::now() < prewarm_deadline,
+                "symbol prewarm did not finish within {:?}",
+                prewarm_started.elapsed()
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
