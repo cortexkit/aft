@@ -84,13 +84,18 @@ fn first_load_memory_corpus() {
     {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
-        eprintln!("first_load_memory rss_peak_kib={}", usage.ru_maxrss);
+        let rss_peak_kib =
+            crate::test_allocations::rss_high_water_bytes().expect("Linux VmHWM") / 1024;
+        eprintln!(
+            "first_load_memory rss_peak_kib={rss_peak_kib} rusage_peak_kib={}",
+            usage.ru_maxrss
+        );
         if let Ok(limit) = std::env::var("AFT_VIEW_MEMORY_LIMIT_MIB") {
-            let limit: i64 = limit.parse().unwrap();
+            let limit: u64 = limit.parse().unwrap();
             assert!(
-                usage.ru_maxrss < limit * 1024,
+                rss_peak_kib < limit.checked_mul(1024).expect("RSS budget fits KiB"),
                 "first load used {} KiB resident memory; budget is {limit} MiB",
-                usage.ru_maxrss
+                rss_peak_kib
             );
         }
     }
@@ -110,7 +115,8 @@ fn first_load_fixed_fixture_peak_rss() {
         }
         std::fs::write(root.path().join(format!("file_{file:03}.rs")), source).unwrap();
     }
-    // A child isolates the process high-water mark from other unit tests.
+    // VmHWM measures the child's new address space; ru_maxrss can also include
+    // the parent address space carried across the spawn's exec boundary.
     // The fixed 64,128-symbol fixture has a 384 MiB resident-memory budget.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -124,6 +130,7 @@ fn first_load_fixed_fixture_peak_rss() {
         .env("AFT_VIEW_MEMORY_OUTPUT", storage.path())
         .env("AFT_VIEW_MEMORY_LIMIT_MIB", "384")
         .env("AFT_VIEW_PROFILE", "1")
+        .env_remove("AFT_VIEW_MEMORY_LEGACY")
         .output()
         .unwrap();
     assert!(

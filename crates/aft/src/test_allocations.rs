@@ -58,8 +58,12 @@ pub(crate) fn heap_marker(prefix: &str, phase: &str) {
         let rss = crate::memory::rss_bytes();
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let rss: Option<u64> = None;
+        #[cfg(target_os = "linux")]
+        let rss_peak = rss_high_water_bytes();
+        #[cfg(not(target_os = "linux"))]
+        let rss_peak: Option<u64> = None;
         eprintln!(
-            "view_heap {prefix}.{phase} live={} peak={} rss={rss:?}",
+            "view_heap {prefix}.{phase} live={} peak={} rss={rss:?} rss_peak={rss_peak:?}",
             LIVE_BYTES.load(Ordering::Relaxed),
             PEAK_BYTES.load(Ordering::Relaxed),
         );
@@ -68,6 +72,18 @@ pub(crate) fn heap_marker(prefix: &str, phase: &str) {
 
 pub(crate) fn live_bytes() -> usize {
     LIVE_BYTES.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn rss_high_water_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("VmHWM:") {
+            return fields.next()?.parse::<u64>().ok()?.checked_mul(1024);
+        }
+    }
+    None
 }
 
 fn record_allocation(bytes: usize) {

@@ -5257,10 +5257,14 @@ mod callgraph_bridge_tests {
             "a durable key replaces the consumed payload"
         );
         let store = driver.owner.open_store(FamilyPlane::Callgraph).unwrap();
-        rusqlite::Connection::open(store.path())
+        let deleted = rusqlite::Connection::open(store.path())
             .unwrap()
-            .execute("DELETE FROM blob_membership", [])
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key=?1",
+                rusqlite::params![attachment.key.as_bytes().as_slice()],
+            )
             .unwrap();
+        assert_eq!(deleted, 1);
         let next = driver.reconcile(&access).unwrap();
         assert_eq!(bridge.extraction_count(), count + 1);
         assert!(
