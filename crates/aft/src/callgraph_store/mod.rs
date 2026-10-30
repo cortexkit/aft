@@ -6276,10 +6276,7 @@ impl DiskProjectIndex<'_> {
         for (id, name, scoped_name, kind, exported, is_default_export) in node_rows {
             index.note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
         }
-        let disk = self
-            .module_resolution_memo
-            .map(|memo| memo.disk_facts(self.project_root))
-            .unwrap_or_else(|| DiskFacts::new(self.project_root));
+        let disk = self.module_resolution_memo.disk_facts(self.project_root);
         let facts = FactPaths {
             root: self.project_root,
             facts: &disk,

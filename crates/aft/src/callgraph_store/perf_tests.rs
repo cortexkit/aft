@@ -1002,6 +1002,11 @@ fn cold_callgraph_filesystem_real_repo() {
     let root = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_ROOT").expect("root"));
     let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_DUMP").expect("dump"));
     let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+    assert!(
+        !files.is_empty(),
+        "no source files under {}",
+        root.display()
+    );
     let dir = tempfile::tempdir().unwrap();
     let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
     let compiles = install_compile_counter(&store);
