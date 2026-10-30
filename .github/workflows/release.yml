@@ -933,8 +933,9 @@ jobs:
     name: Publish to npm
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # v0.62.0: 5.8 min; v0.63.3/v0.63.4 never reached npm. Over twice 5.8.
-    timeout-minutes: 15
+    # v0.62.0 took 5.8 min, but v0.63.4 spent 30-60 s per package in npm's
+    # publish and provenance steps across ten packages. Leave room for that.
+    timeout-minutes: 30
     needs:
       - gate
       - build-darwin-arm64
