@@ -2435,6 +2435,18 @@ impl LspClient {
 
     /// Send `textDocument/didChange` carrying the whole document (see
     /// [`full_did_change_message`]).
+    pub(crate) fn send_full_did_change(
+        &mut self,
+        uri: &lsp_types::Uri,
+        version: i32,
+        text: &str,
+    ) -> Result<(), LspError> {
+        self.send_full_did_change_ordered(uri, version, text)
+            .map(|_| ())
+    }
+
+    /// [`Self::send_full_did_change`], returning the send's position in the
+    /// writer's order so diagnostics can be matched to this exact content.
     pub(crate) fn send_full_did_change_ordered(
         &mut self,
         uri: &lsp_types::Uri,
@@ -2444,6 +2456,9 @@ impl LspClient {
         self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
         let order = self.writer.send_ordered(json)?;
+        // A document change is use: it keeps this server from the per-server
+        // idle stop, like every other didOpen/didChange/didSave sender.
+        self.last_used_at = Instant::now();
         self.note_analysis_document(
             "textDocument/didChange",
             &json!({"textDocument": {"uri": uri.as_str()}}),

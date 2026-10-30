@@ -7029,8 +7029,14 @@ fn unscoped_inspect_current_content_timeout_names_the_file_instead_of_old_result
         diagnostic_messages_for(&response, "broken.ts").is_empty(),
         "old errors must not be returned: {response:#}"
     );
-    assert!(uncovered_files(&response).iter().any(|(file, reason)| file == "broken.ts" && reason ==
-        "no diagnostics for the current file content arrived in time; retry aft_inspect"), "{response:#}");
+    assert!(
+        uncovered_files(&response).iter().any(|(file, reason)| {
+            file == "broken.ts"
+            && reason
+                == "no diagnostics for the current file content arrived in time; retry aft_inspect"
+        }),
+        "{response:#}"
+    );
 }
 
 #[test]
