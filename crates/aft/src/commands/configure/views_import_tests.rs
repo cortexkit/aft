@@ -264,7 +264,19 @@ fn views_import_semantic_waits_for_rebind_before_importing_or_filling() {
 
 #[test]
 fn views_import_semantic_does_not_retry_an_expired_lane() {
-    finish_legacy_import_before_fill(|| false, || panic!("expired lane started an import"));
+    let live = std::cell::Cell::new(true);
+    let mut attempts = 0;
+    finish_legacy_import_before_fill(
+        || live.get(),
+        || {
+            assert_eq!(attempts, 0, "expired lane started another import");
+            attempts += 1;
+            live.set(false);
+            false
+        },
+    );
+    assert_eq!(attempts, 1);
+    finish_legacy_import_before_fill(|| live.get(), || panic!("expired lane started an import"));
 }
 
 #[test]
