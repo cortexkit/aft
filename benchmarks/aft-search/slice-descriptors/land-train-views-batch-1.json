@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "train-views-batch-1"
+  ],
+  "note": "Integration of thirteen ready PRs (views import #1194, cold call-graph #1200, workspace walk #1208, pinned task image #1201, inspect freshness #1203, heartbeat #1209, Python callers #1174, runon reattach #1190, token skip #1183, flake batch 27 #1198, rebind detail #1206, Plexus wait #1186, Plexus pre-read #1191). The only ranking-fence file is semantic_search/mod.rs, from #1194: with views on, a legacy import still building answers from the bounded disk scan with the gap disclosed; a real view load failure keeps the shared view_load_error_response. Views are off by default and the views-off path is unchanged, so canonical ranked rows must stay byte-identical."
+}
