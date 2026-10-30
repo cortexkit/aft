@@ -20066,6 +20066,12 @@ mod callgraph_store_for_ops_tests {
             &ctx,
         );
         assert!(response.success, "configure should succeed: {response:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while crate::folder_admission_runtime::pending(&ctx) || !ctx.configure_tail_idle() {
+            crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+            assert!(std::time::Instant::now() < deadline, "configure did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         ctx
     }
 
@@ -20091,7 +20097,7 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn home_root_gate_blocks_callgraph_store_entry_points() {
+    fn unadmitted_home_folder_blocks_callgraph_store_entry_points() {
         let home = TempDir::new().expect("home tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = home.path().join("src");
@@ -20107,17 +20113,20 @@ mod callgraph_store_for_ops_tests {
             let _wait_guard = force_async_callgraph_builds(&ctx);
             assert!(
                 !ctx.heavy_root_work_allowed(),
-                "HOME root configure must close the heavy-root-work gate"
+                "an unadmitted folder must close the heavy-root-work gate"
             );
             assert!(
                 !ctx.config().indexes.callgraph,
-                "HOME root configure must force-disable the callgraph store"
+                "an unadmitted folder must force-disable the callgraph store"
             );
-            assert!(ctx.is_home_root());
+            assert!(!ctx.is_home_root());
             assert!(ctx
                 .degraded_reasons()
                 .iter()
-                .any(|reason| reason == "home_root"));
+                .any(|reason| reason == "folder_not_admitted"));
+            let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+            assert_eq!(folder["classification"], "not_project");
+            assert_eq!(folder["reason"], "no_project_evidence");
             let status_request = RawRequest {
                 id: "home-status".to_string(),
                 command: "status".to_string(),
@@ -20130,7 +20139,7 @@ mod callgraph_store_for_ops_tests {
             crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
             assert!(
                 ctx.callgraph_store_rx().lock().is_none(),
-                "HOME root maintenance must not schedule a callgraph build"
+                "an unadmitted folder must not schedule a callgraph build"
             );
             assert_eq!(
                 ctx.try_health_snapshot(home.path())
@@ -20138,7 +20147,7 @@ mod callgraph_store_for_ops_tests {
                     .as_ref()
                     .map(|component| component.status),
                 Some("disabled"),
-                "HOME root health must not advertise callgraph building"
+                "an unadmitted folder must not advertise callgraph building"
             );
 
             assert!(matches!(
@@ -20154,7 +20163,7 @@ mod callgraph_store_for_ops_tests {
             assert_eq!(
                 ctx.callgraph_cold_build_spawn_count_for_test(),
                 0,
-                "HOME root gate must not spawn a cold callgraph build"
+                "an unadmitted folder must not spawn a cold callgraph build"
             );
 
             let navigation = RawRequest {
@@ -20169,17 +20178,10 @@ mod callgraph_store_for_ops_tests {
             };
             let response = crate::commands::callers::handle_callers(&navigation, &ctx);
             assert!(!response.success);
-            // HOME is an unavailable callgraph with a named cause, never a
-            // retryable build.
-            assert_eq!(response.data["code"], "callgraph_unavailable");
-            assert_eq!(
-                response.data["index"],
-                json!({"callgraph": {"status": "unavailable", "reason": "home_root"}})
-            );
+            assert_eq!(response.data["code"], "folder_not_admitted");
+            assert_eq!(response.data["reason"], "no_project_evidence");
             assert!(response.data["results"].is_null());
-            assert!(response.data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("disabled for home roots")));
+            assert_eq!(response.data["folder"]["classification"], "not_project");
         });
     }
 

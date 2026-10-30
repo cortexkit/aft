@@ -24345,7 +24345,7 @@ mod tests {
         crate::artifact_owner::artifact_owner_test_lock()
     }
 
-    fn assert_broad_configure_root(root: &std::path::Path) {
+    fn assert_unadmitted_configure_root(root: &std::path::Path) {
         let ctx = test_context();
         let req = configure_request_with_params(json!({
             "project_root": root, "harness": "runner",
@@ -24358,9 +24358,13 @@ mod tests {
         assert!(handle_configure_for_test(&req, &ctx).success);
         assert!(
             !ctx.heavy_root_work_allowed(),
-            "broad root must close the heavy-root-work gate"
+            "an undecided folder must close the heavy-root-work gate"
         );
-        assert!(ctx.degraded_reasons().contains(&"root_too_broad".into()));
+        settle_configure_for_test(&ctx);
+        let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], "not_project");
+        assert_eq!(folder["state"], "decided");
+        assert!(ctx.degraded_reasons().contains(&"folder_not_admitted".into()));
         let assert_no_workers = || {
             assert!(!ctx.config().indexes.trigram);
             assert!(!ctx.config().indexes.semantic);
@@ -24380,13 +24384,13 @@ mod tests {
         let status = ctx.build_status_snapshot();
         for lane in ["search_index", "semantic_index"] {
             assert_eq!(status[lane]["status"], "disabled");
-            assert_eq!(status[lane]["reason"], "root_too_broad");
+            assert_eq!(status[lane]["reason"], folder["reason"]);
         }
         for plane in crate::feature_status::IndexPlane::ALL {
             let observation =
                 crate::feature_status::observed_index_status(&ctx, plane).consumer_json();
             assert_eq!(observation["status"], "off");
-            assert_eq!(observation["reason"], "root_too_broad");
+            assert_eq!(observation["reason"], folder["reason"]);
         }
         let inspect = RawRequest {
             id: "inspect-broad".into(),
@@ -24397,7 +24401,8 @@ mod tests {
         };
         let response = crate::commands::inspect::handle_inspect(&inspect, &ctx);
         assert!(!response.success);
-        assert_eq!(response.data["code"], "root_too_broad");
+        assert_eq!(response.data["code"], "folder_not_admitted");
+        assert_eq!(response.data["reason"], folder["reason"]);
         let search = RawRequest {
             id: "search-broad".into(),
             command: "semantic_search".into(),
@@ -24407,20 +24412,14 @@ mod tests {
         };
         let response = crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
         assert!(!response.success);
-        assert_eq!(response.data["code"], "no_search_lanes_enabled");
-        for lane in ["trigram", "semantic"] {
-            assert_eq!(response.data["lanes"][lane]["status"], "off");
-            assert_eq!(response.data["lanes"][lane]["reason"], "root_too_broad");
-        }
-        assert!(response.data["message"]
-            .as_str()
-            .unwrap()
-            .contains("off: root_too_broad"));
+        assert_eq!(response.data["code"], "folder_not_admitted");
+        assert_eq!(response.data["reason"], folder["reason"]);
+        assert_eq!(response.data["folder"]["classification"], "not_project");
         // A backend left by an older bind must be removed even on the same root.
         install_project_watcher_with(&ctx, root, Vec::new(), |_, _, tx| Ok::<_, &'static str>(tx));
         assert!(ctx.watcher_runtime_active());
         assert!(handle_configure_for_test(&req, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
+        settle_configure_for_test(&ctx);
         super::ensure_project_watcher(&ctx);
         assert_no_workers();
     }
@@ -24429,7 +24428,7 @@ mod tests {
     #[test]
     fn configure_filesystem_root_disables_root_work() {
         let _env = home_env_mutex();
-        assert_broad_configure_root(std::path::Path::new("/"));
+        assert_unadmitted_configure_root(std::path::Path::new("/"));
     }
 
     #[test]
@@ -24438,7 +24437,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         let (volume, _) = crate::storage_retention::volume_anchor(&canonical).unwrap();
-        assert_broad_configure_root(&volume);
+        assert_unadmitted_configure_root(&volume);
     }
 
     #[cfg(windows)]
@@ -24447,7 +24446,7 @@ mod tests {
         let _env = home_env_mutex();
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        assert_broad_configure_root(canonical.ancestors().last().unwrap());
+        assert_unadmitted_configure_root(canonical.ancestors().last().unwrap());
     }
 
     #[test]
@@ -24531,8 +24530,8 @@ mod tests {
         create_dir_symlink(&home, &alias);
         let _home = EnvVarGuard::set("HOME", alias.to_str().unwrap());
         let _profile = EnvVarGuard::set("USERPROFILE", alias.to_str().unwrap());
-        assert_broad_configure_root(&home);
-        assert_broad_configure_root(&alias);
+        assert_unadmitted_configure_root(&home);
+        assert_unadmitted_configure_root(&alias);
     }
 
     #[cfg(unix)]
@@ -24611,77 +24610,30 @@ mod tests {
         ctx.stop_watcher_runtime();
     }
 
-    #[test]
-    fn handle_configure_enters_degraded_mode_when_project_root_is_home() {
+        #[test]
+    fn handle_configure_refuses_a_home_folder_without_project_evidence() {
         let _guard = home_env_mutex();
-        // Simulate the Desktop-launches-from-`~` case by pointing `HOME` at a
-        // tempdir and using that same tempdir as `project_root`. The
-        // canonical-equality check inside `handle_configure` is the same
-        // mechanism that catches real `$HOME` regardless of HOME mutation.
         let temp = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(temp.path()).unwrap();
-
-        // Save + restore HOME so we don't pollute other tests in the
-        // same process (Rust runs tests in parallel by default but env
-        // mutation is process-global). For Windows, USERPROFILE is the
-        // var `resolve_home_dir` checks after HOME.
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        // SAFETY: env mutation is sound here — this is single-threaded test
-        // setup. The matching restore at the bottom runs even on assertion
-        // failure because Rust's panic path executes drop order, but we make
-        // the env writes explicit for clarity.
-        unsafe {
-            std::env::set_var("HOME", &canonical);
-            std::env::set_var("USERPROFILE", &canonical);
-        }
-
+        let _home = EnvVarGuard::set("HOME", canonical.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", canonical.to_str().unwrap());
         let ctx = test_context();
-        // Supply search_index/semantic_search as a user config TIER (how real
-        // configures carry core fields under reset resolution). The point of this
-        // test is that the HOME-root degraded gate force-disables them EVEN WHEN
-        // user config enables them — so they must actually be enabled by the tier
-        // first, then asserted off below.
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": true } }))],
         }));
-        let response = handle_configure_for_test(&req, &ctx);
-
-        // Restore env immediately so a later assertion failure doesn't leak.
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_userprofile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-        drop(_guard);
-
+        let response = handle_configure_and_settle_for_test(&req, &ctx);
         assert!(response.success);
-        assert!(ctx.is_degraded(), "expected degraded mode for HOME root");
-        assert!(
-            !ctx.heavy_root_work_allowed(),
-            "HOME root configure must close the heavy-root-work gate"
-        );
-        assert!(
-            ctx.degraded_reasons().contains(&"home_root".to_string()),
-            "expected `home_root` reason, got {:?}",
-            ctx.degraded_reasons()
-        );
-        // Heavy subsystems must have been force-disabled regardless of user config.
-        assert!(
-            !ctx.config().indexes.trigram,
-            "search_index must be auto-disabled at HOME root"
-        );
-        assert!(
-            !ctx.config().indexes.semantic,
-            "semantic_search must be auto-disabled at HOME root"
-        );
+        assert!(ctx.is_degraded());
+        assert!(!ctx.heavy_root_work_allowed());
+        assert!(ctx.degraded_reasons().contains(&"folder_not_admitted".into()));
+        assert!(!ctx.degraded_reasons().contains(&"home_root".into()));
+        let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], "not_project");
+        assert_eq!(folder["reason"], "no_project_evidence");
+        assert!(!ctx.config().indexes.trigram);
+        assert!(!ctx.config().indexes.semantic);
     }
 
     #[test]
