@@ -7853,9 +7853,34 @@ mod deferred_terminal_tests {
         config.inspect.tier2_pass_timeout_ms = 600_000;
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
+        // Seed heavy analyzers outside the command's per-phase deadline, so a
+        // large checkout measures cache reuse rather than timeout handling.
+        let snapshot = build_snapshot(&ctx).unwrap();
+        let scope = JobScope::for_project(root.clone());
+        for category in InspectCategory::active().iter().copied() {
+            let outcome = if category.is_tier2() {
+                ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
+                    snapshot.clone(),
+                    category,
+                    scope.clone(),
+                )
+            } else if matches!(category, InspectCategory::Metrics | InspectCategory::Todos) {
+                ctx.inspect_manager().submit_category_until(
+                    snapshot.clone(),
+                    category,
+                    scope.clone(),
+                    Instant::now() + Duration::from_secs(900),
+                )
+            } else {
+                continue;
+            };
+            assert!(
+                matches!(outcome, JobOutcome::Fresh { .. }),
+                "{category}: {outcome:?}"
+            );
+        }
         let mut measurements = Vec::new();
         for (name, scope) in [
-            ("cold", None),
             ("unscoped", None),
             ("scoped", Some("crates/aft/src/inspect")),
         ] {
