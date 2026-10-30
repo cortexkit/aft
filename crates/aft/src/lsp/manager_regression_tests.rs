@@ -148,10 +148,13 @@ fn idle_lsp_restart_races_return_start_in_progress_after_three_attempts() {
 fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() {
     let fixture = IdleLspFixture::new();
     let old_pid = fixture.pid(&fixture.idle).unwrap();
-    let key = ServerKey {
-        kind: ServerKind::TypeScript,
-        root: fixture.idle.parent().unwrap().to_path_buf(),
-    };
+    // Use the manager's own key: its root is canonical, and on Windows the
+    // temp path's short `RUNNER~1` spelling would name a different key.
+    let key = fixture
+        .ctx
+        .lsp()
+        .server_key_for_file(&fixture.idle, &fixture.config)
+        .unwrap();
     {
         let mut manager = fixture.ctx.lsp();
         seed_instance_state(&mut manager, &key, &fixture.idle);
@@ -230,6 +233,11 @@ fn idle_lsp_document_notifications_refresh_last_use_but_push_diagnostics_do_not(
         .unwrap();
     let old = Instant::now() - Duration::from_secs(301);
     let mut manager = fixture.ctx.lsp();
+    // The manager's own key root, canonical on every platform.
+    let server_root = manager
+        .server_key_for_file(&fixture.idle, &fixture.config)
+        .unwrap()
+        .root;
     let client = manager
         .client_for_file_mut(&fixture.idle, &fixture.config)
         .unwrap();
@@ -265,7 +273,7 @@ fn idle_lsp_document_notifications_refresh_last_use_but_push_diagnostics_do_not(
         .handle_event(
             &LspEvent::Notification {
                 server_kind: ServerKind::TypeScript,
-                root: fixture.idle.parent().unwrap().to_path_buf(),
+                root: server_root,
                 method: "textDocument/publishDiagnostics".into(),
                 params: Some(json!({"uri": uri.as_str(), "diagnostics": []})),
             }
