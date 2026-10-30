@@ -35,13 +35,13 @@ pub(super) const RELAY_UNSERVED_TEXT: &str = "the running AFT daemon does not se
 const RELAY_MODULE_ID: &str = "aft";
 /// Budget for connecting, listing the catalog and opening the route.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Budget for the whole relayed exchange: every attempt, every transient
-/// retry sleep and any bindings read share it, so the command never waits
-/// longer than one attempt used to. It must cover a prefrontal mint, the
-/// plexus call and GitHub's write: a request with no reply inside it is
-/// reported as an unknown outcome and never resent, so a short budget on a
-/// loaded host would report writes that landed as failures.
-const RELAY_BUDGET: Duration = Duration::from_secs(30);
+/// Budget for the whole governed exchange, including preflight and cleanup
+/// around the daemon's 160 s post-send write wait. Retries share this ceiling.
+const RELAY_BUDGET: Duration = Duration::from_secs(210);
+// A management dispatch still has up to 9.75 s of daemon preflight before
+// Plexus's 160 s reply wait, followed by at most 5 s of route cleanup.
+const MIN_WRITE_DISPATCH_BUDGET: Duration = Duration::from_secs(175);
+const READ_RELAY_BUDGET: Duration = Duration::from_secs(30);
 /// Debug builds only: lets the binary-level tests shorten the relay budget
 /// so a silent daemon does not cost them the full production wait.
 #[cfg(debug_assertions)]
@@ -913,6 +913,7 @@ struct Exchange<'a, Io> {
     budget: Duration,
 }
 
+#[derive(Debug)]
 enum SendFailure {
     Outcome(RouteOutcome),
     Module { code: String, message: String },
@@ -989,6 +990,19 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
         })?;
         let now = self.io.now();
         let remaining = self.deadline().saturating_duration_since(now);
+        // Explicit debug/test budget overrides deliberately allow shorter waits.
+        // Production must not enqueue a write that cannot get its full reply window.
+        if body["op"] == BOT_REQUEST_OPERATION
+            && self.budget == RELAY_BUDGET
+            && remaining < MIN_WRITE_DISPATCH_BUDGET
+        {
+            return Err(SendFailure::Outcome(
+                RouteOutcome::GovernanceUnavailableTimedOut {
+                    stage: ProbeStage::Request,
+                    elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
+                },
+            ));
+        }
         if remaining.is_zero() {
             return Err(SendFailure::Outcome(RouteOutcome::Unavailable(format!(
                 "the gh relay's {} ms budget ran out before the request could be sent; nothing was sent",
@@ -996,7 +1010,11 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
             ))));
         }
         let options = CallOptions {
-            timeout: remaining,
+            timeout: if body["op"] == BOT_REQUEST_OPERATION {
+                remaining
+            } else {
+                remaining.min(READ_RELAY_BUDGET)
+            },
             ..CallOptions::default()
         };
         #[cfg(test)]
@@ -1595,7 +1613,7 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
         let data = crate::gh_shim_worker_broker::request(
             client,
             crate::gh_shim_worker_broker::Operation::SessionContext,
-            relay.relay_budget,
+            relay.relay_budget.min(READ_RELAY_BUDGET),
         )?;
         let worker = data["worker"]
             .as_bool()
@@ -1663,6 +1681,7 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
 /// Send one github_read request through AFT's ticket-authenticated management
 /// relay. Tool refusals remain Response bodies; Error frames are transport errors.
 pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Value, String> {
+    let budget = relay.relay_budget.min(READ_RELAY_BUDGET);
     if let Some(client) = &relay.worker_broker {
         let client = client.as_ref().map_err(ToString::to_string)?;
         let request =
@@ -1670,7 +1689,7 @@ pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Valu
         return crate::gh_shim_worker_broker::request(
             client,
             crate::gh_shim_worker_broker::Operation::ReadRequest { request },
-            relay.relay_budget,
+            budget,
         );
     }
     let ticket = relay
@@ -1687,10 +1706,10 @@ pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Valu
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
-        tokio::time::timeout(relay.relay_budget, async {
+        tokio::time::timeout(budget, async {
             let setup = tokio::time::timeout(SETUP_TIMEOUT, async {
                 let consumer = SubcConsumer::connect(connection, ConsumerOptions {
-                    call_timeout: relay.relay_budget, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
+                    call_timeout: budget, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
                 }).await.map_err(|error| error.to_string())?;
                 let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
                 let route = consumer.open_route(
