@@ -3062,6 +3062,19 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        self.post_terminal_transition_with_token_policy(
+            task,
+            emit_frame,
+            CompletionTokenPolicy::Count,
+        )
+    }
+
+    fn post_terminal_transition_with_token_policy(
+        &self,
+        task: &Arc<BgTask>,
+        emit_frame: bool,
+        token_policy: CompletionTokenPolicy,
+    ) -> Result<(), String> {
         #[cfg(unix)]
         self.stop_secret_proxy(&task.task_id);
         self.settle_memory_accounting(task)?;
@@ -3117,7 +3130,7 @@ impl BgTaskRegistry {
                 .sample_task_process_group(task)
                 .is_some_and(|listing| !listing.is_clean());
         if !survivors_at_exit {
-            let result = self.finish_terminal_transition(task, emit_frame);
+            let result = self.finish_terminal_transition(task, emit_frame, token_policy);
             self.inner.terminal_transition.notify_waiters();
             return result;
         }
@@ -3133,7 +3146,9 @@ impl BgTaskRegistry {
             .spawn(move || {
                 std::thread::sleep(Duration::from_millis(300));
                 let settled = registry.sample_task_process_group(&task);
-                if let Err(error) = registry.finish_terminal_transition(&task, emit_frame) {
+                if let Err(error) =
+                    registry.finish_terminal_transition(&task, emit_frame, token_policy)
+                {
                     crate::slog_warn!(
                         "failed to finish background task {} after descendant sampling: {error}",
                         task.task_id
@@ -3179,6 +3194,7 @@ impl BgTaskRegistry {
         &self,
         task: &Arc<BgTask>,
         emit_frame: bool,
+        token_policy: CompletionTokenPolicy,
     ) -> Result<(), String> {
         if let Err(error) = self.cleanup_terminal_task_temp(task) {
             crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
@@ -3224,6 +3240,7 @@ impl BgTaskRegistry {
             None,
             emit_frame,
             cache.as_ref(),
+            token_policy,
         );
         release_terminal_io_handles(task);
         Ok(())
@@ -13513,7 +13530,11 @@ impl BgTaskRegistry {
         if terminalized {
             #[cfg(test)]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
-            self.post_terminal_transition(&task, true)?;
+            self.post_terminal_transition_with_token_policy(
+                &task,
+                true,
+                CompletionTokenPolicy::Skip,
+            )?;
         } else {
             self.check_group_after_kill(&task);
         }
@@ -13522,7 +13543,10 @@ impl BgTaskRegistry {
             // Another publisher may have set the terminal state without yet
             // queuing its notification, or deferred it for descendant sampling.
             // A terminal kill reply must not outrun the session's completion.
-            self.finish_terminal_transition(&task, true)?;
+            // Removing a project root also kills surviving descendants of
+            // already-completed commands; skip statistics even when their
+            // terminal status stays Completed or Failed.
+            self.finish_terminal_transition(&task, true, CompletionTokenPolicy::Skip)?;
             self.inner.terminal_transition.notify_waiters();
         }
         snapshot.kill_signaled = kill_signaled;
@@ -13864,7 +13888,14 @@ impl BgTaskRegistry {
         if metadata.status.is_terminal() && !metadata.completion_delivered {
             let cache =
                 paths.and_then(|paths| self.render_terminal_output_from_paths(metadata, paths));
-            self.enqueue_completion_from_parts(metadata, None, paths, emit_frame, cache.as_ref());
+            self.enqueue_completion_from_parts(
+                metadata,
+                None,
+                paths,
+                emit_frame,
+                cache.as_ref(),
+                CompletionTokenPolicy::Count,
+            );
         }
     }
 
@@ -13888,6 +13919,7 @@ impl BgTaskRegistry {
         paths: Option<&TaskPaths>,
         emit_frame: bool,
         terminal_render: Option<&TerminalOutputCache>,
+        token_policy: CompletionTokenPolicy,
     ) {
         // Only the terminal-state guard prevents double-recording here. The
         // `completion_delivered` flag is NOT used to gate compression-event
@@ -13915,6 +13947,7 @@ impl BgTaskRegistry {
                     paths,
                     emit_frame,
                     terminal_render,
+                    token_policy,
                 );
             }
             NoticeTarget::Nowhere => return,
@@ -13992,6 +14025,7 @@ impl BgTaskRegistry {
             buffer,
             paths,
             render.map(|render| render.output_preview.as_str()),
+            token_policy,
         );
         let completion = BgCompletion {
             changed_files: self.changed_files_report(&metadata.task_id),
@@ -14435,12 +14469,17 @@ impl BgTaskRegistry {
         buffer: Option<&BgBuffer>,
         paths: Option<&TaskPaths>,
         rendered_output: Option<&str>,
+        token_policy: CompletionTokenPolicy,
     ) -> CompletionTokenCounts {
         // Cancellation output is incomplete and its compression savings are not
-        // useful statistics. In particular, reclaim can kill many tasks in one
-        // pass: tokenizing each tail would delay every following kill and notice.
-        if metadata.mode == BgMode::Pty
-            || matches!(metadata.status, BgTaskStatus::Killed | BgTaskStatus::TimedOut)
+        // useful statistics. Cleaning up a deleted project root can kill many
+        // tasks in one pass: tokenizing each tail delays later kills and notices.
+        if matches!(token_policy, CompletionTokenPolicy::Skip)
+            || metadata.mode == BgMode::Pty
+            || matches!(
+                metadata.status,
+                BgTaskStatus::Killed | BgTaskStatus::TimedOut
+            )
         {
             return CompletionTokenCounts::skipped();
         }
@@ -15683,6 +15722,12 @@ fn stream_starts_like_json(buffer: &BgBuffer, stream: StreamKind) -> bool {
         .chars()
         .find(|ch| !ch.is_whitespace())
         .is_some_and(|ch| matches!(ch, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n'))
+}
+
+#[derive(Clone, Copy)]
+enum CompletionTokenPolicy {
+    Count,
+    Skip,
 }
 
 struct CompletionTokenCounts {
@@ -17693,12 +17738,31 @@ mod tests {
             (BgTaskStatus::TimedOut, true),
         ] {
             metadata.status = status;
-            let counts = registry.completion_token_counts(&metadata, Some(&buffer), None, None);
+            let counts = registry.completion_token_counts(
+                &metadata,
+                Some(&buffer),
+                None,
+                None,
+                CompletionTokenPolicy::Count,
+            );
             assert_eq!(counts.tokens_skipped, skipped, "{:?}", metadata.status);
             assert_eq!(counts.original_tokens, (!skipped).then_some(2));
             assert_eq!(counts.compressed_tokens, (!skipped).then_some(2));
             assert_eq!(counts.original_bytes, (!skipped).then_some(11));
             assert_eq!(counts.compressed_bytes, (!skipped).then_some(11));
+
+            // Removing a project root can reach an already-terminal task with
+            // live children; a memory-limit kill uses Failed rather than Killed.
+            let counts = registry.completion_token_counts(
+                &metadata,
+                Some(&buffer),
+                None,
+                None,
+                CompletionTokenPolicy::Skip,
+            );
+            assert!(counts.tokens_skipped);
+            assert_eq!(counts.original_tokens, None);
+            assert_eq!(counts.compressed_tokens, None);
         }
     }
 
@@ -22540,6 +22604,11 @@ mod tests {
             snapshot.info.status_reason.as_deref(),
             Some(ROOT_RECLAIMED_REASON)
         );
+        let completions = registry.pending_completions_for_session("session");
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].tokens_skipped);
+        assert_eq!(completions[0].original_tokens, None);
+        assert_eq!(completions[0].compressed_tokens, None);
         let persisted = read_task(
             &registry
                 .task_json_path(&task_id, "session")
@@ -25055,6 +25124,9 @@ mod tests {
             "kill must queue the completion before returning"
         );
         assert_eq!(first[0].status, BgTaskStatus::Completed);
+        assert!(first[0].tokens_skipped);
+        assert_eq!(first[0].original_tokens, None);
+        assert_eq!(first[0].compressed_tokens, None);
         assert_eq!(
             second.len(),
             1,
