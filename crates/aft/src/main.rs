@@ -10,14 +10,6 @@ mod context_storage;
 mod executable_cache;
 
 #[cfg(test)]
-#[path = "../tests/helpers/project.rs"]
-mod test_project;
-
-#[cfg(test)]
-#[path = "../tests/helpers/admission.rs"]
-mod test_admission;
-
-#[cfg(test)]
 mod test_env {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
