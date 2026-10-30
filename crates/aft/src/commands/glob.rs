@@ -615,7 +615,9 @@ fn glob_root(
         // A failed view load fails the call, like grep: answering from a
         // fallback walk would hide the outage, and the legacy snapshot may
         // describe another checkout.
-        Some(snapshot.map_err(crate::context::view_load_failure_message)?)
+        snapshot
+            .map_err(crate::context::view_load_failure_message)?
+            .into_ready()
     } else {
         let search_index = ctx
             .search_index()

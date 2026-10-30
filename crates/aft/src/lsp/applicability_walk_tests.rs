@@ -1281,8 +1281,27 @@ fn applicability_walk_repository_measurement() {
         measured(|| walk_applicable_area(&root, None, &config, None).unwrap());
     let (_, cached_calls, cached_time) =
         measured(|| walk_applicable_area(&root, None, &config, None).unwrap());
-    println!("copied_files={copied} legacy: canonicalize={} elapsed={old_time:?}; lexical: canonicalize={} elapsed={new_time:?}; cached: canonicalize={} elapsed={cached_time:?}", old_calls.len(), new_calls.len(), cached_calls.len());
+    let metrics = applicability_metrics(&root);
+    println!("copied_files={copied} visited_entries={} legacy: canonicalize={} elapsed={old_time:?}; lexical: canonicalize={} elapsed={new_time:?}; cached: canonicalize={} elapsed={cached_time:?}; full_walks={} cache_hits={}", new.entries(), old_calls.len(), new_calls.len(), cached_calls.len(), metrics.full_walks, metrics.hits);
     assert_eq!(signature(&old), signature(&new));
+    assert_eq!(metrics.full_walks, 1, "the second lookup must not walk");
+    assert_eq!(metrics.hits, 1);
+
+    // Ignored build/install trees must not increase the iterator's entry count.
+    for name in ["target", "node_modules"] {
+        let dir = root.join(name).join("large-dependency/src");
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..1000 {
+            std::fs::write(dir.join(format!("file{file}.rs")), "").unwrap();
+        }
+    }
+    let ignored = scan(&root, &config);
+    assert_eq!(ignored.entries(), new.entries());
+    assert_eq!(signature(&ignored), signature(&new));
+    println!(
+        "ignored_added_files=2000 visited_entries={} extra_entries=0",
+        ignored.entries()
+    );
     assert_eq!(new_calls, vec![root]);
 }
 

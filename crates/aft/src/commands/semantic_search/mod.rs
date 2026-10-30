@@ -612,12 +612,22 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
 
         let trigram = if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
             match snapshot {
-                Ok(snapshot) => TrigramReadiness {
-                    status: IndexStatus::Ready,
-                    snapshot: Some(Arc::new(snapshot)),
-                    evicted: false,
-                    lock_contended: false,
-                },
+                Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
+                    TrigramReadiness {
+                        status: IndexStatus::Ready,
+                        snapshot: Some(Arc::new(snapshot)),
+                        evicted: false,
+                        lock_contended: false,
+                    }
+                }
+                Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                    TrigramReadiness {
+                        status: IndexStatus::Building,
+                        snapshot: None,
+                        evicted: false,
+                        lock_contended: false,
+                    }
+                }
                 Err(_) => TrigramReadiness {
                     status: IndexStatus::Fallback,
                     snapshot: None,
@@ -977,14 +987,26 @@ fn handle_semantic_search_with_disk_fallback(
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
-    if external_root.is_none() {
-        if let Some(Err(error)) = ctx.lexical_view_snapshot("aft_search") {
-            return crate::context::view_load_error_response(
-                &req.id,
-                crate::context::view_load_failure_message(error),
-            );
+    let import_building = if external_root.is_none() {
+        match ctx.lexical_view_snapshot("aft_search") {
+            Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                // Importing existing indexes is expected progress. Let the
+                // bounded file scan answer and disclose the unavailable indexes
+                // even when neither index has published a snapshot yet.
+                true
+            }
+            Some(Err(error)) => {
+                return crate::context::view_load_error_response(
+                    &req.id,
+                    crate::context::view_load_failure_message(error),
+                );
+            }
+            _ => false,
         }
-    }
+    } else {
+        false
+    };
+    let allow_disk_fallback = allow_disk_fallback || import_building;
     if let Some((pattern_text, compiled)) = pattern {
         return handle_pattern_request(
             req,
@@ -1094,6 +1116,20 @@ fn handle_semantic_search_with_disk_fallback(
     if response.success {
         let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
         attach_search_execution_metadata(&mut response, &plan, embedding_counts);
+        if import_building && response.data.get("index_read_gap").is_none() {
+            let mut text = response.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if let Some(body) = response.data.as_object_mut() {
+                disclose_index_gaps(
+                    &["legacy text and symbol import building".into()],
+                    &mut text,
+                    body,
+                );
+                body.insert("text".into(), serde_json::json!(text));
+            }
+        }
         attach_not_opened_notice(
             &mut response,
             req,
@@ -4107,7 +4143,7 @@ fn regex_route_collection(
 ) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
     let snapshot = if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
         match snapshot {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => snapshot.into_ready()?,
             Err(error) => {
                 return Some(Err(std::io::Error::other(
                     crate::context::view_load_failure_message(error),
@@ -5116,15 +5152,17 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let view_snapshot = if borrowed_index.is_none() {
+    let lexical_view = if borrowed_index.is_none() {
         ctx.lexical_view_snapshot("aft_search")
             .transpose()
             .map_err(crate::context::view_load_failure_message)?
     } else {
         None
     };
-    let context_index = (borrowed_index.is_none() && view_snapshot.is_none())
+    let context_index = (borrowed_index.is_none() && lexical_view.is_none())
         .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
+    let view_snapshot =
+        lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
@@ -7682,7 +7720,7 @@ fn search_index_ready_with_budget(
     wait_budget: Duration,
 ) -> Result<bool, SearchIndexWaitError> {
     if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
-        return Ok(snapshot.is_ok());
+        return Ok(snapshot.is_ok_and(|snapshot| snapshot.is_ready()));
     }
     let deadline = Instant::now() + wait_budget;
     loop {

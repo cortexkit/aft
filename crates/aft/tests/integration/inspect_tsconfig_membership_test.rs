@@ -494,7 +494,11 @@ fn status_bar_counts_filter_build_excluded_files() {
 
     // Each opened file gets one fake error published into the warm set.
     open_with_lsp(&ctx, &included, "export const app = 1;\n");
-    open_with_lsp(&ctx, &excluded_test, "export const t = 1;\n");
+    open_with_lsp(
+        &ctx,
+        &excluded_test,
+        &fs::read_to_string(&excluded_test).unwrap(),
+    );
     open_with_lsp(&ctx, &excluded_tsx, "export const w = 1;\n");
 
     // Seed Tier-2 so the bar surfaces at all (it is gated on Tier-2 presence).
@@ -535,7 +539,11 @@ fn status_bar_counts_invalidate_on_tsconfig_clear() {
     );
     let ctx = configured_context(&root);
     configure_fake_typescript_lsp(&ctx);
-    open_with_lsp(&ctx, &excluded_test, "export const t = 1;\n");
+    open_with_lsp(
+        &ctx,
+        &excluded_test,
+        &fs::read_to_string(&excluded_test).unwrap(),
+    );
     ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
 
     // Excluded file is filtered out -> 0 errors.

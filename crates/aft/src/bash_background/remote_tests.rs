@@ -2459,6 +2459,168 @@ async fn exec_remote_bash_route_outage_past_five_minutes_still_delivers_result()
     drop(clock);
 }
 
+#[tokio::test]
+async fn exec_remote_bash_keyed_disconnect_reattaches_while_job_is_running() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Running).await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let ctx = Arc::new(restarted_context(dir.path()));
+    let registry = ctx.bash_background().clone();
+    let request = orchestrated_request(serde_json::json!({
+        "command": "printf local-proof", "workdir": dir.path(), "runon": "linux",
+        "wait": true, "timeout": 30_000, "foreground_orchestrate": true, "compressed": false,
+    }));
+    let spawned =
+        crate::bash_background::with_remote_policy(Some(launch(daemon.connection.clone())), || {
+            crate::commands::bash::handle(&request, &ctx)
+        });
+    assert!(spawned.success, "{spawned:?}");
+    let task_id = spawned.data["task_id"].as_str().unwrap().to_string();
+    let crate::response_finalize::DispatchOutcome::Deferred(mut pending) =
+        crate::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawned)
+    else {
+        panic!("foreground wait must remain pending while the remote job runs")
+    };
+    daemon.after_refused_connects(1).await;
+    let task = registry.task(&task_id).unwrap();
+    let detached = read_task(&task.paths.json).unwrap();
+    let remote = detached.remote.unwrap();
+    assert!(remote.submission.is_some());
+    assert_eq!(remote.job_id, Some(id()));
+    assert_eq!(remote.last_seq, Some(1), "checkpoint before reconnect");
+    daemon.restore();
+    wait_for(
+        "attached output must arrive before the job finishes",
+        || (fs::read(&task.paths.stdout).unwrap() == b"AB").then_some(()),
+    )
+    .await;
+    assert!(!registry
+        .observed_status(&task_id, "session", 0)
+        .unwrap()
+        .info
+        .status
+        .is_terminal());
+    daemon.finish_job();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+    let attaches = daemon.methods("exec.attach");
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0]["params"]["from_seq"], 2);
+    let durable = read_task(&task.paths.json).unwrap();
+    assert_eq!(durable.status, BgTaskStatus::Completed);
+    assert_eq!(durable.remote.unwrap().last_seq, Some(2));
+    let reply = wait_for(
+        "foreground wait must return the reattached terminal",
+        || (pending.poll)(&ctx),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["exit_code"], 0, "{reply:?}");
+    assert!(
+        reply.data["output"].as_str().unwrap().contains("AB"),
+        "{reply:?}"
+    );
+    let watch = rendered_watch(ctx, &task_id).await;
+    assert!(watch.contains("AB"), "{watch}");
+    assert!(!watch.contains("outcome unknown"), "{watch}");
+}
+
+#[tokio::test]
+async fn exec_remote_bash_keyed_disconnect_replays_job_finished_while_detached() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Running).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(1).await;
+    daemon.hold_next_connect();
+    daemon.after_held_connect().await;
+    daemon.finish_job();
+    daemon.restore();
+    daemon.release_held_connect();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+    let attaches = daemon.methods("exec.attach");
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0]["params"]["from_seq"], 2);
+}
+
+async fn keyed_disconnect_exhausts_allowance(replay: crate::exec_remote::wire_tests::OutageReplay) {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon_with_replay(replay).await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(1).await;
+    daemon.restore();
+    wait_for("failed attaches must retry within the allowance", || {
+        (daemon.methods("exec.attach").len() >= 2).then_some(())
+    })
+    .await;
+    clock.advance(Duration::from_millis(1_500));
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert_eq!(done.info.status_reason.as_deref(), Some(format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; job {} may still be running on ck-motor and holding this workspace for up to its run timeout of 30s, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end or cancel it with bash_kill, then rerun", id(), id()).as_str()));
+    assert!(done.output_preview.contains(&format!(
+        "job {} could not be re-attached before its own time limit passed",
+        id()
+    )));
+    remote_worker_exited(&task_id).await;
+    let attempts = daemon.methods("exec.attach").len();
+    assert!(attempts >= 2);
+    assert_eq!(
+        daemon.methods("exec.run").len(),
+        1,
+        "never resubmit a known job"
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"A");
+    assert_eq!(
+        read_task(&task.paths.json).unwrap().status,
+        BgTaskStatus::FateUnknown
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_keyed_disconnect_job_not_found_keeps_unknown_text() {
+    keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_tests::OutageReplay::NotFound)
+        .await;
+}
+
+#[tokio::test]
+async fn exec_remote_bash_keyed_disconnect_repeated_closes_stop_at_allowance() {
+    keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_tests::OutageReplay::Close).await;
+}
+
+#[tokio::test]
+async fn exec_remote_bash_keyed_disconnect_unknown_attach_terminal_is_not_resubmitted() {
+    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    let daemon = outage_daemon_with_replay(OutageReplay::Unknown).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(1).await;
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(done
+        .info
+        .status_reason
+        .unwrap()
+        .starts_with(&format!("remote outcome unknown (job {})", id())));
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+    assert_eq!(daemon.methods("exec.attach").len(), 1);
+}
+
 /// The common agent call: `runon` with no `timeout`. It gets the 30-minute
 /// background default as its run timeout, which AFT records and sends to the
 /// runner, so a restart outage far past five minutes must still end with the
@@ -3433,6 +3595,15 @@ async fn exec_remote_bash_deadline_is_not_cancel() {
 
 #[tokio::test]
 async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps() {
+    restart_uses_persisted_seq_without_duplicates_or_gaps(false).await;
+}
+
+#[tokio::test]
+async fn exec_remote_bash_keyed_restart_attaches_by_id_without_duplicates_or_gaps() {
+    restart_uses_persisted_seq_without_duplicates_or_gaps(true).await;
+}
+
+async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
     let daemon = daemon(Script::Restart, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let original = registry();
@@ -3457,7 +3628,16 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
-        submission: None,
+        submission: keyed.then(|| KeyedSubmission {
+            key: format!("aft:{task_id}"),
+            created_at_ms: unix_millis(),
+            request_digest: "unused-for-attach".into(),
+            attempts: SUBMISSION_RECOVERY_ATTEMPTS,
+            fresh_key_used: false,
+            resuming: false,
+            reattached: false,
+            refusal: None,
+        }),
         accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(daemon.connection.clone()),
@@ -13234,6 +13414,36 @@ async fn submission_key_never_accepted_uses_one_new_key() {
 }
 
 #[tokio::test]
+async fn submission_key_disconnect_before_acceptance_keeps_keyed_recovery() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Submission {
+            never_accepted: true,
+            mismatch: false,
+            always_unknown: false,
+            disconnect: true,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let runs = submission_runs(&daemon);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
+    assert_ne!(runs[1]["submission_key"], runs[2]["submission_key"]);
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.attach"));
+}
+
+#[tokio::test]
 async fn submission_key_without_capability_is_never_sent_or_retried() {
     let daemon = daemon(Script::Lost, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -13410,7 +13620,7 @@ async fn submission_key_closed_runner_time_budget_is_not_resubmitted() {
 }
 
 #[tokio::test]
-async fn submission_key_daemon_restart_reconnects_before_resubmission() {
+async fn submission_key_daemon_restart_reconnects_and_attaches_without_resubmission() {
     let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
         Script::Submission {
             never_accepted: false,
@@ -13449,9 +13659,16 @@ async fn submission_key_daemon_restart_reconnects_before_resubmission() {
         "line-0\nline-1\nline-2\nline-3\n"
     );
     let runs = submission_runs(&daemon);
-    assert_eq!(runs.len(), 2);
-    assert_eq!(runs[0]["submission_key"], runs[1]["submission_key"]);
-    assert_eq!(runs[1]["resume_from_seq"], 1);
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0]["submission_key"].is_string());
+    let log = daemon.log.lock().unwrap();
+    let attaches: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .collect();
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0].1["params"]["job_id"], id().to_string());
+    assert_eq!(attaches[0].1["params"]["from_seq"], 2);
 }
 
 #[tokio::test]
@@ -13512,7 +13729,14 @@ async fn submission_key_queue_wait_does_not_consume_execution_timeout() {
         terminal(&restarted, &task_id).await.info.status,
         BgTaskStatus::Completed
     );
-    assert_eq!(submission_runs(&daemon).len(), 2);
+    assert_eq!(submission_runs(&daemon).len(), 1);
+    let log = daemon.log.lock().unwrap();
+    let attach = log
+        .iter()
+        .find(|(_, body)| body["method"] == "exec.attach")
+        .unwrap();
+    assert_eq!(attach.1["params"]["job_id"], id().to_string());
+    assert_eq!(attach.1["params"]["from_seq"], 0);
 }
 
 fn lost_submission_roots() -> &'static Mutex<HashSet<PathBuf>> {

@@ -224,7 +224,7 @@ fn base_ref_child() {
     let storage = PathBuf::from(std::env::var_os("BASE_REF_STORAGE").expect("BASE_REF_STORAGE"));
     let ready = PathBuf::from(std::env::var_os("BASE_REF_READY").expect("BASE_REF_READY"));
     let scenario = std::env::var("BASE_REF_SCENARIO").unwrap();
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     match scenario.as_str() {
         "bind-and-park" => {
             let scope = std::env::var("BASE_REF_WORKER").unwrap();
@@ -380,8 +380,8 @@ fn registered(storage: &Path, scope: &str) -> bool {
 /// and one child SIGSTOPped with its intent row across two sweeps.
 #[test]
 fn concurrent_binders_across_processes_keep_the_base_and_a_stopped_owner_keeps_its_intent() {
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
     let storage = tempdir().unwrap();
+    let _space = v3::set_free_space_for_test(storage.path(), u64::MAX, u64::MAX / 2);
     let root = storage.path().join("roots/main");
     let BaseBuild::Published {
         identity, claim, ..
@@ -484,9 +484,9 @@ fn concurrent_binders_across_processes_keep_the_base_and_a_stopped_owner_keeps_i
 /// `<storage>/views/v3`.
 #[test]
 fn a_process_killed_at_any_base_path_boundary_leaves_references_readable() {
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
     for step in DurabilityStep::BASE_PATH {
         let storage = tempdir().unwrap();
+        let _space = v3::set_free_space_for_test(storage.path(), u64::MAX, u64::MAX / 2);
         let control = tempdir().unwrap();
         let ready = control.path().join("ready");
         let mut child = spawn_child(
@@ -553,8 +553,8 @@ fn a_process_killed_at_any_base_path_boundary_leaves_references_readable() {
 /// worker: it serves from its base with correct answers.
 #[test]
 fn a_worker_restarted_after_main_is_deleted_and_collected_serves_from_its_base() {
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
     let storage = tempdir().unwrap();
+    let _space = v3::set_free_space_for_test(storage.path(), u64::MAX, u64::MAX / 2);
     let control = tempdir().unwrap();
     let main_root = storage.path().join("roots/main");
     let ready = control.path().join("main");

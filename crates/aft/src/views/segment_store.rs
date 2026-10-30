@@ -36,6 +36,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+thread_local! {
+    static TRIGRAM_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use crate::blob_store::v2::{
     segment_path, ContentHash, FamilyKey, FamilyPlane, FamilyStore, FamilyStoreReader, StoreError,
     TrigramKey, TrigramPolicy,
@@ -137,7 +142,14 @@ impl TrigramPayload {
     /// Extracts the payload from a file's bytes. It is a pure function of the
     /// bytes and the policy, which is what lets the key omit the path. The
     /// records are the search index's own posting fold of the bytes.
+    #[cfg(test)]
+    pub(crate) fn extraction_count() -> usize {
+        TRIGRAM_EXTRACTIONS.with(std::cell::Cell::get)
+    }
+
     pub fn extract(bytes: &[u8], policy: &TrigramPolicy) -> Self {
+        #[cfg(test)]
+        TRIGRAM_EXTRACTIONS.with(|count| count.set(count.get() + 1));
         if bytes.len() as u64 > policy.max_file_size {
             return Self {
                 flag: TrigramFlag::UnindexedOversize,

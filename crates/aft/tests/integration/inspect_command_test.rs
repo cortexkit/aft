@@ -356,13 +356,12 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
                 .project_root
                 .clone()
                 .expect("configured project root");
+            let file = root.join(".aft-test-authoritative-diagnostics");
+            fs::write(&file, "").unwrap();
             ctx.lsp()
                 .diagnostics_store_mut_for_test()
-                .publish_with_kind(
-                    ServerKind::Rust,
-                    root.join(".aft-test-authoritative-diagnostics"),
-                    Vec::new(),
-                );
+                .publish_with_kind(ServerKind::Rust, file.clone(), Vec::new());
+            ctx.lsp().certify_diagnostic_content_for_test(&file);
         } else {
             // Scoped scanner fixtures need their real scope preserved. The
             // diagnostics prerequisite for an unanalyzed scope comes from
@@ -3591,16 +3590,16 @@ fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
     );
 }
 
-fn close_with_lsp(ctx: &AppContext, file: &Path) {
-    let config = ctx.config().clone();
-    ctx.lsp().notify_file_closed(file).expect("close file");
-    let diagnostics = ctx
-        .lsp()
-        .wait_for_diagnostics(file, &config, Duration::from_secs(30));
-    assert!(
-        diagnostics.is_empty(),
-        "fake LSP close should publish checked-clean diagnostics"
-    );
+fn publish_current_clean(ctx: &AppContext, file: &Path) {
+    let snapshot = ctx.lsp().snapshot_pre_edit_state(file);
+    for (key, state) in snapshot {
+        ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
+            server_kind: key.kind, root: key.root,
+            method: "textDocument/publishDiagnostics".into(),
+            params: Some(json!({"uri":file_uri(file), "version":state.document_version_at_capture, "diagnostics":[]})),
+        });
+    }
+    ctx.lsp().drain_events();
     assert!(
         ctx.lsp().has_diagnostic_report_for_file(file),
         "empty publish should remain as checked-clean proof"
@@ -3864,6 +3863,55 @@ fn inspect_command_diagnostics_without_a_report_is_not_returned_as_a_zero_result
 }
 
 #[test]
+fn inspect_command_diagnostics_unverified_report_without_a_live_server_returns_partial() {
+    let (_temp_dir, root) = fixture_project();
+    let file = crate::helpers::canonicalize_like_product(&write_file(
+        &root,
+        "main.ts",
+        "export const n = 1;\n",
+    ));
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .diagnostics_store_mut_for_test()
+        .publish_with_kind(ServerKind::TypeScript, file.clone(), Vec::new());
+    ctx.lsp().certify_diagnostic_content_for_test(&file);
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+
+    // Retain a report for the previous content, with no live producer to
+    // refresh it. The file is unknown, not checked-clean or an unfinished job.
+    fs::write(&file, "export const n = 2;\n").unwrap();
+    assert!(ctx.lsp().active_server_keys().is_empty());
+    assert!(!ctx.lsp().has_authoritative_report_for_file(&file));
+    let response = inspect_warm_event_driven(
+        &ctx,
+        json!({
+            "id": "inspect-unverified-no-live-server",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert_eq!(
+        uncovered_files(&response),
+        vec![(
+            "main.ts".into(),
+            "no diagnostics for the current file content arrived in time; retry aft_inspect".into(),
+        )],
+        "{response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-clean\"\n");
@@ -3871,7 +3919,7 @@ fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
     open_with_lsp(&ctx, &file, "fn main() {}\n");
-    close_with_lsp(&ctx, &file);
+    publish_current_clean(&ctx, &file);
 
     let response = inspect(
         &ctx,
@@ -4680,6 +4728,55 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
         ctx.lsp().get_diagnostics_for_file(&lib).len(),
         2,
         "the close reply erased the collected diagnostics"
+    );
+}
+
+#[test]
+fn scoped_kotlin_inspect_certifies_unversioned_pushes_after_open_and_edit() {
+    let (_temp, root) = fixture_project();
+    write_file(
+        &root,
+        "settings.gradle",
+        "rootProject.name = 'diagnostics-fixture'\n",
+    );
+    let text = "fun main() { val n = 1 }\n";
+    let file = crate::helpers::canonicalize_like_product(&write_file(&root, "main.kt", text));
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .override_binary(ServerKind::KotlinLs, fake_server_path());
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_UNVERSIONED_PUSH", "1");
+    // kotlin-language-server constructs PublishDiagnosticsParams(uri,
+    // diagnostics) without a version and advertises no diagnostic provider.
+    // Keep the document open so this test isolates text sync, not close replies.
+    open_with_lsp(&ctx, &file, text);
+    let before = scoped_diagnostics_inspect(&ctx, "kotlin-unversioned-open", "main.kt");
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+
+    edit_match_as_opencode(&ctx, "kotlin-unversioned-edit", &file, "n = 1", "n = 2");
+    let after = scoped_diagnostics_inspect(&ctx, "kotlin-unversioned-after", "main.kt");
+    assert_eq!(after["complete"], true, "{after:#}");
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+    assert!(ctx
+        .lsp()
+        .diagnostics_store_for_test()
+        .entries_for_file(&file)
+        .iter()
+        .any(|(key, entry)| key.kind == ServerKind::KotlinLs
+            && entry.from_receive_order
+            && !entry.from_document_pull));
+    assert!(
+        diagnostic_messages_for(&after, "main.kt")
+            .iter()
+            .any(|message| message == "test diagnostic after change"),
+        "{after:#}"
+    );
+
+    fs::write(&file, "fun main() { val n = 3 }\n").unwrap();
+    assert!(
+        !ctx.lsp().has_authoritative_report_for_file(&file),
+        "a later outside write invalidates even a receive-ordered certificate"
     );
 }
 
@@ -5648,8 +5745,8 @@ fn scoped_blocking_inspect_ignores_a_late_clearing_publish_after_its_close() {
 }
 
 /// Only an empty publish after inspect's close is ignored. A publish with
-/// diagnostics that arrives right after the close is real news about the file
-/// and is stored.
+/// diagnostics that arrives right after the close is retained, but it cannot
+/// certify current content without an open document's confirmed version.
 #[test]
 fn scoped_blocking_inspect_stores_a_non_empty_publish_after_its_close() {
     let (_temp_dir, root, lib) = single_crate_fixture("sweep-close-news");
@@ -5666,15 +5763,22 @@ fn scoped_blocking_inspect_stores_a_non_empty_publish_after_its_close() {
     wait_for_close_reply(&ctx);
     let stored = ctx
         .lsp()
-        .get_diagnostics_for_file(&lib)
+        .diagnostics_store_for_test()
+        .entries_for_file(&crate::helpers::canonicalize_like_product(&lib))
         .into_iter()
-        .map(|diagnostic| diagnostic.message.clone())
+        .flat_map(|(_, entry)| {
+            entry
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         stored,
         vec!["test diagnostic after change".to_string()],
         "the publish after the close was not stored"
     );
+    assert!(!ctx.lsp().has_authoritative_report_for_file(&lib));
 }
 
 /// A scoped inspect closes the documents it opened, and the server answers
@@ -6336,6 +6440,8 @@ fn publish_external_typescript_report(
         crate::helpers::canonicalize_like_product(file),
         diagnostics,
     );
+    ctx.lsp()
+        .certify_diagnostic_content_for_test(&crate::helpers::canonicalize_like_product(file));
 }
 
 fn external_error(file: &Path) -> StoredDiagnostic {
@@ -6563,6 +6669,10 @@ fn scoped_diagnostics_external_biome_workspace_counts_json_with_authoritative_re
             crate::helpers::canonicalize_like_product(&external_root.join(name)),
             Vec::new(),
         );
+        ctx.lsp()
+            .certify_diagnostic_content_for_test(&crate::helpers::canonicalize_like_product(
+                &external_root.join(name),
+            ));
     }
     let response = inspect_workspace("inspect-outside-biome-reported");
     assert_eq!(response["success"], true, "{response:#}");
@@ -6899,6 +7009,146 @@ fn configure_content_pull_typescript_lsp(ctx: &AppContext, native: ServerKind) {
         .set_extra_env("AFT_FAKE_LSP_SERVER_NAME", "typescript-go");
 }
 
+#[test]
+fn unscoped_inspect_checks_current_content_after_outside_edits_without_a_watcher() {
+    let (_temp, root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "100");
+    let before = scoped_diagnostics_inspect(&ctx, "current-before", "broken.ts");
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert_eq!(before["summary"]["diagnostics"]["errors"], 1, "{before:#}");
+
+    for (text, errors) in [
+        ("export const n = 42;\n", 0),
+        ("export const n = BROKEN;\n", 1),
+    ] {
+        fs::write(&file, text).unwrap();
+        let response = inspect_tool_call(
+            &ctx,
+            json!({"id":"current-outside", "command":"inspect", "sections":["diagnostics"]}),
+        );
+        assert_ne!(
+            response["summary"]["diagnostics"]["complete"], false,
+            "a matching response within the deadline must complete diagnostics: {response:#}"
+        );
+        assert_eq!(
+            response["summary"]["diagnostics"]["errors"], errors,
+            "{response:#}"
+        );
+    }
+}
+
+#[test]
+fn unscoped_inspect_current_content_timeout_names_the_file_instead_of_old_results() {
+    let (_temp, root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_content_pull_typescript_lsp(&ctx, native);
+    let hold = root.join(".hold-diagnostics");
+    let signal = root.join(".diagnostics-requested");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+    ctx.lsp().set_extra_env(
+        "AFT_FAKE_LSP_PULL_DELAY_WHEN_FILE_EXISTS",
+        hold.to_str().unwrap(),
+    );
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
+    let config = ctx.config().clone();
+    let pulled = ctx.lsp().pull_file_diagnostics(&file, &config).unwrap();
+    assert!(!pulled.is_empty());
+    assert!(ctx.lsp().has_authoritative_report_for_file(&file));
+    fs::remove_file(&signal).unwrap();
+    fs::write(&hold, "hold").unwrap();
+    fs::write(&file, "export const n = 42;\n").unwrap();
+    let response = inspect_tool_call(
+        &ctx,
+        json!({"id":"current-timeout", "command":"inspect", "sections":["diagnostics"]}),
+    );
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        signal.exists(),
+        "inspect must request current diagnostics before reporting the timeout"
+    );
+    assert!(
+        diagnostic_messages_for(&response, "broken.ts").is_empty(),
+        "old errors must not be returned: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).iter().any(|(file, reason)| {
+            file == "broken.ts"
+            && reason
+                == "no diagnostics for the current file content arrived in time; retry aft_inspect"
+        }),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn unscoped_inspect_rejects_late_server_reports_after_an_aft_edit() {
+    for version in [Some(0), None] {
+        for (initial, replacement, expected_errors) in [("BROKEN", "42", 0), ("42", "BROKEN", 1)] {
+            let (_temp, root, file) = external_typescript_fixture();
+            fs::write(&file, format!("export const n = {initial};\n")).unwrap();
+            let native = install_content_pull_native_typescript(&root);
+            let ctx = configured_context(&root);
+            configure_content_pull_typescript_lsp(&ctx, native.clone());
+            let before = scoped_diagnostics_inspect(&ctx, "late-current-before", "broken.ts");
+            assert_eq!(before["complete"], true, "{before:#}");
+            edit_match_as_opencode(&ctx, "late-current-edit", &file, initial, replacement);
+            let diagnostics = if initial == "BROKEN" {
+                json!([{
+                    "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                    "severity":1,"message":"obsolete server error"
+                }])
+            } else {
+                json!([])
+            };
+            ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
+                server_kind: native,
+                root: root.clone(),
+                method: "textDocument/publishDiagnostics".into(),
+                params: Some(
+                    json!({"uri":file_uri(&file),"version":version,"diagnostics":diagnostics}),
+                ),
+            });
+            ctx.lsp().drain_events();
+            assert!(!ctx.lsp().has_authoritative_report_for_file(&file));
+            let warm = inspect_warm_event_driven(
+                &ctx,
+                json!({"id":"late-current-warm","command":"inspect","sections":["diagnostics"]}),
+            );
+            assert_eq!(warm["complete"], false, "{warm:#}");
+            assert!(
+                uncovered_files(&warm)
+                    .iter()
+                    .any(|(file, _)| file == "broken.ts"),
+                "{warm:#}"
+            );
+            assert!(
+                diagnostic_messages_for(&warm, "broken.ts").is_empty(),
+                "{warm:#}"
+            );
+            let current = inspect_tool_call(
+                &ctx,
+                json!({"id":"late-current-refresh","command":"inspect","sections":["diagnostics"]}),
+            );
+            assert_ne!(
+                current["summary"]["diagnostics"]["complete"], false,
+                "{current:#}"
+            );
+            assert_eq!(
+                current["summary"]["diagnostics"]["errors"], expected_errors,
+                "{current:#}"
+            );
+        }
+    }
+}
+
 const CONTENT_PULL_ERROR: &str = "BROKEN marker in synced text";
 
 /// `edit_match` dispatched as an OpenCode host's request is, so a file
@@ -7158,8 +7408,8 @@ fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
     // delayed reply to the inspect's close arrives.
     edit_match_as_opencode(&ctx, "late-clear-edit", &file, "other = 1", "other = 2");
 
-    // Control: the late clearing push reached the store as a current,
-    // pushed (not pulled), empty report for the file.
+    // Control: the late clearing push reached the store, but without a
+    // document version it cannot certify the reopened file's content.
     let canonical = crate::helpers::canonicalize_like_product(&file);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -7171,7 +7421,7 @@ fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
             .into_iter()
             .any(|(key, entry)| {
                 key.kind == native
-                    && !entry.stale
+                    && entry.stale
                     && !entry.from_document_pull
                     && entry.diagnostics.is_empty()
             });
@@ -7185,6 +7435,8 @@ fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+
+    assert!(!ctx.lsp().has_authoritative_report_for_file(&file));
 
     let after =
         scoped_diagnostics_inspect_outside(&ctx, "late-clear-after", file.to_str().unwrap());
@@ -7305,6 +7557,8 @@ fn scoped_diagnostics_render_clean_empty_for_covered_file_without_findings() {
             crate::helpers::canonicalize_like_product(&lib_rs),
             Vec::new(),
         );
+    ctx.lsp()
+        .certify_diagnostic_content_for_test(&crate::helpers::canonicalize_like_product(&lib_rs));
 
     let response = inspect(
         &ctx,

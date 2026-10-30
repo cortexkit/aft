@@ -58,6 +58,11 @@ pub(crate) trait ProjectFacts {
     }
     fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]>;
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>>;
+    /// Probe identities may be shared within a resolver snapshot. Explicit
+    /// canonical-path requests remain live so identity revalidation is not memoized.
+    fn canonical_probe(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        self.canonical(rel)
+    }
     fn canonical_path(&self, root: &Path, rel: &[u8]) -> Option<PathBuf> {
         Some(root.join(byte_path(&self.canonical(rel)?)))
     }
@@ -287,12 +292,12 @@ impl FactPaths<'_> {
     }
     pub fn is_file(&self, path: &Path) -> bool {
         self.rel(path)
-            .and_then(|rel| self.facts.canonical(&rel))
+            .and_then(|rel| self.facts.canonical_probe(&rel))
             .is_some_and(|rel| self.facts.is_file(&rel))
     }
     pub fn is_dir(&self, path: &Path) -> bool {
         self.rel(path)
-            .and_then(|rel| self.facts.canonical(&rel))
+            .and_then(|rel| self.facts.canonical_probe(&rel))
             .is_some_and(|rel| self.facts.is_dir(&rel))
     }
     /// Opaque reads remain distinguishable from the field-instrumented readers.

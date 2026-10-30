@@ -4,15 +4,92 @@ use tempfile::tempdir;
 
 const A: &str = "0123456789abcdef";
 const B: &str = "fedcba9876543210";
-pub(super) fn serial() -> MutexGuard<'static, ()> {
+pub(crate) struct SerialTestGuard {
+    _unlimited: UnlimitedFreeSpaceForTestProcess,
+    _serial: MutexGuard<'static, ()>,
+}
+pub(super) fn serial() -> SerialTestGuard {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
-    guard
+    SerialTestGuard {
+        _unlimited: unlimited_free_space_for_test_process(),
+        _serial: guard,
+    }
 }
+
+#[test]
+fn free_space_override_guard_restores_after_unwind() {
+    let _serial = serial();
+    let storage = tempdir().unwrap();
+    let _previous = set_free_space_for_test(storage.path(), 17, 42);
+    let observed = Mutex::new(None);
+    let panic = std::panic::catch_unwind(|| {
+        let _guard = set_free_space_for_test(storage.path(), 1, 1 << 40);
+        *observed.lock().unwrap() = free_space(storage.path());
+        panic!("unwind the free-space test guard");
+    });
+    assert!(panic.is_err());
+    assert_eq!(*observed.lock().unwrap(), Some((1, 1 << 40)));
+    assert_eq!(free_space(storage.path()), Some((17, 42)));
+    drop(_previous);
+    assert_eq!(free_space(storage.path()), Some((u64::MAX, u64::MAX / 2)));
+}
+
+#[test]
+fn free_space_override_reaches_other_threads_under_its_storage_root() {
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    let storage = root.path().join("storage");
+    let _space = set_free_space_for_test(&storage, 17, 42);
+    let path = storage.join("blobs/v3/plane.sqlite");
+    assert_eq!(
+        std::thread::spawn(move || free_space(&path))
+            .join()
+            .unwrap(),
+        Some((17, 42))
+    );
+    assert_eq!(
+        free_space(&root.path().join("storage-other")),
+        Some((u64::MAX, u64::MAX / 2))
+    );
+    let inner = storage.join("nested");
+    let _inner = set_free_space_for_test(&inner, 23, 84);
+    assert_eq!(free_space(&inner.join("blobs/v3")), Some((23, 84)));
+    assert_eq!(free_space(&storage), Some((17, 42)));
+}
+
+#[cfg(unix)]
+#[test]
+fn free_space_override_matches_resolved_symlink_roots() {
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    let storage = root.path().join("storage");
+    fs::create_dir(&storage).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&storage, &alias).unwrap();
+    let resolved = fs::canonicalize(&storage).unwrap();
+
+    for suffix in ["", "not-created"] {
+        let raw = alias.join(suffix);
+        let canonical = resolved.join(suffix);
+        let _space = set_free_space_for_test(&raw, 17, 42);
+        assert_eq!(free_space(&raw), Some((17, 42)));
+        assert_eq!(free_space(&canonical), Some((17, 42)));
+        assert_eq!(
+            free_space(&canonical.join("missing/blobs/v3")),
+            Some((17, 42))
+        );
+        assert_eq!(
+            free_space(&root.path().join("other-storage")),
+            Some((u64::MAX, u64::MAX / 2))
+        );
+    }
+    assert!(!storage.join("not-created").exists());
+}
+
 fn key() -> FamilyKey {
     FamilyKey::new(FamilyPlane::Semantic, [7; 32])
 }
@@ -565,12 +642,13 @@ fn changing_derived_database_reports_busy_then_measurement_recovers() {
 fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    set_free_space_for_test(NAMESPACE_BUDGET - 1, 8 * NAMESPACE_BUDGET);
+    let _low_space =
+        set_free_space_for_test(root.path(), NAMESPACE_BUDGET - 1, 8 * NAMESPACE_BUDGET);
     let error = publish(root.path(), A, 1, None, |_| Ok(())).unwrap_err();
     assert_eq!(error.to_string(), "device_free_space_floor");
     assert!(!root.path().join("blobs/v3").exists());
     assert!(!root.path().join("reader-floor.json").exists());
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = set_free_space_for_test(root.path(), u64::MAX, u64::MAX / 2);
     let error = publish(root.path(), A, NAMESPACE_BUDGET, None, |_| -> Result<()> {
         panic!("budget must refuse before body")
     })
@@ -593,11 +671,20 @@ fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
         .exists());
 }
 
-struct Recheck;
-impl DurabilityObserver for Recheck {
+struct Recheck<'a> {
+    storage: &'a Path,
+    space: Mutex<Option<FreeSpaceTestGuard>>,
+}
+impl DurabilityObserver for Recheck<'_> {
     fn reached(&self, step: DurabilityStep) {
         if step == DurabilityStep::V3FloorRaised {
-            set_free_space_for_test(NAMESPACE_BUDGET, 8 * NAMESPACE_BUDGET);
+            let mut space = self.space.lock().unwrap();
+            drop(space.take());
+            *space = Some(set_free_space_for_test(
+                self.storage,
+                NAMESPACE_BUDGET,
+                8 * NAMESPACE_BUDGET,
+            ));
         }
     }
 }
@@ -605,7 +692,11 @@ impl DurabilityObserver for Recheck {
 fn floor_recheck_refuses_without_reservation_or_plane_store() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    let error = publish(root.path(), A, 1, Some(&Recheck), |_| -> Result<()> {
+    let observer = Recheck {
+        storage: root.path(),
+        space: Mutex::new(None),
+    };
+    let error = publish(root.path(), A, 1, Some(&observer), |_| -> Result<()> {
         panic!("floor must refuse")
     })
     .unwrap_err();
@@ -636,7 +727,7 @@ fn sequential_reservations_sum_other_family_without_mutating_it() {
     let mut a = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let reservation = a.reserve(100).unwrap();
     let before = a.accounting().unwrap();
-    set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
     let started = std::time::Instant::now();
     let error = publish_locked(root.path(), B, 100, &lock, None, |_| Ok(())).unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -977,7 +1068,7 @@ fn v3_child() {
     let family = std::env::var("AFT_V3_TEST_FAMILY").unwrap();
     let mode = std::env::var("AFT_V3_TEST_MODE").unwrap();
     let control = PathBuf::from(std::env::var_os("AFT_V3_TEST_CONTROL").unwrap());
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     if mode.starts_with("init-") {
         publish(&storage, &family, 0, None, |p| {
             if mode.starts_with("init-plane-") {
@@ -1052,7 +1143,8 @@ fn v3_child() {
         return;
     }
     if mode == "reserve" {
-        set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+        let _space =
+            set_free_space_for_test(&storage, NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
         let result = (|| -> Result<()> {
             let rendezvous = control.parent().unwrap();
             fs::write(rendezvous.join(format!("started-{family}")), b"ready")?;
@@ -1314,7 +1406,7 @@ fn nested_writer_uses_existing_root_guard_and_does_not_touch_peer_ledger() {
 fn capacity_percentage_floor_applies_above_the_four_gib_minimum() {
     let _g = serial();
     let root = tempdir().unwrap();
-    set_free_space_for_test(2 * NAMESPACE_BUDGET, 200 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), 2 * NAMESPACE_BUDGET, 200 * NAMESPACE_BUDGET);
     assert_eq!(
         publish(root.path(), A, 1, None, |_| Ok(()))
             .unwrap_err()
@@ -1781,7 +1873,7 @@ fn publish_after_dead_owner(target: &str) {
             .reserved_bytes,
         100
     );
-    set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
     publish(root.path(), target, 100, None, |_| Ok(()))
         .expect("dead reservations must be recovered before the final floor decision");
     assert_eq!(

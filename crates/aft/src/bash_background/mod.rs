@@ -2033,20 +2033,34 @@ fn normalize_absolute_path(path: &std::path::Path) -> PathBuf {
 }
 
 pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::harness::Harness) {
+    repair_legacy_root_tasks_with(storage_root, harness, legacy_root_tasks_quiescent);
+}
+
+fn repair_legacy_root_tasks_with(
+    storage_root: &std::path::Path,
+    harness: crate::harness::Harness,
+    quiescent: impl FnOnce(&std::path::Path) -> std::io::Result<bool>,
+) {
     let root_tasks = storage_root.join("bash-tasks");
     if !dir_has_entries(&root_tasks) {
+        return;
+    }
+    let harness_tasks = storage_root
+        .join(harness.storage_segment())
+        .join("bash-tasks");
+    // A populated destination prevents migration regardless of writer liveness.
+    // Check it before reading every legacy task on each session's configure.
+    if dir_has_entries(&harness_tasks) {
         return;
     }
     // Detached writers retain both open output handles and absolute marker paths.
     // Even a same-volume rename can strand their later path-based writes. Keep
     // the entire legacy tree readable in place until every task is quiescent.
-    if !legacy_root_tasks_quiescent(&root_tasks).unwrap_or(false) {
+    if !quiescent(&root_tasks).unwrap_or(false) {
         return;
     }
 
-    let harness_tasks = storage_root
-        .join(harness.storage_segment())
-        .join("bash-tasks");
+    // The destination may have been populated while quiescence was checked.
     if dir_has_entries(&harness_tasks) {
         return;
     }
@@ -2119,6 +2133,13 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
 }
 
 fn legacy_root_tasks_quiescent(root: &std::path::Path) -> std::io::Result<bool> {
+    legacy_root_tasks_quiescent_with(root, || {})
+}
+
+fn legacy_root_tasks_quiescent_with(
+    root: &std::path::Path,
+    mut before_metadata_read: impl FnMut(),
+) -> std::io::Result<bool> {
     use persistence::{discover_task_ids, read_exit_marker, read_task_at, resolve_task_layout};
     for session in std::fs::read_dir(root)? {
         let session = session?;
@@ -2131,6 +2152,7 @@ fn legacy_root_tasks_quiescent(root: &std::path::Path) -> std::io::Result<bool> 
         }
         for id in ids {
             let task = resolve_task_layout(&session.path(), &id)?;
+            before_metadata_read();
             let metadata = read_task_at(&task)?;
             if read_exit_marker(&task.paths)?.is_some() {
                 continue;
@@ -2410,6 +2432,91 @@ mod legacy_root_task_repair_tests {
 
     use crate::harness::Harness;
     use crate::walk_boundary::simulated_volumes::simulate;
+
+    #[test]
+    fn legacy_root_tasks_in_populated_harness_do_not_rescan() {
+        let storage = tempfile::tempdir().unwrap();
+        let legacy = storage.path().join("bash-tasks/session");
+        let modern = storage
+            .path()
+            .join(Harness::Opencode.storage_segment())
+            .join("bash-tasks/session");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&modern).unwrap();
+        fs::write(legacy.join("kept"), "legacy").unwrap();
+        fs::write(modern.join("kept"), "modern").unwrap();
+
+        let mut scans = 0;
+        for _ in 0..2 {
+            super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |_| {
+                scans += 1;
+                Ok(true)
+            });
+        }
+        assert_eq!(scans, 0, "a populated destination prevents migration");
+        assert_eq!(fs::read(legacy.join("kept")).unwrap(), b"legacy");
+        assert_eq!(fs::read(modern.join("kept")).unwrap(), b"modern");
+
+        // Emptying the destination must allow migration on the next repair call.
+        fs::remove_dir_all(modern.parent().unwrap()).unwrap();
+        super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |_| {
+            scans += 1;
+            Ok(true)
+        });
+        assert_eq!(scans, 1);
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(modern.join("kept")).unwrap(), b"legacy");
+    }
+
+    #[test]
+    #[ignore = "creates 5000 persisted task bundles to measure configure legacy repair"]
+    fn legacy_root_tasks_populated_harness_measurement() {
+        use super::persistence::*;
+        let storage = tempfile::tempdir().unwrap();
+        let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        for index in 0..5000 {
+            let session = format!("history-{}", index % 100);
+            let id = format!("bash-{index:016x}");
+            let task = create_task_layout(storage.path(), &session, &id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                id,
+                session,
+                "finished checkout task".into(),
+                project.into(),
+                None,
+                None,
+                true,
+                false,
+            );
+            metadata.mark_terminal(super::BgTaskStatus::Completed, Some(0), None);
+            write_task_at(&task, &metadata).unwrap();
+        }
+        fs::create_dir_all(
+            storage
+                .path()
+                .join(Harness::Opencode.storage_segment())
+                .join("bash-tasks/current-session"),
+        )
+        .unwrap();
+        for run in 0..3 {
+            let start = std::time::Instant::now();
+            let mut scans = 0;
+            let mut reads = 0;
+            super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |root| {
+                scans += 1;
+                super::legacy_root_tasks_quiescent_with(root, || reads += 1)
+            });
+            println!(
+                "legacy_repair run={run} checkout={} sessions=100 task_bundles=5000 scans={scans} task_metadata_reads={reads} elapsed_us={}",
+                project.display(), start.elapsed().as_micros()
+            );
+            assert_eq!(reads, 0);
+        }
+    }
 
     #[cfg(unix)]
     #[test]

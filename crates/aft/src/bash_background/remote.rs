@@ -2968,6 +2968,9 @@ impl BgTaskRegistry {
         );
         let mut retry_request = None;
         let resume_submission = initial.is_none()
+            // An accepted job without a terminal was detached by an AFT restart.
+            // Recover its existing job ID, even if the submission also has a key.
+            && !(remote.accepted && remote.job_id.is_some() && remote.terminal.is_none())
             && remote.resubmit_for_recovery()
             && (remote.terminal.as_ref().is_some_and(|record| {
                 exec::grade(record) == Verdict::OutcomeUnknown
@@ -3487,7 +3490,9 @@ impl BgTaskRegistry {
                     if !platform_ok {
                         return Err("remote outcome unknown: Windows platform was not acknowledged; result not trusted".into());
                     }
-                    if verdict == Verdict::OutcomeUnknown {
+                    // An attach already queried the existing job; an unknown
+                    // terminal from it is not a reason to submit the command again.
+                    if verdict == Verdict::OutcomeUnknown && !stream.is_attach() {
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
                             .await?
@@ -3508,15 +3513,19 @@ impl BgTaskRegistry {
                     {
                         return Ok(());
                     }
-                    let keyed = task
+                    let current = task
                         .state
                         .lock()
                         .map_err(|_| "task lock poisoned")?
                         .metadata
                         .remote
                         .as_ref()
-                        .is_some_and(RemoteTask::resubmit_for_recovery);
-                    if keyed {
+                        .cloned()
+                        .unwrap();
+                    // Prefer the accepted job over resubmitting the command with
+                    // its key. The shorter key-recovery limit must not abandon a
+                    // job that can still be queued or running on the executor.
+                    if current.resubmit_for_recovery() && !current.accepted {
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
                             .await?
@@ -3526,16 +3535,16 @@ impl BgTaskRegistry {
                         }
                         return Err(format!("remote outcome unknown; keyed recovery unavailable or exhausted: {error}"));
                     }
-                    let Some(point) = stream.resume_point() else {
+                    let Some(point) = stream.resume_point().or_else(|| current.point()) else {
                         return Err(format!("remote outcome unknown; not resubmitted: {error}"));
                     };
+                    sink.checkpoint_progress().map_err(|e| e.to_string())?;
                     // Even an undecodable frame proves this was not an empty
                     // attach. A quiet but open stream has no output deadline.
                     if stream.received_frame() {
                         recovery.reset();
                     }
-                    // Without a submission key, only attach can recover an
-                    // accepted job without risking a second execution.
+                    // Use the same bounded attach path as an AFT restart.
                     recovery.pause(point.job_id).await?;
                     stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
@@ -3879,18 +3888,21 @@ impl BgTaskRegistry {
             // Back off, then reconnect and attach again; never resubmit.
             recovery.pause(point.job_id).await?;
             if let Some(path) = &remote.connection_file {
+                let identity = subc_protocol::BindIdentity::new(
+                    root.display().to_string(),
+                    remote.harness.clone(),
+                    remote.session.clone(),
+                );
                 let reconnected = recovery
-                    .wait(
-                        point.job_id,
-                        ExecRemoteClient::connect(
-                            path,
-                            subc_protocol::BindIdentity::new(
-                                root.display().to_string(),
-                                remote.harness.clone(),
-                                remote.session.clone(),
-                            ),
-                        ),
-                    )
+                    .wait(point.job_id, async {
+                        // The SDK reconnects its transport, but the old provider
+                        // route stays closed. Reuse that connection when possible;
+                        // reread the connection file if the daemon itself changed.
+                        match client.reopen_route(identity.clone()).await {
+                            Ok(reconnected) => Ok(reconnected),
+                            Err(_) => ExecRemoteClient::connect(path, identity).await,
+                        }
+                    })
                     .await?;
                 if let Ok(reconnected) = reconnected {
                     *client = reconnected;

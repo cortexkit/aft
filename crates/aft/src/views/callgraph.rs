@@ -33,7 +33,7 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// Version 10 stores the parser's corrected symbols: Go type aliases, separate
 /// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
 /// HTML headings that share a row.
-pub const PRODUCER: &str = "ruled-callgraph-v12-rust-module-paths-and-function-references";
+pub const PRODUCER: &str = "ruled-callgraph-v13-python-import-bindings";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
@@ -664,6 +664,8 @@ pub(crate) struct CallgraphView {
     source: Arc<dyn CallgraphReaderSource>,
     query: std::sync::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
     ready: std::sync::atomic::AtomicBool,
+    legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
+    current: crate::migration::v3_ledger::ImportControl,
 }
 
 /// The v3 member scope of a checkout's call-graph view.
@@ -686,14 +688,49 @@ impl CallgraphView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && (self.current)()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: crate::blob_store::v2::TrigramPolicy,
     ) -> Result<Self, CallgraphViewError> {
+        Self::new_with_import(
+            root,
+            storage,
+            family,
+            policy,
+            Arc::new(|| true),
+            crate::cold_build_limiter::global_limiter(),
+        )
+    }
+
+    pub(crate) fn new_with_import(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: crate::blob_store::v2::TrigramPolicy,
+        current: crate::migration::v3_ledger::ImportControl,
+        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    ) -> Result<Self, CallgraphViewError> {
+        if !current() {
+            return Err(CallgraphViewError {
+                reason: "checkout is unbound".into(),
+                busy: true,
+                completion_busy: false,
+            });
+        }
+        let legacy_import = crate::migration::views_background::BackgroundImport::start(
+            &storage.artifacts,
+            &family,
+            &root,
+            policy,
+            current.clone(),
+            limiter,
+        );
         let scope = view_scope(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -729,7 +766,10 @@ impl CallgraphView {
             scope,
             producers,
         });
-        Ok(Self::with_source(root, storage, family, policy, source))
+        let mut view = Self::with_source(root, storage, family, policy, source);
+        view.legacy_import = legacy_import;
+        view.current = current;
+        Ok(view)
     }
 
     pub(crate) fn with_source(
@@ -747,6 +787,8 @@ impl CallgraphView {
             source,
             query: std::sync::Mutex::new(super::contracts::LoadRetry::default()),
             ready: std::sync::atomic::AtomicBool::new(false),
+            legacy_import: None,
+            current: Arc::new(|| true),
         }
     }
 
@@ -793,6 +835,24 @@ impl CallgraphView {
         &self,
         now: impl Fn() -> std::time::Instant,
     ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        if !(self.current)() {
+            return Err(CallgraphViewError {
+                reason: "checkout is no longer bound to this generation".into(),
+                busy: true,
+                completion_busy: false,
+            });
+        }
+        if self
+            .legacy_import
+            .as_ref()
+            .is_some_and(|job| job.is_building())
+        {
+            return Err(CallgraphViewError {
+                reason: "legacy text and symbol import building".into(),
+                busy: true,
+                completion_busy: false,
+            });
+        }
         let mut retry = self
             .query
             .lock()
