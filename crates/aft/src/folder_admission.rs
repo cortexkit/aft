@@ -603,6 +603,35 @@ fn validated_git_worktree(root: &Path, start: Instant, budget: Duration) -> bool
 mod tests {
     use super::*;
 
+    // Fixtures can live under this checkout when TMPDIR is worktree-local.
+    // Do not mistake the enclosing AFT repository for fixture Git evidence.
+    fn isolated<R>(root: &Path, body: impl FnOnce() -> R) -> R {
+        let ceiling = root.parent().unwrap_or(root);
+        crate::git_probe::with_child_env_for_test(
+            &[("GIT_CEILING_DIRECTORIES", ceiling.as_os_str())],
+            body,
+        )
+    }
+
+    fn probe(
+        root: &Path,
+        policy: &ProjectDetectionConfig,
+        budgets: ProbeBudgets,
+    ) -> FolderAdmission {
+        isolated(root, || super::probe(root, policy, budgets))
+    }
+
+    fn probe_with_read_dir(
+        root: &Path,
+        policy: &ProjectDetectionConfig,
+        budgets: ProbeBudgets,
+        read_dir: impl Fn(&Path) -> std::io::Result<std::fs::ReadDir>,
+    ) -> FolderAdmission {
+        isolated(root, || {
+            super::probe_with_read_dir(root, policy, budgets, read_dir)
+        })
+    }
+
     fn classify(root: &Path) -> FolderAdmission {
         probe(
             root,
@@ -935,6 +964,30 @@ mod tests {
         assert_eq!(
             classify(bare.path()).classification,
             FolderClassification::NotProject
+        );
+    }
+
+    #[test]
+    fn project_subdirectory_inherits_git_evidence_without_broadening_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        let child = root.path().join("src");
+        std::fs::create_dir(&child).unwrap();
+        let result = isolated(root.path(), || {
+            super::probe(
+                &child,
+                &ProjectDetectionConfig::default(),
+                ProbeBudgets::default(),
+            )
+        });
+        assert_eq!(result.reason, AdmissionReason::GitCheckout);
+        assert_eq!(
+            result.canonical_root,
+            Some(
+                crate::path_identity::ProjectRootId::from_path(&child)
+                    .unwrap()
+                    .into_path_buf()
+            )
         );
     }
 
